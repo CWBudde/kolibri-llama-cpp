@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Write a vocab-only Kolibri-1 GGUF with llama.cpp's own converter code.
 
-Phase 2 shim: the Kolibri architecture does not exist in llama.cpp yet
-(Phase 3), so the vocabulary is written under the placeholder architecture
-qwen3moe. llama.cpp skips all hyperparameters when it loads a model with
+Phase 2 shim: libllama has no model class for the kolibri architecture yet
+(Phase 4), and llama_model_create rejects it even with vocab_only=true. The
+vocabulary is therefore written under the placeholder architecture qwen3moe.
+llama.cpp skips all hyperparameters when it loads a model with
 vocab_only=true, so the placeholder does not influence tokenization. Once
-MODEL_ARCH.KOLIBRI exists, convert_hf_to_gguf.py --vocab-only replaces this.
+llama_model_kolibri exists, convert_hf_to_gguf.py --vocab-only replaces this.
 
     vocab_gguf.py --llama-cpp third_party/llama.cpp --out third_party/llama.cpp/models/ggml-vocab-kolibri.gguf
 
