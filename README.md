@@ -27,7 +27,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | 0 | Reference outputs from the official vLLM implementation | open; needs hardware for the 78–156 GB checkpoint |
 | 1 | Checkpoint and tensor inventory | done: [docs/phase1-tensor-inventory.md](docs/phase1-tensor-inventory.md) |
 | 2 | Tokenizer compatibility | done: [docs/phase2-tokenizer.md](docs/phase2-tokenizer.md) |
-| 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration and base metadata done: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
+| 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration and GGUF metadata done: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
 | 4–9 | Model graph, hybrid KV cache, numerical validation, quantization, Apple Silicon, chat behavior | open |
 
 ### Results so far
@@ -43,9 +43,14 @@ See [`PLAN.md`](PLAN.md) for the full plan.
     IDs and detokenized bytes.
 - **The `kolibri` architecture is registered.** It is known to gguf-py and
   libllama; the model class itself is Phase 4.
-- **The converter writes the base metadata.** `convert_hf_to_gguf.py` knows
-  `Kolibri1ForCausalLM`. It writes block count, embedding size, head counts,
-  head/RoPE dimension and RMSNorm epsilon. Tensor conversion is still to come.
+- **The converter writes the GGUF metadata.** `convert_hf_to_gguf.py` knows
+  `Kolibri1ForCausalLM`. It writes:
+  - the dimensions, head counts and RMSNorm epsilon;
+  - the MoE layout: 384 experts, Top-6, expert FFN 512, one shared expert;
+  - the hybrid attention: sliding window 513 (512 preceding + current), a
+    per-layer SWA/full pattern, and RoPE on the sliding layers only.
+
+  Router gating keys and tensor conversion are still to come.
 
 ## Layout
 

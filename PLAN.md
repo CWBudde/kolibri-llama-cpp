@@ -166,12 +166,28 @@ cases and about 1.35 million fuzz strings match the reference. See
         (2026-10-03) — `kolibri.attention.layer_norm_rms_epsilon = 1e-6`.
         `tools/gguf/check_metadata.py` checks all five items against
         `config.json`, using a `--vocab-only` conversion of the pinned files.
-    -   [ ] 384 experts / 6 active;
-    -   [ ] expert FFN size 512;
-    -   [ ] shared expert;
-    -   [ ] SWA size 512;
-    -   [ ] repeating SWA/full pattern;
-    -   [ ] RoPE base 10,000 and SWA-only RoPE behavior.
+    -   [x] 384 experts / 6 active;
+        (2026-10-03) — `kolibri.expert_count = 384`, `expert_used_count = 6`,
+        written by `TextModel`; `patches/llama.cpp/0004-kolibri-moe-swa-metadata.patch`.
+    -   [x] expert FFN size 512;
+        (2026-10-03) — `kolibri.expert_feed_forward_length = 512`.
+    -   [x] shared expert;
+        (2026-10-03) — `expert_shared_count = 1`,
+        `expert_shared_feed_forward_length = 512`; checked against the
+        inventory's `ffn_gate_shexp` count and shape.
+    -   [x] SWA size 512;
+        (2026-10-03) — `kolibri.attention.sliding_window = 513`, the
+        `config.json` value. llama.cpp `LLAMA_SWA_TYPE_STANDARD` masks when
+        `p1 - p0 >= n_swa`, so 513 = 512 preceding tokens + the current one,
+        as vLLM's `window = (512, 0)`. Phase 5 tests the boundaries.
+    -   [x] repeating SWA/full pattern;
+        (2026-10-03) — `attention.sliding_window_pattern`, a per-layer bool
+        array from `layer_types` (full layers 4, 9, …, 49).
+    -   [x] RoPE base 10,000 and SWA-only RoPE behavior.
+        (2026-10-03) — `rope.freq_base = 10000` (`TextModel`) and
+        `attention.rope_pattern` = SWA pattern (1 = RoPE; read by
+        `llama_hparams::has_rope`). `tools/gguf/check_metadata.py` checks all
+        six items.
     -   [ ] router gating: `expert_gating_func = sigmoid`,
         `expert_weights_norm = false`, `expert_weights_scale = 1.0`
         (not in the original list; Phase 4 reads these keys).
