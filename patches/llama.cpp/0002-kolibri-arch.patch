@@ -1,0 +1,100 @@
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 1e0a6b18a..338a79e21 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -616,6 +616,7 @@ class MODEL_ARCH(IntEnum):
+     ARCEE            = auto()
+     AFMOE            = auto()
+     LAGUNA           = auto()
++    KOLIBRI          = auto()
+     ERNIE4_5         = auto()
+     ERNIE4_5_MOE     = auto()
+     HUNYUAN_MOE      = auto()
+@@ -1395,6 +1396,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.ARCEE:            "arcee",
+     MODEL_ARCH.AFMOE:            "afmoe",
+     MODEL_ARCH.LAGUNA:           "laguna",
++    MODEL_ARCH.KOLIBRI:          "kolibri",
+     MODEL_ARCH.ERNIE4_5:         "ernie4_5",
+     MODEL_ARCH.ERNIE4_5_MOE:     "ernie4_5-moe",
+     MODEL_ARCH.FALCON_H1:        "falcon-h1",
+@@ -4889,6 +4891,29 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.FFN_UP_SHEXP,
+         MODEL_TENSOR.FFN_DOWN_SHEXP,
+     ],
++    MODEL_ARCH.KOLIBRI: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.OUTPUT_NORM,
++        MODEL_TENSOR.OUTPUT,
++        MODEL_TENSOR.ATTN_NORM,
++        MODEL_TENSOR.ATTN_Q,
++        MODEL_TENSOR.ATTN_K,
++        MODEL_TENSOR.ATTN_V,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.ATTN_Q_NORM,
++        MODEL_TENSOR.ATTN_K_NORM,
++        MODEL_TENSOR.ATTN_POST_NORM,
++        MODEL_TENSOR.FFN_NORM,
++        MODEL_TENSOR.FFN_GATE_INP,
++        MODEL_TENSOR.FFN_EXP_PROBS_B,
++        MODEL_TENSOR.FFN_GATE_EXP,
++        MODEL_TENSOR.FFN_DOWN_EXP,
++        MODEL_TENSOR.FFN_UP_EXP,
++        MODEL_TENSOR.FFN_GATE_SHEXP,
++        MODEL_TENSOR.FFN_UP_SHEXP,
++        MODEL_TENSOR.FFN_DOWN_SHEXP,
++        MODEL_TENSOR.FFN_POST_NORM,
++    ],
+     MODEL_ARCH.ERNIE4_5: [
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.OUTPUT_NORM,
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 2af5445df..51b5c9d5f 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -117,6 +117,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_ARCEE,            "arcee"            },
+     { LLM_ARCH_AFMOE,            "afmoe"            },
+     { LLM_ARCH_LAGUNA,           "laguna"           },
++    { LLM_ARCH_KOLIBRI,          "kolibri"          },
+     { LLM_ARCH_ERNIE4_5,         "ernie4_5"         },
+     { LLM_ARCH_ERNIE4_5_MOE,     "ernie4_5-moe"     },
+     { LLM_ARCH_HUNYUAN_MOE,      "hunyuan-moe"      },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 148d293ce..80d18846f 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -122,6 +122,7 @@ enum llm_arch {
+     LLM_ARCH_ARCEE,
+     LLM_ARCH_AFMOE,
+     LLM_ARCH_LAGUNA,
++    LLM_ARCH_KOLIBRI,
+     LLM_ARCH_ERNIE4_5,
+     LLM_ARCH_ERNIE4_5_MOE,
+     LLM_ARCH_HUNYUAN_MOE,
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 97e0cee70..03a83ac49 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3182,6 +3182,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_PANGU_EMBED:
+         case LLM_ARCH_AFMOE:
+         case LLM_ARCH_LAGUNA:
++        case LLM_ARCH_KOLIBRI:
+         case LLM_ARCH_QWEN3NEXT:
+         case LLM_ARCH_MIMO2:
+         case LLM_ARCH_STEP35:
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 93bf47baa..53ed9bfbe 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -672,6 +672,9 @@ static bool arch_supported(const llm_arch arch) {
+     if (arch == LLM_ARCH_GRANITE_SWITCH) {
+         return false; // FIXME adapter fixture
+     }
++    if (arch == LLM_ARCH_KOLIBRI) {
++        return false; // FIXME no llama_model_kolibri yet
++    }
+     if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
+         return false; // FIXME Embedding (?) models produce inconsistent results.
+     }

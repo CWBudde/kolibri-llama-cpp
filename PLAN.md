@@ -140,10 +140,17 @@ cases and about 1.35 million fuzz strings match the reference. See
 
 ## Phase 3 --- GGUF architecture and HF → GGUF conversion
 
--   [ ] Add `MODEL_ARCH.KOLIBRI` in `gguf-py/gguf/constants.py`.
--   [ ] Add matching `LLM_ARCH_KOLIBRI` in `src/llama-arch.h`.
--   [ ] Add architecture-name/key/tensor mappings in the normal
+-   [x] Add `MODEL_ARCH.KOLIBRI` in `gguf-py/gguf/constants.py`.
+    (2026-10-03) — named `kolibri`; `patches/llama.cpp/0002-kolibri-arch.patch`.
+-   [x] Add matching `LLM_ARCH_KOLIBRI` in `src/llama-arch.h`.
+    (2026-10-03) — plus `LLM_ARCH_NAMES` and NEOX in `llama_model_rope_type`;
+    `test-llama-archs` skips `kolibri` until Phase 4 adds the model class.
+-   [x] Add architecture-name/key/tensor mappings in the normal
     llama.cpp architecture tables.
+    (2026-10-03) — `MODEL_TENSORS[KOLIBRI]` lists the 21 Phase 1 tensor
+    kinds; `tools/gguf/check_arch.py` checks them against the inventory. No
+    `tensor_mapping.py` entries: the converter maps the block norms
+    explicitly (Phase 1, pitfall 1). See `docs/phase3-gguf-arch.md`.
 -   [ ] Define GGUF metadata for:
     -   [ ] 50 blocks;
     -   [ ] embedding size 2,560;
@@ -187,6 +194,11 @@ novel MoE implementation.
     primitives if compatible.
 -   [ ] Add routed + shared outputs in exactly the reference order.
 -   [ ] Add graph callbacks/names useful for layer-by-layer debugging.
+-   [ ] Remove the `kolibri` skip from `arch_supported()` in
+    `tests/test-llama-archs.cpp` (added in Phase 3).
+-   [ ] Regenerate `ggml-vocab-kolibri.gguf` under `MODEL_ARCH.KOLIBRI`
+    instead of the `qwen3moe` placeholder, and update
+    `tools/gguf/check_arch.py`, which expects "unsupported model architecture".
 
 **Definition of Done:** The complete 50-layer unquantized graph builds
 and executes without tensor-shape or unsupported-op errors.
