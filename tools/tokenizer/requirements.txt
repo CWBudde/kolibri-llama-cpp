@@ -1,0 +1,12 @@
+# Versions used for the Phase 2 golden file and comparison runs.
+# The reference repo requires transformers>=5.5.3; vLLM tokenizes through it.
+--extra-index-url https://download.pytorch.org/whl/cpu
+transformers==5.18.0
+tokenizers==0.23.2
+huggingface-hub==1.33.0
+cffi==2.1.1
+numpy==2.5.3
+sentencepiece==0.2.2
+protobuf==4.25.9
+# imported at module level by llama.cpp's conversion package (vocab_gguf.py)
+torch==2.11.0
