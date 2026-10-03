@@ -13,7 +13,6 @@ libllama: a GGUF whose general.architecture is "kolibri" is a known
 """
 
 import argparse
-import importlib.util
 import json
 import re
 import sys
@@ -23,6 +22,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SUMMARY = ROOT / "inventory" / "bf16" / "summary.json"
 ARCH = "kolibri"
+
+sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
+from common import libllama  # noqa: E402
 
 
 def check_tensors(gguf) -> list[str]:
@@ -46,23 +48,10 @@ def check_tensors(gguf) -> list[str]:
     return errs
 
 
-def load_libllama(llama_cpp: Path):
-    """cffi bindings for libllama, using the loader in llama.cpp's
-    tests/test-tokenizer-random.py (as tools/tokenizer/compare.py does)."""
-    spec = importlib.util.spec_from_file_location("tokrand", llama_cpp / "tests" / "test-tokenizer-random.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.LibLlama(
-        path_llama_h=str(llama_cpp / "include" / "llama.h"),
-        path_includes=[str(llama_cpp / "ggml" / "include"), str(llama_cpp / "include")],
-        path_libllama=str(llama_cpp / "build" / "bin" / "libllama.so"),
-    )
-
-
 def check_libllama(gguf, llama_cpp: Path) -> list[str]:
     # In-process with a log callback: llama-tokenize's asynchronous logger can
     # drop its last lines when the output is a pipe.
-    lib = load_libllama(llama_cpp)
+    lib = libllama(llama_cpp)
     log: list[str] = []
 
     @lib.ffi.callback("void(enum ggml_log_level, const char *, void *)")
