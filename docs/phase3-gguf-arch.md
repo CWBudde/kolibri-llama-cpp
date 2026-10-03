@@ -1,8 +1,20 @@
-# Phase 3: GGUF architecture registration
+# Phase 3: GGUF architecture registration and converter
 
-Scope of this step: the first three Phase 3 items. These register the `kolibri`
-architecture in gguf-py and in libllama, and list its tensors. The converter
-class, the GGUF metadata, and expert packing come next.
+This report covers two steps:
+
+1. The first three Phase 3 items register the `kolibri` architecture in gguf-py
+   and in libllama, and list its tensors (patch 0002).
+2. The converter class writes the first five GGUF metadata items: block count,
+   embedding size, head counts, head/RoPE dimension, and RMSNorm epsilon
+   (patch 0003). See [Converter and base metadata](#converter-and-base-metadata).
+
+The remaining metadata, expert packing and tensor conversion come next.
+
+The patches are also kept as commits on the `feat/kolibri` branch of
+[CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp). Patches 0001 and
+0002 applied to the pinned commit give exactly that branch's tree. The one
+exception is `models/ggml-vocab-kolibri.gguf`, which the fork commits and the
+patches do not.
 
 ## Changes (`patches/llama.cpp/0002-kolibri-arch.patch`)
 
@@ -80,3 +92,81 @@ llama.cpp test suites still pass:
 
 - `test-llama-archs`: `all 133 test(s) passed`; `kolibri` is listed as SKIP;
 - `ctest -R 'test-tokenizer-0|test-generate-models'`: 17/17.
+
+## Converter and base metadata
+
+### Changes (`patches/llama.cpp/0003-kolibri-converter.patch`)
+
+The patch applies on top of 0002. In the fork it is the commit on
+`feat/kolibri-converter`.
+
+| File | Change |
+|---|---|
+| `conversion/kolibri.py` | `KolibriModel`, registered for `Kolibri1ForCausalLM` |
+| `conversion/__init__.py` | `TEXT_MODEL_MAP` entry `"Kolibri1ForCausalLM": "kolibri"` |
+
+`KolibriModel` does three things:
+
+- **`set_vocab`:** calls `_set_vocab_gpt2()`. The Phase 2 pre-tokenizer hash
+  resolves to `kolibri`.
+- **`set_gguf_parameters`:** calls `super()`, then writes
+  `rope.dimension_count = head_dim`, because the sliding layers rotate the full
+  head (Phase 1).
+- **`modify_tensors`:** raises `NotImplementedError`. Without an override, the
+  generic `TensorNameMap` would map the sandwich norms to the wrong tensors
+  (Phase 1, pitfall 1) and would not stack the per-expert tensors. A full
+  conversion therefore fails until the tensor mapping exists.
+
+### Metadata written
+
+| PLAN.md item | GGUF key | Value | Written by |
+|---|---|---|---|
+| 50 blocks | `kolibri.block_count` | 50 | `TextModel` |
+| embedding size | `kolibri.embedding_length` | 2560 | `TextModel` |
+| 48/4 Q/KV heads | `kolibri.attention.head_count`, `.head_count_kv` | 48, 4 | `TextModel` |
+| head / RoPE dimension | `kolibri.attention.key_length`, `.value_length` | 128, 128 | `TextModel` (from `head_dim`) |
+| head / RoPE dimension | `kolibri.rope.dimension_count` | 128 | `KolibriModel` |
+| RMSNorm epsilon | `kolibri.attention.layer_norm_rms_epsilon` | 1e-6 (as float32) | `TextModel` |
+
+`TextModel` also writes `context_length` (262144), `expert_count` (384),
+`expert_used_count` (6) and `rope.freq_base` (10000). The later metadata items
+own those keys and will check them together with the rest of the MoE and
+SWA/RoPE metadata.
+
+The remaining items can use existing keys, so no new GGUF keys are needed:
+
+- **SWA/full pattern:** `attention.sliding_window_pattern`, as a per-layer bool
+  array (as granite-swa does).
+- **SWA-only RoPE:** `attention.rope_pattern`, a per-layer bool array where
+  1 = RoPE. `llama_hparams::has_rope` reads it.
+
+### Check
+
+`tools/gguf/check_metadata.py --llama-cpp third_party/llama.cpp` checks the
+metadata without a single tensor:
+
+1. It runs `convert_hf_to_gguf.py --vocab-only` on the pinned config and
+   tokenizer files. This works because `prepare_metadata(vocab_only=True)` still
+   calls `set_gguf_parameters()`.
+2. It reads the result with `gguf.GGUFReader`.
+3. It compares each key with `inventory/bf16/config.json`, not with converter
+   code. Each line names the PLAN.md item it covers.
+
+Results on 2026-10-03:
+
+```
+PASS architecture: general.architecture = 'kolibri'
+PASS 50 blocks: kolibri.block_count = 50
+PASS embedding size 2,560: kolibri.embedding_length = 2560
+PASS 48/4 Q/KV heads: kolibri.attention.head_count = 48
+PASS 48/4 Q/KV heads: kolibri.attention.head_count_kv = 4
+PASS head dimension / RoPE dimension: kolibri.attention.key_length = 128
+PASS head dimension / RoPE dimension: kolibri.attention.value_length = 128
+PASS head dimension / RoPE dimension: kolibri.rope.dimension_count = 128
+PASS RMSNorm epsilon: kolibri.attention.layer_norm_rms_epsilon = 9.999999974752427e-07
+```
+
+Before the patch, the converter failed with `Model Kolibri1ForCausalLM is not
+supported`. As a mutation test, a config copy with 49 layers, `head_dim = 64`
+and `rms_norm_eps = 1e-5` (passed via `--model-dir`) fails exactly the
+block-count, key/value length, RoPE dimension, and epsilon lines.
