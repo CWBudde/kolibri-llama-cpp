@@ -142,17 +142,18 @@ def per_pos(ref, got):
     return ((ref - got) ** 2).sum(-1) / (ref ** 2).sum(-1)
 
 
-def kv_caches(log: list[str]) -> dict[str, int]:
-    """The layer count of each cache llama_kv_cache_iswa logged ("non-SWA", "SWA"), and "recurrent"
-    if a recurrent memory (llama_memory_hybrid_iswa) logged its size."""
+def kv_caches(log: list[str], field: str = "layers") -> dict[str, int]:
+    """The layer count (or with field="cells" the cell count) of each cache llama_kv_cache_iswa
+    logged ("non-SWA", "SWA"), and "recurrent" if a recurrent memory (llama_memory_hybrid_iswa)
+    logged its size."""
     caches, cache = {}, None
     for line in "".join(log).splitlines():
         if "creating non-SWA KV cache" in line or "creating     SWA KV cache" in line:
             cache = "non-SWA" if "non-SWA" in line else "SWA"
         elif "llama_kv_cache: size =" in line and cache:
-            caches[cache], cache = int(re.search(r"(\d+) layers", line)[1]), None
+            caches[cache], cache = int(re.search(rf"(\d+) {field}", line)[1]), None
         elif "llama_memory_recurrent: size =" in line:
-            caches["recurrent"] = int(re.search(r"(\d+) layers", line)[1])
+            caches["recurrent"] = int(re.search(rf"(\d+) {field}", line)[1])
     return caches
 
 

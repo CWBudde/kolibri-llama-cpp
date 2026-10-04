@@ -110,7 +110,8 @@ class Runner:
 
     def logits(self, path: Path, dev, tokens: list[int], n_ubatch: int, overrides: dict | None = None,
                nodes: dict[str, list[str]] | None = None, capture: dict | None = None,
-               chunks: list[int] | None = None, n_ctx: int = 256, **ctx_params):
+               chunks: list[int] | None = None, n_ctx: int = 256, outputs: list[int] | None = None,
+               rows: dict[str, tuple[int, list[int]]] | None = None, **ctx_params):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
         overrides maps GGUF keys to int, float or bool values that replace the file's.
         If nodes is given, it receives every graph node's name with the names of its inputs.
@@ -119,9 +120,12 @@ class Runner:
         reversed ([1, 1, n_tokens, n_embd] for an activation); see joined. If a computation has
         several nodes of that name (Vcur is the matmul and its reshape), the last one counts.
         With capture, every chunk must fit into one ubatch, so each llama_decode is one computation.
+        rows maps a captured name to (token axis as in joined, positions): of that node only the
+        given positions are kept, so a long context does not keep every activation.
         chunks are the sizes of consecutive llama_decode calls (default: one call), so the later
-        calls read the KV cache the earlier ones wrote. ctx_params set further llama_context_params
-        fields (swa_full, flash_attn_type, type_k, ...)."""
+        calls read the KV cache the earlier ones wrote. outputs are the positions that get logits
+        (default: all), and the result has one row per output position, in order. ctx_params set
+        further llama_context_params fields (swa_full, flash_attn_type, type_k, ...)."""
         import numpy as np
 
         self.log.clear()
@@ -145,6 +149,9 @@ class Runner:
         assert sum(chunks) == len(tokens) and (capture is None or max(chunks) <= n_ubatch)
         cparams = self.ll.context_default_params(n_ctx=n_ctx, n_batch=max(chunks), n_ubatch=n_ubatch,
                                                  op_offload=False, **ctx_params)
+        want = None if outputs is None else set(outputs)
+        span = [0, 0]  # the positions of the current llama_decode call
+        keep = {name: np.asarray(sorted(pos)) for name, (_, pos) in (rows or {}).items()}
         if nodes is not None or capture is not None:
             computation, seen = [0], {}  # the llama_decode call, and per name the call of its last capture
 
@@ -159,7 +166,12 @@ class Runner:
                 parts = capture[name] or []
                 if seen.get(name) == computation[0]:
                     parts.pop()  # a later node of the same name in the same computation
-                capture[name], seen[name] = parts + [self._read(t, np)], computation[0]
+                part = self._read(t, np)
+                ax = rows[name][0] if name in keep else None
+                if ax is not None and part.shape[ax] == span[1] - span[0]:  # not an earlier node of that name
+                    pos = keep[name]
+                    part = np.take(part, pos[(pos >= span[0]) & (pos < span[1])] - span[0], axis=ax)
+                capture[name], seen[name] = parts + [part], computation[0]
                 return True
 
             cparams.cb_eval = on_node
@@ -177,14 +189,15 @@ class Runner:
                     batch.pos[i] = start + i
                     batch.n_seq_id[i] = 1
                     batch.seq_id[i][0] = 0
-                    batch.logits[i] = True
+                    batch.logits[i] = want is None or start + i in want
                 batch.n_tokens = n
+                span[:] = start, start + n
                 if capture is not None:
                     computation[0] += 1
                 if (rc := self.lib.llama_decode(ctx, batch)) != 0:
                     raise RuntimeError(f"llama_decode returned {rc} at position {start}: " + self.errors())
                 out += [np.frombuffer(self.ffi.buffer(self.lib.llama_get_logits_ith(ctx, i), 4 * n_vocab),
-                                      dtype=np.float32).copy() for i in range(n)]
+                                      dtype=np.float32).copy() for i in range(n) if batch.logits[i]]
                 start += n
             return np.stack(out)
         finally:
