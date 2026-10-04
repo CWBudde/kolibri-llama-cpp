@@ -237,8 +237,10 @@ parameters keep this affordable:
   and k and v on the sliding layers within the window before a checked row.
 
 The checks, per run:
-- **KV cache:** `llama_kv_cache_iswa` with n cells for the 2 full layers, the 4
-  sliding layers in the SWA cache.
+- **KV cache:** `llama_kv_cache_iswa` with n cells for the 2 full layers, and
+  the 4 sliding layers in a SWA cache of window + ubatch cells, padded to 256
+  (`src/llama-kv-cache-iswa.cpp:73`): 1024 or 1280. A SWA cache of n cells
+  (`swa_full`) fails this, since it would never evict.
 - **`kqv_out`:** at the checked rows, against the attention recomputed in
   float64 from libllama's own q, k and v. On the full layers it covers all
   earlier keys, up to 262143 of them; on the sliding layers the window of 513.
@@ -271,14 +273,15 @@ below.
 ```
 
 rc 0, 60 PASS lines in 566 s (12 configurations, 5 lines each). The longest
-length on each device:
+length on each device (the KV-cache lines from the rerun after the SWA cache
+size was added to the assert; decode times vary by a few seconds between runs):
 
 ```
-PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] KV cache layers {'non-SWA': 2, 'SWA': 4}, cells {'non-SWA': 65536, 'SWA': 1280} (llama_kv_cache_iswa: 65536 cells for the 2 full layers, the 4 sliding layers in the SWA cache; decoded in 181 s)
+PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] KV cache layers {'non-SWA': 2, 'SWA': 4}, cells {'non-SWA': 65536, 'SWA': 1280} (llama_kv_cache_iswa: 65536 cells for the 2 full layers, 1280 = window + ubatch, padded, for the 4 sliding layers; decoded in 187 s)
 PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] kqv_out vs reference on the full layers (all earlier keys) at 66 positions in [32767, 65535]: max NMSE 1.8e-10 (<= 0.0001)
 PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] kqv_out vs reference on the sliding layers (window 513) at 66 positions in [32767, 65535]: max NMSE 6.7e-08 (<= 0.0001)
 PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] Qcur_rope vs float64 RoPE at 66 positions in [32767, 65535]: NMSE 5.2e-06, vLLM's float32 cos/sin cache 2.1e-07 (<= 100x)
-PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] KV cache layers {'non-SWA': 2, 'SWA': 4}, cells {'non-SWA': 262144, 'SWA': 1280} (llama_kv_cache_iswa: 262144 cells for the 2 full layers, the 4 sliding layers in the SWA cache; decoded in 222 s)
+PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] KV cache layers {'non-SWA': 2, 'SWA': 4}, cells {'non-SWA': 262144, 'SWA': 1280} (llama_kv_cache_iswa: 262144 cells for the 2 full layers, 1280 = window + ubatch, padded, for the 4 sliding layers; decoded in 227 s)
 PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] kqv_out vs reference on the full layers (all earlier keys) at 66 positions in [131071, 262143]: max NMSE 1.2e-08 (<= 0.0001)
 PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] kqv_out vs reference on the sliding layers (window 513) at 66 positions in [131071, 262143]: max NMSE 1.4e-07 (<= 0.0001)
 PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] Qcur_rope vs float64 RoPE at 66 positions in [131071, 262143]: NMSE 6.8e-06, vLLM's float32 cos/sin cache 2.9e-06 (<= 100x)

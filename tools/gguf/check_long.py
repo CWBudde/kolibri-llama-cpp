@@ -95,10 +95,13 @@ def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], rows:
         v = torch.from_numpy(joined(parts, axis[k])).double()
         got[k] = v.reshape(v.shape[-3], -1, d) if axis[k] == -3 else v.reshape(v.shape[-2], -1)
 
+    # the SWA cache holds the window plus one ubatch, padded to 256 cells (src/llama-kv-cache-iswa.cpp:73),
+    # so it evicts: a cache of n cells would hide a wrong window behind cells that are never reused
+    n_swa = -(-min(n, window + run["n_ubatch"]) // 256) * 256
     layers, cells = kv_caches(runner.log), kv_caches(runner.log, "cells")
-    res = [(layers == {"non-SWA": sum(full), "SWA": n_layer - sum(full)} and cells.get("non-SWA") == n,
-            f"KV cache layers {layers}, cells {cells} (llama_kv_cache_iswa: {n} cells for the "
-            f"{sum(full)} full layers, the {n_layer - sum(full)} sliding layers in the SWA cache; "
+    res = [(layers == {"non-SWA": sum(full), "SWA": n_layer - sum(full)} and cells == {"non-SWA": n, "SWA": n_swa},
+            f"KV cache layers {layers}, cells {cells} (llama_kv_cache_iswa: {n} cells for the {sum(full)} full "
+            f"layers, {n_swa} = window + ubatch, padded, for the {n_layer - sum(full)} sliding layers; "
             f"decoded in {seconds:.0f} s)")]
 
     pos = torch.tensor(rows)
