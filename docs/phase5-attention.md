@@ -14,12 +14,15 @@ half of Phase 4 item 9 (graph callbacks for layer-by-layer debugging):
 - two evaluations: `load_swa_pattern()` and `llama_memory_hybrid_iswa`.
 
 `tools/gguf/check_attn.py` compares every attention step in libllama with the
-reference implementation, layer by layer. It runs on a tiny checkpoint with
-the real attention heads and sliding window.
+reference implementation, layer by layer. It runs on two tiny checkpoints:
+one with the real attention heads and sliding window, one with the real
+50-layer SWA/full pattern.
 
-The model class is described in [phase4-model.md](phase4-model.md). Neither
-batch needed a change to it: the fork already had the window, the RoPE
-pattern and the iSWA cache; they had not been checked against the reference.
+The report covers two batches: #10 (window, off-by-one, RoPE, KV-cache reads)
+and #11 (layer pattern, iSWA cache split, GQA, QK norm). Neither needed a
+change to the model class described in [phase4-model.md](phase4-model.md):
+the fork already had the window, the RoPE pattern and the iSWA cache; they had
+not been checked against the reference.
 
 ## The reference
 
