@@ -110,7 +110,8 @@ def main() -> None:
     ap.add_argument("--gguf", type=Path, help="check this converted GGUF instead of a --vocab-only conversion")
     args = ap.parse_args()
 
-    if args.model_dir is None:
+    # Only the --vocab-only conversion needs the tokenizer files.
+    if args.model_dir is None and args.gguf is None:
         sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
         from common import tokenizer_dir
         args.model_dir = tokenizer_dir()
