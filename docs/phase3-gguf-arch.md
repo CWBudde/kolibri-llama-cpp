@@ -1,6 +1,6 @@
 # Phase 3: GGUF architecture registration and converter
 
-This report covers four steps:
+This report covers five steps:
 
 1. The first three Phase 3 items register the `kolibri` architecture in gguf-py
    and in libllama, and list its tensors (patch 0002).
@@ -12,9 +12,13 @@ This report covers four steps:
    (patch 0004). See [MoE and hybrid-attention metadata](#moe-and-hybrid-attention-metadata).
 4. The converter writes the router gating keys: sigmoid gating, no weight
    renormalization, scale 1.0 (patch 0005). See [Router gating metadata](#router-gating-metadata).
+5. The converter maps and writes every tensor: explicit block norms and
+   correction bias, stacked experts, BF16 output (patch 0006). See
+   [Tensor conversion](#tensor-conversion).
 
-With that, every GGUF metadata item of Phase 3 is written. Expert packing and
-tensor conversion come next.
+With that, every GGUF metadata item of Phase 3 is written, and a conversion
+writes every tensor. Only a tiny synthetic checkpoint has been converted so
+far; the real 156 GB checkpoint is still to come.
 
 The patches are also kept as commits on the `feat/kolibri` branch of
 [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp):
@@ -22,9 +26,10 @@ The patches are also kept as commits on the `feat/kolibri` branch of
 - 0001–0002 were committed there directly.
 - 0003 came in through `feat/kolibri-converter` (fork PR #2).
 - 0004 came in through `feat/kolibri-moe-swa-metadata` (fork PR #3).
-- 0005 comes in through `feat/kolibri-router-gating` (fork PR #5).
+- 0005 came in through `feat/kolibri-router-gating` (fork PR #5).
+- 0006 comes in through `feat/kolibri-tensor-conversion` (fork PR #6).
 
-Patches 0001–0005 applied to the pinned commit give exactly the tree of
+Patches 0001–0006 applied to the pinned commit give exactly the tree of
 `feat/kolibri`. The one exception is `models/ggml-vocab-kolibri.gguf`, which the
 fork commits and the patches do not.
 
@@ -127,7 +132,8 @@ The patch applies on top of 0002. In the fork it is the commit on
 - **`modify_tensors`:** raises `NotImplementedError`. Without an override, the
   generic `TensorNameMap` would map the sandwich norms to the wrong tensors
   (Phase 1, pitfall 1) and would not stack the per-expert tensors. A full
-  conversion therefore fails until the tensor mapping exists.
+  conversion therefore fails until the tensor mapping exists. Patch 0006 adds
+  it; see [Tensor conversion](#tensor-conversion).
 
 ### Metadata written
 
@@ -301,3 +307,138 @@ other 18 passed. As mutation tests:
   `expert_weights_norm` line;
 - a converter with `SOFTMAX` and scale 0.5 fails exactly the gating function
   and scale lines.
+
+## Tensor conversion
+
+### Changes (`patches/llama.cpp/0006-kolibri-tensor-conversion.patch`)
+
+The patch applies on top of 0005. It replaces the `NotImplementedError` in
+`KolibriModel.modify_tensors` with the tensor mapping:
+
+| HF tensor (per layer) | GGUF tensor | How |
+|---|---|---|
+| `input_layernorm` | `attn_norm` | explicit |
+| `post_attn_norm` | `post_attention_norm` | explicit (sandwich norm) |
+| `post_attention_layernorm` | `ffn_norm` | explicit (pre-FFN norm, Qwen convention) |
+| `post_ffn_norm` | `post_ffw_norm` | explicit (sandwich norm) |
+| `moe.router.expert_bias` | `exp_probs_b.bias` | explicit |
+| `mlp.experts.{E}.{gate,up,down}_proj` | `ffn_{gate,up,down}_exps` | stacked per layer, expert order |
+| everything else | as in the Phase 1 table | generic `TensorNameMap` |
+
+- **Explicit names.** The generic map sends `post_attention_layernorm` to
+  `ffn_norm` or to `post_attention_norm`, depending on the model family, and
+  `post_attn_norm` to `attn_output_norm` (Phase 1, pitfall 1). The four block
+  norms therefore never go through it.
+- **Experts.** The checkpoint has one tensor per expert. They are buffered per
+  layer, as for Qwen2MoE. Once all 3 × `num_experts` are in, they are stacked to
+  a PyTorch `[n_expert, out, in]` tensor, which is ggml
+  `ne = {in, out, n_expert}`. Only names under `mlp.experts.` take this path.
+  `mlp.shared_experts` contains "experts" too, but takes the generic path to
+  `ffn_*_shexp`. `prepare_tensors` fails if an expert tensor is left over.
+- **Dtypes.** No override is needed:
+  - the base class keeps 1D tensors (norms, `exp_probs_b`) and the router
+    `ffn_gate_inp` in F32;
+  - `--outtype bf16` writes all other matrices as BF16, which is lossless for
+    the BF16 checkpoint.
+- **Not covered.**
+  - Streaming: the base class loads tensors lazily, but no measurement on the
+    real checkpoint exists yet.
+  - FP8: a follow-up.
+  - `--fuse-gate-up-exps`: needs `ffn_gate_up_exps` in
+    `MODEL_TENSORS[KOLIBRI]`, which it is not.
+
+### Tiny checkpoint (`cmd/kolibri-tiny`)
+
+The check needs a checkpoint, and the real one is 156 GB. `cmd/kolibri-tiny`
+writes a tiny random one with the shape of the reference repo's fixture
+(`tests/checkpoints.py` at `049a6a7`):
+- 6 layers: 4 sliding, then 2 full;
+- hidden 256, 8/2 heads, head_dim 32;
+- 8 experts, top 2, expert and shared FFN 256.
+
+It differs from the reference fixture in three points:
+
+- **Vocabulary.** `vocab_size` and the special-token IDs are the real ones:
+  128000, no BOS, EOS 127906. The converter reads the real tokenizer, which
+  `check_tensors.py` copies in from the pinned, sha256-checked files.
+- **BF16 weights,** like the released checkpoint, where the reference fixture
+  uses F32.
+- **Random norms** instead of `ones`. The four block norms share a shape, so
+  only different values reveal a converter that swaps two of them.
+
+Names and shapes come from `internal/kolibri`, the Go source of truth behind
+the Phase 1 inventory. The generator also writes `manifest.json`, which lists
+for every expected GGUF tensor:
+- its ggml shape;
+- its HF sources, in stacking order.
+
+Go tests check:
+- the file against `ExpectedNames` and `ExpectedShape`;
+- the manifest: 111 tensors, every source exactly once, experts in index order;
+- that the block norms differ;
+- that two runs with the same seed are byte-identical.
+
+The safetensors writer is new in `internal/safetensors`, with a round-trip test
+against the existing header parser.
+
+### Check
+
+`tools/gguf/check_tensors.py`:
+
+1. generates the tiny checkpoint;
+2. converts it with `convert_hf_to_gguf.py --outtype bf16`;
+3. compares the GGUF with the manifest:
+   - the tensor set;
+   - the shape of every tensor;
+   - its dtype;
+   - its data, bit-exact against the BF16 source and stacked in expert
+     order for `*_exps`;
+4. checks three metadata keys of the full (not `--vocab-only`) conversion.
+
+Results on 2026-10-04:
+
+```
+PASS tensor set: 111 tensors, manifest 111
+PASS token_embd (1/1): ne [256, 128000], BF16, data bit-exact
+PASS output_norm (1/1): ne [256], F32, data bit-exact
+PASS output (1/1): ne [256, 128000], BF16, data bit-exact
+PASS attn_norm (6/6): ne [256], F32, data bit-exact
+PASS attn_q (6/6): ne [256, 256], BF16, data bit-exact
+PASS attn_k (6/6): ne [256, 64], BF16, data bit-exact
+PASS attn_v (6/6): ne [256, 64], BF16, data bit-exact
+PASS attn_q_norm (6/6): ne [32], F32, data bit-exact
+PASS attn_k_norm (6/6): ne [32], F32, data bit-exact
+PASS attn_output (6/6): ne [256, 256], BF16, data bit-exact
+PASS post_attention_norm (6/6): ne [256], F32, data bit-exact
+PASS ffn_norm (6/6): ne [256], F32, data bit-exact
+PASS ffn_gate_inp (6/6): ne [256, 8], F32, data bit-exact
+PASS exp_probs_b (6/6): ne [8], F32, data bit-exact
+PASS ffn_gate_exps (6/6): ne [256, 256, 8], BF16, 8 experts stacked, data bit-exact
+PASS ffn_up_exps (6/6): ne [256, 256, 8], BF16, 8 experts stacked, data bit-exact
+PASS ffn_down_exps (6/6): ne [256, 256, 8], BF16, 8 experts stacked, data bit-exact
+PASS ffn_gate_shexp (6/6): ne [256, 256], BF16, data bit-exact
+PASS ffn_up_shexp (6/6): ne [256, 256], BF16, data bit-exact
+PASS ffn_down_shexp (6/6): ne [256, 256], BF16, data bit-exact
+PASS post_ffw_norm (6/6): ne [256], F32, data bit-exact
+PASS metadata: general.architecture = 'kolibri'
+PASS metadata: kolibri.block_count = 6
+PASS metadata: kolibri.expert_count = 8
+PASS metadata: kolibri.attention.sliding_window_pattern = [True, True, True, True, False, False]
+```
+
+In the reference shape, hidden size, expert FFN and `8 × 32` are all 256, so
+many matrices are square. The shape lines therefore cannot tell `gate`
+from `down`, or a transposed matrix from the right one. The data comparison
+can, because it compares the row-major bytes.
+
+Before the patch, the conversion stopped at the first tensor with the
+`NotImplementedError`. As mutation tests on the converter:
+
+- **Norm swap.** Swapping the `post_attn_norm` and `post_attention_layernorm`
+  targets fails exactly the 12 `post_attention_norm` and `ffn_norm` tensors
+  (data). Remapping only one of them aborts the conversion with a duplicate
+  tensor name.
+- **Reversed expert order** fails all 18 `ffn_*_exps` tensors (data).
+- **Naive expert match.** Matching `"experts"` anywhere in the name, as
+  Qwen2MoE does, also catches `mlp.shared_experts`. The conversion then
+  aborts: "Unprocessed experts: ['model.layers.0.mlp.shared_experts…".

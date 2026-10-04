@@ -196,19 +196,36 @@ cases and about 1.35 million fuzz strings match the reference. See
         comes from `norm_topk_prob`. `config.json` names no scoring function,
         so `TextModel` wrote no gating key before. `tools/gguf/check_metadata.py`
         checks them (21/21); the correction-bias selection stays Phase 4.
--   [ ] Implement Kolibri converter class.
+-   [x] Implement Kolibri converter class.
     (2026-10-03) — partial: `KolibriModel` in the CWBudde/llama.cpp fork
     (`feat/kolibri`, patch 0003) registers `Kolibri1ForCausalLM`
     and writes the vocab and base hparams. `modify_tensors` still raises;
     the tensor mapping remains.
--   [ ] Map/pack expert tensors in the layout expected by llama.cpp.
--   [ ] Start with BF16 as the correctness reference.
+    (2026-10-04) — `modify_tensors` maps all 21 tensor kinds
+    (`patches/llama.cpp/0006-kolibri-tensor-conversion.patch`): the four
+    block norms and `expert_bias` → `exp_probs_b.bias` explicitly, the rest
+    through the generic map. `tools/gguf/check_tensors.py` converts the
+    `cmd/kolibri-tiny` checkpoint and matches all 111 tensors.
+-   [x] Map/pack expert tensors in the layout expected by llama.cpp.
+    (2026-10-04) — per-expert gate/up/down are stacked per layer into
+    `ffn_*_exps`, ne `{n_embd, n_ff, n_expert}` (down: `{n_ff, n_embd, n_expert}`),
+    in expert order; `mlp.shared_experts` stays `ffn_*_shexp`. Checked
+    bit-exact per expert; a reversed order fails all 18 `*_exps` tensors.
+-   [x] Start with BF16 as the correctness reference.
+    (2026-10-04) — `check_tensors.py` converts a BF16 checkpoint with
+    `--outtype bf16`: matrices stay BF16, norms, `exp_probs_b` and the router
+    `ffn_gate_inp` are F32, and every tensor is bit-exact against its source.
 -   [ ] Treat direct FP8 conversion as a follow-up optimization rather
     than blocking initial correctness.
 -   [ ] Stream tensors/shards during conversion so the full 156 GB
     checkpoint never needs to reside in RAM.
--   [ ] Verify GGUF metadata, tensor count, shapes, and dtypes with
+-   [x] Verify GGUF metadata, tensor count, shapes, and dtypes with
     automated assertions.
+    (2026-10-04) — `check_metadata.py` (21 keys, real config, `--vocab-only`)
+    plus `check_tensors.py` (tensor set, ggml shape, dtype and data of all
+    111 tensors, plus metadata of the full conversion), on the tiny
+    checkpoint. Both are in the README check list. Running it on the real
+    156 GB checkpoint is still open (Definition of Done).
 
 **Definition of Done:** A structurally correct unquantized GGUF is
 produced reproducibly.
@@ -392,7 +409,8 @@ conventions.
 ## Immediate implementation tasks derived from the repository audit
 
 - [x] Pin the reference to commit `049a6a7bd2405b27d6d280d256bd3d585191c7ae` in project notes/tests.
-- [ ] Port the tiny synthetic checkpoint shape from `tests/checkpoints.py` into a llama.cpp conversion/inference fixture. This allows architecture work without downloading 156 GB.
+- [x] Port the tiny synthetic checkpoint shape from `tests/checkpoints.py` into a llama.cpp conversion/inference fixture. This allows architecture work without downloading 156 GB.
+  (2026-10-04) — `cmd/kolibri-tiny`: the reference shape (6 layers SSSSFF, 8 experts), BF16, random norms, the real 128k vocab; plus a manifest of the expected GGUF tensors. `check_tensors.py` converts it; the inference use comes with Phase 4.
 - [ ] Add a standalone router unit test using 384 experts / Top-6 and a non-zero correction bias, matching `test_routing_semantics()` from the official repo.
 - [ ] Add a tiny 6-layer hybrid-attention fixture so both SWA and full/RNoPE layers execute in one fast test.
 - [x] Make sandwich norms a first-class mapping requirement before any full-checkpoint conversion.
