@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Write a vocab-only Kolibri-1 GGUF with llama.cpp's own converter code.
 
-Phase 2 shim: libllama has no model class for the kolibri architecture yet
-(Phase 4), and llama_model_create rejects it even with vocab_only=true. The
-vocabulary is therefore written under the placeholder architecture qwen3moe.
-llama.cpp skips all hyperparameters when it loads a model with
-vocab_only=true, so the placeholder does not influence tokenization. Once
-llama_model_kolibri exists, convert_hf_to_gguf.py --vocab-only replaces this.
+This is convert_hf_to_gguf.py --vocab-only with the converter's Kolibri
+class (architecture kolibri, with the hyperparameters from config.json), plus
+a fixed general.name: run on the HF cache, the converter would record the
+revision SHA as the model name and fine-tune.
 
     vocab_gguf.py --llama-cpp third_party/llama.cpp --out third_party/llama.cpp/models/ggml-vocab-kolibri.gguf
 
@@ -34,19 +32,10 @@ def main() -> None:
     sys.path.insert(0, str(args.llama_cpp / "gguf-py"))
     sys.path.insert(0, str(args.llama_cpp))
     import gguf
-    from conversion import ModelBase, TextModel
+    from conversion import get_model_class
 
-    @ModelBase.register("Kolibri1ForCausalLM")
-    class KolibriVocab(TextModel):
-        model_arch = gguf.MODEL_ARCH.QWEN3MOE  # placeholder, see module docstring
-
-        def set_vocab(self):
-            self._set_vocab_gpt2()
-
-        def set_gguf_parameters(self):
-            pass  # vocab-only: llama.cpp does not read hyperparameters
-
-    model = KolibriVocab(args.tokenizer_dir, gguf.LlamaFileType.ALL_F32, args.out, model_name="Kolibri-1")
+    cls = get_model_class("Kolibri1ForCausalLM")
+    model = cls(args.tokenizer_dir, gguf.LlamaFileType.ALL_F32, args.out, model_name="Kolibri-1")
     with tempfile.TemporaryDirectory() as empty:
         # The HF cache directory is named after the revision SHA, which the
         # metadata heuristics would otherwise record as general.finetune.
