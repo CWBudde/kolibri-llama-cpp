@@ -27,10 +27,11 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | Reference outputs from the official vLLM implementation | open; needs hardware for the 78–156 GB checkpoint |
 | Checkpoint and tensor inventory | done: [docs/checkpoint.md](docs/checkpoint.md) |
 | Tokenizer compatibility | done: [docs/tokenizer.md](docs/tokenizer.md) |
-| GGUF architecture and HF → GGUF converter | arch registration, GGUF metadata and tensor conversion done, checked on a tiny synthetic checkpoint: [docs/gguf-conversion.md](docs/gguf-conversion.md). The real checkpoint, FP8 input and streaming conversion are open |
-| Model class and MoE graph | done on tiny synthetic checkpoints (CPU and Metal); router and MoE block match the reference function: [docs/model.md](docs/model.md). The 50-layer graph needs the full checkpoint |
+| GGUF architecture and HF → GGUF converter | arch registration, GGUF metadata and tensor conversion done, checked on a tiny synthetic checkpoint: [docs/gguf-conversion.md](docs/gguf-conversion.md). The real BF16 checkpoint converts with a peak footprint of 7.5 GiB and is bit-exact in every tensor: [docs/real-checkpoint.md](docs/real-checkpoint.md). FP8 input is open |
+| Model class and MoE graph | done on tiny synthetic checkpoints (CPU and Metal); router and MoE block match the reference function: [docs/model.md](docs/model.md). The full 50-layer graph runs on the real BF16 weights (CPU) |
 | Hybrid attention and KV cache | done; the 4:1 pattern over 50 layers, the iSWA cache split, sliding-window mask, off-by-one, RoPE on the sliding layers only, GQA 48/4 and per-head QK norm match the reference on tiny checkpoints; the attention and KV cache also hold at 8k, 16k, 64k and 262k tokens: [docs/attention.md](docs/attention.md) |
-| Numerical validation, quantization, Apple Silicon | open; need the checkpoint |
+| Numerical validation | open; needs the vLLM reference outputs |
+| Quantization, Apple Silicon | first candidate runs: Q3_K routed experts with Q8_0 elsewhere, 33.7 GiB, fully on Metal on a 48 GB Mac at about 59 tokens/s, 32k context within the default Metal limit. Quality is only measured against this port's own BF16 (KLD 0.108) until the numerical validation passes: [docs/real-checkpoint.md](docs/real-checkpoint.md) |
 | Chat template and inference behavior | in progress; llama-server renders the chat template exactly as the reference does for every reasoning mode and tool-call shape, the chat parser splits reasoning, content and tool calls, and generation stops on the reference's two eos tokens: [docs/chat.md](docs/chat.md). The recommended sampling waits for the numerical validation |
 
 ### Results so far
@@ -128,10 +129,10 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `inventory/{bf16,fp8}/` | Committed inventories: `summary.json` and `tensors.jsonl.gz`. They pin the model revisions and the sha256 of every file. |
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
 | `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
-| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. `check_long.py` does the same for the attention at 8k, 16k, 64k and 262k tokens, on sampled positions. |
+| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. `check_long.py` does the same for the attention at 8k, 16k, 64k and 262k tokens, on sampled positions. `check_real.py` checks a GGUF converted from the real BF16 checkpoint against the inventory: shard hashes, tensor set, shapes, dtypes and bit-exact data. |
 | `tools/chat/` | `check_chat.py` checks the chat template in the GGUFs and in llama-server, compares llama-server's rendered prompts with the reference renderer for every reasoning mode and tool-call shape, and checks the stop tokens. |
 | `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. |
-| `docs/` | Reference docs per topic (checkpoint, tokenizer, conversion, model, attention, chat), with findings, pitfalls and reproduction steps. |
+| `docs/` | Reference docs per topic (checkpoint, tokenizer, conversion, model, attention, chat, real checkpoint), with findings, pitfalls and reproduction steps. |
 
 ## Setup
 
@@ -185,6 +186,16 @@ ctest --test-dir third_party/llama.cpp/build -R 'test-tokenizer-0|test-generate-
 third_party/llama.cpp/build/bin/test-llama-archs
 ```
 
+On the real checkpoint (156 GB download, another 156 GB for the GGUF; see
+[docs/real-checkpoint.md](docs/real-checkpoint.md)):
+
+```sh
+.venv/bin/python tools/gguf/check_real.py --llama-cpp third_party/llama.cpp \
+    --model-dir ~/models/Kolibri-1-BF16 --gguf ~/models/Kolibri-1-BF16.gguf  # about 12 min
+.venv/bin/python tools/gguf/check_metadata.py --llama-cpp third_party/llama.cpp \
+    --gguf ~/models/Kolibri-1-BF16.gguf
+```
+
 Network access:
 - The tokenizer tools download only `config.json`, `tokenizer.json` and
   `tokenizer_config.json`. They use the pinned revision and verify each file's
@@ -195,7 +206,8 @@ Network access:
 ## Known upstream issues
 
 These belong upstream, not in the Kolibri patches. Details are in
-[docs/tokenizer.md](docs/tokenizer.md).
+[docs/tokenizer.md](docs/tokenizer.md), except the last, which is in
+[docs/real-checkpoint.md](docs/real-checkpoint.md).
 
 - **Invalid UTF-8 can crash `llama_tokenize`.** Some inputs abort the whole
   process, for example the 4 bytes `F4 90 80 80` (U+110000). This affects
@@ -203,3 +215,8 @@ These belong upstream, not in the Kolibri patches. Details are in
 - **`tests/test-tokenizer-random.py` is broken:**
   - its `LibLlamaModel` uses the pre-`llama_vocab` API;
   - under transformers 5 its word lists collapse into one string.
+- **Metal with `--cpu-moe` crashes on files larger than the Metal working set.**
+  The mmap'd GGUF is wrapped in no-copy Metal buffers, and the CPU expert
+  matmul (`ggml_compute_forward_mul_mat_id`) then dies with SIGBUS
+  (`KERN_PROTECTION_FAILURE`). A 33.7 GiB file runs; the 79 GiB Q8_0 and
+  149 GiB BF16 files crash. CPU-only runs are unaffected.

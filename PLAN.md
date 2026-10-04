@@ -57,8 +57,8 @@ KV-cache mechanism.
 ## Done so far
 
 Evidence, mutation tests and reproduction steps live in `docs/`. Everything
-below is checked on tiny synthetic checkpoints (`cmd/kolibri-tiny`) on CPU
-and Metal; the real checkpoint is still to come.
+below except the last bullet is checked on tiny synthetic checkpoints
+(`cmd/kolibri-tiny`) on CPU and Metal.
 
 -   **Checkpoint and tensor inventory.** Every BF16 and FP8 tensor is
     identified and classified; the HF → GGUF mapping, expert storage,
@@ -106,6 +106,16 @@ and Metal; the real checkpoint is still to come.
     runs sliding and full/NoPE layers in one fast `check_attn.py` test.
     Sandwich norms are a first-class mapping
     requirement.
+-   **Real checkpoint (structural, not numerical).**
+    -   The pinned BF16 checkpoint converts in 8 minutes with a peak
+        footprint of 7.5 GiB. All 903 GGUF tensors are bit-exact against the
+        58,353 safetensors tensors, and all 21 metadata assertions pass.
+    -   The 50-layer graph runs unquantized on the CPU.
+    -   The first quantized candidate fits Metal on the 48 GB Mac with 32k
+        context: Q3_K routed experts, Q8_0 elsewhere, F32 router and norms,
+        33.7 GiB.
+    -   `check_real.py`, `check_metadata.py --gguf`;
+        [docs/real-checkpoint.md](docs/real-checkpoint.md).
 
 ## Phase 0 --- Reproducible reference environment
 
@@ -131,11 +141,21 @@ is left needs the 156 GB BF16 checkpoint.
 
 -   [ ] Treat direct FP8 conversion as a follow-up optimization rather
     than blocking initial correctness.
--   [ ] Stream tensors/shards during conversion so the full 156 GB
-    checkpoint never needs to reside in RAM.
--   [ ] Convert the real BF16 checkpoint and run the metadata, tensor
-    count, shape and dtype assertions on it.
--   [ ] Build and execute the complete 50-layer unquantized graph.
+-   [x] Stream tensors/shards during conversion so the full 156 GB
+    checkpoint never needs to reside in RAM. (2026-10-04) — no converter
+    change needed. The lazy base class and the per-layer expert buffer keep
+    the conversion at "8025841608 peak memory footprint" (`/usr/bin/time -l`)
+    for the 156 GB checkpoint.
+-   [x] Convert the real BF16 checkpoint and run the metadata, tensor
+    count, shape and dtype assertions on it. (2026-10-04) — new
+    `check_real.py`: "PASS tensor set: 903 tensors, inventory 903", every
+    class "data bit-exact", "PASS parameters: 78,103,074,560 in the GGUF".
+    `check_metadata.py --gguf` on the real GGUF: 21 PASS, 0 FAIL.
+-   [x] Build and execute the complete 50-layer unquantized graph.
+    (2026-10-04) — BF16 GGUF, CPU-only (`-dev none`), greedy: "The capital of
+    Germany is Berlin.", "1.45 tokens per second". Metal with `--cpu-moe`
+    crashes with SIGBUS for files above the Metal working set (generic
+    ggml-metal; README "Known upstream issues").
 
 **Definition of Done:** A structurally correct unquantized GGUF is
 produced reproducibly, and the complete 50-layer unquantized graph builds
@@ -172,12 +192,23 @@ consistent with the reference within documented tolerances.
 The 48 GB target makes mixed quantization more important than simply
 producing a generic Q4.
 
--   [ ] Produce Q8 first as a quantizer sanity check.
+-   [x] Produce Q8 first as a quantizer sanity check. (2026-10-04) —
+    79,279 MiB in 40 s. On the CPU (`--no-repack`) it answers "Berlin". Against
+    this port's BF16 on wikitext-2 (20 × 512): "Mean KLD: 0.049704 ± 0.004569",
+    "Same top p: 92.490 ± 0.369 %".
 -   [ ] Produce Q6/Q5 baselines if useful.
 -   [ ] Produce Q4 variants.
--   [ ] Produce IQ3/Q3 variants if Q4 lacks memory headroom.
--   [ ] Keep router tensors at high precision initially.
--   [ ] Keep normalization tensors at high precision.
+-   [ ] Produce IQ3/Q3 variants if Q4 lacks memory headroom. (2026-10-04) —
+    partial: Q4 lacks headroom, since dry runs give Q3_K_M 35,781 MiB and
+    IQ4_XS 40,286 MiB against a Metal working set of 38,338 MiB. One variant
+    exists: Q3_K routed experts with Q8_0 elsewhere, "quant size = 33716.93 MiB
+    (3.62 BPW)". IQ3 variants with an importance matrix remain.
+-   [x] Keep router tensors at high precision initially. (2026-10-04) —
+    `ffn_gate_inp` and `exp_probs_b` stay F32 in both quantized files.
+    `llama-quantize` dry run: "blk.0.ffn_gate_inp.weight ... type = f32".
+-   [x] Keep normalization tensors at high precision. (2026-10-04) — all
+    1D norms stay F32. `llama-quantize` dry run: "blk.0.attn_norm.weight ...
+    type = f32".
 -   [ ] Evaluate Q/K projections and QK norms conservatively because
     routing/attention errors can amplify across 50 layers.
 -   [ ] Evaluate whether shared experts deserve higher precision than
@@ -185,9 +216,17 @@ producing a generic Q4.
 -   [ ] Build an importance matrix if supported/useful for the selected
     quantization scheme.
 -   [ ] Compare perplexity/task outputs and router expert-selection
-    agreement against the unquantized model.
+    agreement against the unquantized model. (2026-10-04) — partial:
+    perplexity and KLD are measured against this port's BF16. For the Q3 mix
+    on Metal: "Mean KLD: 0.108174 ± 0.007597", "Same top p: 88.431 ± 0.448 %".
+    Router agreement, task outputs and any judgment of quality wait for the
+    Phase 6 gate.
 -   [ ] Specifically measure how often quantization changes Top-6 expert
     selection.
+-   [ ] Explain why Q8_0 against BF16 reaches KLD 0.050 with 92.5% same top
+    token on the same backend (CPU), about 50 times a dense model's Q8_0.
+    The suspect is Top-6 flips at router near-ties. Investigate after
+    Phase 6.
 
 **Definition of Done:** At least one quantization retains acceptable
 behavior and runs stably through Metal.
@@ -200,12 +239,20 @@ cache, and macOS. Q4 is therefore a boundary case, not a guaranteed fit.
 
 For each candidate:
 
--   [ ] Measure GGUF file size.
--   [ ] Measure actual unified-memory use after load.
--   [ ] Measure Metal buffers/runtime overhead.
+-   [ ] Measure GGUF file size. (2026-10-04) — partial: the Q3 mix is
+    33,717 MiB; other candidates remain.
+-   [ ] Measure actual unified-memory use after load. (2026-10-04) —
+    partial, Q3 mix at 32k: "MTL0 ... 34384 = 33384 + 740 + 260", host 418 MiB.
+-   [ ] Measure Metal buffers/runtime overhead. (2026-10-04) — partial,
+    Q3 mix: compute buffer 260 MiB on MTL0 and 43 MiB on CPU.
 -   [ ] Measure SWA and full-attention KV-cache memory separately.
--   [ ] Measure prompt-processing tokens/s.
--   [ ] Measure generation tokens/s.
+    (2026-10-04) — partial, Q3 mix at 32k: full attention "640.00 MiB (32768
+    cells, 10 layers)", SWA "100.00 MiB (1280 cells, 40 layers)".
+-   [ ] Measure prompt-processing tokens/s. (2026-10-04) — partial: only a
+    5-token prompt so far (71 tokens/s); a real `llama-bench` run remains.
+-   [ ] Measure generation tokens/s. (2026-10-04) — partial, Q3 mix on
+    Metal: 59.9 tokens/s (`llama-completion`) and 58.7 tokens/s
+    (`llama-server` chat).
 -   [ ] Measure expert-routing overhead.
 -   [ ] Test 8k, 16k, and 32k contexts first.
 -   [ ] Expand context only if memory headroom permits.
@@ -268,7 +315,7 @@ conventions.
 ## Immediate implementation tasks derived from the repository audit
 
 - [ ] Treat BF16 as the initial source of truth; postpone direct FP8-source support until BF16 logits match.
-- [ ] Report the upstream llama.cpp issues found along the way (invalid UTF-8 aborting `llama_tokenize`, overlong decoding, two test-tooling bugs); see README "Known upstream issues" and [docs/tokenizer.md](docs/tokenizer.md).
+- [ ] Report the upstream llama.cpp issues found along the way (invalid UTF-8 aborting `llama_tokenize`, overlong decoding, two test-tooling bugs, Metal `--cpu-moe` SIGBUS above the working set); see README "Known upstream issues", [docs/tokenizer.md](docs/tokenizer.md) and [docs/real-checkpoint.md](docs/real-checkpoint.md).
 
 ## First actionable milestone
 
