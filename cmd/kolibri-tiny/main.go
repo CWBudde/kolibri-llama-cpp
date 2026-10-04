@@ -1,7 +1,7 @@
 // Command kolibri-tiny writes a tiny random-weight Kolibri-1 checkpoint for
 // converter tests, so they need no 156 GB download.
 //
-//	kolibri-tiny -out DIR -tokenizer-dir DIR [-seed N]
+//	kolibri-tiny -out DIR -tokenizer-dir DIR [-seed N] [-router | -attn]
 //
 // The shape follows the reference repo's tests/checkpoints.py
 // (Aleph-Alpha/aleph-alpha-inference@049a6a7): 6 layers (4 sliding, 2 full),
@@ -18,6 +18,11 @@
 // test_routing_semantics instead: 384 experts, top 6, router logits with
 // standard deviation about 3 and a correction bias with standard deviation 5.
 // moe_intermediate_size drops to 16 to keep the 384 experts small.
+//
+// With -attn it writes the real attention shapes instead: 48 query heads,
+// 4 KV heads, head_dim 128 and the real sliding window of 513 (512
+// preceding tokens plus the current one), so the window boundaries can be
+// tested at 511, 512 and 513 tokens.
 //
 // Tensor names and shapes come from internal/kolibri, the same source of
 // truth as the Phase 1 inventory. manifest.json lists every expected GGUF
@@ -101,34 +106,61 @@ func main() {
 	tokDir := flag.String("tokenizer-dir", "", "directory with tokenizer.json and tokenizer_config.json (optional)")
 	seed := flag.Uint64("seed", 1, "random seed")
 	router := flag.Bool("router", false, "384 experts, top 6, and the reference router test's magnitudes")
+	attn := flag.Bool("attn", false, "the real attention heads (48 Q, 4 KV, head_dim 128) and sliding window (513)")
 	flag.Parse()
-	if *out == "" || flag.NArg() != 0 {
+	if *out == "" || flag.NArg() != 0 || *router && *attn {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := generate(*out, *tokDir, *seed, *router); err != nil {
+	p := presetDefault
+	switch {
+	case *router:
+		p = presetRouter
+	case *attn:
+		p = presetAttn
+	}
+	if err := generate(*out, *tokDir, *seed, p); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// configJSON returns tinyConfig, or with router its 384-expert variant.
-func configJSON(router bool) ([]byte, error) {
-	if !router {
+// preset selects a variant of tinyConfig.
+type preset int
+
+const (
+	presetDefault preset = iota
+	// presetRouter has the shape of the reference test_routing_semantics.
+	presetRouter
+	// presetAttn has the real attention heads and sliding window.
+	presetAttn
+)
+
+// configJSON returns tinyConfig with the changes of preset p.
+func configJSON(p preset) ([]byte, error) {
+	if p == presetDefault {
 		return []byte(tinyConfig), nil
 	}
 	var m map[string]any
 	if err := json.Unmarshal([]byte(tinyConfig), &m); err != nil {
 		return nil, err
 	}
-	m["num_experts"] = 384
-	m["num_experts_per_tok"] = 6
-	m["moe_intermediate_size"] = 16
+	switch p {
+	case presetRouter:
+		m["num_experts"] = 384
+		m["num_experts_per_tok"] = 6
+		m["moe_intermediate_size"] = 16
+	case presetAttn:
+		m["num_attention_heads"] = 48
+		m["num_key_value_heads"] = 4
+		m["head_dim"] = 128
+		m["sliding_window"] = 513
+	}
 	raw, err := json.MarshalIndent(m, "", "  ")
 	return append(raw, '\n'), err
 }
 
-func generate(dir, tokDir string, seed uint64, router bool) error {
-	raw, err := configJSON(router)
+func generate(dir, tokDir string, seed uint64, p preset) error {
+	raw, err := configJSON(p)
 	if err != nil {
 		return err
 	}
@@ -163,7 +195,7 @@ func generate(dir, tokDir string, seed uint64, router bool) error {
 			return err
 		}
 		shape := cfg.ExpectedShape(e)
-		mean, std := initScale(e.Spec, router)
+		mean, std := initScale(e.Spec, p == presetRouter)
 		tensors = append(tensors, safetensors.WriteTensor{Name: name, DType: "BF16", Shape: shape, Data: randBF16(rng, shape, mean, std)})
 	}
 	if err := writeFile(filepath.Join(dir, "model.safetensors"), func(w *bufio.Writer) error {

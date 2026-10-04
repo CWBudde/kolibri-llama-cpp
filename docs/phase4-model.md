@@ -210,8 +210,11 @@ needs a reference:
 > [Phase 4: router](phase4-router.md).
 
 - **Phase 4 item 9, attention half:** callbacks proven useful for debugging
-  the attention, which needs the Phase 5/6 reference.
+  the attention, which needs the Phase 5/6 reference. Update: done, see
+  [Phase 5: attention](phase5-attention.md).
 - **The Phase 4 Definition of Done:** the 50-layer graph. Only the 6-layer
   fixture and the `test-llama-archs` model have run.
 - **Phase 5.** The graph already contains iSWA, RoPE on the SWA layers only and
-  GQA, but none of it is checked against the reference.
+  GQA, but none of it is checked against the reference. Update: the window,
+  the RoPE pattern and the SWA cache now match the reference; see
+  [Phase 5: attention](phase5-attention.md).

@@ -234,6 +234,7 @@ commit give exactly `feat/kolibri` at 2e3588bf4, except
   - Phase 6 compares the selected expert ids, and Phase 8 decides whether the
     router logits need an F32 path on Metal.
 - **Attention-side callbacks** (item 9) and all attention semantics: Phases 5
-  and 6.
+  and 6. Update: the callbacks and the window and RoPE semantics are done; see
+  [Phase 5: attention](phase5-attention.md).
 - **The Phase 4 Definition of Done:** the 50-layer graph needs a full-size
   GGUF.

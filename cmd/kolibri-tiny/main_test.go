@@ -16,7 +16,7 @@ import (
 
 func TestGenerate(t *testing.T) {
 	dir := t.TempDir()
-	if err := generate(dir, "", 1, false); err != nil {
+	if err := generate(dir, "", 1, presetDefault); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,7 +146,7 @@ func TestGenerate(t *testing.T) {
 
 func TestGenerateRouter(t *testing.T) {
 	dir := t.TempDir()
-	if err := generate(dir, "", 1, true); err != nil {
+	if err := generate(dir, "", 1, presetRouter); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
@@ -207,6 +207,50 @@ func TestGenerateRouter(t *testing.T) {
 	}
 }
 
+func TestGenerateAttn(t *testing.T) {
+	dir := t.TempDir()
+	if err := generate(dir, "", 1, presetAttn); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := kolibri.ParseConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The real head shapes and window; the MoE stays the reference fixture's.
+	if cfg.NumAttentionHeads != 48 || cfg.NumKeyValueHeads != 4 || cfg.HeadDim != 128 || cfg.SlidingWindow != 513 ||
+		cfg.NumExperts != 8 || cfg.NumHiddenLayers != 6 || !cfg.IsFullAttention(4) || cfg.IsFullAttention(3) {
+		t.Errorf("config = %+v", cfg)
+	}
+
+	f, err := os.Open(filepath.Join(dir, "model.safetensors"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h, err := safetensors.ReadHeader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]int64{}
+	for _, tt := range h.Tensors {
+		got[tt.Name] = tt.Shape
+	}
+	for name, shape := range map[string][]int64{
+		"model.layers.0.self_attn.q_proj.weight": {48 * 128, 256},
+		"model.layers.0.self_attn.k_proj.weight": {4 * 128, 256},
+		"model.layers.0.self_attn.o_proj.weight": {256, 48 * 128},
+		"model.layers.0.self_attn.q_norm.weight": {128},
+	} {
+		if !slices.Equal(got[name], shape) {
+			t.Errorf("%s: shape %v, want %v", name, got[name], shape)
+		}
+	}
+}
+
 func bf16Stats(buf []byte) (mean, std float64) {
 	n := len(buf) / 2
 	var sum, sq float64
@@ -221,10 +265,10 @@ func bf16Stats(buf []byte) (mean, std float64) {
 
 func TestGenerateDeterministic(t *testing.T) {
 	a, b := t.TempDir(), t.TempDir()
-	if err := generate(a, "", 7, false); err != nil {
+	if err := generate(a, "", 7, presetDefault); err != nil {
 		t.Fatal(err)
 	}
-	if err := generate(b, "", 7, false); err != nil {
+	if err := generate(b, "", 7, presetDefault); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"config.json", "model.safetensors", "manifest.json"} {
