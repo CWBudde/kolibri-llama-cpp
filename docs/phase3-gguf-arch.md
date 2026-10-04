@@ -1,20 +1,28 @@
 # Phase 3: GGUF architecture registration and converter
 
-This report covers two steps:
+This report covers three steps:
 
 1. The first three Phase 3 items register the `kolibri` architecture in gguf-py
    and in libllama, and list its tensors (patch 0002).
 2. The converter class writes the first five GGUF metadata items: block count,
    embedding size, head counts, head/RoPE dimension, and RMSNorm epsilon
    (patch 0003). See [Converter and base metadata](#converter-and-base-metadata).
+3. The converter writes the MoE and hybrid-attention metadata: experts, expert
+   FFN size, shared expert, sliding window, SWA/full pattern, and SWA-only RoPE
+   (patch 0004). See [MoE and hybrid-attention metadata](#moe-and-hybrid-attention-metadata).
 
-The remaining metadata, expert packing and tensor conversion come next.
+The router gating keys, expert packing and tensor conversion come next.
 
 The patches are also kept as commits on the `feat/kolibri` branch of
-[CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp). Patches 0001 and
-0002 applied to the pinned commit give exactly that branch's tree. The one
-exception is `models/ggml-vocab-kolibri.gguf`, which the fork commits and the
-patches do not.
+[CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp):
+
+- 0001–0002 were committed there directly.
+- 0003 came in through `feat/kolibri-converter` (fork PR #2).
+- 0004 came in through `feat/kolibri-moe-swa-metadata` (fork PR #3).
+
+Patches 0001–0004 applied to the pinned commit give exactly the tree of
+`feat/kolibri`. The one exception is `models/ggml-vocab-kolibri.gguf`, which the
+fork commits and the patches do not.
 
 ## Changes (`patches/llama.cpp/0002-kolibri-arch.patch`)
 
@@ -129,16 +137,8 @@ The patch applies on top of 0002. In the fork it is the commit on
 | RMSNorm epsilon | `kolibri.attention.layer_norm_rms_epsilon` | 1e-6 (as float32) | `TextModel` |
 
 `TextModel` also writes `context_length` (262144), `expert_count` (384),
-`expert_used_count` (6) and `rope.freq_base` (10000). The later metadata items
-own those keys and will check them together with the rest of the MoE and
-SWA/RoPE metadata.
-
-The remaining items can use existing keys, so no new GGUF keys are needed:
-
-- **SWA/full pattern:** `attention.sliding_window_pattern`, as a per-layer bool
-  array (as granite-swa does).
-- **SWA-only RoPE:** `attention.rope_pattern`, a per-layer bool array where
-  1 = RoPE. `llama_hparams::has_rope` reads it.
+`expert_used_count` (6) and `rope.freq_base` (10000). The next step checks the
+last three of these (see below).
 
 ### Check
 
@@ -170,3 +170,81 @@ Before the patch, the converter failed with `Model Kolibri1ForCausalLM is not
 supported`. As a mutation test, a config copy with 49 layers, `head_dim = 64`
 and `rms_norm_eps = 1e-5` (passed via `--model-dir`) fails exactly the
 block-count, key/value length, RoPE dimension, and epsilon lines.
+
+## MoE and hybrid-attention metadata
+
+### Changes (`patches/llama.cpp/0004-kolibri-moe-swa-metadata.patch`)
+
+The patch applies on top of 0003. It only extends
+`KolibriModel.set_gguf_parameters` in `conversion/kolibri.py`, using existing
+gguf-py writers. No new GGUF keys are needed.
+
+Before this patch, the 0003 comments were reflowed to one sentence per line.
+That addressed a Codex review finding: llama.cpp `AGENTS.md` asks for no
+hard-wrapped comments.
+
+### Metadata written
+
+| PLAN.md item | GGUF key | Value | Written by |
+|---|---|---|---|
+| 384 experts / 6 active | `kolibri.expert_count`, `.expert_used_count` | 384, 6 | `TextModel` |
+| expert FFN size 512 | `kolibri.expert_feed_forward_length` | 512 | `KolibriModel` |
+| shared expert | `kolibri.expert_shared_count` | 1 | `KolibriModel` |
+| shared expert | `kolibri.expert_shared_feed_forward_length` | 512 | `KolibriModel` |
+| SWA size 512 | `kolibri.attention.sliding_window` | 513 | `KolibriModel` |
+| repeating SWA/full pattern | `kolibri.attention.sliding_window_pattern` | bool[50], true = SWA | `KolibriModel` |
+| RoPE base 10,000 | `kolibri.rope.freq_base` | 10000 | `TextModel` |
+| SWA-only RoPE | `kolibri.attention.rope_pattern` | bool[50], true = RoPE | `KolibriModel` |
+
+- **Shared expert.** The checkpoint has one ungated shared expert per layer,
+  with `gate_proj` shape [512, 2560]. Qwen2/3-MoE write only the shared FFN
+  length. Kolibri also writes `expert_shared_count = 1`, so the count does not
+  depend on a model-class default.
+- **Sliding window 513.** `config.json` stores `sliding_window = 513`, and vLLM
+  passes it to FlashAttention as `window = (512, 0)`: the 512 preceding tokens
+  plus the current one. llama.cpp `LLAMA_SWA_TYPE_STANDARD` masks a key when
+  `p1 - p0 >= n_swa` (`src/llama-hparams.h`). With `n_swa = 513` that is the
+  same window, so the value is stored unchanged. Phase 5 tests the 511, 512 and
+  513 boundaries numerically.
+- **Patterns.** Both arrays come from `layer_types`:
+  - `sliding_window_pattern` is read by `llama_model_base::load_swa_pattern`
+    (`get_arr` into `hparams.is_swa_impl`).
+  - `rope_pattern` is read into `hparams.rope_pattern` and used by
+    `llama_hparams::has_rope`. It equals the SWA pattern, because the
+    full-attention layers 4, 9, …, 49 use no positional encoding (RNoPE,
+    Phase 1).
+
+  The Phase 4/5 loader decides how `llama_model_kolibri` reads these keys.
+
+### Check
+
+`check_metadata.py` takes the expected values for these keys from the Phase 1
+inventory summary, not from `config.json` alone:
+
+- **shared expert:** count = `ffn_gate_shexp` tensors / layers, and FFN size =
+  its `hf_shape[0]`;
+- **sliding window:** `attention.sliding_window`;
+- **pattern:** built from `attention.full_attention_layers`, and checked against
+  `swa_period` (period 5, full layer last).
+
+The per-layer arrays print as 0/1 strings. Results on 2026-10-03:
+
+```
+PASS 384 experts / 6 active: kolibri.expert_count = 384
+PASS 384 experts / 6 active: kolibri.expert_used_count = 6
+PASS expert FFN size 512: kolibri.expert_feed_forward_length = 512
+PASS shared expert: kolibri.expert_shared_count = 1
+PASS shared expert: kolibri.expert_shared_feed_forward_length = 512
+PASS SWA size 512: kolibri.attention.sliding_window = 513
+PASS repeating SWA/full pattern (period 5, full last): kolibri.attention.sliding_window_pattern = 11110111101111011110111101111011110111101111011110
+PASS RoPE base 10,000 and SWA-only RoPE: kolibri.rope.freq_base = 10000.0
+PASS RoPE base 10,000 and SWA-only RoPE: kolibri.attention.rope_pattern = 11110111101111011110111101111011110111101111011110
+```
+
+The batch 1 lines still pass. Before the patch, the six keys that only
+`KolibriModel` writes (expert FFN size, both shared-expert keys, sliding window,
+and the two patterns) were missing, and exactly those six lines failed.
+
+As a mutation test, a config copy with `sliding_window = 512`, `layer_types`
+shifted by one layer, and `moe_intermediate_size = 256` fails exactly the
+expert FFN, sliding window, SWA pattern, and RoPE pattern lines.
