@@ -15,14 +15,14 @@ TOKENIZER_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 
 
 def pinned_source() -> tuple[str, str, dict[str, str]]:
-    """Returns repo, revision and the sha256 of every file recorded in Phase 1."""
+    """Returns repo, revision and the sha256 of every file recorded in the inventory."""
     s = json.loads(SUMMARY.read_text())
     return s["repo"], s["revision"], {f["name"]: f["sha256"] for f in s["files"]}
 
 
 def tokenizer_dir() -> Path:
     """Downloads (or reuses from the HF cache) the tokenizer files of the
-    pinned BF16 revision and verifies them against the Phase 1 inventory."""
+    pinned BF16 revision and verifies them against the checkpoint inventory."""
     from huggingface_hub import hf_hub_download
 
     repo, revision, hashes = pinned_source()

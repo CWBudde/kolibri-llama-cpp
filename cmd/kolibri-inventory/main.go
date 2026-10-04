@@ -383,7 +383,7 @@ func writeJSON(path string, v any) error {
 	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
-// TokenizerInfo summarizes tokenizer.json for the Phase 2 compatibility work.
+// TokenizerInfo summarizes tokenizer.json for the tokenizer compatibility checks.
 type TokenizerInfo struct {
 	SHA256        string          `json:"sha256"`
 	ModelType     string          `json:"model_type"`

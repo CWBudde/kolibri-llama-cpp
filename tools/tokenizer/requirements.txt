@@ -1,4 +1,4 @@
-# Versions used for the Phase 2 golden file and comparison runs.
+# Versions used for the tokenizer golden file and comparison runs.
 # The reference repo requires transformers>=5.5.3; vLLM tokenizes through it.
 --extra-index-url https://download.pytorch.org/whl/cpu
 transformers==5.18.0

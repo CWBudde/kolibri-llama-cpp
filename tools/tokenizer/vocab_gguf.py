@@ -8,7 +8,7 @@ revision SHA as the model name and fine-tune.
 
     vocab_gguf.py --llama-cpp third_party/llama.cpp --out third_party/llama.cpp/models/ggml-vocab-kolibri.gguf
 
-Without --tokenizer-dir it uses the pinned BF16 revision from the Phase 1
+Without --tokenizer-dir it uses the pinned BF16 revision from the checkpoint
 inventory, checked against the recorded sha256.
 """
 

@@ -1,7 +1,7 @@
-# Phase 5: hybrid attention, KV cache and RoPE against the reference
+# Kolibri hybrid attention, KV cache and RoPE
 
-This report covers Phase 5, plus the attention half of Phase 4 item 9 (graph
-callbacks for layer-by-layer debugging):
+This document shows that libllama's attention for Kolibri matches the
+reference implementation:
 
 - `LLAMA_SWA_TYPE_STANDARD` and Kolibri's 512-preceding-token window;
 - RoPE with base 10,000 on the sliding-window layers only;
@@ -11,7 +11,7 @@ callbacks for layer-by-layer debugging):
 - the 4:1 SWA/full pattern over the real 50 layers, and the per-layer split of
   the iSWA KV cache;
 - GQA with 48 query and 4 KV heads, and the per-head Q/K RMSNorm;
-- two evaluations: `load_swa_pattern()` and `llama_memory_hybrid_iswa`;
+- why `load_swa_pattern()` and `llama_memory_hybrid_iswa` are not used;
 - long contexts: 8k, 16k and 64k tokens, and the real 262k.
 
 `tools/gguf/check_attn.py` compares every attention step in libllama with the
@@ -20,11 +20,9 @@ one with the real attention heads and sliding window, one with the real
 50-layer SWA/full pattern. `tools/gguf/check_long.py` compares the attention
 at long contexts on the first one.
 
-The report covers three batches: #10 (window, off-by-one, RoPE, KV-cache
-reads), #11 (layer pattern, iSWA cache split, GQA, QK norm) and the
-long-context batch. None needed a change to the model class described in
-[phase4-model.md](phase4-model.md): the fork already had the window, the RoPE
-pattern and the iSWA cache; they had not been checked against the reference.
+None of this needed a change to the model class described in
+[model.md](model.md): the fork already had the window, the RoPE pattern and
+the iSWA cache. These checks hold them against the reference.
 
 ## The reference
 
@@ -51,7 +49,8 @@ pattern and the iSWA cache; they had not been checked against the reference.
     where vLLM uses float32.
 - **llama.cpp** (`src/llama-hparams.h:489`): `LLAMA_SWA_TYPE_STANDARD` masks
   key `p0` for query `p1` when `p1 - p0 >= n_swa`. With `n_swa = 513` that is
-  the same mask, as Phase 1 already concluded from the source alone.
+  the same mask, as [checkpoint.md](checkpoint.md) concluded from the source
+  alone.
 
 ## Fixture: `kolibri-tiny -attn`
 
@@ -208,9 +207,9 @@ PASS MTL0 attn [batch, flash attn on, KV f16] Qcur_normed per head: one RMSNorm 
 PASS MTL0 attn [batch, flash attn on, KV f16] GQA 48/4: query head h reads KV head h // 12; with h % 4 kqv_out is off by NMSE 1.5e+00, with h // 12 by 1.2e-07 (>= 100x)
 ```
 
-The `-pattern` fixture adds 62 s and the GQA contrast about 35 s to the 76 s
-of the first version. The check keeps every configuration: the evicting run
-on the 40-layer SWA cache is the one that exercises the real layer split.
+Of the 173 s, the `-pattern` fixture takes about 62 s and the GQA contrast
+about 35 s. The check keeps every configuration: the evicting run on the
+40-layer SWA cache is the one that exercises the real layer split.
 
 With an F32 KV cache and flash attention off, the chunked and single-token
 runs give exactly the batch run's numbers. In the other configurations they
@@ -273,8 +272,7 @@ below.
 ```
 
 rc 0, 60 PASS lines in 566 s (12 configurations, 5 lines each). The longest
-length on each device (the KV-cache lines from the rerun after the SWA cache
-size was added to the assert; decode times vary by a few seconds between runs):
+length on each device (decode times vary by a few seconds between runs):
 
 ```
 PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] KV cache layers {'non-SWA': 2, 'SWA': 4}, cells {'non-SWA': 65536, 'SWA': 1280} (llama_kv_cache_iswa: 65536 cells for the 2 full layers, 1280 = window + ubatch, padded, for the 4 sliding layers; decoded in 187 s)
@@ -321,16 +319,42 @@ length.
 At 262144 the reference's own float32 cache is off from exact RoPE by NMSE
 2.9e-6 in q and k, so exact parity with float64 is not the target there.
 
-## Answers to the plan items
+## Verified behavior
 
-- **The 4:1 pattern for 50 layers (5.1):** the converter writes
+- **The 4:1 pattern over 50 layers:** the converter writes
   `attention.sliding_window_pattern` and `attention.rope_pattern` from
-  `layer_types` (Phase 3, `check_metadata.py`). On the 50-layer `-pattern`
+  `layer_types` (see [gguf-conversion.md](gguf-conversion.md),
+  `check_metadata.py`). On the 50-layer `-pattern`
   fixture, libllama has RoPE nodes in exactly the 40 sliding layers, a KV
   cache split of 10 non-SWA and 40 SWA layers, and `kqv_out` matching the
   window-513 reference on the sliding layers and the causal one on the full
   layers, also with an evicting SWA cache.
-- **`load_swa_pattern()` (5.2):** not used; the required explicit array stays.
+- **`LLAMA_SWA_TYPE_STANDARD`:** it matches. `kqv_out` on the sliding
+  layers equals the reference with FlashAttention window `(512, 0)` in every
+  run, and `CHUNKED` fails (M4).
+- **RoPE base 10,000 on the sliding layers only:** `Qcur/Kcur_rope` equal
+  vLLM's NeoX RoPE with `rope_theta` from `config.json`, in layers 0–3. A
+  different base (M3) or the GPT-J rotation (M6) fails.
+- **No rotation on the full layers:** layers 4 and 5 have no RoPE node,
+  and their `kqv_out` matches the unrotated reference to 2.9e-15, against
+  2.8e-2 for a rotated one. RoPE on every layer (M5) fails.
+- **Off-by-one:** 512 preceding tokens plus the current one. The window
+  coefficient is at most 4.2e-4 (CPU) and 5.8e-3 (Metal) toward window 512 or
+  514. Both overrides (M1, M2) move it to 1.0.
+- **Boundaries 511, 512, 513 and beyond:** 1100 tokens. The errors at
+  511–514 are those of the other positions, in one batch, in chunks with
+  cache reads and eviction, and in single-token steps across the boundary.
+  M1 leaves position 511 unchanged and fails from 512 on; M2 fails from 513 on.
+- **GQA 48/4:** the existing path (`build_qkv` with `n_head_kv`, then
+  `build_attn`) groups query heads contiguously: head h reads KV head h // 12,
+  as in FlashAttention. `kqv_out` matches that reference to 1.8e-14; the
+  strided mapping h % 4 is off by 1.5.
+- **Per-head Q/K RMSNorm:** `build_norm` on the `[head_dim, n_head,
+  n_tokens]` view with the `[head_dim]` weight is the reference's
+  `RMSNorm(head_dim)` on `q.view(..., n_heads, head_dim)`: `Qcur/Kcur_normed`
+  match to 1.1e-14. One RMSNorm over all heads is off by 3.7e-3 (Q) and
+  2.9e-3 (K). Without the Q or K norm (M8, M9) exactly that node fails.
+- **`load_swa_pattern()`:** not used; the required explicit array stays.
   - `kolibri.cpp` reads `attention.sliding_window_pattern` with a required
     `ml.get_arr` into `hparams.is_swa_impl`, and `rope_pattern` the same way.
     There is no custom per-layer logic: the graph asks `hparams.is_swa(il)`
@@ -347,7 +371,7 @@ At 262144 the reference's own float32 cache is off from exact RoPE by NMSE
     6-layer fixture fails at layer 5. A Kolibri GGUF always carries the
     array, and a missing one fails the load instead of silently using a
     period.
-- **`llama_memory_hybrid_iswa` (5.4):** it does not apply. It pairs a
+- **`llama_memory_hybrid_iswa`:** it does not apply. It pairs a
   recurrent memory with an iSWA attention cache
   (`src/llama-memory-hybrid-iswa.h`), for models whose layers are attention
   or recurrent. Kolibri has no recurrent layers, `llm_arch_is_hybrid` is
@@ -356,32 +380,7 @@ At 262144 the reference's own float32 cache is off from exact RoPE by NMSE
   for the sliding layers. The check asserts that split from the libllama log
   in every run, with no recurrent memory, and the chunked runs show that the
   evicting SWA cache hands each query exactly its window.
-- **GQA 48/4 (5.5):** the existing path (`build_qkv` with `n_head_kv`, then
-  `build_attn`) groups query heads contiguously: head h reads KV head h // 12,
-  as in FlashAttention. `kqv_out` matches that reference to 1.8e-14; the
-  strided mapping h % 4 is off by 1.5.
-- **Per-head Q/K RMSNorm (5.6):** `build_norm` on the `[head_dim, n_head,
-  n_tokens]` view with the `[head_dim]` weight is the reference's
-  `RMSNorm(head_dim)` on `q.view(..., n_heads, head_dim)`: `Qcur/Kcur_normed`
-  match to 1.1e-14. One RMSNorm over all heads is off by 3.7e-3 (Q) and
-  2.9e-3 (K). Without the Q or K norm (M8, M9) exactly that node fails.
-- **`LLAMA_SWA_TYPE_STANDARD` (5.3):** it matches. `kqv_out` on the sliding
-  layers equals the reference with FlashAttention window `(512, 0)` in every
-  run, and `CHUNKED` fails (M4).
-- **RoPE base 10,000 on the sliding layers only (5.7):** `Qcur/Kcur_rope` equal
-  vLLM's NeoX RoPE with `rope_theta` from `config.json`, in layers 0–3. A
-  different base (M3) or the GPT-J rotation (M6) fails.
-- **No rotation on the full layers (5.8):** layers 4 and 5 have no RoPE node,
-  and their `kqv_out` matches the unrotated reference to 2.9e-15, against
-  2.8e-2 for a rotated one. RoPE on every layer (M5) fails.
-- **Off-by-one (5.9):** 512 preceding tokens plus the current one. The window
-  coefficient is at most 4.2e-4 (CPU) and 5.8e-3 (Metal) toward window 512 or
-  514. Both overrides (M1, M2) move it to 1.0.
-- **Boundaries 511, 512, 513 and beyond (5.10):** 1100 tokens. The errors at
-  511–514 are those of the other positions, in one batch, in chunks with
-  cache reads and eviction, and in single-token steps across the boundary.
-  M1 leaves position 511 unchanged and fails from 512 on; M2 fails from 513 on.
-- **Short contexts, then 8k/16k/64k, then 262k (5.11):** the short case is
+- **Short contexts, then 8k/16k/64k, then 262k:** the short case is
   `check_attn.py` (1100 tokens). `check_long.py` decodes 8192, 16384 and 65536
   tokens on the CPU and Metal, and 262144 on Metal with flash attention. In
   every run the full layers hold n cells, and `kqv_out` matches the float64
@@ -389,7 +388,7 @@ At 262144 the reference's own float32 cache is off from exact RoPE by NMSE
   65536 in the strict configuration, 1.2e-8 at 262144 on Metal. Only the RoPE
   angles lose precision with the position, as float32 does in vLLM's own
   cache; libllama stays within 30× (CPU) and 2.6× (Metal) of that.
-- **Graph callbacks, attention half (4.9):** the existing names (`attn_norm`,
+- **Graph node names for debugging:** the existing names (`attn_norm`,
   `Qcur/Kcur_normed`, `Vcur`, `Qcur/Kcur_rope`, `kqv_out`, `attn_out`,
   `attn_post_norm`, `ffn_inp`, `l_out`) suffice to localize each step. Each
   mutation fails at the node it changes: M3 and M6 only at the RoPE nodes,
@@ -423,7 +422,3 @@ configurations fail in the same checks.
 
 M10 changes each angle by up to 1e-4 relative, so its error grows with the
 position: 60× from 8192 to 65536 tokens.
-
-## What stays open
-
-- **Phase 6:** the same comparison against a vLLM run of the real checkpoint.

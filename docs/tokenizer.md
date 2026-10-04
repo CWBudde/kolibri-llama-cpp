@@ -1,10 +1,9 @@
-# Phase 2: Tokenizer compatibility
+# Kolibri-1 tokenizer in llama.cpp
 
-**Verdict.** The shipped Kolibri-1 tokenizer is an ordinary byte-level BPE
-tokenizer. llama.cpp's existing `gpt2` vocab type represents it exactly,
-together with the existing `QWEN2` pre-tokenizer. No tokenizer runtime code is
-needed; this passes the decision gate in `PLAN.md`. Kolibri needs only a name
-registration: the converter maps Kolibri's pre-tokenizer checksum to `kolibri`,
+The shipped Kolibri-1 tokenizer is an ordinary byte-level BPE tokenizer.
+llama.cpp's existing `gpt2` vocab type represents it exactly, together with
+the existing `QWEN2` pre-tokenizer. No tokenizer runtime code is needed.
+Kolibri needs only a name registration: the converter maps Kolibri's pre-tokenizer checksum to `kolibri`,
 and `llama-vocab.cpp` maps `kolibri` to `LLAMA_VOCAB_PRE_TYPE_QWEN2` and declares
 that the model has no BOS token.
 
@@ -82,8 +81,8 @@ llama.cpp's converter already does the same: it builds the token list from
 `special/reserved-shifted` pins this behavior.
 
 All chat, reasoning, tool and PII tokens come before the gap, so the shift only
-affects reserved tokens, which the model never uses. Phase 1's inventory
-(`summary.json`) now records both views: `runtime_id` per added token,
+affects reserved tokens, which the model never uses. The checkpoint inventory
+(`summary.json`, see [checkpoint.md](checkpoint.md)) records both views: `runtime_id` per added token,
 `file_id_gaps` and `runtime_unassigned`. A Go test (`cmd/kolibri-inventory`)
 cross-checks them against the golden file.
 
@@ -99,8 +98,8 @@ cross-checks them against the golden file.
 input text (`split_special_tokens: false`). llama.cpp matches `USER_DEFINED`
 tokens always, but `CONTROL` tokens only with `parse_special = true`. That is
 the mode llama.cpp uses for chat-templated prompts, and the comparison runs use
-it. For Phase 9: user-supplied text containing `<|im_end|>` is tokenized as a
-control token by both stacks.
+it. So user-supplied text containing `<|im_end|>` is tokenized as a control
+token by both stacks (relevant for chat, see [chat.md](chat.md)).
 
 **False-positive warning.** transformers ≥ 5 logs "incorrect regex pattern …
 set `fix_mistral_regex=True`" when it loads this tokenizer from a local
@@ -187,7 +186,8 @@ Both were worked around in `compare.py`; neither affects the Kolibri patch.
 
 ## The llama.cpp patch
 
-`patches/llama.cpp/0001-kolibri-tokenizer.patch` applies to `1537a0a8`:
+The tokenizer part is `patches/llama.cpp/0001-kolibri-tokenizer.patch`, the
+first of the series against `1537a0a8`:
 
 - `conversion/base.py`: checksum `6e040dfe…` → `res = "kolibri"`;
 - `convert_hf_to_gguf_update.py`: registers `kolibri` with
@@ -198,29 +198,30 @@ Both were worked around in `compare.py`; neither affects the Kolibri patch.
 - `models/ggml-vocab-kolibri.gguf.{inp,out}`: the upstream test strings and the
   reference IDs.
 
-The patch leaves out the 4.8 MB `models/ggml-vocab-kolibri.gguf`, which is
-regenerated with `tools/tokenizer/vocab_gguf.py`.
+## Vocab GGUF
 
-That file is a **Phase 2 shim**. Kolibri has no llama.cpp architecture yet, so
-the script registers `Kolibri1ForCausalLM` with the placeholder architecture
-`qwen3moe` and writes only the vocab through `_set_vocab_gpt2()`, the same
-function the real converter will call. llama.cpp skips all hyperparameters when
-`vocab_only=true`, so the placeholder has no effect on tokenization. Once Phase 3
-adds `MODEL_ARCH.KOLIBRI`, regenerate the fixture with
-`convert_hf_to_gguf.py --vocab-only`. It should be token-for-token identical:
-same tokens, types, merges and special IDs.
+The patches leave out the 4.8 MB `models/ggml-vocab-kolibri.gguf`.
+`tools/tokenizer/vocab_gguf.py` regenerates it with the converter's own Kolibri
+class (`get_model_class("Kolibri1ForCausalLM")`, then `write_vocab()`). That is
+`convert_hf_to_gguf.py --vocab-only` plus a fixed `general.name`: run on the HF
+cache, the CLI would record the revision SHA as `general.name` and
+`general.finetune`.
 
-> Update (Phase 4): done. `vocab_gguf.py` now uses the converter's Kolibri
-> class and writes `general.architecture = kolibri`; tokens, types, merges and
-> special IDs are unchanged. See [Phase 4: router](phase4-router.md#vocab-gguf-under-kolibri-item-11).
+The file has `general.architecture = kolibri`, the 21 `kolibri.*`
+hyperparameter keys, `general.file_type = 0`, the tokens, merges, token types,
+special IDs and the chat template. libllama skips the hyperparameters with
+`vocab_only=true`, but needs the `kolibri` model class to accept the file at
+all. `test-tokenizer-0-kolibri` passes with the existing `.inp`/`.out`,
+`compare.py` matches on all fuzz sets, and regenerating gives a byte-identical
+file.
 
 ## Reproducing
 
 ```sh
-# llama.cpp at the pinned commit, with the patch
+# llama.cpp at the pinned commit, with the patches
 git clone https://github.com/ggml-org/llama.cpp third_party/llama.cpp
 git -C third_party/llama.cpp checkout -b kolibri 1537a0a8b2f8711d840878b0a0677ab2213c882c
-git -C third_party/llama.cpp apply ../../patches/llama.cpp/0001-kolibri-tokenizer.patch
+for p in patches/llama.cpp/*.patch; do git -C third_party/llama.cpp apply "$PWD/$p"; done
 cmake -S third_party/llama.cpp -B third_party/llama.cpp/build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DBUILD_SHARED_LIBS=ON
 cmake --build third_party/llama.cpp/build --target llama test-tokenizer-0
@@ -240,13 +241,3 @@ third_party/llama.cpp/build/bin/test-tokenizer-0 third_party/llama.cpp/models/gg
 The tools download only `config.json`, `tokenizer.json` and
 `tokenizer_config.json`, at the pinned revision, and verify their sha256 against
 `inventory/bf16/summary.json`.
-
-## Follow-ups
-
-- **Phase 3:** regenerate `ggml-vocab-kolibri.gguf` under `MODEL_ARCH.KOLIBRI`
-  and rerun `compare.py`.
-- **Phase 9:** the chat template is embedded in the vocab GGUF
-  (`tokenizer.chat_template`). Add the reference repo's template test cases
-  (`reasoning_effort` precedence, tool loops) to llama.cpp's template tests.
-- **Separately, upstream:** the invalid-UTF-8 abort and overlong decoding
-  described above, and the two test-tooling issues.

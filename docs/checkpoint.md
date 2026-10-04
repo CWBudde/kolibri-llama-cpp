@@ -1,7 +1,10 @@
-# Phase 1: Checkpoint and tensor inventory
+# Kolibri-1 checkpoint and tensor inventory
 
-Status: **done**. Every tensor needed for a forward pass is identified and
-mapped to a GGUF name, and both checkpoints match `config.json` exactly.
+Every tensor needed for a forward pass is identified and mapped to a GGUF
+name, and both released checkpoints (BF16 and FP8) match `config.json`
+exactly. This page also records the block structure, router and attention
+semantics of the reference implementation, and the pitfalls they cause for a
+llama.cpp port.
 
 ## Pinned sources
 
@@ -98,16 +101,14 @@ column are in ggml `ne` order (innermost first). `L` is 0..49 and `E` is
 This table mirrors `internal/kolibri/tensors.go` (`Specs`), which is the
 source of truth. The per-class numbers are in `inventory/*/summary.json`.
 
-## Answers to the Phase 1 questions
+## Expert storage
 
-### Packed or per-expert?
-
-**Per-expert.** There are 19,200 separate tensors for each of gate, up, and
-down: 50 layers × 384 experts. Gate and up are stored separately, not fused.
+Routed experts are stored **per expert**, not packed. There are 19,200
+separate tensors for each of gate, up, and down: 50 layers × 384 experts. Gate and up are stored separately, not fused.
 The converter must stack the 384 experts of each layer along a new outermost
 axis, as `Qwen2MoeModel.modify_tensors` already does.
 
-### Block structure and residual order
+## Block structure and residual order
 
 The structure comes from `Kolibri1DecoderLayer` with vLLM's fused add-RMSNorm.
 It is a sandwich-norm block like Gemma2 and OLMo2:
@@ -134,7 +135,7 @@ MoE(h) = Routed(h) + Shared(h)
 - vLLM's `MoERunner` returns `shared_output + fused_output` with
   `routed_scaling_factor = 1.0`. `post_ffn_norm` is then applied to that sum.
 
-### Router semantics
+## Router semantics
 
 From `sigmoid_logit_add_routing` and `test_routing_semantics`:
 
@@ -154,7 +155,9 @@ From `sigmoid_logit_add_routing` and `test_routing_semantics`:
 
 The reference test mentions magnitudes of up to about 20.
 
-Attention details from `Kolibri1Attention`:
+## Attention
+
+From `Kolibri1Attention`:
 
 - Q, K, and V have no bias.
 - `q_norm` and `k_norm` are RMSNorms over `head_dim = 128`, applied per head
@@ -170,12 +173,14 @@ Attention details from `Kolibri1Attention`:
   llama.cpp `LLAMA_SWA_TYPE_STANDARD` masks when `p1 - p0 >= n_swa`, so storing
   **`n_swa = 513` unchanged** gives the same mask.
 
-LM head: `config.json` has `head_dtype: "float32"`. In vLLM 0.29,
+## LM head
+
+`config.json` has `head_dtype: "float32"`. In vLLM 0.29,
 `LogitsProcessor` honors it: it casts the BF16 `lm_head` weight and the hidden
 state to FP32, or accumulates in FP32 on CUDA. The weight itself is stored as
 BF16. In llama.cpp, the output matmul should run at `GGML_PREC_F32`.
 
-### BF16 vs FP8 differences
+## BF16 vs FP8 differences
 
 - FP8 uses `quant_method = fp8`, dynamic activations, and 128×128 weight
   blocks. Scales are stored as F32 `weight_scale_inv` with shape
@@ -197,7 +202,10 @@ BF16. In llama.cpp, the output matmul should run at `GGML_PREC_F32`.
 - With FP8 you download 78.9 GB instead of 156.2 GB. But the resulting GGUF is
   2.6 % RMSE away from BF16 before any llama.cpp quantization is applied.
 
-## Pitfalls for Phase 3/4 found during the audit
+## Pitfalls
+
+These came up while auditing the reference against llama.cpp. Other docs
+refer to them by number.
 
 1. **Norm names collide with gguf-py's generic `TensorNameMap`.**
    - `post_attn_norm` maps to `ATTN_OUT_NORM` (via grok-2). Kolibri needs
@@ -212,13 +220,14 @@ BF16. In llama.cpp, the output matmul should run at `GGML_PREC_F32`.
    semantics. Kolibri needs `selection = logits + exp_probs_b` with
    `weights = sigmoid(logits)`. Because sigmoid is monotonic, the two choices
    pick the same experts only when the bias is zero, and Kolibri's bias is not
-   zero. Phase 4 therefore needs an arch-specific selection branch, like the
-   existing special cases for `LLM_ARCH_LLAMA4` and `LLM_ARCH_GROVEMOE`.
+   zero. The model therefore needs an arch-specific selection branch, like the
+   existing special cases for `LLM_ARCH_LLAMA4` and `LLM_ARCH_GROVEMOE` (see
+   [model.md](model.md)).
 3. **`exp_probs_b` precision.** The source is BF16, but GGUF should store it as
    F32 (vLLM keeps it as an FP32 parameter). Router logits should also be
    computed in F32.
-4. **The FP32 LM head** (see above).
-5. **The tokenizer** (input to Phase 2):
+4. **The FP32 LM head** (see [LM head](#lm-head)).
+5. **The tokenizer** (details in [tokenizer.md](tokenizer.md)):
    - type: byte-level `BPE` with `byte_fallback: true`;
    - 127,900 base vocab entries plus 98 added tokens;
    - 127,644 merges, stored as pairs;
@@ -230,9 +239,7 @@ BF16. In llama.cpp, the output matmul should run at `GGML_PREC_F32`.
    library ignores those IDs and numbers added tokens contiguously. At runtime
    `<|reserved-token-2|>` … `<|reserved-token-76|>` therefore sit two IDs
    lower than the file says, and **127998 and 127999 are the unassigned IDs**.
-   The summary's `runtime_id` and `runtime_unassigned` fields record this; see
-   `docs/phase2-tokenizer.md`. (An earlier version of this note named
-   127923/127924, the file IDs.)
+   The summary's `runtime_id` and `runtime_unassigned` fields record this.
    `<think>`, `</think>`, `<tool_call>`, and `<tool_response>` are added tokens
    with `special: false`. Other details:
 
@@ -241,7 +248,8 @@ BF16. In llama.cpp, the output matmul should run at `GGML_PREC_F32`.
      the pad token;
    - there is no BOS token and `add_bos_token` is false.
 6. **The chat template** in `tokenizer_config.json` equals the reference repo's
-   `tests/kolibri1_chat_template.jinja`, apart from that file's header comment.
+   `tests/kolibri1_chat_template.jinja`, apart from that file's header comment
+   (see [chat.md](chat.md)).
 
 ## Machine-readable outputs
 
