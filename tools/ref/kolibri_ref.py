@@ -56,6 +56,8 @@ class Weights:
         self.rope_base = f[f"{arch}.rope.freq_base"]
         self.n_expert_used = f[f"{arch}.expert_used_count"]
         self.norm_topk = f[f"{arch}.expert_weights_norm"]
+        # the converter writes 1.0; build_moe_ffn multiplies the routed output with it
+        self.weights_scale = f.get(f"{arch}.expert_weights_scale", 1.0)
         self.window = f[f"{arch}.attention.sliding_window"]
         self.is_swa = f[f"{arch}.attention.sliding_window_pattern"]
         self.has_rope = f[f"{arch}.attention.rope_pattern"]
@@ -134,7 +136,8 @@ def forward(W: Weights, tokens: list[int], dtype: str = "float32", dump: dict | 
     n = len(tokens)
     pos = torch.arange(n)
     d = W.head_dim
-    cos_sin = rope_cos_sin_cache(W.rope_base, d, n, torch.float32)
+    # vLLM builds the table in float32; the float64 mode builds it in float64, as check_attn.py does
+    cos_sin = rope_cos_sin_cache(W.rope_base, d, n, torch.float64 if p.dtype == torch.float64 else torch.float32)
     if p.bf16:
         cos_sin = p.round(cos_sin.to(p.dtype))
 
@@ -167,7 +170,7 @@ def forward(W: Weights, tokens: list[int], dtype: str = "float32", dump: dict | 
             y = swiglu(p, x[rows], W.get(blk + "ffn_gate_exps.weight", e), W.get(blk + "ffn_up_exps.weight", e),
                        W.get(blk + "ffn_down_exps.weight", e))
             moe.index_add_(0, rows, y * weights[rows, slot, None].to(p.dtype))
-        moe = p.round(moe)
+        moe = p.round(moe * W.weights_scale)
         shexp = swiglu(p, x, W.get(blk + "ffn_gate_shexp.weight"), W.get(blk + "ffn_up_shexp.weight"),
                        W.get(blk + "ffn_down_shexp.weight"))
         m = rms_norm(p, p.round(moe + shexp), W.get(blk + "post_ffw_norm.weight"), W.eps)
