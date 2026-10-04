@@ -72,6 +72,8 @@ supports. `llama_model_create` throws `unsupported model architecture` for an
 architecture without a model class. Phase 4 adds `llama_model_kolibri` and
 removes the skip.
 
+> Update: patch 0007 did both; see [Phase 4](phase4-model.md).
+
 For the same reason, `ggml-vocab-kolibri.gguf` keeps the `qwen3moe`
 placeholder architecture. `llama_model_create` runs even with `vocab_only`,
 so a vocab GGUF that declares `kolibri` does not load before Phase 4.
@@ -92,6 +94,10 @@ any mismatch. It checks two things:
     the expected result until Phase 4.
 
   If the empty GGUF ever loads, the check fails and asks to be updated.
+
+  > Update: since patch 0007 the expected result is that the empty probe gets
+  > past the architecture and fails on its missing vocabulary; see
+  > [Phase 4](phase4-model.md).
 
   The probe does not use `llama-tokenize`. Its asynchronous logger lost the
   error line in one of three runs whose output was a pipe.
@@ -286,6 +292,7 @@ The patch applies on top of 0004. It adds three writer calls to
   bias. Kolibri adds `expert_bias` to the raw logits for the selection only,
   while `build_moe_ffn` adds `exp_probs_b` to the sigmoid output. Phase 4
   needs an arch-specific selection branch for that (Phase 1, pitfall 2).
+  Patch 0007 adds it; see [Phase 4](phase4-model.md).
 
 ### Check
 
@@ -356,7 +363,7 @@ writes a tiny random one with the shape of the reference repo's fixture
 - hidden 256, 8/2 heads, head_dim 32;
 - 8 experts, top 2, expert and shared FFN 256.
 
-It differs from the reference fixture in three points:
+It differs from the reference fixture in four points:
 
 - **Vocabulary.** `vocab_size` and the special-token IDs are the real ones:
   128000, no BOS, EOS 127906. The converter reads the real tokenizer, which
@@ -365,6 +372,12 @@ It differs from the reference fixture in three points:
   uses F32.
 - **Random norms** instead of `ones`. The four block norms share a shape, so
   only different values reveal a converter that swaps two of them.
+- **Scaled weights** (added in Phase 4). Matrices have standard deviation
+  0.02, HF's default `initializer_range`; norms scatter around 1 (std 0.1);
+  the correction bias keeps std 1, like the real one. With the reference's
+  unit-scale `randn` matrices, the activations grow over the layers and
+  rounding noise flips the top-k routing, which makes a forward-pass check
+  useless. The converter check is bit-exact and does not depend on the scale.
 
 Names and shapes come from `internal/kolibri`, the Go source of truth behind
 the Phase 1 inventory. The generator also writes `manifest.json`, which lists

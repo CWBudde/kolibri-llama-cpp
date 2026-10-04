@@ -28,7 +28,8 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | 1 | Checkpoint and tensor inventory | done: [docs/phase1-tensor-inventory.md](docs/phase1-tensor-inventory.md) |
 | 2 | Tokenizer compatibility | done: [docs/phase2-tokenizer.md](docs/phase2-tokenizer.md) |
 | 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration, GGUF metadata and tensor conversion done, checked on a tiny synthetic checkpoint: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
-| 4–9 | Model graph, hybrid KV cache, numerical validation, quantization, Apple Silicon, chat behavior | open |
+| 4 | Native model loading and MoE graph | in progress; model class loads and runs the tiny synthetic checkpoint on CPU and Metal, not yet compared with the reference: [docs/phase4-model.md](docs/phase4-model.md) |
+| 5–9 | Hybrid KV cache, numerical validation, quantization, Apple Silicon, chat behavior | open |
 
 ### Results so far
 
@@ -42,7 +43,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
   - about 1.35 million differential fuzz strings match as well, both token
     IDs and detokenized bytes.
 - **The `kolibri` architecture is registered.** It is known to gguf-py and
-  libllama; the model class itself is Phase 4.
+  libllama.
 - **The converter writes the GGUF metadata.** `convert_hf_to_gguf.py` knows
   `Kolibri1ForCausalLM`. It writes:
   - the dimensions, head counts and RMSNorm epsilon;
@@ -56,6 +57,18 @@ See [`PLAN.md`](PLAN.md) for the full plan.
     to a GGUF whose 111 tensors match the expected names, shapes and dtypes.
   - Their data is bit-exact against the source.
   - The real 156 GB checkpoint has not been converted yet.
+- **libllama loads and runs a Kolibri GGUF.** `llama_model_kolibri` builds
+  the sandwich-norm block, the iSWA attention with RoPE on the sliding layers
+  only, and the routed + shared MoE. Its router selects experts by
+  `logits + bias` and weights them by `sigmoid(logits)`.
+  - The tiny checkpoint decodes 100 tokens on CPU and Metal.
+  - With all experts active, the two devices and two ubatch sizes agree to
+    NMSE ≤ 3e-6; with top-2 routing the greedy tokens agree at every
+    position.
+  - The graph's wiring is checked node by node: bias on the raw logits,
+    routed + shared sum, sandwich norms, RoPE only on the sliding layers.
+  - Nothing is compared with the reference implementation yet, so the
+    numerics are still unverified.
 
 ## Layout
 
@@ -63,12 +76,12 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 |---|---|
 | `cmd/kolibri-inventory` | Builds the tensor inventory from Hugging Face. It reads only the safetensors headers, through HTTP range requests, so no payload is downloaded. |
 | `cmd/kolibri-peek` | Fetches individual small tensors through range requests and prints value statistics. |
-| `cmd/kolibri-tiny` | Writes a tiny random-weight checkpoint with the reference fixture's shape, plus a manifest of the expected GGUF tensors, for converter tests. |
+| `cmd/kolibri-tiny` | Writes a tiny random-weight checkpoint with the reference fixture's shape, plus a manifest of the expected GGUF tensors, for converter and model tests. |
 | `internal/` | Hugging Face client, safetensors header parser and writer, and the Kolibri tensor specs. `internal/kolibri/tensors.go` is the source of truth for the HF → GGUF mapping. |
 | `inventory/{bf16,fp8}/` | Committed inventories: `summary.json` and `tensors.jsonl.gz`. They pin the model revisions and the sha256 of every file. |
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
 | `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
-| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. |
+| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. |
 | `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. |
 | `docs/` | One report per phase, with findings, pitfalls and reproduction steps. |
 
@@ -114,6 +127,7 @@ go vet ./... && go test ./...
 .venv/bin/python tools/gguf/check_arch.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_metadata.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_tensors.py --llama-cpp third_party/llama.cpp
+.venv/bin/python tools/gguf/check_model.py --llama-cpp third_party/llama.cpp
 ctest --test-dir third_party/llama.cpp/build -R 'test-tokenizer-0|test-generate-models'
 third_party/llama.cpp/build/bin/test-llama-archs
 ```

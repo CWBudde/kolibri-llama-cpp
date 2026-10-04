@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -83,6 +85,30 @@ func TestGenerate(t *testing.T) {
 		norms = append(norms, buf)
 	}
 
+	// A forward pass needs a well-conditioned model: unit-scale matrices
+	// make the activations grow and the top-k routing chaotic.
+	for _, tc := range []struct {
+		name      string
+		mean, std float64
+	}{
+		{"model.layers.0.self_attn.q_proj.weight", 0, 0.02},
+		{"model.layers.0.mlp.experts.3.down_proj.weight", 0, 0.02},
+		{"model.layers.0.post_ffn_norm.weight", 1, 0.1},
+		{"model.layers.0.self_attn.k_norm.weight", 1, 0.1},
+		{"model.layers.0.moe.router.expert_bias", 0, 1},
+	} {
+		tt := got[tc.name]
+		buf := make([]byte, tt.NumBytes())
+		if _, err := f.ReadAt(buf, 8+h.Size+tt.Offsets[0]); err != nil {
+			t.Fatal(err)
+		}
+		mean, std := bf16Stats(buf)
+		// Loose bounds: the smallest tensors (expert_bias) have 8 values.
+		if math.Abs(mean-tc.mean) > tc.std || std < tc.std/3 || std > 3*tc.std {
+			t.Errorf("%s: mean %.3f std %.3f, want about %.3f and %.3f", tc.name, mean, std, tc.mean, tc.std)
+		}
+	}
+
 	raw, err = os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +142,18 @@ func TestGenerate(t *testing.T) {
 			t.Errorf("%s appears %d times in the manifest", name, seen[name])
 		}
 	}
+}
+
+func bf16Stats(buf []byte) (mean, std float64) {
+	n := len(buf) / 2
+	var sum, sq float64
+	for i := range n {
+		v := float64(math.Float32frombits(uint32(binary.LittleEndian.Uint16(buf[2*i:])) << 16))
+		sum += v
+		sq += v * v
+	}
+	mean = sum / float64(n)
+	return mean, math.Sqrt(sq/float64(n) - mean*mean)
 }
 
 func TestGenerateDeterministic(t *testing.T) {

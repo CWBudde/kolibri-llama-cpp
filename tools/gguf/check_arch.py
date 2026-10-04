@@ -5,9 +5,11 @@ gguf-py:  MODEL_ARCH.KOLIBRI is named "kolibri", and MODEL_TENSORS[KOLIBRI]
           lists exactly the tensor kinds of the Phase 1 HF -> GGUF mapping
           (inventory/bf16/summary.json, "classes").
 libllama: a GGUF whose general.architecture is "kolibri" is a known
-          architecture. Until Phase 4 adds llama_model_kolibri, loading it
-          must fail with "unsupported model architecture", not with
-          "unknown model architecture".
+          architecture with a model class (llama_model_kolibri, Phase 4).
+          A vocab-only load of an otherwise empty GGUF must get past the
+          architecture and fail on the missing vocabulary, not with
+          "unknown model architecture" or "unsupported model architecture".
+          check_model.py loads a complete GGUF.
 
     check_arch.py --llama-cpp third_party/llama.cpp
 """
@@ -71,12 +73,14 @@ def check_libllama(gguf, llama_cpp: Path) -> list[str]:
     text = "".join(log)
     if model:
         lib.lib.llama_model_free(model)
-        return [f"libllama loaded an empty '{ARCH}' GGUF; update this check for Phase 4"]
+        return [f"libllama loaded an empty '{ARCH}' GGUF without a vocabulary"]
     if f"unsupported model architecture: '{ARCH}'" in text:
-        print(f"libllama: '{ARCH}' is a known architecture without a model class (expected before Phase 4)")
-        return []
+        return [f"libllama has no model class for '{ARCH}'"]
     if f"unknown model architecture: '{ARCH}'" in text:
         return [f"libllama does not know the architecture '{ARCH}'"]
+    if "error loading model vocabulary" in text:
+        print(f"libllama: '{ARCH}' is a known architecture with a model class (the empty probe fails on its vocabulary)")
+        return []
     return [f"unexpected libllama log: {text.strip()[-300:]}"]
 
 

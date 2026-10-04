@@ -23,23 +23,16 @@ Prints one line per tensor kind and one FAIL line per wrong tensor.
 import argparse
 import json
 import re
-import subprocess
 import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+from tiny import convert, generate_tiny
+
 ARCH = "kolibri"
 # 2D tensors that stay F32 (convert_hf_to_gguf.py prepare_tensors).
 F32_MATRICES = {"ffn_gate_inp"}
-
-
-def run(cmd: list[str], what: str) -> None:
-    # from the repo root, so go run ./cmd/... works from any directory
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
-    if r.returncode != 0:
-        raise SystemExit(f"FAIL {what} exited {r.returncode}:\n{r.stderr.strip()[-1500:]}")
 
 
 def kind(name: str) -> str:
@@ -61,19 +54,13 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1, help="cmd/kolibri-tiny random seed")
     args = ap.parse_args()
 
-    sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
-    from common import tokenizer_dir
     sys.path.insert(0, str(args.llama_cpp / "gguf-py"))
     import gguf
     from safetensors.torch import load_file
 
     with tempfile.TemporaryDirectory() as tmp:
-        model = Path(tmp) / "kolibri-tiny"
-        out = Path(tmp) / "kolibri-tiny-bf16.gguf"
-        run(["go", "run", "./cmd/kolibri-tiny", "-out", str(model), "-tokenizer-dir", str(tokenizer_dir()),
-             "-seed", str(args.seed)], "cmd/kolibri-tiny")
-        run([sys.executable, str(args.llama_cpp / "convert_hf_to_gguf.py"), str(model),
-             "--outtype", "bf16", "--outfile", str(out)], "convert_hf_to_gguf.py --outtype bf16")
+        model = generate_tiny(Path(tmp), args.seed)
+        out = convert(model, args.llama_cpp, "bf16")
 
         cfg = json.loads((model / "config.json").read_text())
         manifest = {m["name"]: m for m in json.loads((model / "manifest.json").read_text())}

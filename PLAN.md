@@ -235,24 +235,53 @@ produced reproducibly.
 Start from existing infrastructure rather than treating Kolibri as a
 novel MoE implementation.
 
--   [ ] Add `llama_model_kolibri` and register it in the model factory.
--   [ ] Load embeddings, output norm/head, block norms, Q/K norms, and
+-   [x] Add `llama_model_kolibri` and register it in the model factory.
+    (2026-10-04) — `src/models/kolibri.cpp` plus the factory case
+    (`patches/llama.cpp/0007-kolibri-model.patch`). `tools/gguf/check_model.py`
+    loads the converted tiny GGUF (BF16 and F32) on CPU and Metal; see
+    `docs/phase4-model.md`.
+-   [x] Load embeddings, output norm/head, block norms, Q/K norms, and
     attention projections.
--   [ ] Reuse existing expert tensor representation where possible.
--   [ ] Reuse `build_moe_ffn()` or the closest current helper for the
+    (2026-10-04) — all 21 tensor kinds, including both sandwich norms and an
+    untied head. libllama consumes all 111 tensors of the tiny GGUF; without
+    the `post_ffw_norm` loads it fails with "wrong number of tensors; expected
+    111, got 105".
+-   [x] Reuse existing expert tensor representation where possible.
+    (2026-10-04) — stacked `ffn_{gate,up,down}_exps`, ne `{n_embd, n_ff_exp,
+    n_expert}` as in laguna/qwen3moe, exactly as patch 0006 writes them. The
+    GGUF loads, and the graph-wiring check sees `ffn_moe_down` read
+    `blk.N.ffn_down_exps`.
+-   [x] Reuse `build_moe_ffn()` or the closest current helper for the
     384 routed experts.
+    (2026-10-04) — `build_moe_ffn` with a Kolibri branch: the selection bias
+    is added to the raw logits, and the weights stay `sigmoid(logits)`
+    (Phase 1, pitfall 2). The wiring check confirms both in every layer;
+    without the branch it fails (`ffn_moe_probs_biased-0 <- ffn_moe_probs-0`).
+    With all experts active, CPU vs Metal NMSE is 1.7e-6. Numerics against
+    the reference stay with the Top-6 and gating items.
 -   [ ] Configure Top-6 selection.
 -   [ ] Configure sigmoid expert gating; verify whether
     normalization/scaling flags are required.
--   [ ] Add the shared expert path using existing shared-expert
+-   [x] Add the shared expert path using existing shared-expert
     primitives if compatible.
+    (2026-10-04) — `build_ffn` (SiLU, parallel gate), ungated, on the same
+    input as the routed experts. The wiring check sees `ffn_out = ffn_moe_out
+    + ffn_shexp` in every layer. If the shared expert is loaded but not
+    added, the check fails; if it is not loaded, the load fails ("got 93").
 -   [ ] Add routed + shared outputs in exactly the reference order.
 -   [ ] Add graph callbacks/names useful for layer-by-layer debugging.
--   [ ] Remove the `kolibri` skip from `arch_supported()` in
+-   [x] Remove the `kolibri` skip from `arch_supported()` in
     `tests/test-llama-archs.cpp` (added in Phase 3).
+    (2026-10-04) — skip removed; `kolibri` is MoE-only, and the fixture writes
+    the SWA and RoPE patterns as arrays. `test-llama-archs -a '^kolibri$'`
+    gives 4/4 OK (Metal NMSE 4.7e-07, roundtrip OK), 506 tests in total.
+    Without the `moe_mandatory` entry, the row fails.
 -   [ ] Regenerate `ggml-vocab-kolibri.gguf` under `MODEL_ARCH.KOLIBRI`
     instead of the `qwen3moe` placeholder, and update
     `tools/gguf/check_arch.py`, which expects "unsupported model architecture".
+    (2026-10-04) — partial: `check_arch.py` now expects the model class (the
+    empty probe gets past the architecture and fails on its missing
+    vocabulary). Regenerating the vocab GGUF remains.
 
 **Definition of Done:** The complete 50-layer unquantized graph builds
 and executes without tensor-shape or unsupported-op errors.
