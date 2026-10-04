@@ -1,7 +1,7 @@
 // Command kolibri-tiny writes a tiny random-weight Kolibri-1 checkpoint for
 // converter tests, so they need no 156 GB download.
 //
-//	kolibri-tiny -out DIR -tokenizer-dir DIR [-seed N] [-router | -attn]
+//	kolibri-tiny -out DIR -tokenizer-dir DIR [-seed N] [-router | -attn | -pattern]
 //
 // The shape follows the reference repo's tests/checkpoints.py
 // (Aleph-Alpha/aleph-alpha-inference@049a6a7): 6 layers (4 sliding, 2 full),
@@ -23,6 +23,10 @@
 // 4 KV heads, head_dim 128 and the real sliding window of 513 (512
 // preceding tokens plus the current one), so the window boundaries can be
 // tested at 511, 512 and 513 tokens.
+//
+// With -pattern it writes the released checkpoint's 50 layers instead, four
+// sliding then one full, repeated, with the real sliding window of 513. The
+// heads stay small, so a check can capture every layer.
 //
 // Tensor names and shapes come from internal/kolibri, the same source of
 // truth as the Phase 1 inventory. manifest.json lists every expected GGUF
@@ -107,8 +111,9 @@ func main() {
 	seed := flag.Uint64("seed", 1, "random seed")
 	router := flag.Bool("router", false, "384 experts, top 6, and the reference router test's magnitudes")
 	attn := flag.Bool("attn", false, "the real attention heads (48 Q, 4 KV, head_dim 128) and sliding window (513)")
+	pattern := flag.Bool("pattern", false, "the real 50 layers (4 sliding, 1 full, repeated) and sliding window (513)")
 	flag.Parse()
-	if *out == "" || flag.NArg() != 0 || *router && *attn {
+	if *out == "" || flag.NArg() != 0 || btoi(*router)+btoi(*attn)+btoi(*pattern) > 1 {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -118,6 +123,8 @@ func main() {
 		p = presetRouter
 	case *attn:
 		p = presetAttn
+	case *pattern:
+		p = presetPattern
 	}
 	if err := generate(*out, *tokDir, *seed, p); err != nil {
 		log.Fatal(err)
@@ -133,7 +140,16 @@ const (
 	presetRouter
 	// presetAttn has the real attention heads and sliding window.
 	presetAttn
+	// presetPattern has the real layer pattern and sliding window.
+	presetPattern
 )
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 // configJSON returns tinyConfig with the changes of preset p.
 func configJSON(p preset) ([]byte, error) {
@@ -153,6 +169,17 @@ func configJSON(p preset) ([]byte, error) {
 		m["num_attention_heads"] = 48
 		m["num_key_value_heads"] = 4
 		m["head_dim"] = 128
+		m["sliding_window"] = 513
+	case presetPattern:
+		types := make([]string, 50)
+		for il := range types {
+			types[il] = "sliding_attention"
+			if il%5 == 4 {
+				types[il] = "full_attention"
+			}
+		}
+		m["num_hidden_layers"] = len(types)
+		m["layer_types"] = types
 		m["sliding_window"] = 513
 	}
 	raw, err := json.MarshalIndent(m, "", "  ")
