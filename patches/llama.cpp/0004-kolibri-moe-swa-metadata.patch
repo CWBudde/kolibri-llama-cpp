@@ -1,5 +1,5 @@
 diff --git a/conversion/kolibri.py b/conversion/kolibri.py
-index 65c2830ca..0d048438a 100644
+index 4635cd10c..0f5620e51 100644
 --- a/conversion/kolibri.py
 +++ b/conversion/kolibri.py
 @@ -19,10 +19,24 @@ class KolibriModel(TextModel):
