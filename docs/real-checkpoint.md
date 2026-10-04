@@ -1,0 +1,308 @@
+# The real checkpoint on a 48 GB Mac
+
+This document covers the full Kolibri-1 BF16 checkpoint:
+
+- download and conversion to GGUF;
+- the structural checks on the converted file;
+- the first unquantized runs;
+- the quantized variants that fit a 48 GB Apple Silicon Mac.
+
+The tiny synthetic checkpoints of [gguf-conversion.md](gguf-conversion.md),
+[model.md](model.md) and [attention.md](attention.md) cover the converter and
+the graph in detail. This document only shows that those results carry over
+to the real weights.
+
+**What this is not:** a numerical validation. Without the official vLLM
+reference (PLAN Phase 0 and Phase 6), a coherent answer and a low KL divergence
+cannot tell a port bug from quantization damage. Every quality number below
+compares llama.cpp with llama.cpp: a quantized GGUF against this port's own BF16
+GGUF.
+
+Measured on a Mac17,9 (Apple M5 Pro, 15 cores, 48 GB) at fork commit
+`e1a553f5f` (`feat/kolibri` after the chat-template merge).
+
+## Download
+
+```sh
+.venv/bin/hf download Aleph-Alpha/Kolibri-1-BF16 \
+    --revision 7a8f290e7858825c3cf5e4c447ba68345de9f1d3 \
+    --local-dir ~/models/Kolibri-1-BF16
+```
+
+32 shards, 156,206,149,120 bytes, about 70 minutes at 37 MiB/s. Before the
+conversion, `check_real.py` hashes every shard against the inventory's pinned
+size and sha256:
+
+```text
+$ .venv/bin/python tools/gguf/check_real.py --llama-cpp third_party/llama.cpp \
+      --model-dir ~/models/Kolibri-1-BF16
+PASS shards: 32/32 match the pinned size and sha256 (58 s)
+```
+
+## Conversion
+
+```sh
+/usr/bin/time -l .venv/bin/python third_party/llama.cpp/convert_hf_to_gguf.py \
+    ~/models/Kolibri-1-BF16 --outtype bf16 --outfile ~/models/Kolibri-1-BF16.gguf
+```
+
+```text
+INFO:gguf.gguf_writer:/Users/christian/models/Kolibri-1-BF16.gguf: n_tensors = 903, total_size = 156.3G
+      466.60 real       172.76 user       234.77 sys
+          8524414976  maximum resident set size
+          8025841608  peak memory footprint
+```
+
+- **Streaming.** No converter change was needed. The base class loads tensors
+  lazily, and `KolibriModel` buffers the 1,152 expert tensors of one layer as
+  lazy references until it stacks them. The peak footprint stays at 7.5 GiB
+  for a 146 GiB checkpoint.
+- **Shards in layer order.** Each layer spans at most two consecutive shards
+  ([checkpoint.md](checkpoint.md)), so a layer's experts are complete soon
+  after its first shard is read.
+- **Disk.** The GGUF is 156,310,433,312 bytes, the same as the safetensors plus
+  the tokenizer and metadata. Converting needs about 312 GB free for both.
+
+## Structural checks on the real GGUF
+
+`tools/gguf/check_real.py` runs the comparisons of `check_tensors.py` on the
+full checkpoint. Its expectations come from the inventory
+(`inventory/bf16/summary.json`), not from the converter. It expands the 21
+tensor classes over 50 layers into 903 GGUF tensors and 58,353 HF sources.
+
+It reads raw BF16 bytes from the safetensors headers, without torch. Both files
+are memory-mapped, so a full run reads 312 GB and peaks at about 1 GB of
+footprint.
+
+```text
+$ .venv/bin/python tools/gguf/check_real.py --llama-cpp third_party/llama.cpp \
+      --model-dir ~/models/Kolibri-1-BF16 --gguf ~/models/Kolibri-1-BF16.gguf --no-hash
+PASS tensor set: 903 tensors, inventory 903
+PASS token_embd (1/1): ne [2560, 128000], BF16, data bit-exact
+PASS attn_norm (50/50): ne [2560], F32, data bit-exact
+...
+PASS ffn_gate_inp (50/50): ne [2560, 384], F32, data bit-exact
+PASS exp_probs_b (50/50): ne [384], F32, data bit-exact
+PASS ffn_gate_exps (50/50): ne [2560, 512, 384], BF16, 384 experts stacked, data bit-exact
+PASS ffn_up_exps (50/50): ne [2560, 512, 384], BF16, 384 experts stacked, data bit-exact
+PASS ffn_down_exps (50/50): ne [512, 2560, 384], BF16, 384 experts stacked, data bit-exact
+...
+PASS output (1/1): ne [2560, 128000], BF16, data bit-exact
+info data comparison took 637 s
+PASS metadata: general.architecture
+PASS metadata: kolibri.block_count
+PASS metadata: kolibri.expert_count
+PASS metadata: kolibri.expert_used_count
+PASS metadata: kolibri.attention.sliding_window_pattern
+PASS parameters: 78,103,074,560 in the GGUF, inventory 78,103,074,560
+```
+
+`check_metadata.py --gguf` reads the hyperparameters from the converted file,
+instead of from a `--vocab-only` conversion, and compares them with
+`config.json` and the inventory. All 21 assertions pass on the real GGUF.
+
+**Mutation.** I ran the check on the tiny fixture with the manifest in place of
+the inventory, then flipped one byte of expert 3's `gate_proj` in layer 0
+after conversion. The data comparison catches it:
+
+```text
+FAIL blk.0.ffn_gate_exps.weight: data differs from model.layers.0.mlp.experts.3.gate_proj.weight
+```
+
+## Unquantized run
+
+```sh
+build/bin/llama-completion -m ~/models/Kolibri-1-BF16.gguf -dev none -ngl 0 \
+    -c 512 -n 32 --temp 0 --seed 1 -no-cnv -p "The capital of Germany is"
+```
+
+```text
+The capital of Germany is Berlin.
+
+We are going to Berlin.
+
+We are going to Berlin.
+
+We
+prompt eval time =    7598.19 ms /     5 tokens ( 1519.64 ms per token,     0.66 tokens per second)
+       eval time =   21363.46 ms /    31 runs   (  689.14 ms per token,     1.45 tokens per second)
+```
+
+- The complete 50-layer graph builds and runs on the real weights without a
+  shape error or an unsupported op.
+- The greedy repetition is normal for a raw text prompt without the chat
+  template.
+- Generation runs on the CPU from the memory-mapped file. Each token touches
+  6 experts per layer, about 2.4 GB of expert weights. The OS page cache serves
+  the experts it holds, and the SSD the rest.
+
+### Metal with `--cpu-moe` crashes with SIGBUS
+
+`-ngl 99 --cpu-moe` on the BF16 GGUF puts attention and the shared expert on
+Metal and keeps the routed experts on the CPU. It dies in the warmup decode:
+
+```text
+EXC_BAD_ACCESS (SIGBUS) KERN_PROTECTION_FAILURE
+libggml-cpu   ggml_compute_forward_mul_mat_id
+libggml-cpu   ggml_graph_compute_thread
+libllama      llama_context::decode
+libllama-common common_init_from_params
+```
+
+Before the crash, Metal warns that its allocation exceeds the recommended
+working set. With mmap, `ggml-metal-device.m` wraps the whole mapped file in
+no-copy shared buffers (`newBufferWithBytesNoCopy`). Here that file is
+156 GB, against a working set of 37 GiB. The CPU then faults reading expert
+pages in the same mapping.
+
+The crash follows the file size, not the weight type:
+
+| GGUF | Size | `-ngl 99 --cpu-moe` |
+|---|---|---|
+| Q3_K experts, rest Q8_0 | 33,717 MiB | runs, 17.6 tokens/s |
+| Q8_0 (with `--no-repack`) | 79,279 MiB | SIGBUS (exit 138) |
+| BF16 | 149,065 MiB | SIGBUS (exit 138) |
+
+CPU-only (`-dev none`) runs both large files fine. This is generic ggml-metal
+behaviour, not Kolibri code. It matters only for models larger than the Metal
+working set, and the quantized model that fits has no need for `--cpu-moe`.
+
+## Quantization
+
+`llama-quantize --dry-run` sizes on the BF16 GGUF:
+
+| Type | Size | BPW |
+|---|---|---|
+| Q8_0 | 79,279 MiB | 8.51 |
+| IQ4_XS | 40,286 MiB | 4.33 |
+| Q3_K_M | 35,781 MiB | 3.84 |
+| Q8_0, routed experts Q3_K | 33,717 MiB | 3.62 |
+| Q3_K_S | 32,297 MiB | 3.47 |
+| IQ3_XXS | 30,302 MiB | 3.25 |
+
+The first candidate keeps everything except the routed experts at Q8_0:
+
+```sh
+build/bin/llama-quantize --tensor-type ffn_gate_exps=q3_k --tensor-type ffn_up_exps=q3_k \
+    --tensor-type ffn_down_exps=q3_k ~/models/Kolibri-1-BF16.gguf \
+    ~/models/Kolibri-1-Q3_K-exps-Q8_0.gguf Q8_0
+```
+
+- **Routed experts:** Q3_K. They are 96.7% of the parameters.
+- **Q8_0:** attention, the shared expert, the token embeddings and the output.
+- **F32:** the router (`ffn_gate_inp`), the correction bias (`exp_probs_b`)
+  and every norm. `llama-quantize` never quantizes `ffn_gate_inp`, and it
+  leaves 1D tensors alone.
+
+`llama-quantize` streams tensor by tensor:
+
+| Output | Time | Peak RSS |
+|---|---|---|
+| Q8_0 | 40 s | 5.4 GB |
+| Q3_K experts | 70 s | 5.4 GB |
+
+## The quantized model on Metal
+
+```sh
+build/bin/llama-completion -m ~/models/Kolibri-1-Q3_K-exps-Q8_0.gguf -ngl 99 \
+    -c 512 -n 32 --temp 0 --seed 1 -no-cnv -p "The capital of Germany is"
+```
+
+```text
+The capital of Germany is Berlin.
+The capital of France is Paris.
+The capital of Italy is Rome.
+The capital of Spain is Madrid.
+The capital of Portugal is Lisbon.
+       load time =   13228.82 ms
+prompt eval time =      70.31 ms /     5 tokens (   14.06 ms per token,    71.12 tokens per second)
+       eval time =     517.49 ms /    31 runs   (   16.69 ms per token,    59.90 tokens per second)
+```
+
+Memory at 32k context (`-c 32768 -v`), with the default Metal limit (no
+`iogpu.wired_limit_mb` change):
+
+```text
+| memory breakdown [MiB]  | total    free     self   model   context   compute    unaccounted |
+|   - MTL0 (Apple M5 Pro) | 38338 = 38338 + (34384 = 33384 +     740 +     260) +      -34384 |
+|   - Host                |                    418 =   332 +       0 +      86                |
+llama_kv_cache: size =  640.00 MiB ( 32768 cells,  10 layers,  1/1 seqs), K (f16):  320.00 MiB, V (f16):  320.00 MiB
+llama_kv_cache: size =  100.00 MiB (  1280 cells,  40 layers,  1/1 seqs), K (f16):   50.00 MiB, V (f16):   50.00 MiB
+```
+
+- **Full-attention KV cache:** only the 10 full-attention layers grow with
+  context, at 20 KiB per token, or 640 MiB at 32k.
+- **Sliding-window KV cache:** the 40 sliding layers hold 1,280 cells
+  regardless of context.
+- **Headroom:** about 3.9 GiB below the default Metal working set of
+  38,338 MiB.
+- **Token embeddings:** they stay in host memory, at 332 MiB.
+
+## Quantization loss against this port's BF16
+
+The reference is `llama-perplexity` on the BF16 GGUF, CPU-only, over
+wikitext-2 `wiki.test.raw`:
+
+- 20 chunks of 512 tokens;
+- logits saved with `--kl-divergence-base`;
+- 50 minutes, at 570 s per pass of 4 chunks;
+- result: PPL = 27.8827 ± 1.36009.
+
+| Model | Backend | Mean KLD | 99% KLD | Same top token | PPL(Q)/PPL(base) |
+|---|---|---|---|---|---|
+| Q3_K experts, rest Q8_0 | Metal | 0.108 ± 0.008 | 1.81 | 88.4 ± 0.4% | 0.993 ± 0.007 |
+| Q8_0 | CPU, `--no-repack` | 0.050 ± 0.005 | 0.76 | 92.5 ± 0.4% | 1.003 ± 0.005 |
+
+The Q3 row includes backend differences, because BF16 ran on the CPU and Q3
+on Metal. The Q8_0 row compares like with like on the CPU, at 213 s per pass.
+
+**Q8_0 KLD is high.** Here Q8_0 reaches 0.050 with 92.5% same top token, on
+the same backend as its reference. For dense models, Q8_0 usually lands near
+KLD 0.001 with over 99% same top token. A likely amplifier is the router: a small error in a
+router logit that sits near the top-6 boundary swaps an expert. That fits the
+PLAN Phase 6 note on Metal near-ties and the Phase 7 item "measure how often
+quantization changes Top-6 expert selection". Per the Phase 6 hard gate, this
+stays undiagnosed until the BF16 port matches vLLM.
+
+**Q8_0 on the CPU: use `--no-repack`.** The first Q8_0 run used the CPU
+backend's default weight repacking. macOS killed it (exit 137) after 8 chunks,
+with 11.7 of 13.3 GB swap in use. Other processes also used memory at the
+time, so repacking is the suspect, not a confirmed cause. With `--no-repack`
+the weights stay memory-mapped, and the footprint stays at about 2.5 GB.
+
+## Chat on the quantized model
+
+```sh
+build/bin/llama-server -m ~/models/Kolibri-1-Q3_K-exps-Q8_0.gguf -ngl 99 -c 16384 --jinja --port 8099
+```
+
+Three OpenAI-style requests, greedy (`temperature: 0`):
+
+| Request | Result | Speed |
+|---|---|---|
+| "Erkläre in zwei Sätzen, warum der Himmel blau ist." (default reasoning) | 528 tokens; `reasoning_content` holds the plan; `content`: "Das Sonnenlicht besteht aus allen Farben des Regenbogens. Da die Erdatmosphäre das blaue Licht stärker streut als die anderen Farben, erscheint der Himmel blau."; `finish_reason: stop` | 58.7 tokens/s |
+| "What is 17 * 23? Answer with the number only." with `reasoning_effort: "none"` | empty reasoning, `content`: "391", 4 tokens | 58.2 tokens/s |
+| "What is the weather in Berlin right now?" with a `get_weather` tool and `reasoning_effort: "low"` | `tool_calls`: `get_weather({"city": "Berlin"})`, `finish_reason: tool_calls` | 59.3 tokens/s |
+
+On the real weights, as on the fixtures of [chat.md](chat.md):
+
+- the reasoning split works;
+- the thinking-off prefill works;
+- the tool-call parser works;
+- generation stops on the reference's EOS.
+
+## Reproduce
+
+All files live outside the repo, in `~/models`.
+
+1. Download the checkpoint (156 GB) and run `check_real.py` without `--gguf`
+   to hash the shards.
+2. Convert with `--outtype bf16` (156 GB more), then run `check_real.py` with
+   `--gguf` and `check_metadata.py --gguf`.
+3. Delete the safetensors. Re-download them from the pinned revision if
+   needed.
+4. Run `llama-quantize` as above.
+5. Get wikitext-2 with `third_party/llama.cpp/scripts/get-wikitext-2.sh`.
+
+Disk peaks at about 312 GB during the conversion. After that it is the BF16
+GGUF plus the quantized files.

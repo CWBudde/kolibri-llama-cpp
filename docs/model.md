@@ -12,6 +12,11 @@ graph. Two checks cover it:
 The attention half of the graph (window, RoPE, KV cache, GQA, QK norm) is
 checked against the reference in [attention.md](attention.md).
 
+On the real weights, the complete 50-layer graph runs unquantized on the CPU,
+and a Q3_K/Q8_0 quantization runs fully on Metal. See
+[real-checkpoint.md](real-checkpoint.md). Those runs are structural only:
+without the vLLM reference they say nothing about numerical agreement.
+
 ## Changes (`patches/llama.cpp/0007-kolibri-model.patch`)
 
 | File | Change |
@@ -144,6 +149,21 @@ as they are. The router logits accumulate in F32, as vLLM computes them.
 The two bias placements select different experts at 592 of 600 token-layers
 on the `-router` fixture. A router that put the bias on `sigmoid(logits)`, as
 llama.cpp's default branch does, would therefore fail almost everywhere.
+
+### Router sensitivity on the real weights (open)
+
+On the real checkpoint, Q8_0 against this port's BF16 GGUF reaches a mean KL
+divergence of 0.050, with the same top token at 92.5% of positions. Both ran on
+the CPU, over wikitext-2, 20 × 512 tokens. For dense models, Q8_0 usually lands
+near 0.001 and over 99%.
+
+The suspect is the top-6 selection. A small change to a router logit near the
+selection boundary swaps a whole expert, and the change then carries through
+the remaining layers.
+
+This is not measured yet. The PLAN Phase 7 Top-6 agreement item and the
+Phase 6 Metal near-tie item cover it, after the BF16 port matches vLLM.
+Numbers are in [real-checkpoint.md](real-checkpoint.md).
 
 ## Fixtures (`cmd/kolibri-tiny`)
 

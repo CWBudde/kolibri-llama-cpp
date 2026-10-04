@@ -107,9 +107,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llama-cpp", type=Path, required=True, help="llama.cpp checkout with the Kolibri converter")
     ap.add_argument("--model-dir", type=Path, help="directory with config.json, tokenizer.json, tokenizer_config.json")
+    ap.add_argument("--gguf", type=Path, help="check this converted GGUF instead of a --vocab-only conversion")
     args = ap.parse_args()
 
-    if args.model_dir is None:
+    # Only the --vocab-only conversion needs the tokenizer files.
+    if args.model_dir is None and args.gguf is None:
         sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
         from common import tokenizer_dir
         args.model_dir = tokenizer_dir()
@@ -119,11 +121,15 @@ def main() -> None:
 
     cfg = json.loads(CONFIG.read_text())
     summary = json.loads(SUMMARY.read_text())
-    with tempfile.TemporaryDirectory() as tmp:
-        out = Path(tmp) / "kolibri-vocab.gguf"
-        convert(args.llama_cpp, args.model_dir, out)
-        reader = gguf.GGUFReader(out)
+    if args.gguf is not None:
+        reader = gguf.GGUFReader(args.gguf)
         fields = {name: f.contents() for name, f in reader.fields.items()}
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kolibri-vocab.gguf"
+            convert(args.llama_cpp, args.model_dir, out)
+            reader = gguf.GGUFReader(out)
+            fields = {name: f.contents() for name, f in reader.fields.items()}
 
     errs = []
     checked = set()
