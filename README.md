@@ -27,7 +27,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | 0 | Reference outputs from the official vLLM implementation | open; needs hardware for the 78–156 GB checkpoint |
 | 1 | Checkpoint and tensor inventory | done: [docs/phase1-tensor-inventory.md](docs/phase1-tensor-inventory.md) |
 | 2 | Tokenizer compatibility | done: [docs/phase2-tokenizer.md](docs/phase2-tokenizer.md) |
-| 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration and GGUF metadata done: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
+| 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration, GGUF metadata and tensor conversion done, checked on a tiny synthetic checkpoint: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
 | 4–9 | Model graph, hybrid KV cache, numerical validation, quantization, Apple Silicon, chat behavior | open |
 
 ### Results so far
@@ -50,8 +50,12 @@ See [`PLAN.md`](PLAN.md) for the full plan.
   - the hybrid attention: sliding window 513 (512 preceding + current), a
     per-layer SWA/full pattern, and RoPE on the sliding layers only;
   - the router gating: sigmoid weights, no renormalization, scale 1.0.
-
-  Tensor conversion is still to come.
+- **The converter writes every tensor.** The block norms and the correction
+  bias map explicitly, and the per-expert tensors are stacked per layer.
+  - A tiny random BF16 checkpoint with the reference fixture's shape converts
+    to a GGUF whose 111 tensors match the expected names, shapes and dtypes.
+  - Their data is bit-exact against the source.
+  - The real 156 GB checkpoint has not been converted yet.
 
 ## Layout
 
@@ -59,11 +63,12 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 |---|---|
 | `cmd/kolibri-inventory` | Builds the tensor inventory from Hugging Face. It reads only the safetensors headers, through HTTP range requests, so no payload is downloaded. |
 | `cmd/kolibri-peek` | Fetches individual small tensors through range requests and prints value statistics. |
-| `internal/` | Hugging Face client, safetensors header parser, and the Kolibri tensor specs. `internal/kolibri/tensors.go` is the source of truth for the HF → GGUF mapping. |
+| `cmd/kolibri-tiny` | Writes a tiny random-weight checkpoint with the reference fixture's shape, plus a manifest of the expected GGUF tensors, for converter tests. |
+| `internal/` | Hugging Face client, safetensors header parser and writer, and the Kolibri tensor specs. `internal/kolibri/tensors.go` is the source of truth for the HF → GGUF mapping. |
 | `inventory/{bf16,fp8}/` | Committed inventories: `summary.json` and `tensors.jsonl.gz`. They pin the model revisions and the sha256 of every file. |
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
 | `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
-| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. |
+| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. |
 | `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. |
 | `docs/` | One report per phase, with findings, pitfalls and reproduction steps. |
 
@@ -108,6 +113,7 @@ go vet ./... && go test ./...
     --vocab third_party/llama.cpp/models/ggml-vocab-kolibri.gguf  # golden + fuzz + UTF-8 report
 .venv/bin/python tools/gguf/check_arch.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_metadata.py --llama-cpp third_party/llama.cpp
+.venv/bin/python tools/gguf/check_tensors.py --llama-cpp third_party/llama.cpp
 ctest --test-dir third_party/llama.cpp/build -R 'test-tokenizer-0|test-generate-models'
 third_party/llama.cpp/build/bin/test-llama-archs
 ```
