@@ -42,6 +42,9 @@ def swa_layers(cfg: dict, summary: dict) -> list[bool]:
 def expected(cfg: dict, summary: dict) -> list[tuple[str, str, object]]:
     """(PLAN.md item, GGUF key, expected value)."""
     shexp = next(c for c in summary["classes"] if c["class"] == "ffn_gate_shexp")
+    n_shexp, rest = divmod(shexp["count"], cfg["num_hidden_layers"])
+    if rest:
+        raise SystemExit(f"FAIL inventory: {shexp['count']} ffn_gate_shexp tensors for {cfg['num_hidden_layers']} layers")
     is_swa = swa_layers(cfg, summary)
     period = summary["attention"]["swa_period"]
     return [
@@ -59,7 +62,7 @@ def expected(cfg: dict, summary: dict) -> list[tuple[str, str, object]]:
         ("384 experts / 6 active", f"{ARCH}.expert_used_count", cfg["num_experts_per_tok"]),
         ("expert FFN size 512", f"{ARCH}.expert_feed_forward_length", cfg["moe_intermediate_size"]),
         # One shared gate_proj per layer, with 512 output rows.
-        ("shared expert", f"{ARCH}.expert_shared_count", shexp["count"] // cfg["num_hidden_layers"]),
+        ("shared expert", f"{ARCH}.expert_shared_count", n_shexp),
         ("shared expert", f"{ARCH}.expert_shared_feed_forward_length", shexp["hf_shape"][0]),
         # 513 = 512 preceding tokens + the current one: llama.cpp masks when
         # p1 - p0 >= n_swa (LLAMA_SWA_TYPE_STANDARD), vLLM uses window (512, 0).
