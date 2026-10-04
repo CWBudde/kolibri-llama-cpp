@@ -64,6 +64,12 @@ def expected(cfg: dict, summary: dict) -> list[tuple[str, str, object]]:
         # One shared gate_proj per layer, with 512 output rows.
         ("shared expert", f"{ARCH}.expert_shared_count", n_shexp),
         ("shared expert", f"{ARCH}.expert_shared_feed_forward_length", shexp["hf_shape"][0]),
+        # config.json names no gating function; the weights are sigmoid(logits[selected])
+        # (Phase 1, vLLM sigmoid_logit_add_routing). 2 = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID.
+        ("router gating", f"{ARCH}.expert_gating_func", 2),
+        ("router gating", f"{ARCH}.expert_weights_norm", cfg["norm_topk_prob"]),
+        # vLLM routed_scaling_factor = 1.0 (Phase 1); not in config.json.
+        ("router gating", f"{ARCH}.expert_weights_scale", 1.0),
         # 513 = 512 preceding tokens + the current one: llama.cpp masks when
         # p1 - p0 >= n_swa (LLAMA_SWA_TYPE_STANDARD), vLLM uses window (512, 0).
         ("SWA size 512", f"{ARCH}.attention.sliding_window", summary["attention"]["sliding_window"]),
