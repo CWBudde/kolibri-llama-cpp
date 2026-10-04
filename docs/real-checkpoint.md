@@ -264,11 +264,16 @@ router logit that sits near the top-6 boundary swaps an expert. That fits the
 PLAN Phase 6 note on Metal near-ties and the Phase 7 item "measure how often
 quantization changes Top-6 expert selection".
 
-The reference forward (below) supports that: it is not a port defect. On the
-reference's own routing, the 6th and 7th expert scores lie within 0.01 of each
-other for 22% of the (token, layer) pairs. Rounding the reference itself to
-BF16 already costs KLD 0.033 against its float32 run. Q8_0's 0.050 on top of
-BF16 is in that range.
+The reference forward (below) makes that amplification plausible:
+
+- On the reference's own routing, the 6th and 7th expert scores lie within
+  0.01 of each other for 22% of the (token, layer) pairs.
+- Rounding the reference itself to BF16 already costs KLD 0.033 against its
+  float32 run. Q8_0's 0.050 on top of BF16 is in that range.
+
+It does not run the Q8_0 GGUF or its quantization path, though, so it cannot
+rule out an additional Q8_0 defect. That stays open until Q8_0's expert
+selections are measured against BF16 (the Phase 7 Top-6 item).
 
 **Q8_0 on the CPU: use `--no-repack`.** The first Q8_0 run used the CPU
 backend's default weight repacking. macOS killed it (exit 137) after 8 chunks,
@@ -430,8 +435,8 @@ norm outputs and residual stream; F32 router logits and LM head.
 libllama on the tiny fixture (F32, CPU, F32 KV cache):
 
 ```text
-PASS tiny, all 8 experts: logits NMSE 4.27e-13, worst layer node NMSE 6.64e-13 (bound 1e-06)
-PASS tiny, top-2 routing: same experts for 100.0% of (token, layer) pairs, worst layer node NMSE 6.25e-13 where they agree (bound 1e-06)
+PASS tiny, all 8 experts: logits NMSE 4.75e-13, worst layer node NMSE 7.49e-13 (bound 1e-06)
+PASS tiny, top-2 routing: same experts for 100.0% of (token, layer) pairs, worst layer node NMSE 7.19e-13 where they agree (bound 1e-06)
 ```
 
 **Mutations of the reference**, each reverted:
@@ -480,8 +485,10 @@ reference in float32. It takes 15 minutes, with a peak footprint of 11 GB.
   reference itself does (KLD 0.033 each).
 - The hidden states drift apart through expert flips at near-tie router scores,
   not through a faulty step.
-- The German repetition and the high Q8_0 KLD are therefore what the vLLM model
-  code computes on these weights, not a llama.cpp defect.
+- The German repetition is therefore what the vLLM model code computes on
+  these weights, not a llama.cpp defect.
+- The BF16 sensitivity makes router amplification a plausible cause of the
+  high Q8_0 KLD. Q8_0 itself was not run here, so that stays open.
 - What this cannot rule out is a misreading of the vLLM code shared by the port
   and this reference. Only running vLLM itself covers that (PLAN Phases 0 and 6).
 
