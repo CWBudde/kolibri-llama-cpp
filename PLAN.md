@@ -152,18 +152,34 @@ cases and about 1.35 million fuzz strings match the reference. See
     `tensor_mapping.py` entries: the converter maps the block norms
     explicitly (Phase 1, pitfall 1). See `docs/phase3-gguf-arch.md`.
 -   [ ] Define GGUF metadata for:
-    -   [ ] 50 blocks;
-    -   [ ] embedding size 2,560;
-    -   [ ] 48/4 Q/KV heads;
-    -   [ ] head dimension / RoPE dimension;
-    -   [ ] RMSNorm epsilon;
+    -   [x] 50 blocks;
+        (2026-10-03) — `kolibri.block_count = 50`, written by `TextModel`;
+        `patches/llama.cpp/0003-kolibri-converter.patch`.
+    -   [x] embedding size 2,560;
+        (2026-10-03) — `kolibri.embedding_length = 2560`, written by `TextModel`.
+    -   [x] 48/4 Q/KV heads;
+        (2026-10-03) — `kolibri.attention.head_count = 48`, `head_count_kv = 4`.
+    -   [x] head dimension / RoPE dimension;
+        (2026-10-03) — `key_length = value_length = 128` from `head_dim`;
+        `KolibriModel` adds `rope.dimension_count = 128` (full-head NEOX RoPE).
+    -   [x] RMSNorm epsilon;
+        (2026-10-03) — `kolibri.attention.layer_norm_rms_epsilon = 1e-6`.
+        `tools/gguf/check_metadata.py` checks all five items against
+        `config.json`, using a `--vocab-only` conversion of the pinned files.
     -   [ ] 384 experts / 6 active;
     -   [ ] expert FFN size 512;
     -   [ ] shared expert;
     -   [ ] SWA size 512;
     -   [ ] repeating SWA/full pattern;
     -   [ ] RoPE base 10,000 and SWA-only RoPE behavior.
+    -   [ ] router gating: `expert_gating_func = sigmoid`,
+        `expert_weights_norm = false`, `expert_weights_scale = 1.0`
+        (not in the original list; Phase 4 reads these keys).
 -   [ ] Implement Kolibri converter class.
+    (2026-10-03) — partial: `KolibriModel` in the CWBudde/llama.cpp fork
+    (`feat/kolibri-converter`, patch 0003) registers `Kolibri1ForCausalLM`
+    and writes the vocab and base hparams. `modify_tensors` still raises;
+    the tensor mapping remains.
 -   [ ] Map/pack expert tensors in the layout expected by llama.cpp.
 -   [ ] Start with BF16 as the correctness reference.
 -   [ ] Treat direct FP8 conversion as a follow-up optimization rather

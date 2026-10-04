@@ -19,7 +19,6 @@ tests/test-tokenizer-random.py and checks, with vocab_only=true:
 """
 
 import argparse
-import importlib.util
 import multiprocessing
 import os
 import random
@@ -27,14 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from common import load_golden, tokenizer_dir
-
-
-def load_upstream(llama_cpp: Path):
-    spec = importlib.util.spec_from_file_location("tokrand", llama_cpp / "tests" / "test-tokenizer-random.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+from common import libllama, load_golden, load_upstream, tokenizer_dir
 
 
 class Llama:
@@ -43,11 +35,7 @@ class Llama:
     its cffi loader is reused."""
 
     def __init__(self, up, llama_cpp: Path, vocab: Path):
-        lib = up.LibLlama(
-            path_llama_h=str(llama_cpp / "include" / "llama.h"),
-            path_includes=[str(llama_cpp / "ggml" / "include"), str(llama_cpp / "include")],
-            path_libllama=str(llama_cpp / "build" / "bin" / "libllama.so"),
-        )
+        lib = libllama(llama_cpp, up)
         self.lib, self.ffi = lib.lib, lib.ffi
         self.model = self.lib.llama_model_load_from_file(str(vocab).encode(), lib.model_default_params(vocab_only=True))
         if not self.model:

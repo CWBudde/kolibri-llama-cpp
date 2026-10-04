@@ -27,7 +27,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | 0 | Reference outputs from the official vLLM implementation | open; needs hardware for the 78–156 GB checkpoint |
 | 1 | Checkpoint and tensor inventory | done: [docs/phase1-tensor-inventory.md](docs/phase1-tensor-inventory.md) |
 | 2 | Tokenizer compatibility | done: [docs/phase2-tokenizer.md](docs/phase2-tokenizer.md) |
-| 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration done: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
+| 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration and base metadata done: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
 | 4–9 | Model graph, hybrid KV cache, numerical validation, quantization, Apple Silicon, chat behavior | open |
 
 ### Results so far
@@ -43,6 +43,9 @@ See [`PLAN.md`](PLAN.md) for the full plan.
     IDs and detokenized bytes.
 - **The `kolibri` architecture is registered.** It is known to gguf-py and
   libllama; the model class itself is Phase 4.
+- **The converter writes the base metadata.** `convert_hf_to_gguf.py` knows
+  `Kolibri1ForCausalLM`. It writes block count, embedding size, head counts,
+  head/RoPE dimension and RMSNorm epsilon. Tensor conversion is still to come.
 
 ## Layout
 
@@ -54,8 +57,8 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `inventory/{bf16,fp8}/` | Committed inventories: `summary.json` and `tensors.jsonl.gz`. They pin the model revisions and the sha256 of every file. |
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
 | `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
-| `tools/gguf/check_arch.py` | Checks the `kolibri` architecture registration in gguf-py and libllama. |
-| `patches/llama.cpp/` | The llama.cpp changes, applied in order. |
+| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. |
+| `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. |
 | `docs/` | One report per phase, with findings, pitfalls and reproduction steps. |
 
 ## Setup
@@ -67,10 +70,15 @@ CMake, Ninja and a C++ compiler.
 # Go tools and tests (no network needed for the tests)
 go test ./...
 
-# llama.cpp at the pinned commit, with the patches applied
+# llama.cpp source, option A: the pinned commit with the patches applied
 git clone https://github.com/ggml-org/llama.cpp third_party/llama.cpp
 git -C third_party/llama.cpp checkout -b kolibri 1537a0a8b2f8711d840878b0a0677ab2213c882c
 for p in patches/llama.cpp/*.patch; do git -C third_party/llama.cpp apply "$PWD/$p"; done
+
+# option B, instead of A: the fork, which has the same patches as commits
+git clone --branch feat/kolibri https://github.com/CWBudde/llama.cpp third_party/llama.cpp
+
+# build (either option)
 cmake -S third_party/llama.cpp -B third_party/llama.cpp/build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DBUILD_SHARED_LIBS=ON
 cmake --build third_party/llama.cpp/build --target llama llama-tokenize test-tokenizer-0 test-llama-archs
@@ -80,7 +88,8 @@ uv venv --python 3.12 .venv
 VIRTUAL_ENV=.venv uv pip install --index-strategy unsafe-best-match -r tools/tokenizer/requirements.txt
 ```
 
-`third_party/` and `.venv/` are gitignored.
+`third_party/` and `.venv/` are gitignored. Without Ninja, `-G "Unix Makefiles"`
+works too. On macOS, the Python tools load `libllama.dylib` instead of `libllama.so`.
 
 ## Checks
 
@@ -92,6 +101,7 @@ go vet ./... && go test ./...
 .venv/bin/python tools/tokenizer/compare.py --llama-cpp third_party/llama.cpp \
     --vocab third_party/llama.cpp/models/ggml-vocab-kolibri.gguf  # golden + fuzz + UTF-8 report
 .venv/bin/python tools/gguf/check_arch.py --llama-cpp third_party/llama.cpp
+.venv/bin/python tools/gguf/check_metadata.py --llama-cpp third_party/llama.cpp
 ctest --test-dir third_party/llama.cpp/build -R 'test-tokenizer-0|test-generate-models'
 third_party/llama.cpp/build/bin/test-llama-archs
 ```
