@@ -16,7 +16,7 @@ import (
 
 func TestGenerate(t *testing.T) {
 	dir := t.TempDir()
-	if err := generate(dir, "", 1); err != nil {
+	if err := generate(dir, "", 1, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,6 +144,69 @@ func TestGenerate(t *testing.T) {
 	}
 }
 
+func TestGenerateRouter(t *testing.T) {
+	dir := t.TempDir()
+	if err := generate(dir, "", 1, true); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := kolibri.ParseConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The reference router test: 384 experts, top 6.
+	if cfg.NumExperts != 384 || cfg.NumExpertsPerTok != 6 || cfg.MoEIntermediateSize != 16 ||
+		cfg.NumHiddenLayers != 6 || !cfg.IsFullAttention(4) {
+		t.Errorf("config = %+v", cfg)
+	}
+
+	f, err := os.Open(filepath.Join(dir, "model.safetensors"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h, err := safetensors.ReadHeader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.Tensors) != len(cfg.ExpectedNames()) {
+		t.Errorf("%d tensors, want %d", len(h.Tensors), len(cfg.ExpectedNames()))
+	}
+	got := map[string]safetensors.Tensor{}
+	for _, tt := range h.Tensors {
+		got[tt.Name] = tt
+	}
+	// Logits with std about 3 (router std 3/16 on a unit-RMS input of width
+	// 256) and a bias with std 5, as test_routing_semantics draws them.
+	for _, tc := range []struct {
+		name      string
+		mean, std float64
+	}{
+		{"model.layers.0.mlp.gate.weight", 0, 3.0 / 16},
+		{"model.layers.0.moe.router.expert_bias", 0, 5},
+		{"model.layers.0.mlp.experts.383.down_proj.weight", 0, 0.02},
+		{"model.layers.0.self_attn.q_proj.weight", 0, 0.02},
+	} {
+		tt, ok := got[tc.name]
+		if !ok {
+			t.Errorf("missing %s", tc.name)
+			continue
+		}
+		buf := make([]byte, tt.NumBytes())
+		if _, err := f.ReadAt(buf, 8+h.Size+tt.Offsets[0]); err != nil {
+			t.Fatal(err)
+		}
+		mean, std := bf16Stats(buf)
+		// 384 bias values: the sample std is within 10 % of the true one.
+		if math.Abs(mean-tc.mean) > tc.std/2 || math.Abs(std-tc.std) > tc.std/10 {
+			t.Errorf("%s: mean %.3f std %.3f, want about %.3f and %.3f", tc.name, mean, std, tc.mean, tc.std)
+		}
+	}
+}
+
 func bf16Stats(buf []byte) (mean, std float64) {
 	n := len(buf) / 2
 	var sum, sq float64
@@ -158,10 +221,10 @@ func bf16Stats(buf []byte) (mean, std float64) {
 
 func TestGenerateDeterministic(t *testing.T) {
 	a, b := t.TempDir(), t.TempDir()
-	if err := generate(a, "", 7); err != nil {
+	if err := generate(a, "", 7, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := generate(b, "", 7); err != nil {
+	if err := generate(b, "", 7, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"config.json", "model.safetensors", "manifest.json"} {
