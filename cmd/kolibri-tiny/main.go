@@ -10,7 +10,9 @@
 //     converter reads the real 128k tokenizer (copied from -tokenizer-dir);
 //   - weights are BF16 like the released checkpoint, not F32;
 //   - norms are random instead of ones, so a converter that swaps two block
-//     norms (they share a shape) produces different data.
+//     norms (they share a shape) produces different data;
+//   - matrices have standard deviation 0.02 instead of 1 (see initScale), so
+//     a forward pass is well-conditioned.
 //
 // Tensor names and shapes come from internal/kolibri, the same source of
 // truth as the Phase 1 inventory. manifest.json lists every expected GGUF
@@ -135,7 +137,8 @@ func generate(dir, tokDir string, seed uint64) error {
 			return err
 		}
 		shape := cfg.ExpectedShape(e)
-		tensors = append(tensors, safetensors.WriteTensor{Name: name, DType: "BF16", Shape: shape, Data: randBF16(rng, shape)})
+		mean, std := initScale(e.Spec)
+		tensors = append(tensors, safetensors.WriteTensor{Name: name, DType: "BF16", Shape: shape, Data: randBF16(rng, shape, mean, std)})
 	}
 	if err := writeFile(filepath.Join(dir, "model.safetensors"), func(w *bufio.Writer) error {
 		return safetensors.Write(w, tensors, map[string]string{"format": "pt"})
@@ -181,15 +184,33 @@ func manifest(cfg *kolibri.Config) []entry {
 	return m
 }
 
-// randBF16 draws standard normal values, rounded to BF16 (nearest even).
-func randBF16(rng *rand.Rand, shape []int64) []byte {
+// initScale returns the mean and standard deviation of a tensor kind.
+// Matrices use HF's default initializer_range (0.02) and norms scatter
+// around 1, so a forward pass stays well-conditioned; with unit-scale
+// matrices the activations grow and tiny rounding differences flip the
+// top-k routing. The correction bias keeps unit scale, like the real one
+// (sampled ranges about [-7.6, 3.0]), so it decides the routing.
+func initScale(s *kolibri.Spec) (mean, std float64) {
+	switch {
+	case s.Group == kolibri.GroupBlockNorm || s.Group == kolibri.GroupQKNorm:
+		return 1, 0.1
+	case s.Class == "exp_probs_b":
+		return 0, 1
+	default:
+		return 0, 0.02
+	}
+}
+
+// randBF16 draws normal values with the given mean and standard deviation,
+// rounded to BF16 (nearest even).
+func randBF16(rng *rand.Rand, shape []int64, mean, std float64) []byte {
 	n := int64(1)
 	for _, d := range shape {
 		n *= d
 	}
 	buf := make([]byte, 2*n)
 	for i := range n {
-		bits := math.Float32bits(float32(rng.NormFloat64()))
+		bits := math.Float32bits(float32(mean + std*rng.NormFloat64()))
 		bits += 0x7fff + (bits>>16)&1
 		binary.LittleEndian.PutUint16(buf[2*i:], uint16(bits>>16))
 	}
