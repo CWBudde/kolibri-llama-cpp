@@ -76,7 +76,7 @@ git -C third_party/llama.cpp checkout -b kolibri 1537a0a8b2f8711d840878b0a0677ab
 for p in patches/llama.cpp/*.patch; do git -C third_party/llama.cpp apply "$PWD/$p"; done
 
 # option B, instead of A: the fork, which has the same patches as commits
-git clone --branch feat/kolibri-converter https://github.com/CWBudde/llama.cpp third_party/llama.cpp
+git clone --branch feat/kolibri https://github.com/CWBudde/llama.cpp third_party/llama.cpp
 
 # build (either option)
 cmake -S third_party/llama.cpp -B third_party/llama.cpp/build -G Ninja \
