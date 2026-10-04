@@ -20,6 +20,10 @@ llama.cpp port.
 repos. The `tokenizer.json` sha256 is `5d4798f2…4a4c13`. The full hashes of all
 metadata files are in `inventory/*/summary.json`.
 
+The full BF16 revision was downloaded and converted on 2026-10-04. All 32
+shards match the inventory's pinned size and sha256, and the converted GGUF is
+bit-exact against all 58,353 tensors. See [real-checkpoint.md](real-checkpoint.md).
+
 ## Reproducing the inventory
 
 ```sh

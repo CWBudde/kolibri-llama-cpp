@@ -158,7 +158,10 @@ All keys use existing gguf-py writers; Kolibri needs no new GGUF keys.
     `ffn_gate_inp` in F32;
   - `--outtype bf16` writes all other matrices as BF16, which is lossless for
     the BF16 checkpoint.
-- **Loading.** The base class loads tensors lazily.
+- **Loading.** The base class loads tensors lazily. On the real 156 GB
+  checkpoint this keeps the conversion at a peak footprint of 7.5 GiB, with
+  no streaming code of its own. `check_real.py` confirms every tensor is
+  bit-exact: [real-checkpoint.md](real-checkpoint.md).
 - **`--fuse-gate-up-exps`** is not supported: it needs `ffn_gate_up_exps` in
   `MODEL_TENSORS[KOLIBRI]`, which is not listed.
 

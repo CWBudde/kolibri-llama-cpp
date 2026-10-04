@@ -219,6 +219,11 @@ of its window.
 
 ## Long contexts (`tools/gguf/check_long.py`)
 
+On the real weights the cache split shows directly in the memory use. At
+`-c 32768` the iSWA cache holds 640 MiB for the 10 full-attention layers
+(32768 cells, 20 KiB per token) and 100 MiB for the 40 sliding layers (1280
+cells, independent of context). See [real-checkpoint.md](real-checkpoint.md).
+
 The `-attn` fixture, converted to F32, with the GGUF `context_length`
 overridden to the real 262144. The tokens are decoded as one sequence in
 ubatches of 256 (flash attention off) or 512 (on), each reading the KV cache of

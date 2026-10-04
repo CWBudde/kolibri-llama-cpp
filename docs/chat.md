@@ -8,7 +8,15 @@ This document covers what llama.cpp does with Kolibri's chat conventions:
 - the official reasoning and tool parsers compared with llama.cpp's;
 - the stop tokens and EOS.
 
-None of it needs the checkpoint. Aleph Alpha's recommended sampling
+None of it needs the checkpoint. On the real weights, a Q3_K/Q8_0
+quantization served by `llama-server --jinja` does the same:
+
+- it splits reasoning from content;
+- it honours `reasoning_effort: "none"`;
+- it returns a parsed tool call;
+- it stops on EOS.
+
+See [real-checkpoint.md](real-checkpoint.md). Aleph Alpha's recommended sampling
 (`temperature=1.0`, `top_p=0.97`, `top_k=128`) is not covered here: it is
 validated only once base greedy inference matches the reference.
 
