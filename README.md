@@ -29,7 +29,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | 2 | Tokenizer compatibility | done: [docs/phase2-tokenizer.md](docs/phase2-tokenizer.md) |
 | 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration, GGUF metadata and tensor conversion done, checked on a tiny synthetic checkpoint: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
 | 4 | Native model loading and MoE graph | in progress; model class loads and runs the tiny synthetic checkpoint on CPU and Metal: [docs/phase4-model.md](docs/phase4-model.md). Router and MoE block match the reference function: [docs/phase4-router.md](docs/phase4-router.md). The 50-layer graph needs the full checkpoint |
-| 5 | Hybrid attention and KV cache | in progress; the 4:1 pattern over 50 layers, the iSWA cache split, sliding-window mask, off-by-one, RoPE on the sliding layers only, GQA 48/4 and per-head QK norm match the reference on tiny checkpoints; long contexts (8k and up) are open: [docs/phase5-attention.md](docs/phase5-attention.md) |
+| 5 | Hybrid attention and KV cache | done; the 4:1 pattern over 50 layers, the iSWA cache split, sliding-window mask, off-by-one, RoPE on the sliding layers only, GQA 48/4 and per-head QK norm match the reference on tiny checkpoints; the attention and KV cache also hold at 8k, 16k, 64k and 262k tokens: [docs/phase5-attention.md](docs/phase5-attention.md) |
 | 6–9 | Numerical validation, quantization, Apple Silicon, chat behavior | open |
 
 ### Results so far
@@ -98,6 +98,14 @@ See [`PLAN.md`](PLAN.md) for the full plan.
   off-by-one in either direction moves the output all the way to the wrong
   window's reference, in every configuration.
 
+  At long contexts (8192, 16384 and 65536 tokens on CPU and Metal, the real
+  262144 on Metal), the full layers' KV cache holds every position, and the
+  attention at sampled positions matches a float64 recomputation over all
+  earlier keys without degrading: NMSE 5.6e-14 at 65536 on the CPU with an F32
+  KV cache. Only the RoPE angles lose float32 precision with the position, and
+  vLLM's own float32 cos/sin cache loses it too; libllama stays within 30× of
+  that error.
+
 ## Layout
 
 | Path | Contents |
@@ -109,7 +117,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `inventory/{bf16,fp8}/` | Committed inventories: `summary.json` and `tensors.jsonl.gz`. They pin the model revisions and the sha256 of every file. |
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
 | `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
-| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. |
+| `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. `check_long.py` does the same for the attention at 8k, 16k, 64k and 262k tokens, on sampled positions. |
 | `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. |
 | `docs/` | One report per phase, with findings, pitfalls and reproduction steps. |
 
@@ -158,6 +166,7 @@ go vet ./... && go test ./...
 .venv/bin/python tools/gguf/check_model.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_moe.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_attn.py --llama-cpp third_party/llama.cpp
+.venv/bin/python tools/gguf/check_long.py --llama-cpp third_party/llama.cpp  # about 10 min
 ctest --test-dir third_party/llama.cpp/build -R 'test-tokenizer-0|test-generate-models'
 third_party/llama.cpp/build/bin/test-llama-archs
 ```
