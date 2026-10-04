@@ -42,6 +42,10 @@ func Write(w io.Writer, tensors []WriteTensor, metadata map[string]string) error
 			errs = append(errs, fmt.Errorf("%s: duplicate name", t.Name))
 			continue
 		}
+		if slices.ContainsFunc(t.Shape, func(d int64) bool { return d < 0 }) {
+			errs = append(errs, fmt.Errorf("%s: negative dimension in %v", t.Name, t.Shape))
+			continue
+		}
 		hdr := Tensor{DType: t.DType, Shape: t.Shape, Offsets: [2]int64{off, off + int64(len(t.Data))}}
 		bits, ok := dtypeBits[t.DType]
 		if !ok {

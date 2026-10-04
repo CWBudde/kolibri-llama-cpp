@@ -51,6 +51,8 @@ func TestWriteRejects(t *testing.T) {
 		want string
 	}{
 		{"size", []WriteTensor{{Name: "a", DType: "BF16", Shape: []int64{3}, Data: make([]byte, 4)}}, "want 6"},
+		// [-1, -1] has a positive element count, so the size check alone passes.
+		{"negative", []WriteTensor{{Name: "a", DType: "U8", Shape: []int64{-1, -1}, Data: []byte{0}}}, "negative dimension"},
 		{"dtype", []WriteTensor{{Name: "a", DType: "Q4", Shape: []int64{1}, Data: make([]byte, 1)}}, "unknown dtype"},
 		{"duplicate", []WriteTensor{{Name: "a", DType: "U8", Shape: []int64{1}, Data: []byte{0}}, {Name: "a", DType: "U8", Shape: []int64{1}, Data: []byte{0}}}, "duplicate"},
 		{"reserved", []WriteTensor{{Name: "__metadata__", DType: "U8", Shape: []int64{1}, Data: []byte{0}}}, "reserved"},
