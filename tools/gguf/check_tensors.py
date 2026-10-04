@@ -36,7 +36,8 @@ F32_MATRICES = {"ffn_gate_inp"}
 
 
 def run(cmd: list[str], what: str) -> None:
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    # from the repo root, so go run ./cmd/... works from any directory
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     if r.returncode != 0:
         raise SystemExit(f"FAIL {what} exited {r.returncode}:\n{r.stderr.strip()[-1500:]}")
 

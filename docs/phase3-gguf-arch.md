@@ -393,7 +393,8 @@ against the existing header parser.
    - its dtype;
    - its data, bit-exact against the BF16 source and stacked in expert
      order for `*_exps`;
-4. checks three metadata keys of the full (not `--vocab-only`) conversion.
+4. checks four metadata keys of the full (not `--vocab-only`) conversion:
+   the architecture, block count, expert count and per-layer SWA pattern.
 
 Results on 2026-10-04:
 
