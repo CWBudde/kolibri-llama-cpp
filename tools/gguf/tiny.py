@@ -17,7 +17,8 @@ def run(cmd: list[str], what: str) -> None:
 def generate_tiny(tmp: Path, seed: int, preset: str = "") -> Path:
     """Writes the tiny checkpoint, with the real tokenizer, into tmp.
     preset "router" selects the 384-expert top-6 variant (kolibri-tiny -router), "attn" the real
-    attention heads and sliding window (kolibri-tiny -attn)."""
+    attention heads and sliding window (kolibri-tiny -attn), "pattern" the real 50-layer SWA/full
+    pattern (kolibri-tiny -pattern)."""
     sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
     from common import tokenizer_dir
 
