@@ -130,16 +130,24 @@ index 5aa948251..4c13d2013 100644
          { "HuggingFaceTB-SmolLM3-3B.jinja",                  "<|im_start|>user",       "<|im_start|>assistant"      },
          { "MiMo-VL.jinja",                                   "<|im_start|>user",       "<|im_start|>assistant"      },
 diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
-index c7edf0c2d..23ab26f87 100644
+index c7edf0c2d..478d9c0ea 100644
 --- a/tests/test-chat.cpp
 +++ b/tests/test-chat.cpp
-@@ -5432,6 +5432,115 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+@@ -23,6 +23,7 @@
+ #include <set>
+ #include <stdexcept>
+ #include <string>
++#include <tuple>
+ 
+ using json = common_json;
+ 
+@@ -5432,6 +5433,115 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
              .run();
      }
  
 +    // Aleph-Alpha Kolibri-1 tests - ChatML, <think> reasoning, JSON tool calls in <tool_call> tags.
-+    // Thinking is on by default and the model opens <think> itself; with thinking off the template
-+    // prefills an empty think block. Cases follow aleph-alpha-inference tests/test_reasoning.py.
++    // Thinking is on by default and the model opens <think> itself; with thinking off the template prefills an empty think block.
++    // Cases follow aleph-alpha-inference tests/test_reasoning.py.
 +    {
 +        auto tst = peg_tester("models/templates/Aleph-Alpha-Kolibri-1.jinja", detailed_debug);
 +
@@ -249,7 +257,7 @@ index c7edf0c2d..23ab26f87 100644
  
      // Apertus-8B-Instruct tests - FUNC_NAME_AS_KEY format
      // Format: <|tools_prefix|>[{"function_name": {...arguments...}}]<|tools_suffix|>
-@@ -7586,10 +7695,103 @@ static void test_reasoning_effort_caps() {
+@@ -7586,10 +7696,103 @@ static void test_reasoning_effort_caps() {
      assert_supports_effort("models/templates/openai-gpt-oss-120b.jinja", true);
      assert_supports_effort("models/templates/upstage-Solar-Open-100B.jinja", true);
      assert_supports_effort("models/templates/Cohere2MoE.jinja", true);
@@ -332,7 +340,7 @@ index c7edf0c2d..23ab26f87 100644
 +    }
 +
 +    // server: the reasoning_effort field wins over an enable_thinking kwarg, as in vLLM
-+    server_chat_params opt;
++    server_chat_params opt{};
 +    opt.tmpls           = read_templates("models/templates/Aleph-Alpha-Kolibri-1.jinja");
 +    opt.use_jinja       = true;
 +    opt.enable_thinking = true;
@@ -353,7 +361,7 @@ index c7edf0c2d..23ab26f87 100644
  static void test_msg_diffs_compute() {
      LOG_DBG("%s\n", __func__);
      {
-@@ -7750,6 +7952,7 @@ int main(int argc, char ** argv) {
+@@ -7750,6 +7953,7 @@ int main(int argc, char ** argv) {
          test_deepseek_v4_tool_result_ordering();
          test_template_generation_prompt();
          test_reasoning_effort_caps();
