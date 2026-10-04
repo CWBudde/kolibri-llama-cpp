@@ -287,11 +287,18 @@ novel MoE implementation.
     fused_output`) and `Kolibri1DecoderLayer` do. `check_moe.py` (CPU,
     float64 reference, all 6 layers): `ffn_out` NMSE 3.0e-14, `ffn_post_norm`
     3.3e-14, `l_out` 1.7e-14.
--   [ ] Add graph callbacks/names useful for layer-by-layer debugging.
+-   [x] Add graph callbacks/names useful for layer-by-layer debugging.
     (2026-10-04) — partial: the MoE half is done. `check_moe.py` captures 10
     named nodes per layer and localizes each MoE step against the reference.
     The attention names (`Qcur_normed`, `Qcur_rope`, `attn_out`) exist but
     still need a reference comparison (Phases 5/6).
+    (2026-10-04) — attention half: `tools/gguf/check_attn.py` captures 11
+    named nodes per layer (`attn_norm` … `kqv_out`, `attn_out`, `ffn_inp`) and
+    compares each with a float64 recomputation from libllama's own input to
+    that step. Each mutation fails at the node it changes: a RoPE base
+    override only at "Qcur_rope vs reference: max NMSE over layers 1.2e+00",
+    a window of 512 at "kqv_out at positions 511: 2.7e-14, 512: 2.0e-03". See
+    `docs/phase5-attention.md`.
 -   [x] Remove the `kolibri` skip from `arch_supported()` in
     `tests/test-llama-archs.cpp` (added in Phase 3).
     (2026-10-04) — skip removed; `kolibri` is MoE-only, and the fixture writes
@@ -322,18 +329,44 @@ already contains reusable hybrid-SWA machinery.
     repeating for 50 layers.
 -   [ ] Evaluate `load_swa_pattern()` instead of introducing custom
     per-layer attention logic.
--   [ ] Use `LLAMA_SWA_TYPE_STANDARD` if its mask semantics match
+-   [x] Use `LLAMA_SWA_TYPE_STANDARD` if its mask semantics match
     Kolibri's 512-preceding-token window.
+    (2026-10-04) — it matches: vLLM v0.29.0 hands `sliding_window = 513` to
+    FlashAttention as window `(512, 0)`, and STANDARD masks `p1 - p0 >= 513`.
+    `check_attn.py` (`kolibri-tiny -attn`, 1100 tokens, CPU and Metal, 20
+    configurations): "kqv_out vs reference: max NMSE over layers 1.8e-14
+    (<= 1e-10)" on the CPU with an F32 KV cache. With `CHUNKED` it fails
+    ("kqv_out at positions … 513: 1.6e+02").
 -   [ ] Evaluate `llama_memory_hybrid_iswa` for mixed SWA/full KV
     storage.
 -   [ ] Reuse existing GQA path for 48 Q heads / 4 KV heads.
 -   [ ] Reuse existing per-head Q/K RMSNorm support.
--   [ ] Apply RoPE with base 10,000 on SWA layers only.
--   [ ] Ensure full-attention layers receive no positional rotation,
+-   [x] Apply RoPE with base 10,000 on SWA layers only.
+    (2026-10-04) — "RoPE nodes in layers [0, 1, 2, 3] (sliding layers [0, 1,
+    2, 3])", and "Qcur_rope vs reference: max NMSE over layers 6.8e-10 (<=
+    1e-08)" against a port of vLLM's NeoX RoPE with `rope_theta`. The bound
+    covers ggml's float32 angles (`ggml_rope_cache_init`). A base of 20000
+    fails with NMSE 1.2; the GPT-J rotation fails with 1.7.
+-   [x] Ensure full-attention layers receive no positional rotation,
     matching Kolibri.
--   [ ] Validate the exact off-by-one semantics: 512 preceding tokens +
+    (2026-10-04) — layers 4 and 5 have no RoPE node, and "no RoPE on the full
+    layers: a rotated reference is off by NMSE 2.8e-02, the unrotated one by
+    2.9e-15 (>= 100x)". With RoPE on every layer it fails ("RoPE nodes in
+    layers [0, 1, 2, 3, 4, 5]").
+-   [x] Validate the exact off-by-one semantics: 512 preceding tokens +
     current token.
--   [ ] Test at context boundaries: 511, 512, 513, and larger.
+    (2026-10-04) — the deviation from the window-513 reference, projected onto
+    the step to the window-512 and window-514 references: "libllama moves
+    +1.4e-08 of the way to the window-512 reference (|c| <= 0.1)" (CPU, F32
+    KV). Every configuration stays within |c| <= 5.8e-3, Metal with F16
+    included. With `sliding_window` overridden to 512 or 514, c is +1.0.
+-   [x] Test at context boundaries: 511, 512, 513, and larger.
+    (2026-10-04) — 1100 tokens, decoded as one batch, in chunks of 64 that
+    read the KV cache (with an evicting 768-cell SWA cache, and with a full
+    one), and one token at a time across 500–529: "kqv_out at positions 511:
+    2.7e-14, 512: 2.7e-14, 513: 2.7e-14, 514: 3.1e-14" in every run (CPU, F32
+    KV), and at most 3.6e-6 under F16 and Metal. A window of 512 leaves 511
+    unchanged and fails from 512 on.
 -   [ ] Test short contexts first, then 8k/16k/64k before attempting
     262k.
 
