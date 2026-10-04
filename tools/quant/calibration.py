@@ -15,8 +15,10 @@ weighted up to about 45% English, 35% German and 20% code by token count:
   wiki.test.raw, a disjoint split);
 - German: articles of German Wikipedia (wikimedia/wikipedia, 20231101.de)
   from fixed offsets, through the Hugging Face datasets server;
-- code: C++, Python and Go source files at fixed paths of this repo and its
-  pinned llama.cpp submodule.
+- code: C++, Python and Go source files at fixed paths of this repo and of
+  third_party/llama.cpp. third_party/ is not a submodule and may come from a
+  moving branch, so every code slice is checked against the sha256 it had in
+  the documented corpus (llama.cpp e1a553f5f).
 
 The sections are interleaved in blocks, so a run cut short with --chunks still
 sees all three domains.
@@ -38,12 +40,19 @@ ROWS_URL = ("https://datasets-server.huggingface.co/rows?dataset=wikimedia/wikip
 DE_OFFSETS = [0, 100000, 400000, 800000, 1200000, 1600000, 2000000, 2400000, 2800000]
 DE_ROWS_PER_OFFSET = 25
 DE_MAX_ARTICLE = 800
+LLAMA_CPP_REV = "e1a553f5fa1f82edfb702e93012c4daa70634e92"
+# Path, characters taken from the start, sha256 of those characters (UTF-8).
 CODE_FILES = [
-    ("third_party/llama.cpp/src/llama-graph.cpp", 35000),
-    ("third_party/llama.cpp/gguf-py/gguf/gguf_writer.py", 20000),
-    ("third_party/llama.cpp/tools/server/server-context.cpp", 20000),
-    ("internal/safetensors/safetensors.go", 7000),
-    ("cmd/kolibri-tiny/main.go", 10000),
+    ("third_party/llama.cpp/src/llama-graph.cpp", 35000,
+     "e8ed5db69b6c78daf1c127c31524e591cc8f6c61199524c3f06f09ffa914250e"),
+    ("third_party/llama.cpp/gguf-py/gguf/gguf_writer.py", 20000,
+     "52e99c707a35894fdb0e13b53d7a47e484a7b2b0cd5553d7412956864f6c2612"),
+    ("third_party/llama.cpp/tools/server/server-context.cpp", 20000,
+     "54ca626f53b2ccf8f86636cabb9ce28bb28ac8e227d32a65da3b833742b34e35"),
+    ("internal/safetensors/safetensors.go", 7000,
+     "08d8aaf05996b708023f5e25841e1241e898e12ce134181bb4d9d664b9637aad"),
+    ("cmd/kolibri-tiny/main.go", 10000,
+     "e332048198abbcd6acab264c679a5529a072c257c450277edafed2e16574e6f4"),
 ]
 EN_BYTES = 260000
 BLOCK = 4000
@@ -67,9 +76,15 @@ def german(cache: Path) -> str:
 
 def code() -> str:
     parts = []
-    for rel, limit in CODE_FILES:
+    changed = []
+    for rel, limit, want in CODE_FILES:
         text = (ROOT / rel).read_text()[:limit]
+        if hashlib.sha256(text.encode()).hexdigest() != want:
+            changed.append(rel)
         parts.append(f"// {rel}\n{text}")
+    if changed:
+        raise SystemExit("FAIL code inputs differ from the documented corpus: " + ", ".join(changed)
+                         + f"; check out llama.cpp {LLAMA_CPP_REV[:9]} and this repo's matching commit")
     return "\n\n".join(parts)
 
 

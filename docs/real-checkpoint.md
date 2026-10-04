@@ -279,7 +279,8 @@ the weights stay memory-mapped, and the footprint stays at about 2.5 GB.
 - 45% English: the start of wikitext-2 `wiki.train.raw`;
 - 35% German: Wikipedia lead sections from fixed offsets of
   `wikimedia/wikipedia` 20231101.de;
-- 20% code: C++, Python and Go files of this repo and the pinned submodule;
+- 20% code: C++, Python and Go files of this repo and of llama.cpp
+  `e1a553f5f`, each checked against a pinned sha256;
 - 522,320 bytes, 128,098 tokens, sha256 `e6fc52c9…`.
 
 English wikitext alone does not reach enough experts. A test run over 8 chunks
