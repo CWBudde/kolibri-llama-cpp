@@ -13,18 +13,16 @@ This report covers three steps:
 
 The router gating keys, expert packing and tensor conversion come next.
 
-The patches are also kept as commits in
+The patches are also kept as commits on the `feat/kolibri` branch of
 [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp):
 
-| Patches | Fork branch |
-|---|---|
-| 0001–0002 | `feat/kolibri` |
-| 0001–0003 | `feat/kolibri-converter` |
-| 0001–0004 | `feat/kolibri-moe-swa-metadata` |
+- 0001–0002 were committed there directly.
+- 0003 came in through `feat/kolibri-converter` (fork PR #2).
+- 0004 came in through `feat/kolibri-moe-swa-metadata` (fork PR #3).
 
-The patches applied to the pinned commit give exactly the tree of the matching
-branch. The one exception is `models/ggml-vocab-kolibri.gguf`, which the fork
-commits and the patches do not.
+Patches 0001–0004 applied to the pinned commit give exactly the tree of
+`feat/kolibri`. The one exception is `models/ggml-vocab-kolibri.gguf`, which the
+fork commits and the patches do not.
 
 ## Changes (`patches/llama.cpp/0002-kolibri-arch.patch`)
 
