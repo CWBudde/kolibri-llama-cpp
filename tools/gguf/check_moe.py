@@ -38,7 +38,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from check_model import MAX_NMSE, Runner, nmse
+from check_model import MAX_NMSE, Runner, joined, nmse
 from tiny import convert, generate_tiny
 
 N_TOKENS = 100
@@ -78,11 +78,11 @@ def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], max_n
     cap = {f"{s}-{il}": None for il in range(n_layer) for s in steps}
     nodes: dict[str, list[str]] = {}
     runner.logits(gguf, dev, tokens, N_TOKENS, overrides, nodes=nodes, capture=cap)
-    missing = [k for k, v in cap.items() if v is None]
+    missing = [k for k, v in cap.items() if not v]
     if missing:
         return [(False, f"nodes not captured: {missing[:4]}")]
     # [n_tokens, n] tensors
-    got = {k: torch.from_numpy(v.reshape(N_TOKENS, -1)) for k, v in cap.items()}
+    got = {k: torch.from_numpy(joined(v).reshape(N_TOKENS, -1)) for k, v in cap.items()}
     shapes = {tuple(got[f"ffn_moe_topk-{il}"].shape) for il in range(n_layer)}
     top_ok = (shapes == {(N_TOKENS, top_k)}, f"Top-{top_k}: ffn_moe_topk is {sorted(shapes)} (n_tokens, n_expert_used)")
     if not top_ok[0]:
@@ -163,7 +163,7 @@ def main() -> None:
     tokens = random.Random(args.seed).choices(range(127900), k=N_TOKENS)  # base vocab, no special tokens
     errs = 0
     with tempfile.TemporaryDirectory() as tmp:
-        model = generate_tiny(Path(tmp), args.seed, router=True)
+        model = generate_tiny(Path(tmp), args.seed, "router")
         gguf = convert(model, args.llama_cpp, "f32")
         for name, dev in runner.devices():
             is_cpu = runner.lib.ggml_backend_dev_type(dev) == runner.lib.GGML_BACKEND_DEVICE_TYPE_CPU

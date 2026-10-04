@@ -58,6 +58,14 @@ def nmse(a, b) -> float:
     return float(((a - b) ** 2).sum() / (a ** 2).sum())
 
 
+def joined(parts: list, token_axis: int = -2):
+    """One captured node over all graph computations: the parts concatenated along the token
+    axis (-2 for an activation [.., n_tokens, n_embd], -3 for heads [.., n_tokens, n_head, d])."""
+    import numpy as np
+
+    return np.concatenate(parts, axis=token_axis)
+
+
 class Runner:
     def __init__(self, llama_cpp: Path):
         sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
@@ -101,12 +109,19 @@ class Runner:
                           strides=[t.nb[i] for i in reversed(range(4))]).copy()
 
     def logits(self, path: Path, dev, tokens: list[int], n_ubatch: int, overrides: dict | None = None,
-               nodes: dict[str, list[str]] | None = None, capture: dict | None = None):
+               nodes: dict[str, list[str]] | None = None, capture: dict | None = None,
+               chunks: list[int] | None = None, n_ctx: int = 256, **ctx_params):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
         overrides maps GGUF keys to int, float or bool values that replace the file's.
         If nodes is given, it receives every graph node's name with the names of its inputs.
         If capture is given, it receives the data of every node whose name it already holds as a
-        key, as a numpy array in ggml order reversed ([n_tokens, n_embd] for an activation)."""
+        key: a list with one numpy array per graph computation (one per ubatch), in ggml order
+        reversed ([1, 1, n_tokens, n_embd] for an activation); see joined. If a computation has
+        several nodes of that name (Vcur is the matmul and its reshape), the last one counts.
+        With capture, every chunk must fit into one ubatch, so each llama_decode is one computation.
+        chunks are the sizes of consecutive llama_decode calls (default: one call), so the later
+        calls read the KV cache the earlier ones wrote. ctx_params set further llama_context_params
+        fields (swa_full, flash_attn_type, type_k, ...)."""
         import numpy as np
 
         self.log.clear()
@@ -126,9 +141,13 @@ class Runner:
         model = self.lib.llama_model_load_from_file(str(path).encode(), mparams)
         if not model:
             raise RuntimeError("load failed: " + self.errors())
-        cparams = self.ll.context_default_params(n_ctx=256, n_batch=len(tokens), n_ubatch=n_ubatch,
-                                                 op_offload=False)
+        chunks = chunks or [len(tokens)]
+        assert sum(chunks) == len(tokens) and (capture is None or max(chunks) <= n_ubatch)
+        cparams = self.ll.context_default_params(n_ctx=n_ctx, n_batch=max(chunks), n_ubatch=n_ubatch,
+                                                 op_offload=False, **ctx_params)
         if nodes is not None or capture is not None:
+            computation, seen = [0], {}  # the llama_decode call, and per name the call of its last capture
+
             @self.ffi.callback("bool(struct ggml_tensor *, bool, void *)")
             def on_node(t, ask, user_data):
                 name = self.ffi.string(t.name).decode()
@@ -137,7 +156,10 @@ class Runner:
                         srcs = [t.src[i] for i in range(len(t.src))]
                         nodes[name] = [self.ffi.string(x.name).decode() for x in srcs if x != self.ffi.NULL]
                     return capture is not None and name in capture
-                capture[name] = self._read(t, np)
+                parts = capture[name] or []
+                if seen.get(name) == computation[0]:
+                    parts.pop()  # a later node of the same name in the same computation
+                capture[name], seen[name] = parts + [self._read(t, np)], computation[0]
                 return True
 
             cparams.cb_eval = on_node
@@ -145,20 +167,26 @@ class Runner:
         if not ctx:
             self.lib.llama_model_free(model)
             raise RuntimeError("context failed: " + self.errors())
-        batch = self.lib.llama_batch_init(len(tokens), 0, 1)
+        batch = self.lib.llama_batch_init(max(chunks), 0, 1)
         try:
-            for i, t in enumerate(tokens):
-                batch.token[i] = t
-                batch.pos[i] = i
-                batch.n_seq_id[i] = 1
-                batch.seq_id[i][0] = 0
-                batch.logits[i] = True
-            batch.n_tokens = len(tokens)
-            if (rc := self.lib.llama_decode(ctx, batch)) != 0:
-                raise RuntimeError(f"llama_decode returned {rc}: " + self.errors())
             n_vocab = self.lib.llama_vocab_n_tokens(self.lib.llama_model_get_vocab(model))
-            return np.stack([np.frombuffer(self.ffi.buffer(self.lib.llama_get_logits_ith(ctx, i), 4 * n_vocab),
-                                           dtype=np.float32).copy() for i in range(len(tokens))])
+            out, start = [], 0
+            for n in chunks:
+                for i in range(n):
+                    batch.token[i] = tokens[start + i]
+                    batch.pos[i] = start + i
+                    batch.n_seq_id[i] = 1
+                    batch.seq_id[i][0] = 0
+                    batch.logits[i] = True
+                batch.n_tokens = n
+                if capture is not None:
+                    computation[0] += 1
+                if (rc := self.lib.llama_decode(ctx, batch)) != 0:
+                    raise RuntimeError(f"llama_decode returned {rc} at position {start}: " + self.errors())
+                out += [np.frombuffer(self.ffi.buffer(self.lib.llama_get_logits_ith(ctx, i), 4 * n_vocab),
+                                      dtype=np.float32).copy() for i in range(n)]
+                start += n
+            return np.stack(out)
         finally:
             self.lib.llama_batch_free(batch)
             self.lib.llama_free(ctx)

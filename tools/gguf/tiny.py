@@ -14,15 +14,16 @@ def run(cmd: list[str], what: str) -> None:
         raise SystemExit(f"FAIL {what} exited {r.returncode}:\n{r.stderr.strip()[-1500:]}")
 
 
-def generate_tiny(tmp: Path, seed: int, router: bool = False) -> Path:
+def generate_tiny(tmp: Path, seed: int, preset: str = "") -> Path:
     """Writes the tiny checkpoint, with the real tokenizer, into tmp.
-    router selects the 384-expert top-6 variant (kolibri-tiny -router)."""
+    preset "router" selects the 384-expert top-6 variant (kolibri-tiny -router), "attn" the real
+    attention heads and sliding window (kolibri-tiny -attn)."""
     sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
     from common import tokenizer_dir
 
-    model = tmp / ("kolibri-tiny-router" if router else "kolibri-tiny")
+    model = tmp / ("kolibri-tiny" + (f"-{preset}" if preset else ""))
     run(["go", "run", "./cmd/kolibri-tiny", "-out", str(model), "-tokenizer-dir", str(tokenizer_dir()),
-         "-seed", str(seed)] + (["-router"] if router else []), "cmd/kolibri-tiny")
+         "-seed", str(seed)] + ([f"-{preset}"] if preset else []), "cmd/kolibri-tiny")
     return model
 
 
