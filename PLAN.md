@@ -320,7 +320,7 @@ novel MoE implementation.
 **Definition of Done:** The complete 50-layer unquantized graph builds
 and executes without tensor-shape or unsupported-op errors.
 
-## Phase 5 --- Hybrid attention and KV cache
+## Phase 5 --- Hybrid attention and KV cache — ✅ DONE (2026-10-04)
 
 This phase is now lower risk than originally assumed because llama.cpp
 already contains reusable hybrid-SWA machinery.
@@ -396,8 +396,19 @@ already contains reusable hybrid-SWA machinery.
     2.7e-14, 512: 2.7e-14, 513: 2.7e-14, 514: 3.1e-14" in every run (CPU, F32
     KV), and at most 3.6e-6 under F16 and Metal. A window of 512 leaves 511
     unchanged and fails from 512 on.
--   [ ] Test short contexts first, then 8k/16k/64k before attempting
+-   [x] Test short contexts first, then 8k/16k/64k before attempting
     262k.
+    (2026-10-04) — the short case is `check_attn.py` (1100 tokens);
+    `check_long.py` decodes 8192, 16384 and 65536 tokens on CPU and Metal and
+    262144 on Metal (flash attention), compares 66 sampled query rows per
+    length, and keeps only the activations those rows need. "cells
+    {'non-SWA': 262144, 'SWA': 1280}", "kqv_out vs reference on the full layers
+    (all earlier keys) at 66 positions in [131071, 262143]: max NMSE 1.2e-08
+    (<= 0.0001)" (Metal), and on the CPU with an F32 KV cache, run once at
+    65536: 5.6e-14 (<= 1e-10). RoPE is held to vLLM's own float32 cos/sin
+    cache: "Qcur_rope vs float64 RoPE at 66 positions in [131071, 262143]:
+    NMSE 6.8e-06, vLLM's float32 cos/sin cache 2.9e-06 (<= 100x)"; the CPU's
+    ratio is 25–28.
 
 **Definition of Done:** Attention masks, RoPE behavior, and KV-cache
 semantics match the reference implementation.

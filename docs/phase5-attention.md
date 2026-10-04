@@ -1,7 +1,7 @@
 # Phase 5: hybrid attention, KV cache and RoPE against the reference
 
-This report covers Phase 5 except item 11 (long contexts), plus the attention
-half of Phase 4 item 9 (graph callbacks for layer-by-layer debugging):
+This report covers Phase 5, plus the attention half of Phase 4 item 9 (graph
+callbacks for layer-by-layer debugging):
 
 - `LLAMA_SWA_TYPE_STANDARD` and Kolibri's 512-preceding-token window;
 - RoPE with base 10,000 on the sliding-window layers only;
@@ -11,18 +11,20 @@ half of Phase 4 item 9 (graph callbacks for layer-by-layer debugging):
 - the 4:1 SWA/full pattern over the real 50 layers, and the per-layer split of
   the iSWA KV cache;
 - GQA with 48 query and 4 KV heads, and the per-head Q/K RMSNorm;
-- two evaluations: `load_swa_pattern()` and `llama_memory_hybrid_iswa`.
+- two evaluations: `load_swa_pattern()` and `llama_memory_hybrid_iswa`;
+- long contexts: 8k, 16k and 64k tokens, and the real 262k.
 
 `tools/gguf/check_attn.py` compares every attention step in libllama with the
 reference implementation, layer by layer. It runs on two tiny checkpoints:
 one with the real attention heads and sliding window, one with the real
-50-layer SWA/full pattern.
+50-layer SWA/full pattern. `tools/gguf/check_long.py` compares the attention
+at long contexts on the first one.
 
-The report covers two batches: #10 (window, off-by-one, RoPE, KV-cache reads)
-and #11 (layer pattern, iSWA cache split, GQA, QK norm). Neither needed a
-change to the model class described in [phase4-model.md](phase4-model.md):
-the fork already had the window, the RoPE pattern and the iSWA cache; they had
-not been checked against the reference.
+The report covers three batches: #10 (window, off-by-one, RoPE, KV-cache
+reads), #11 (layer pattern, iSWA cache split, GQA, QK norm) and the
+long-context batch. None needed a change to the model class described in
+[phase4-model.md](phase4-model.md): the fork already had the window, the RoPE
+pattern and the iSWA cache; they had not been checked against the reference.
 
 ## The reference
 
@@ -216,6 +218,106 @@ stay within the same bounds and window coefficients. So the KV cache,
 including the evicting 768-cell SWA cache, hands each query exactly the keys
 of its window.
 
+## Long contexts (`tools/gguf/check_long.py`)
+
+The `-attn` fixture, converted to F32, with the GGUF `context_length`
+overridden to the real 262144. The tokens are decoded as one sequence in
+ubatches of 256 (flash attention off) or 512 (on), each reading the KV cache of
+the earlier ones; `n_ctx` is the sequence length, and the SWA cache holds the
+window plus one ubatch (1024 or 1280 cells, so it evicts all the way).
+
+A float64 reference over all positions costs O(n²), so the check compares 66
+query rows per length: the last 32 positions, 32 random ones from the second
+half, and the two around the ubatch boundary at n/2. Two optional `Runner`
+parameters keep this affordable:
+- `outputs`: logits only at the last position, where 262144 rows would take
+  134 GB;
+- `rows`: `cb_eval` keeps only the positions a node is needed at. That is q and
+  `kqv_out` at the checked rows; k and v at every position on the full layers;
+  and k and v on the sliding layers within the window before a checked row.
+
+The checks, per run:
+- **KV cache:** `llama_kv_cache_iswa` with n cells for the 2 full layers, the 4
+  sliding layers in the SWA cache.
+- **`kqv_out`:** at the checked rows, against the attention recomputed in
+  float64 from libllama's own q, k and v. On the full layers it covers all
+  earlier keys, up to 262143 of them; on the sliding layers the window of 513.
+  The bounds are those of `check_attn.py`: 1e-10 for the CPU with an F32 KV
+  cache, 1e-4 otherwise. The reference uses libllama's rotated q and k, so the
+  RoPE angles do not enter it.
+- **`Qcur_rope`, `Kcur_rope`:** against float64 RoPE of libllama's own
+  `Qcur/Kcur_normed`. They must be within 100× (`MAX_ROPE_VS_VLLM`, fixed
+  before the first run) of the error of vLLM's float32 cos/sin cache at the
+  same positions. That error comes from the `check_attn.py` port with a
+  float32 cache, applied in float64 so that only the cache differs.
+
+| Configuration | 8192 | 16384 | 65536 | 262144 |
+|---|---|---|---|---|
+| CPU, flash attention off, F32 KV (strict) | 11 s | 40 s | 617 s, run once | — |
+| CPU, flash attention on, F16 KV | 5 s | 20 s | 181 s | — |
+| Metal, flash attention off, F16 KV | 1 s | 3 s | 33 s | — |
+| Metal, flash attention on, F16 KV | 1 s | 2 s | 16 s | 222 s |
+
+The CPU runs on all cores (`n_threads = os.cpu_count()`); libllama's default
+of 4 threads takes twice as long. Without flash attention the KQ matrix is
+n_kv × n_ubatch × 48 heads in float32, so the ubatch stays at 256. The strict
+CPU run at 65536 took 617 s, so it is not part of the check; its result is
+below.
+
+### Result
+
+```
+.venv/bin/python tools/gguf/check_long.py --llama-cpp third_party/llama.cpp
+```
+
+rc 0, 60 PASS lines in 566 s (12 configurations, 5 lines each). The longest
+length on each device:
+
+```
+PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] KV cache layers {'non-SWA': 2, 'SWA': 4}, cells {'non-SWA': 65536, 'SWA': 1280} (llama_kv_cache_iswa: 65536 cells for the 2 full layers, the 4 sliding layers in the SWA cache; decoded in 181 s)
+PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] kqv_out vs reference on the full layers (all earlier keys) at 66 positions in [32767, 65535]: max NMSE 1.8e-10 (<= 0.0001)
+PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] kqv_out vs reference on the sliding layers (window 513) at 66 positions in [32767, 65535]: max NMSE 6.7e-08 (<= 0.0001)
+PASS CPU attn [65536 tokens, ubatch 512, flash attn on, KV f16] Qcur_rope vs float64 RoPE at 66 positions in [32767, 65535]: NMSE 5.2e-06, vLLM's float32 cos/sin cache 2.1e-07 (<= 100x)
+PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] KV cache layers {'non-SWA': 2, 'SWA': 4}, cells {'non-SWA': 262144, 'SWA': 1280} (llama_kv_cache_iswa: 262144 cells for the 2 full layers, the 4 sliding layers in the SWA cache; decoded in 222 s)
+PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] kqv_out vs reference on the full layers (all earlier keys) at 66 positions in [131071, 262143]: max NMSE 1.2e-08 (<= 0.0001)
+PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] kqv_out vs reference on the sliding layers (window 513) at 66 positions in [131071, 262143]: max NMSE 1.4e-07 (<= 0.0001)
+PASS MTL0 attn [262144 tokens, ubatch 512, flash attn on, KV f16] Qcur_rope vs float64 RoPE at 66 positions in [131071, 262143]: NMSE 6.8e-06, vLLM's float32 cos/sin cache 2.9e-06 (<= 100x)
+```
+
+The strict CPU configuration, run once at 65536 (617 s to decode):
+
+```
+PASS CPU [65536 tokens, ubatch 256, flash attn off, KV f32] kqv_out vs reference on the full layers (all earlier keys) at 66 positions in [32767, 65535]: max NMSE 5.6e-14 (<= 1e-10)
+PASS CPU [65536 tokens, ubatch 256, flash attn off, KV f32] kqv_out vs reference on the sliding layers (window 513) at 66 positions in [32767, 65535]: max NMSE 2.6e-14 (<= 1e-10)
+```
+
+`kqv_out` does not grow with the context: in the strict configuration it is
+1.1e-14 at 8192 and 5.6e-14 at 65536 on the full layers, 2.6e-14 on the
+sliding layers at every length. With flash attention it stays at 1.2e-8 on
+Metal up to 262144.
+
+### RoPE at large positions
+
+`Qcur_rope` against float64, the largest NMSE over the sliding layers
+(`Kcur_rope` is the same within 10%):
+
+| Positions | CPU (`ggml_rope_cache_init`) | Metal | vLLM float32 cache | CPU / vLLM | Metal / vLLM |
+|---|---|---|---|---|---|
+| up to 1100 (`check_attn.py`) | 6.8e-10 | 6e-11 | 2.3e-11 | 30 | 2.6 |
+| 4095–8191 | 9.9e-8 | 8.5e-9 | 3.8e-9 | 26 | 2.2 |
+| 8191–16383 | 3.3e-7 | 2.9e-8 | 1.2e-8 | 28 | 2.4 |
+| 32767–65535 | 5.2e-6 | 4.8e-7 | 2.1e-7 | 25 | 2.3 |
+| 131071–262143 | not run | 6.8e-6 | 2.9e-6 | — | 2.3 |
+
+The error grows with the square of the position for all three, as float32
+rounding of an angle of about p radians predicts. The ratio to vLLM's own
+float32 cache stays flat: about 27 on the CPU, which multiplies the angle once
+per frequency, and about 2.3 on Metal. Both are inside the 100× bound at every
+length.
+
+At 262144 the reference's own float32 cache is off from exact RoPE by NMSE
+2.9e-6 in q and k, so exact parity with float64 is not the target there.
+
 ## Answers to the plan items
 
 - **The 4:1 pattern for 50 layers (5.1):** the converter writes
@@ -276,6 +378,14 @@ of its window.
   511–514 are those of the other positions, in one batch, in chunks with
   cache reads and eviction, and in single-token steps across the boundary.
   M1 leaves position 511 unchanged and fails from 512 on; M2 fails from 513 on.
+- **Short contexts, then 8k/16k/64k, then 262k (5.11):** the short case is
+  `check_attn.py` (1100 tokens). `check_long.py` decodes 8192, 16384 and 65536
+  tokens on the CPU and Metal, and 262144 on Metal with flash attention. In
+  every run the full layers hold n cells, and `kqv_out` matches the float64
+  attention over all earlier keys. It does not degrade with length: 5.6e-14 at
+  65536 in the strict configuration, 1.2e-8 at 262144 on Metal. Only the RoPE
+  angles lose precision with the position, as float32 does in vLLM's own
+  cache; libllama stays within 30× (CPU) and 2.6× (Metal) of that.
 - **Graph callbacks, attention half (4.9):** the existing names (`attn_norm`,
   `Qcur/Kcur_normed`, `Vcur`, `Qcur/Kcur_rope`, `kqv_out`, `attn_out`,
   `attn_post_norm`, `ffn_inp`, `l_out`) suffice to localize each step. Each
@@ -287,11 +397,12 @@ of its window.
 
 ## Mutation tests
 
-Each mutation was run, then reverted. M1–M3 are kv overrides through the C
-API; M4–M9 are libllama variants built from an edited `src/models/kolibri.cpp`.
-M1–M6 ran on `-attn`, M7 on both fixtures.
-The table shows the strict CPU configuration (batch, flash attention off, F32
-KV); the F16 configurations fail in the same checks.
+Each mutation was run, then reverted. M1–M3 and M10 are kv overrides through
+the C API; M4–M9 and M11 are libllama variants built from an edited
+`src/models/kolibri.cpp`. M1–M6 ran on `-attn`, M7 on both fixtures, M10 and
+M11 through `check_long.py`. The table shows the strict CPU configuration
+(batch, flash attention off, F32 KV; for M10 and M11, 8192 tokens); the F16
+configurations fail in the same checks.
 
 | Mutation | `check_attn.py` (CPU, strict) |
 |---|---|
@@ -304,14 +415,12 @@ KV); the F16 configurations fail in the same checks.
 | M7 `hparams.set_swa_pattern(5)` instead of the pattern array | `-attn` FAIL: `KV cache layers {'non-SWA': 1, 'SWA': 5}`, `kqv_out` NMSE 5.9e-2 (layer 5 gets the window), and as a consequence the full-layer RoPE and GQA contrasts; `-pattern` PASS (0 failures) |
 | M8 no `attn_q_norm` | FAIL: `Qcur_normed` NMSE 4.7e-1 and its per-head contrast; nothing else |
 | M9 no `attn_k_norm` | FAIL: `Kcur_normed` NMSE 4.7e-1 and its per-head contrast; nothing else |
+| M10 `rope.freq_base = 10001` | FAIL: `Qcur_rope`, `Kcur_rope` NMSE 1.7e-4 at 8192 against a bound of 3.8e-7 (100 × vLLM's 3.8e-9); 1.0e-2 at 65536 on Metal; `kqv_out` and the KV cache pass |
+| M11 RoPE on every layer (`has_rope` ignored) | FAIL: `kqv_out` on the full layers, NMSE 2.6e-1, since the reference attends with the unrotated `Qcur/Kcur_normed` there; the sliding layers and RoPE pass |
+
+M10 changes each angle by up to 1e-4 relative, so its error grows with the
+position: 60× from 8192 to 65536 tokens.
 
 ## What stays open
 
-- **Phase 5 item 11:** short contexts first, then 8k, 16k and 64k, before
-  262k. It needs its own design:
-  - a float64 reference over all positions costs O(n²), so it would compare
-    sampled query rows, with a capture that keeps only those rows;
-  - at large positions the RoPE angles in float32 (ggml, and vLLM's own
-    cos/sin cache) differ by up to about 1e-7 × position radians, so the
-    reference for long contexts has to be decided.
 - **Phase 6:** the same comparison against a vLLM run of the real checkpoint.
