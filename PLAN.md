@@ -178,6 +178,11 @@ and executes without tensor-shape or unsupported-op errors.
 -   [ ] Compare complete layer outputs.
 -   [ ] Compare final logits.
 -   [ ] Compare greedy next-token sequences.
+-   [ ] Include raw German continuations in that comparison. In this
+    port's BF16 (CPU), "Die Hauptstadt von Deutschland ist" continues
+    greedily with " Deutschland Deutschland Deutschland …", while English
+    raw prompts and German through the chat template stay coherent.
+    Tokenization matches the reference (2026-10-05).
 -   [ ] Establish tolerances separately for BF16 and any FP8 reference
     run.
 
@@ -198,11 +203,12 @@ producing a generic Q4.
     "Same top p: 92.490 ± 0.369 %".
 -   [ ] Produce Q6/Q5 baselines if useful.
 -   [ ] Produce Q4 variants.
--   [ ] Produce IQ3/Q3 variants if Q4 lacks memory headroom. (2026-10-04) —
-    partial: Q4 lacks headroom, since dry runs give Q3_K_M 35,781 MiB and
-    IQ4_XS 40,286 MiB against a Metal working set of 38,338 MiB. One variant
-    exists: Q3_K routed experts with Q8_0 elsewhere, "quant size = 33716.93 MiB
-    (3.62 BPW)". IQ3 variants with an importance matrix remain.
+-   [x] Produce IQ3/Q3 variants if Q4 lacks memory headroom. (2026-10-05) —
+    Q4 lacks headroom: dry runs give Q3_K_M 35,781 MiB and IQ4_XS
+    40,286 MiB against a Metal working set of 38,338 MiB. Five routed-expert
+    variants with Q8_0 elsewhere: Q3_K with and without the imatrix and IQ3_S
+    ("quant size = 33716.93 MiB"), IQ3_XXS ("quant size = 30341.93 MiB") and
+    IQ3_XXS gate/up with IQ4_XS down ("quant size = 33904.43 MiB").
 -   [x] Keep router tensors at high precision initially. (2026-10-04) —
     `ffn_gate_inp` and `exp_probs_b` stay F32 in both quantized files.
     `llama-quantize` dry run: "blk.0.ffn_gate_inp.weight ... type = f32".
@@ -213,12 +219,18 @@ producing a generic Q4.
     routing/attention errors can amplify across 50 layers.
 -   [ ] Evaluate whether shared experts deserve higher precision than
     routed experts.
--   [ ] Build an importance matrix if supported/useful for the selected
-    quantization scheme.
+-   [x] Build an importance matrix if supported/useful for the selected
+    quantization scheme. (2026-10-05) — built from Q8_0 on a 45/35/20
+    English/German/code text (`tools/quant/calibration.py`), "loaded 550
+    importance matrix entries ... computed on 250 chunks". It does not help
+    Q3_K ("Mean KLD: 0.108158" with, 0.108174 without) but enables the IQ
+    variants; the best is IQ3_XXS/IQ4_XS at "Mean KLD: 0.095291 ± 0.006905".
 -   [ ] Compare perplexity/task outputs and router expert-selection
     agreement against the unquantized model. (2026-10-04) — partial:
-    perplexity and KLD are measured against this port's BF16. For the Q3 mix
-    on Metal: "Mean KLD: 0.108174 ± 0.007597", "Same top p: 88.431 ± 0.448 %".
+    perplexity and KLD are measured against this port's BF16 for all five
+    3-bit variants (0.095 to 0.108 mean KLD, 88.0 to 88.5% same top token; the
+    table is in docs/real-checkpoint.md). For the Q3 mix on Metal: "Mean KLD:
+    0.108174 ± 0.007597", "Same top p: 88.431 ± 0.448 %".
     Router agreement, task outputs and any judgment of quality wait for the
     Phase 6 gate.
 -   [ ] Specifically measure how often quantization changes Top-6 expert
@@ -239,20 +251,25 @@ cache, and macOS. Q4 is therefore a boundary case, not a guaranteed fit.
 
 For each candidate:
 
--   [ ] Measure GGUF file size. (2026-10-04) — partial: the Q3 mix is
-    33,717 MiB; other candidates remain.
+-   [x] Measure GGUF file size. (2026-10-05) — `llama-quantize` "quant
+    size" for every candidate: Q3_K and IQ3_S 33,717 MiB, IQ3_XXS 30,342 MiB,
+    IQ3_XXS/IQ4_XS 33,904 MiB.
 -   [ ] Measure actual unified-memory use after load. (2026-10-04) —
     partial, Q3 mix at 32k: "MTL0 ... 34384 = 33384 + 740 + 260", host 418 MiB.
+    IQ3_XXS/IQ4_XS at 32k (2026-10-05): "MTL0 ... 34904 = 33904 + 740 + 260",
+    host 375 MiB. IQ3_S and IQ3_XXS remain.
 -   [ ] Measure Metal buffers/runtime overhead. (2026-10-04) — partial,
     Q3 mix: compute buffer 260 MiB on MTL0 and 43 MiB on CPU.
 -   [ ] Measure SWA and full-attention KV-cache memory separately.
     (2026-10-04) — partial, Q3 mix at 32k: full attention "640.00 MiB (32768
     cells, 10 layers)", SWA "100.00 MiB (1280 cells, 40 layers)".
--   [ ] Measure prompt-processing tokens/s. (2026-10-04) — partial: only a
-    5-token prompt so far (71 tokens/s); a real `llama-bench` run remains.
--   [ ] Measure generation tokens/s. (2026-10-04) — partial, Q3 mix on
-    Metal: 59.9 tokens/s (`llama-completion`) and 58.7 tokens/s
-    (`llama-server` chat).
+-   [x] Measure prompt-processing tokens/s. (2026-10-05) — `llama-bench
+    -ngl 99 -p 512 -r 3` on Metal: Q3 mix "pp512 | 1223.02 ± 10.95",
+    IQ3_S 1331.99, IQ3_XXS 1367.29, IQ3_XXS/IQ4_XS "pp512 | 1350.55 ± 7.73".
+-   [x] Measure generation tokens/s. (2026-10-05) — `llama-bench -ngl 99
+    -n 128 -r 3` on Metal: Q3 mix "tg128 | 60.67 ± 0.08", IQ3_S 61.78,
+    IQ3_XXS 63.03, IQ3_XXS/IQ4_XS "tg128 | 64.00 ± 0.07". `llama-server` chat
+    on the Q3 mix: 58.7 tokens/s.
 -   [ ] Measure expert-routing overhead.
 -   [ ] Test 8k, 16k, and 32k contexts first.
 -   [ ] Expand context only if memory headroom permits.

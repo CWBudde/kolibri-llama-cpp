@@ -31,7 +31,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | Model class and MoE graph | done on tiny synthetic checkpoints (CPU and Metal); router and MoE block match the reference function: [docs/model.md](docs/model.md). The full 50-layer graph runs on the real BF16 weights (CPU) |
 | Hybrid attention and KV cache | done; the 4:1 pattern over 50 layers, the iSWA cache split, sliding-window mask, off-by-one, RoPE on the sliding layers only, GQA 48/4 and per-head QK norm match the reference on tiny checkpoints; the attention and KV cache also hold at 8k, 16k, 64k and 262k tokens: [docs/attention.md](docs/attention.md) |
 | Numerical validation | open; needs the vLLM reference outputs |
-| Quantization, Apple Silicon | first candidate runs: Q3_K routed experts with Q8_0 elsewhere, 33.7 GiB, fully on Metal on a 48 GB Mac at about 59 tokens/s, 32k context within the default Metal limit. Quality is only measured against this port's own BF16 (KLD 0.108) until the numerical validation passes: [docs/real-checkpoint.md](docs/real-checkpoint.md) |
+| Quantization, Apple Silicon | candidates run fully on Metal on a 48 GB Mac, with 32k context within the default Metal limit. The best so far: IQ3_XXS gate/up and IQ4_XS down for the routed experts with an importance matrix, Q8_0 elsewhere, 33.1 GiB, 64 tokens/s. Quality is only measured against this port's own BF16 (KLD 0.095; 0.108 for the plain Q3_K mix) until the numerical validation passes: [docs/real-checkpoint.md](docs/real-checkpoint.md) |
 | Chat template and inference behavior | in progress; llama-server renders the chat template exactly as the reference does for every reasoning mode and tool-call shape, the chat parser splits reasoning, content and tool calls, and generation stops on the reference's two eos tokens: [docs/chat.md](docs/chat.md). The recommended sampling waits for the numerical validation |
 
 ### Results so far
@@ -130,6 +130,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
 | `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
 | `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. `check_long.py` does the same for the attention at 8k, 16k, 64k and 262k tokens, on sampled positions. `check_real.py` checks a GGUF converted from the real BF16 checkpoint against the inventory: shard hashes, tensor set, shapes, dtypes and bit-exact data. |
+| `tools/quant/` | `calibration.py` builds the imatrix calibration text from English wikitext, German Wikipedia and source code, so the imatrix reaches the experts that English text alone leaves without data. |
 | `tools/chat/` | `check_chat.py` checks the chat template in the GGUFs and in llama-server, compares llama-server's rendered prompts with the reference renderer for every reasoning mode and tool-call shape, and checks the stop tokens. |
 | `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. |
 | `docs/` | Reference docs per topic (checkpoint, tokenizer, conversion, model, attention, chat, real checkpoint), with findings, pitfalls and reproduction steps. |
@@ -202,6 +203,8 @@ Network access:
   sha256 against `inventory/bf16/summary.json`.
 - Regenerating the inventory needs network access but downloads no tensor
   payloads; see [docs/checkpoint.md](docs/checkpoint.md).
+- `tools/quant/calibration.py` downloads 225 German Wikipedia articles from
+  the Hugging Face datasets server once and caches them next to its output.
 
 ## Known upstream issues
 
