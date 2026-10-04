@@ -340,7 +340,7 @@ line, its new server cases fail (see above).
 - **Chat template preserved:**
   - The converter copies it into every GGUF. The fork adds it as a template
     file for llama.cpp's tests.
-  - All six copies (including llama-server's `/props`) share sha256
+  - All five copies (including llama-server's `/props`) share sha256
     `9ba35d4b…`.
 - **Reasoning modes:**
   - llama-server renders every reasoning mode exactly as the reference does.
