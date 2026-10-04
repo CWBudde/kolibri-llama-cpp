@@ -48,9 +48,10 @@ See [`PLAN.md`](PLAN.md) for the full plan.
   - the dimensions, head counts and RMSNorm epsilon;
   - the MoE layout: 384 experts, Top-6, expert FFN 512, one shared expert;
   - the hybrid attention: sliding window 513 (512 preceding + current), a
-    per-layer SWA/full pattern, and RoPE on the sliding layers only.
+    per-layer SWA/full pattern, and RoPE on the sliding layers only;
+  - the router gating: sigmoid weights, no renormalization, scale 1.0.
 
-  Router gating keys and tensor conversion are still to come.
+  Tensor conversion is still to come.
 
 ## Layout
 

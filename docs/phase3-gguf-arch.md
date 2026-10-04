@@ -1,6 +1,6 @@
 # Phase 3: GGUF architecture registration and converter
 
-This report covers three steps:
+This report covers four steps:
 
 1. The first three Phase 3 items register the `kolibri` architecture in gguf-py
    and in libllama, and list its tensors (patch 0002).
@@ -10,8 +10,11 @@ This report covers three steps:
 3. The converter writes the MoE and hybrid-attention metadata: experts, expert
    FFN size, shared expert, sliding window, SWA/full pattern, and SWA-only RoPE
    (patch 0004). See [MoE and hybrid-attention metadata](#moe-and-hybrid-attention-metadata).
+4. The converter writes the router gating keys: sigmoid gating, no weight
+   renormalization, scale 1.0 (patch 0005). See [Router gating metadata](#router-gating-metadata).
 
-The router gating keys, expert packing and tensor conversion come next.
+With that, every GGUF metadata item of Phase 3 is written. Expert packing and
+tensor conversion come next.
 
 The patches are also kept as commits on the `feat/kolibri` branch of
 [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp):
@@ -19,8 +22,9 @@ The patches are also kept as commits on the `feat/kolibri` branch of
 - 0001–0002 were committed there directly.
 - 0003 came in through `feat/kolibri-converter` (fork PR #2).
 - 0004 came in through `feat/kolibri-moe-swa-metadata` (fork PR #3).
+- 0005 comes in through `feat/kolibri-router-gating` (fork PR #5).
 
-Patches 0001–0004 applied to the pinned commit give exactly the tree of
+Patches 0001–0005 applied to the pinned commit give exactly the tree of
 `feat/kolibri`. The one exception is `models/ggml-vocab-kolibri.gguf`, which the
 fork commits and the patches do not.
 
@@ -248,3 +252,52 @@ and the two patterns) were missing, and exactly those six lines failed.
 As a mutation test, a config copy with `sliding_window = 512`, `layer_types`
 shifted by one layer, and `moe_intermediate_size = 256` fails exactly the
 expert FFN, sliding window, SWA pattern, and RoPE pattern lines.
+
+## Router gating metadata
+
+### Changes (`patches/llama.cpp/0005-kolibri-router-gating.patch`)
+
+The patch applies on top of 0004. It adds three writer calls to
+`KolibriModel.set_gguf_parameters`, again with existing gguf-py writers.
+
+### Metadata written
+
+| GGUF key | Value | Source |
+|---|---|---|
+| `kolibri.expert_gating_func` | 2 (`LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`) | Phase 1 router semantics |
+| `kolibri.expert_weights_norm` | false | `config.json` `norm_topk_prob` |
+| `kolibri.expert_weights_scale` | 1.0 | vLLM `routed_scaling_factor = 1.0` |
+
+- **Gating function.** Kolibri weights each selected expert with the sigmoid
+  of its raw router logit (Phase 1, from `sigmoid_logit_add_routing`).
+  `TextModel` writes `expert_gating_func` only when the config names a scoring
+  function, and Kolibri's `config.json` names none. So `KolibriModel` writes it,
+  as the GLM, Laguna and Hunyuan converters do.
+- **No renormalization, no scaling.** The six selected weights are used as
+  they are. `expert_weights_scale = 1.0` is written explicitly, so the value
+  does not depend on a loader default.
+- **What this does not cover.** These keys do not describe the correction
+  bias. Kolibri adds `expert_bias` to the raw logits for the selection only,
+  while `build_moe_ffn` adds `exp_probs_b` to the sigmoid output. Phase 4
+  needs an arch-specific selection branch for that (Phase 1, pitfall 2).
+
+### Check
+
+`check_metadata.py` takes `expert_weights_norm` from `config.json`. The
+gating function and the scale have no config key, so the checker holds them
+to the Phase 1 reference values, with a comment naming the source. Results on
+2026-10-04, after the 18 earlier lines:
+
+```
+PASS router gating: kolibri.expert_gating_func = 2
+PASS router gating: kolibri.expert_weights_norm = False
+PASS router gating: kolibri.expert_weights_scale = 1.0
+```
+
+Before the patch, exactly these three lines failed (key missing), and the
+other 18 passed. As mutation tests:
+
+- a config copy with `norm_topk_prob = true` fails only the
+  `expert_weights_norm` line;
+- a converter with `SOFTMAX` and scale 0.5 fails exactly the gating function
+  and scale lines.

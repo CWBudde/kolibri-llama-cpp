@@ -151,7 +151,7 @@ cases and about 1.35 million fuzz strings match the reference. See
     kinds; `tools/gguf/check_arch.py` checks them against the inventory. No
     `tensor_mapping.py` entries: the converter maps the block norms
     explicitly (Phase 1, pitfall 1). See `docs/phase3-gguf-arch.md`.
--   [ ] Define GGUF metadata for:
+-   [x] Define GGUF metadata for:
     -   [x] 50 blocks;
         (2026-10-03) — `kolibri.block_count = 50`, written by `TextModel`;
         `patches/llama.cpp/0003-kolibri-converter.patch`.
@@ -188,12 +188,17 @@ cases and about 1.35 million fuzz strings match the reference. See
         `attention.rope_pattern` = SWA pattern (1 = RoPE; read by
         `llama_hparams::has_rope`). `tools/gguf/check_metadata.py` checks all
         six items.
-    -   [ ] router gating: `expert_gating_func = sigmoid`,
+    -   [x] router gating: `expert_gating_func = sigmoid`,
         `expert_weights_norm = false`, `expert_weights_scale = 1.0`
         (not in the original list; Phase 4 reads these keys).
+        (2026-10-04) — `KolibriModel` writes all three
+        (`patches/llama.cpp/0005-kolibri-router-gating.patch`); the norm flag
+        comes from `norm_topk_prob`. `config.json` names no scoring function,
+        so `TextModel` wrote no gating key before. `tools/gguf/check_metadata.py`
+        checks them (21/21); the correction-bias selection stays Phase 4.
 -   [ ] Implement Kolibri converter class.
     (2026-10-03) — partial: `KolibriModel` in the CWBudde/llama.cpp fork
-    (`feat/kolibri-converter`, patch 0003) registers `Kolibri1ForCausalLM`
+    (`feat/kolibri`, patch 0003) registers `Kolibri1ForCausalLM`
     and writes the vocab and base hparams. `modify_tensors` still raises;
     the tensor mapping remains.
 -   [ ] Map/pack expert tensors in the layout expected by llama.cpp.
