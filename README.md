@@ -70,16 +70,18 @@ CMake, Ninja and a C++ compiler.
 # Go tools and tests (no network needed for the tests)
 go test ./...
 
-# llama.cpp at the pinned commit, with the patches applied
+# llama.cpp source, option A: the pinned commit with the patches applied
 git clone https://github.com/ggml-org/llama.cpp third_party/llama.cpp
 git -C third_party/llama.cpp checkout -b kolibri 1537a0a8b2f8711d840878b0a0677ab2213c882c
 for p in patches/llama.cpp/*.patch; do git -C third_party/llama.cpp apply "$PWD/$p"; done
+
+# option B, instead of A: the fork, which has the same patches as commits
+git clone --branch feat/kolibri-converter https://github.com/CWBudde/llama.cpp third_party/llama.cpp
+
+# build (either option)
 cmake -S third_party/llama.cpp -B third_party/llama.cpp/build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DBUILD_SHARED_LIBS=ON
 cmake --build third_party/llama.cpp/build --target llama llama-tokenize test-tokenizer-0 test-llama-archs
-
-# alternatively, the fork already has the patches as commits
-git clone --branch feat/kolibri https://github.com/CWBudde/llama.cpp third_party/llama.cpp
 
 # Python environment for the tokenizer and GGUF tools
 uv venv --python 3.12 .venv
