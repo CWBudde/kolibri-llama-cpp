@@ -30,7 +30,8 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | 3 | GGUF architecture and HF → GGUF converter | in progress; arch registration, GGUF metadata and tensor conversion done, checked on a tiny synthetic checkpoint: [docs/phase3-gguf-arch.md](docs/phase3-gguf-arch.md) |
 | 4 | Native model loading and MoE graph | in progress; model class loads and runs the tiny synthetic checkpoint on CPU and Metal: [docs/phase4-model.md](docs/phase4-model.md). Router and MoE block match the reference function: [docs/phase4-router.md](docs/phase4-router.md). The 50-layer graph needs the full checkpoint |
 | 5 | Hybrid attention and KV cache | done; the 4:1 pattern over 50 layers, the iSWA cache split, sliding-window mask, off-by-one, RoPE on the sliding layers only, GQA 48/4 and per-head QK norm match the reference on tiny checkpoints; the attention and KV cache also hold at 8k, 16k, 64k and 262k tokens: [docs/phase5-attention.md](docs/phase5-attention.md) |
-| 6–9 | Numerical validation, quantization, Apple Silicon, chat behavior | open |
+| 6–8 | Numerical validation, quantization, Apple Silicon | open; need the checkpoint |
+| 9 | Chat template and inference behavior | in progress; llama-server renders the chat template exactly as the reference does for every reasoning mode and tool-call shape, the chat parser splits reasoning, content and tool calls, and generation stops on the reference's two eos tokens: [docs/phase9-chat.md](docs/phase9-chat.md). The recommended sampling waits for Phase 6 |
 
 ### Results so far
 
@@ -105,6 +106,15 @@ See [`PLAN.md`](PLAN.md) for the full plan.
   KV cache. Only the RoPE angles lose float32 precision with the position, and
   vLLM's own float32 cos/sin cache loses it too; libllama stays within 30× of
   that error.
+- **llama-server renders the chat template exactly as the reference does.**
+  For 7 message sets (tool loops, parallel calls, reasoning in the history)
+  and 31 ways to choose the reasoning mode, `/apply-template` gives the same
+  prompt, byte for byte, as transformers with the arguments vLLM derives. One
+  request shape (`reasoning_effort: "none"` next to `enable_thinking: true`)
+  needed a one-line llama-server fix. llama.cpp's chat parser splits
+  `<think>` reasoning and `<tool_call>` JSON calls like the official parsers,
+  apart from whitespace and a tool call written inside the reasoning.
+  Generation stops on exactly `<|im_end|>` and `<|endoftext|>`.
 
 ## Layout
 
@@ -118,6 +128,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
 | `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
 | `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. `check_long.py` does the same for the attention at 8k, 16k, 64k and 262k tokens, on sampled positions. |
+| `tools/chat/` | `check_chat.py` checks the chat template in the GGUFs and in llama-server, compares llama-server's rendered prompts with the reference renderer for every reasoning mode and tool-call shape, and checks the stop tokens. |
 | `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. |
 | `docs/` | One report per phase, with findings, pitfalls and reproduction steps. |
 
@@ -141,7 +152,8 @@ git clone --branch feat/kolibri https://github.com/CWBudde/llama.cpp third_party
 # build (either option)
 cmake -S third_party/llama.cpp -B third_party/llama.cpp/build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DBUILD_SHARED_LIBS=ON
-cmake --build third_party/llama.cpp/build --target llama llama-tokenize test-tokenizer-0 test-llama-archs
+cmake --build third_party/llama.cpp/build --target llama llama-tokenize llama-server test-tokenizer-0 test-llama-archs \
+    test-chat test-chat-peg-parser test-chat-auto-parser test-chat-template
 
 # Python environment for the tokenizer and GGUF tools
 uv venv --python 3.12 .venv
@@ -167,7 +179,8 @@ go vet ./... && go test ./...
 .venv/bin/python tools/gguf/check_moe.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_attn.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_long.py --llama-cpp third_party/llama.cpp  # about 10 min
-ctest --test-dir third_party/llama.cpp/build -R 'test-tokenizer-0|test-generate-models'
+.venv/bin/python tools/chat/check_chat.py --llama-cpp third_party/llama.cpp
+ctest --test-dir third_party/llama.cpp/build -R 'test-tokenizer-0|test-generate-models|test-chat'
 third_party/llama.cpp/build/bin/test-llama-archs
 ```
 

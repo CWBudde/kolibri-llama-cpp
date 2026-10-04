@@ -492,12 +492,44 @@ GB Mac.
 Base inference correctness and chat/tool behavior should be tested
 separately.
 
--   [ ] Port/preserve the Kolibri chat template.
--   [ ] Validate reasoning modes: none / low / medium / high.
--   [ ] Validate tool-call formatting.
--   [ ] Compare the official Kolibri reasoning/tool parsers with what
+-   [x] Port/preserve the Kolibri chat template.
+    (2026-10-04) — the converter already copies it into every GGUF; the fork
+    adds it as `models/templates/Aleph-Alpha-Kolibri-1.jinja` (patch 0008).
+    `tools/chat/check_chat.py`: "PASS chat template: tokenizer_config.json
+    9ba35d4bd6ba, vocab GGUF 9ba35d4bd6ba, converted GGUF 9ba35d4bd6ba,
+    models/templates/Aleph-Alpha-Kolibri-1.jinja 9ba35d4bd6ba, llama-server
+    /props 9ba35d4bd6ba". See `docs/phase9-chat.md`.
+-   [x] Validate reasoning modes: none / low / medium / high.
+    (2026-10-04) — llama-server's `/apply-template` equals the transformers
+    render with vLLM 0.29's template arguments for the reference's 10
+    `chat_template_kwargs` sets, `reasoning_effort` none … max alone and next
+    to `enable_thinking`, with and without `--reasoning-preserve`, on 7 message
+    sets: "render [default] tool_loop: 31/31 prompts equal the reference,
+    prefilled think block iff thinking off 31/31". One shape
+    (`reasoning_effort: "none"` + `enable_thinking: true`) rendered thinking on
+    (30/31); fixed in `server-common.cpp` (patch 0008). `test-chat`
+    `test_kolibri_reasoning_effort` parses each mode; "100% tests passed out
+    of 21".
+-   [x] Validate tool-call formatting.
+    (2026-10-04) — tools, tool loops, two parallel calls with grouped tool
+    results render byte-identically ("render [--no-reasoning-preserve]
+    parallel_calls: 31/31 prompts equal the reference"); the `test-chat`
+    Kolibri block parses `<tool_call>` JSON calls after reasoning, with
+    thinking off, parallel with content, and partial.
+-   [x] Compare the official Kolibri reasoning/tool parsers with what
     can be represented through llama.cpp templates/grammars.
--   [ ] Confirm stop tokens and EOS behavior.
+    (2026-10-04) — the autoparser detects the template (`peg-native`, `<think>`
+    tags, `<tool_call>` JSON, lazy grammar); the reference's thinking-mode
+    rules, splits and tool loops are ported into `test-chat` and pass. Two
+    output-splitting differences remain and are documented: llama.cpp strips
+    the template's newlines around the reasoning, and keeps a `<tool_call>`
+    written before `</think>` as reasoning where vLLM's `Qwen3Parser` ends the
+    reasoning (table in `docs/phase9-chat.md`).
+-   [x] Confirm stop tokens and EOS behavior.
+    (2026-10-04) — "libllama EOG tokens over all 128000 ids [127901, 127906]
+    (generation_config.json eos_token_id [127901, 127906])" in the vocab and
+    the converted GGUF; eos 127906, eot one of the two (no eot key); the six
+    tag tokens render as text and are neither EOG nor control.
 -   [ ] Only after base greedy inference is correct, validate Aleph
     Alpha's recommended sampling parameters.
 
@@ -545,7 +577,8 @@ conventions.
 - [ ] Add a tiny 6-layer hybrid-attention fixture so both SWA and full/RNoPE layers execute in one fast test.
 - [x] Make sandwich norms a first-class mapping requirement before any full-checkpoint conversion.
 - [ ] Treat BF16 as the initial source of truth; postpone direct FP8-source support until BF16 logits match.
-- [ ] Copy the official chat-template compatibility cases into later llama.cpp template tests, especially the `reasoning_effort` precedence and tool-loop cases.
+- [x] Copy the official chat-template compatibility cases into later llama.cpp template tests, especially the `reasoning_effort` precedence and tool-loop cases.
+  (2026-10-04) — `test_kolibri_reasoning_effort` in the fork's `tests/test-chat.cpp` (patch 0008) carries `THINKING_OFF_KWARGS`/`THINKING_ON_KWARGS` of `tests/test_reasoning.py` for the single-turn and tool-loop messages: prefilled think block iff thinking off, and the parser's split. Removing the prefill from the template fails it ("Expected: 1 Actual: 0").
 
 ## First actionable milestone
 
