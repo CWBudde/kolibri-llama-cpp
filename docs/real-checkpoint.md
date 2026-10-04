@@ -270,6 +270,129 @@ with 11.7 of 13.3 GB swap in use. Other processes also used memory at the
 time, so repacking is the suspect, not a confirmed cause. With `--no-repack`
 the weights stay memory-mapped, and the footprint stays at about 2.5 GB.
 
+## Importance matrix and IQ3 variants
+
+### Calibration text
+
+`tools/quant/calibration.py` builds the calibration text:
+
+- 45% English: the start of wikitext-2 `wiki.train.raw`;
+- 35% German: Wikipedia lead sections from fixed offsets of
+  `wikimedia/wikipedia` 20231101.de;
+- 20% code: C++, Python and Go files of this repo and the pinned submodule;
+- 522,320 bytes, 128,098 tokens, sha256 `e6fc52c9…`.
+
+English wikitext alone does not reach enough experts. A test run over 8 chunks
+of `wiki.train.raw` left 12 to 28% of the experts in layers 46 to 49 without a
+token. `llama-quantize` gives an expert without data uniform weights, as if
+there were no imatrix.
+
+```sh
+.venv/bin/python tools/quant/calibration.py \
+    --wikitext ~/models/eval/wikitext-2-raw/wiki.train.raw -o ~/models/eval/kolibri-calibration.txt
+build/bin/llama-imatrix -m ~/models/Kolibri-1-Q8_0.gguf -f ~/models/eval/kolibri-calibration.txt \
+    -dev none -ngl 0 --no-repack -c 512 -b 2048 -ub 2048 -o ~/models/eval/kolibri-imatrix.gguf
+```
+
+- **Source model:** Q8_0 on the CPU. BF16 would take about 3 times as long
+  (570 s per pass of 4 chunks in the KLD base run).
+- **`-ub 2048`:** each pass reads the memory-mapped weights once for 4 chunks
+  instead of 4 times, so a pass takes 80 s instead of 213 s.
+- **Run:** 250 chunks in 87 minutes, peak footprint 4.9 GB.
+
+### Expert coverage
+
+Coverage is read from the imatrix file's per-expert counts:
+
+| Layers | Experts with data | Median tokens per expert |
+|---|---|---|
+| 0, 1, 2 | 41.1%, 30.7%, 66.1% | 0, 0, 476 |
+| 3 to 49 | 84.9% to 99.7% | 616 to 1,551 |
+
+1,888 of the 19,200 (layer, expert) pairs have fewer than 32 tokens. Layers
+0 and 1 route most tokens to a minority of their experts, so more calibration
+text would probably not fill them.
+
+### Variants
+
+Each variant:
+
+- quantizes only the routed experts, from the BF16 GGUF;
+- keeps Q8_0 elsewhere and F32 for the router and the norms.
+
+KLD is against this port's BF16 on `wiki.test.raw`, 20 × 512 tokens. Speed
+is `llama-bench -ngl 99 -p 512 -n 128 -r 3` on Metal.
+
+| Experts (gate, up / down) | imatrix | Size | Mean KLD | 99% KLD | Same top token | PPL(Q)/PPL(base) | RMS Δp | pp512 tokens/s | tg128 tokens/s | Quantize time |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Q3_K / Q3_K | no | 33,717 MiB | 0.108 ± 0.008 | 1.81 | 88.4 ± 0.4% | 0.993 ± 0.007 | 7.38% | 1,223 | 60.7 | 70 s |
+| Q3_K / Q3_K | yes | 33,717 MiB | 0.108 ± 0.008 | 2.03 | 88.4 ± 0.4% | 1.025 ± 0.008 | 7.51% | 1,219 | 59.8 | 134 s |
+| IQ3_S / IQ3_S | yes | 33,717 MiB | 0.100 ± 0.007 | 1.90 | 88.5 ± 0.4% | 0.990 ± 0.007 | 7.15% | 1,332 | 61.8 | 846 s |
+| IQ3_XXS / IQ3_XXS | yes | 30,342 MiB | 0.107 ± 0.007 | 1.86 | 88.0 ± 0.5% | 1.031 ± 0.008 | 7.21% | 1,367 | 63.0 | 1,306 s |
+| IQ3_XXS / IQ4_XS | yes | 33,904 MiB | 0.095 ± 0.007 | 1.82 | 88.5 ± 0.4% | 1.016 ± 0.007 | 6.70% | 1,351 | 64.0 | 1,151 s |
+
+- **The imatrix does not help Q3_K here.** The mean KLD is unchanged.
+- **The best KLD is IQ3_XXS gate/up with IQ4_XS down.** It is 12% below the
+  Q3_K mix, 187 MiB larger, and generates 5% faster. The gap is about 1.3
+  standard errors of the separate runs. The runs share their tokens, so the
+  paired difference is probably tighter, but `llama-perplexity` does not
+  report it.
+- **IQ3_XXS for all experts** matches the Q3_K mix at 3.3 GiB less, which
+  leaves room for longer contexts.
+- **The IQ types are faster on Metal than Q3_K here**, by 9 to 12% in prompt
+  processing and 2 to 5% in generation.
+- **A floor:** Q8_0 alone reaches KLD 0.050, about half of every 3-bit
+  variant's KLD. Better expert quantization cannot remove that part.
+- **Caveats:**
+  - The KLD text is English wikitext, and the calibration includes wikitext's
+    train split.
+  - As above, this measures quantization loss against this port's own BF16,
+    not quality.
+
+The IQ3_XXS/IQ4_XS file at 32k context (`-c 32768 -v`):
+
+```text
+| memory breakdown [MiB]  | total    free     self   model   context   compute    unaccounted |
+|   - MTL0 (Apple M5 Pro) | 38338 = 3101 + (34904 = 33904 +     740 +     260) +         332 |
+|   - Host                |                   375 =   332 +       0 +      43                |
+```
+
+That leaves 3.4 GiB below the default Metal working set.
+
+```sh
+build/bin/llama-quantize --imatrix ~/models/eval/kolibri-imatrix.gguf \
+    --tensor-type ffn_gate_exps=iq3_xxs --tensor-type ffn_up_exps=iq3_xxs \
+    --tensor-type ffn_down_exps=iq4_xs ~/models/Kolibri-1-BF16.gguf \
+    ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf Q8_0
+```
+
+## Raw German completions repeat, BF16 included
+
+Greedy raw completions (`llama-completion -no-cnv --temp 0`, no chat
+template) of short German prompts fall into repetition on every file,
+including the unquantized BF16 on the CPU:
+
+| Prompt | BF16 (CPU) | Q8_0 (CPU) | IQ3_XXS/IQ4_XS (Metal) |
+|---|---|---|---|
+| "Die Hauptstadt von Deutschland ist" | " Deutschland Deutschland Deutschland …" | ", dass, dass, dass …" | " Deutschland Deutschland Deutschland …" |
+| "Der Rhein ist ein Fluss, der" | | | ", der, der, der …" |
+| "Frage: Was ist die Hauptstadt von Deutschland?\nAntwort:" | | | " Berlin\n\nDie Hauptstadt von Deutschland ist Berlin. Berlin ist die größte Stadt Deutschlands und liegt im Osten des Landes." |
+| "The capital of Germany is" | " Berlin." (see above) | " Berlin." | " Berlin. Berlin is the largest city in Germany and the capital." |
+
+What is ruled out:
+
+- **Tokenization:** llama.cpp and the reference tokenizer give the same
+  five ids, `452 22090 493 1678 2459`.
+- **A missing BOS:** neither side adds one. The reference has
+  `add_bos_token: False` and no `bos_token`, and the GGUF has
+  `tokenizer.ggml.add_bos_token = False`.
+
+German through the chat template works: the 528-token German answer below
+is coherent. Kolibri is a post-trained reasoning model, so raw continuation
+may be its genuine behavior, but only the reference can tell. Per the
+Phase 6 gate, this goes to the greedy-sequence comparison against vLLM,
+not into a diagnosis here.
+
 ## Chat on the quantized model
 
 ```sh
@@ -303,6 +426,9 @@ All files live outside the repo, in `~/models`.
    needed.
 4. Run `llama-quantize` as above.
 5. Get wikitext-2 with `third_party/llama.cpp/scripts/get-wikitext-2.sh`.
+6. Build the calibration text and the imatrix, then quantize the IQ variants,
+   as in "Importance matrix and IQ3 variants". The imatrix takes 87 minutes;
+   each IQ variant takes 14 to 22 minutes to quantize.
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
