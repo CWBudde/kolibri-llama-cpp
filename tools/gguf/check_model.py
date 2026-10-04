@@ -89,34 +89,56 @@ class Runner:
         lines = "".join(self.log).splitlines()
         return " | ".join(ln.strip() for ln in lines if "error" in ln.lower()) or (lines[-1] if lines else "")
 
-    def logits(self, path: Path, dev, tokens: list[int], n_ubatch: int, n_expert_used: int | None = None,
-               nodes: dict[str, list[str]] | None = None):
+    def _read(self, t, np):
+        """A graph tensor's data. A view is read from its root tensor with its own strides."""
+        dtype = {self.lib.GGML_TYPE_F32: np.float32, self.lib.GGML_TYPE_I32: np.int32}.get(t.type)
+        if dtype is None:
+            raise RuntimeError(f"{self.ffi.string(t.name).decode()}: ggml type {t.type}, not F32 or I32")
+        root, offs = (t.view_src, t.view_offs) if t.view_src != self.ffi.NULL else (t, 0)
+        buf = bytearray(self.lib.ggml_nbytes(root))
+        self.lib.ggml_backend_tensor_get(root, self.ffi.from_buffer(buf), 0, len(buf))
+        return np.ndarray(shape=[t.ne[i] for i in reversed(range(4))], dtype=dtype, buffer=buf, offset=offs,
+                          strides=[t.nb[i] for i in reversed(range(4))]).copy()
+
+    def logits(self, path: Path, dev, tokens: list[int], n_ubatch: int, overrides: dict | None = None,
+               nodes: dict[str, list[str]] | None = None, capture: dict | None = None):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
-        If nodes is given, it receives every graph node's name with the names of its inputs."""
+        overrides maps GGUF keys to int, float or bool values that replace the file's.
+        If nodes is given, it receives every graph node's name with the names of its inputs.
+        If capture is given, it receives the data of every node whose name it already holds as a
+        key, as a numpy array in ggml order reversed ([n_tokens, n_embd] for an activation)."""
         import numpy as np
 
         self.log.clear()
         devs = self.ffi.new("ggml_backend_dev_t[]", [dev, self.ffi.NULL])
         mparams = self.ll.model_default_params(devices=devs, n_gpu_layers=-1)
-        if n_expert_used is not None:
-            overrides = self.ffi.new("struct llama_model_kv_override[2]")  # zeroed: [1] ends the list
-            overrides[0].tag = self.lib.LLAMA_KV_OVERRIDE_TYPE_INT
-            overrides[0].key = f"{ARCH}.expert_used_count".encode()
-            overrides[0].val_i64 = n_expert_used
-            mparams.kv_overrides = overrides
+        if overrides:
+            kv = self.ffi.new("struct llama_model_kv_override[]", len(overrides) + 1)  # zeroed: the last ends the list
+            for o, (key, val) in zip(kv, overrides.items()):
+                o.key = key.encode()
+                if isinstance(val, bool):
+                    o.tag, o.val_bool = self.lib.LLAMA_KV_OVERRIDE_TYPE_BOOL, val
+                elif isinstance(val, int):
+                    o.tag, o.val_i64 = self.lib.LLAMA_KV_OVERRIDE_TYPE_INT, val
+                else:
+                    o.tag, o.val_f64 = self.lib.LLAMA_KV_OVERRIDE_TYPE_FLOAT, val
+            mparams.kv_overrides = kv
         model = self.lib.llama_model_load_from_file(str(path).encode(), mparams)
         if not model:
             raise RuntimeError("load failed: " + self.errors())
         cparams = self.ll.context_default_params(n_ctx=256, n_batch=len(tokens), n_ubatch=n_ubatch,
                                                  op_offload=False)
-        if nodes is not None:
+        if nodes is not None or capture is not None:
             @self.ffi.callback("bool(struct ggml_tensor *, bool, void *)")
             def on_node(t, ask, user_data):
+                name = self.ffi.string(t.name).decode()
                 if ask:
-                    srcs = [t.src[i] for i in range(len(t.src))]
-                    nodes[self.ffi.string(t.name).decode()] = [self.ffi.string(x.name).decode() for x in srcs
-                                                               if x != self.ffi.NULL]
-                return False  # names only, no data
+                    if nodes is not None:
+                        srcs = [t.src[i] for i in range(len(t.src))]
+                        nodes[name] = [self.ffi.string(x.name).decode() for x in srcs if x != self.ffi.NULL]
+                    return capture is not None and name in capture
+                capture[name] = self._read(t, np)
+                return True
 
             cparams.cb_eval = on_node
         ctx = self.lib.llama_init_from_model(model, cparams)
@@ -180,9 +202,10 @@ def main() -> None:
             sys.exit(1)
 
         for label, n_used in ((f"no routing (top-{n_expert} of {n_expert})", n_expert), ("top-2 routing", None)):
-            ref = runner.logits(ggufs["f32"], cpu, tokens, N_TOKENS, n_used)
-            others = [(f"{cpu_name} ubatch 16 vs 100", runner.logits(ggufs["f32"], cpu, tokens, 16, n_used))]
-            others += [(f"{name} vs {cpu_name}", runner.logits(ggufs["f32"], dev, tokens, N_TOKENS, n_used))
+            used = {f"{ARCH}.expert_used_count": n_used} if n_used else None
+            ref = runner.logits(ggufs["f32"], cpu, tokens, N_TOKENS, used)
+            others = [(f"{cpu_name} ubatch 16 vs 100", runner.logits(ggufs["f32"], cpu, tokens, 16, used))]
+            others += [(f"{name} vs {cpu_name}", runner.logits(ggufs["f32"], dev, tokens, N_TOKENS, used))
                        for name, dev in devs[1:]]
             for what, got in others:
                 per_pos = ((ref - got) ** 2).sum(1) / (ref ** 2).sum(1)
