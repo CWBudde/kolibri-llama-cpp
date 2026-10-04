@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// Group is the coarse tensor category from PLAN.md Phase 1.
+// Group is the coarse tensor category of the HF -> GGUF mapping (docs/checkpoint.md).
 type Group string
 
 const (

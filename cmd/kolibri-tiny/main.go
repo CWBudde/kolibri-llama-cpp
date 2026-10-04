@@ -29,7 +29,7 @@
 // heads stay small, so a check can capture every layer.
 //
 // Tensor names and shapes come from internal/kolibri, the same source of
-// truth as the Phase 1 inventory. manifest.json lists every expected GGUF
+// truth as the checkpoint inventory. manifest.json lists every expected GGUF
 // tensor with its ggml shape and its HF sources in stacking order.
 package main
 

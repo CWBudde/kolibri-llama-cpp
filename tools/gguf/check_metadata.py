@@ -4,13 +4,13 @@
 Runs convert_hf_to_gguf.py --vocab-only on the pinned BF16 config and
 tokenizer files. The vocab-only path still calls set_gguf_parameters(), so
 the output holds every hyperparameter but no tensor payload. The values are
-then compared with inventory/bf16/config.json and the Phase 1 summary
-(inventory/bf16/summary.json), independently of the converter code. Each line
-names the PLAN.md Phase 3 metadata item it covers.
+then compared with inventory/bf16/config.json and the checkpoint inventory
+(inventory/bf16/summary.json, docs/checkpoint.md), independently of the converter code. Each line
+names the metadata item it covers.
 
     check_metadata.py --llama-cpp third_party/llama.cpp
 
-Without --model-dir it uses the pinned BF16 revision from the Phase 1
+Without --model-dir it uses the pinned BF16 revision from the checkpoint
 inventory, checked against the recorded sha256.
 """
 
@@ -28,7 +28,7 @@ ARCH = "kolibri"
 
 
 def swa_layers(cfg: dict, summary: dict) -> list[bool]:
-    """Per-layer SWA flags from the Phase 1 attention summary. Checks that the
+    """Per-layer SWA flags from the inventory's attention summary. Checks that the
     summary is consistent with its own period (full layer last)."""
     att = summary["attention"]
     n = cfg["num_hidden_layers"]
@@ -55,7 +55,7 @@ def expected(cfg: dict, summary: dict) -> list[tuple[str, str, object]]:
         ("48/4 Q/KV heads", f"{ARCH}.attention.head_count_kv", cfg["num_key_value_heads"]),
         ("head dimension / RoPE dimension", f"{ARCH}.attention.key_length", cfg["head_dim"]),
         ("head dimension / RoPE dimension", f"{ARCH}.attention.value_length", cfg["head_dim"]),
-        # Sliding layers rotate the full head (Phase 1: get_rope default).
+        # Sliding layers rotate the full head (vLLM get_rope default).
         ("head dimension / RoPE dimension", f"{ARCH}.rope.dimension_count", cfg["head_dim"]),
         ("RMSNorm epsilon", f"{ARCH}.attention.layer_norm_rms_epsilon", cfg["rms_norm_eps"]),
         ("384 experts / 6 active", f"{ARCH}.expert_count", cfg["num_experts"]),
@@ -65,10 +65,10 @@ def expected(cfg: dict, summary: dict) -> list[tuple[str, str, object]]:
         ("shared expert", f"{ARCH}.expert_shared_count", n_shexp),
         ("shared expert", f"{ARCH}.expert_shared_feed_forward_length", shexp["hf_shape"][0]),
         # config.json names no gating function; the weights are sigmoid(logits[selected])
-        # (Phase 1, vLLM sigmoid_logit_add_routing). 2 = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID.
+        # (vLLM sigmoid_logit_add_routing). 2 = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID.
         ("router gating", f"{ARCH}.expert_gating_func", 2),
         ("router gating", f"{ARCH}.expert_weights_norm", cfg["norm_topk_prob"]),
-        # vLLM routed_scaling_factor = 1.0 (Phase 1); not in config.json.
+        # vLLM routed_scaling_factor = 1.0; not in config.json.
         ("router gating", f"{ARCH}.expert_weights_scale", 1.0),
         # 513 = 512 preceding tokens + the current one: llama.cpp masks when
         # p1 - p0 >= n_swa (LLAMA_SWA_TYPE_STANDARD), vLLM uses window (512, 0).
@@ -76,7 +76,7 @@ def expected(cfg: dict, summary: dict) -> list[tuple[str, str, object]]:
         (f"repeating SWA/full pattern (period {period}, full last)",
          f"{ARCH}.attention.sliding_window_pattern", is_swa),
         ("RoPE base 10,000 and SWA-only RoPE", f"{ARCH}.rope.freq_base", cfg["rope_theta"]),
-        # Full-attention layers use no positional encoding (Phase 1).
+        # Full-attention layers use no positional encoding (vLLM).
         ("RoPE base 10,000 and SWA-only RoPE", f"{ARCH}.attention.rope_pattern", is_swa),
     ]
 

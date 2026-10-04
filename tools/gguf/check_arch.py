@@ -2,10 +2,10 @@
 """Check the kolibri architecture registration in a patched llama.cpp.
 
 gguf-py:  MODEL_ARCH.KOLIBRI is named "kolibri", and MODEL_TENSORS[KOLIBRI]
-          lists exactly the tensor kinds of the Phase 1 HF -> GGUF mapping
+          lists exactly the tensor kinds of the HF -> GGUF mapping
           (inventory/bf16/summary.json, "classes").
 libllama: a GGUF whose general.architecture is "kolibri" is a known
-          architecture with a model class (llama_model_kolibri, Phase 4).
+          architecture with a model class (llama_model_kolibri).
           A vocab-only load of an otherwise empty GGUF must get past the
           architecture and fail on the missing vocabulary, not with
           "unknown model architecture" or "unsupported model architecture".
@@ -46,7 +46,7 @@ def check_tensors(gguf) -> list[str]:
         errs.append(f"MODEL_TENSORS[KOLIBRI] lacks {missing}")
     if extra := sorted(have - want):
         errs.append(f"MODEL_TENSORS[KOLIBRI] has tensors the checkpoint does not: {extra}")
-    print(f"gguf-py: {len(have)} tensor names registered, {len(want)} in the Phase 1 mapping")
+    print(f"gguf-py: {len(have)} tensor names registered, {len(want)} in the HF -> GGUF mapping")
     return errs
 
 

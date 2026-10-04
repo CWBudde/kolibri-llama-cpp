@@ -5,7 +5,7 @@ Generates the tiny random-weight checkpoint of cmd/kolibri-tiny (the shape of
 the reference repo's tests/checkpoints.py, BF16, with the real tokenizer),
 converts it with convert_hf_to_gguf.py --outtype bf16, and compares the GGUF
 with the generator's manifest.json, which comes from internal/kolibri (the
-Phase 1 mapping), not from the converter:
+HF -> GGUF mapping of docs/checkpoint.md), not from the converter:
 
 - tensor set: every expected tensor, nothing else;
 - shape: the ggml shape, per-expert tensors stacked on the outermost axis;

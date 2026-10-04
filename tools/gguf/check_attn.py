@@ -70,7 +70,7 @@ MAX_TOWARD = 0.1
 # How much further off a rotated reference must be on the full layers than the unrotated one.
 MIN_SEPARATION = 100
 # The CPU with an F32 KV cache and without flash attention (llama-graph.cpp casts the KV to F16 for
-# flash attention) vs a float64 recomputation; set from the first run, see docs/phase5-attention.md.
+# flash attention) vs a float64 recomputation; set from the first run, see docs/attention.md.
 MAX_NMSE_STRICT = 1e-10
 # The RoPE nodes there: ggml_rope_cache_init builds the angles by repeated float32 multiplication
 # (observed 6.8e-10 at positions up to 1100; vLLM's own float32 cos/sin cache is off by 2.3e-11).

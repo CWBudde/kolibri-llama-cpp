@@ -49,7 +49,7 @@ from tiny import convert, generate_tiny
 CONTEXT_LENGTH = 262144  # the real max_position_embeddings
 LENGTHS = (8192, 16384, 65536)
 # How much further off than vLLM's own float32 cos/sin cache libllama's RoPE may be, both against
-# float64; fixed before the first run (the ratio is about 30 at 1100 tokens, see docs/phase5-attention.md).
+# float64; fixed before the first run (the ratio is about 30 at 1100 tokens, see docs/attention.md).
 MAX_ROPE_VS_VLLM = 100
 
 
@@ -148,7 +148,7 @@ def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], rows:
 def configs(lib, is_cpu: bool):
     """(n_tokens, run, label, strict). Without flash attention, the KQ matrix (n_kv x n_ubatch x
     48 heads, float32) keeps the ubatch at 256; the CPU runs that with an F32 KV cache against the
-    strict bounds, up to 16384 tokens (65536 take 620 s, see docs/phase5-attention.md). 262144
+    strict bounds, up to 16384 tokens (65536 take 620 s, see docs/attention.md). 262144
     tokens run only on a GPU with flash attention."""
     off, on = lib.LLAMA_FLASH_ATTN_TYPE_DISABLED, lib.LLAMA_FLASH_ATTN_TYPE_ENABLED
     kv_off = lib.GGML_TYPE_F32 if is_cpu else lib.GGML_TYPE_F16

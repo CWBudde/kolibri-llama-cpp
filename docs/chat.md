@@ -1,7 +1,6 @@
-# Phase 9: chat template, reasoning modes, tool calls and stop tokens
+# Kolibri chat template, reasoning and tool calls
 
-This report covers Phase 9 items 1–5, plus the immediate task "copy the
-official chat-template compatibility cases into llama.cpp template tests":
+This document covers what llama.cpp does with Kolibri's chat conventions:
 
 - the Kolibri chat template, preserved byte for byte;
 - the reasoning modes none / low / medium / high;
@@ -9,9 +8,9 @@ official chat-template compatibility cases into llama.cpp template tests":
 - the official reasoning and tool parsers compared with llama.cpp's;
 - the stop tokens and EOS.
 
-None of it needs the checkpoint. Item 6 (Aleph Alpha's recommended sampling)
-stays open: the plan allows it only after base greedy inference is correct
-(Phase 6).
+None of it needs the checkpoint. Aleph Alpha's recommended sampling
+(`temperature=1.0`, `top_p=0.97`, `top_k=128`) is not covered here: it is
+validated only once base greedy inference matches the reference.
 
 Two checks cover it:
 
@@ -21,9 +20,9 @@ Two checks cover it:
   comes back: how llama.cpp splits generated text into reasoning, content and
   tool calls.
 
-The batch changed one line of shared llama-server code (see
-[The `reasoning_effort: "none"` fix](#the-reasoning_effort-none-fix)) and
-added the template file and tests. Everything else already worked.
+Kolibri needed one line of shared llama-server code (see
+[The `reasoning_effort: "none"` fix](#the-reasoning_effort-none-fix)), plus the
+template file and tests. Everything else already worked.
 
 ## The reference
 
@@ -88,7 +87,7 @@ Where llama.cpp keeps it:
 - The converter's Kolibri class writes it into `tokenizer.chat_template` from
   `tokenizer_config.json` (`gguf.SpecialVocab`). The vocab GGUF and every
   converted GGUF carry it.
-- The fork now also has it as `models/templates/Aleph-Alpha-Kolibri-1.jinja`,
+- The fork also has it as `models/templates/Aleph-Alpha-Kolibri-1.jinja`,
   where llama.cpp's chat tests read templates from.
 
 ### How llama.cpp handles it
@@ -235,8 +234,8 @@ tests (`test-chat`, `test-chat-peg-parser`, `test-chat-auto-parser`,
 
 ## The `reasoning_effort: "none"` fix
 
-**The mismatch:** the first `check_chat.py` run with the vLLM merge failed
-1/31 requests on every message set:
+**The mismatch:** without the fix, `check_chat.py` fails 1/31 requests on
+every message set:
 
 ```
 FAIL chat render [default] single: 30/31 prompts equal the reference, prefilled think block iff thinking off 30/31; {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}}: at char 49: llama.cpp 't|>system\n# Reasoning effort\n\nReasoning effort is set to high. Think carefully t', reference 't|>system\n# Reasoning effort\n\nReasoning is disabled. Proceed straight to answeri'
@@ -251,7 +250,7 @@ FAIL chat render [default] single: 30/31 prompts equal the reference, prefilled 
 - So Kolibri rendered a thinking prompt. vLLM lets the field win and renders
   thinking off.
 
-**The fix** (shared code, decided by the user): `"none"` now also sets the
+**The fix** (shared code): `"none"` also sets the
 `enable_thinking` kwarg to false, one line in `server-common.cpp`. For
 templates that read only `enable_thinking`, nothing changes. For the
 contradicting request, the template now sees what the server already assumed.
@@ -259,9 +258,9 @@ contradicting request, the template now sees what the server already assumed.
 **Verification:**
 - The new server cases in `test_kolibri_reasoning_effort` fail without the
   line ("Expected: 1", `test-chat` rc 134) and pass with it.
-- `check_chat.py` then gives 31/31 on every message set.
+- With it, `check_chat.py` gives 31/31 on every message set.
 
-## Official parsers vs llama.cpp (item 9.4)
+## Official parsers vs llama.cpp
 
 | Behaviour | vLLM (`kolibri1` parsers) | llama.cpp | Covered by |
 |---|---|---|---|
@@ -272,7 +271,7 @@ contradicting request, the template now sees what the server already assumed.
 | `<tool_call>` before `</think>` | `Qwen3Parser` ends the reasoning at `<tool_call>` (`vllm/parser/qwen3.py:139`, "Tool call directly from reasoning (implicit end)") | stays reasoning until `</think>` | peg block (fake call in the reasoning) |
 | Tool calls | `Hermes2ProToolParser`: one or more `<tool_call>` JSON blocks, content before the first call | the same format, parallel calls, content before them, streaming partial arguments | peg block |
 | Structured output | the grammar applies once the reasoning has ended (`is_reasoning_end`, current turn only) | lazy grammar, triggered on `<tool_call>` | `test_peg_parser` builds the grammar and checks its triggers |
-| `continue_final_message` | known gap, documented in `reasoning.py` | not tested | open |
+| `continue_final_message` | known gap, documented in `reasoning.py` | not tested | — |
 
 Two differences remain, both in how output is split, not in the prompt:
 
@@ -336,38 +335,28 @@ Each was run, then reverted.
 The `reasoning_effort: "none"` fix was also checked in reverse: without the
 line, its new server cases fail (see above).
 
-## Answers to the plan items
+## Verified behavior
 
-- **9.1 Port/preserve the Kolibri chat template:**
-  - It was already preserved: the converter copies it into every GGUF. The
-    fork adds it as a template file for llama.cpp's tests.
+- **Chat template preserved:**
+  - The converter copies it into every GGUF. The fork adds it as a template
+    file for llama.cpp's tests.
   - All six copies (including llama-server's `/props`) share sha256
     `9ba35d4b…`.
-- **9.2 Validate reasoning modes:**
+- **Reasoning modes:**
   - llama-server renders every reasoning mode exactly as the reference does.
     The modes come from the reference's 10 argument sets, 7 effort levels with
     and without `enable_thinking`, and 2 CLI defaults, on 7 message sets, with
     and without preserved reasoning.
   - The parser splits reasoning and content per mode.
   - One request shape needed the server fix above.
-- **9.3 Validate tool-call formatting:** tools, tool loops, parallel calls and
-  grouped tool results render byte-identically. llama.cpp parses the Hermes
-  JSON calls (single, parallel, after reasoning, partial).
-- **9.4 Compare the official parsers:** the table above. Behaviour is the same
-  except the two documented output-splitting differences.
-- **9.5 Stop tokens and EOS:** libllama stops on exactly the two eos ids of
+- **Tool-call formatting:** tools, tool loops, parallel calls and grouped tool
+  results render byte-identically. llama.cpp parses the Hermes JSON calls
+  (single, parallel, after reasoning, partial).
+- **Official parsers:** the table above. Behaviour is the same except the two
+  documented output-splitting differences. `continue_final_message` with
+  thinking is a known gap in the reference parser itself and is not tested.
+- **Stop tokens and EOS:** libllama stops on exactly the two eos ids of
   `generation_config.json`, and the tag tokens reach the parser as text.
-- **Immediate task, copy the official chat-template cases:**
-  `test_kolibri_reasoning_effort` carries the reference's
-  `THINKING_OFF_KWARGS`/`THINKING_ON_KWARGS` precedence cases and the
-  tool-loop message set into `test-chat`.
-
-## What stays open
-
-- **9.6, Aleph Alpha's recommended sampling** (`temperature=1.0`,
-  `top_p=0.97`, `top_k=128`): only after base greedy inference matches
-  (Phase 6).
-- **The `reasoning_effort: "none"` fix** is in the fork, on the Kolibri
-  branch. Proposing it upstream is a separate decision.
-- **`continue_final_message`** with thinking: a known gap in the reference
-  parser itself; not tested here.
+- **Reference compatibility cases:** `test_kolibri_reasoning_effort` carries the
+  reference's `THINKING_OFF_KWARGS`/`THINKING_ON_KWARGS` precedence cases and
+  the tool-loop message set into `test-chat`.
