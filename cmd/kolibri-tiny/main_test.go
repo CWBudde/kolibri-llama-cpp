@@ -251,6 +251,54 @@ func TestGenerateAttn(t *testing.T) {
 	}
 }
 
+func TestGeneratePattern(t *testing.T) {
+	dir := t.TempDir()
+	if err := generate(dir, "", 1, presetPattern); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := kolibri.ParseConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The released checkpoint's 50-layer pattern, on the default heads.
+	raw, err = os.ReadFile(filepath.Join("..", "..", "inventory", "bf16", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, err := kolibri.ParseConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.LayerTypes, released.LayerTypes) || cfg.NumHiddenLayers != 50 {
+		t.Errorf("layer_types = %v, want the released %v", cfg.LayerTypes, released.LayerTypes)
+	}
+	if cfg.SlidingWindow != released.SlidingWindow || cfg.NumAttentionHeads != 8 || cfg.NumKeyValueHeads != 2 {
+		t.Errorf("config = %+v", cfg)
+	}
+
+	f, err := os.Open(filepath.Join(dir, "model.safetensors"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h, err := safetensors.ReadHeader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.Tensors) != len(cfg.ExpectedNames()) {
+		t.Errorf("%d tensors, want %d", len(h.Tensors), len(cfg.ExpectedNames()))
+	}
+	if !slices.ContainsFunc(h.Tensors, func(tt safetensors.Tensor) bool {
+		return tt.Name == "model.layers.49.self_attn.q_norm.weight"
+	}) {
+		t.Error("layer 49 is missing")
+	}
+}
+
 func bf16Stats(buf []byte) (mean, std float64) {
 	n := len(buf) / 2
 	var sum, sq float64

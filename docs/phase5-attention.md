@@ -1,21 +1,28 @@
-# Phase 5: hybrid attention masks and RoPE against the reference
+# Phase 5: hybrid attention, KV cache and RoPE against the reference
 
-This report covers the mask and RoPE half of Phase 5, plus the attention half
-of Phase 4 item 9 (graph callbacks for layer-by-layer debugging):
+This report covers Phase 5 except item 11 (long contexts), plus the attention
+half of Phase 4 item 9 (graph callbacks for layer-by-layer debugging):
 
 - `LLAMA_SWA_TYPE_STANDARD` and Kolibri's 512-preceding-token window;
 - RoPE with base 10,000 on the sliding-window layers only;
 - no positional rotation on the full-attention layers;
 - the exact off-by-one, and the boundaries 511, 512 and 513 and beyond, also
-  across KV-cache reads and SWA-cache eviction.
+  across KV-cache reads and SWA-cache eviction;
+- the 4:1 SWA/full pattern over the real 50 layers, and the per-layer split of
+  the iSWA KV cache;
+- GQA with 48 query and 4 KV heads, and the per-head Q/K RMSNorm;
+- two evaluations: `load_swa_pattern()` and `llama_memory_hybrid_iswa`.
 
 `tools/gguf/check_attn.py` compares every attention step in libllama with the
-reference implementation, layer by layer. It runs on a tiny checkpoint with
-the real attention heads and sliding window.
+reference implementation, layer by layer. It runs on two tiny checkpoints:
+one with the real attention heads and sliding window, one with the real
+50-layer SWA/full pattern.
 
-The model class is described in [phase4-model.md](phase4-model.md). This
-batch needed no change to it: the fork already had the window, the RoPE
-pattern and the iSWA cache; they had not been checked against the reference.
+The report covers two batches: #10 (window, off-by-one, RoPE, KV-cache reads)
+and #11 (layer pattern, iSWA cache split, GQA, QK norm). Neither needed a
+change to the model class described in [phase4-model.md](phase4-model.md):
+the fork already had the window, the RoPE pattern and the iSWA cache; they had
+not been checked against the reference.
 
 ## The reference
 
@@ -56,8 +63,17 @@ pattern and the iSWA cache; they had not been checked against the reference.
 | hidden, experts | 256, 8 (top 2) | same | 2560, 384 (top 6) |
 
 `TestGenerateAttn` checks the config and the attention tensor shapes. The
-default fixture and its determinism test are unchanged. `-router` and `-attn`
-are mutually exclusive.
+default fixture and its determinism test are unchanged.
+
+## Fixture: `kolibri-tiny -pattern`
+
+The real layer pattern on the default fixture's small heads: 50 layers, full
+attention where `il % 5 == 4` (four sliding, then one full), and
+`sliding_window` 513. `TestGeneratePattern` checks that `layer_types` equals
+the released `inventory/bf16/config.json`. The small heads (8 Q, 2 KV,
+head_dim 32) keep the capture of all 50 layers at about 0.6 GB.
+
+`-router`, `-attn` and `-pattern` are mutually exclusive.
 
 ## Check (`tools/gguf/check_attn.py`)
 
@@ -75,6 +91,11 @@ ways:
 The four runs are crossed with flash attention off and on, on every device.
 The CPU also runs with an F32 KV cache, with flash attention off.
 
+The `-pattern` fixture runs the batch and the evicting chunked run, in the
+same configurations. Its SWA cache holds 40 layers in 768 cells (libllama log:
+"creating SWA KV cache, size = 768 cells" and "768 cells, 40 layers"). The
+single-token and full-cache runs are left to `-attn`.
+
 `cb_eval` captures each layer's attention nodes, one part per `llama_decode`
 call. Every step is recomputed in float64 from libllama's own input to that
 step, so each failure points at one node:
@@ -89,7 +110,11 @@ step, so each failure points at one node:
 | `attn_post_norm`, `ffn_inp` | the sandwich norm and the residual add |
 
 Further checks:
-- **RoPE nodes:** they exist in layers 0–3 and in no full layer.
+- **KV cache:** from the libllama log, `llama_kv_cache_iswa` creates a non-SWA
+  cache with exactly the full layers and a SWA cache with exactly the sliding
+  layers, and no recurrent memory is created.
+- **RoPE nodes:** they exist in exactly the sliding layers (0–3; for
+  `-pattern`, the 40 layers with `il % 5 != 4`) and in no full layer.
 - **Boundaries:** the `kqv_out` error at positions 511, 512, 513 and 514.
 - **Window (off-by-one):** from the first position where the masks differ,
   libllama's deviation from the window-513 reference is projected onto the
@@ -99,6 +124,16 @@ Further checks:
   meaning, not by a run.
 - **No RoPE on the full layers:** a reference with RoPE applied on the full
   layers is at least 100× further off than the unrotated one.
+- **Per-head Q/K RMSNorm:** one RMSNorm over the whole projection (all heads,
+  the weight repeated per head) is at least 100× further off `Qcur/Kcur_normed`
+  than the per-head one.
+- **GQA mapping:** query head h reads KV head h // 12, as FlashAttention and
+  ggml's `mul_mat` broadcast group them. The strided mapping h % 4 is at least
+  100× further off `kqv_out`.
+
+The 100× separations are the same factor as the full-layer RoPE check. The
+smallest observed margin is 6.7e3 times that (no RoPE on the full layers,
+`-pattern`, CPU flash attention).
 
 ### Thresholds
 
@@ -106,7 +141,7 @@ Further checks:
 |---|---|---|
 | CPU, flash attention off, F32 KV | 1e-10 | at most 1.5e-13 (`attn_out`) |
 | the same, `Qcur_rope`/`Kcur_rope` only | 1e-8 | 6.8e-10 |
-| everything else (F16 KV, CPU flash attention, Metal) | 1e-4 (`test-llama-archs`) | at most 1.1e-6 over all positions, 3.6e-6 at a single position (CPU flash attention, single-token steps) |
+| everything else (F16 KV, CPU flash attention, Metal) | 1e-4 (`test-llama-archs`) | at most 1.1e-6 over all positions, 3.6e-6 at a single position (CPU flash attention, single-token steps); `-pattern` at most 1.7e-6 (`attn_out`) |
 
 The three non-strict cases each have a cause found in the source:
 
@@ -123,7 +158,9 @@ The three non-strict cases each have a cause found in the source:
 
 On F16 alone the window bound is weak: an off-by-one gives `kqv_out` NMSE
 3.2e-4 against the 1e-4 bound, a margin of 3×. The projection test holds
-every configuration to `|c| <= 4.2e-4` on the CPU and `<= 5.8e-3` on Metal.
+every configuration to `|c| <= 4.2e-4` on the CPU and `<= 5.8e-3` on Metal
+for `-attn`, and `<= 1.4e-2` for `-pattern`. The strict CPU configuration
+gives at most 1.5e-7.
 
 ### Result
 
@@ -131,31 +168,47 @@ every configuration to `|c| <= 4.2e-4` on the CPU and `<= 5.8e-3` on Metal.
 .venv/bin/python tools/gguf/check_attn.py --llama-cpp third_party/llama.cpp
 ```
 
-rc 0, 300 PASS lines (12 CPU and 8 Metal configurations, 15 lines each).
-The strict CPU configuration and one Metal configuration:
+rc 0, 570 PASS lines in 173 s: 380 for `-attn` (12 CPU and 8 Metal
+configurations, 19 lines each) and 190 for `-pattern` (6 CPU and 4 Metal
+configurations). The strict CPU configuration for `-attn`, then `-pattern`
+with the evicting SWA cache, then the new lines on Metal:
 
 ```
-PASS CPU [batch, flash attn off, KV f32] RoPE nodes in layers [0, 1, 2, 3] (sliding layers [0, 1, 2, 3])
-PASS CPU [batch, flash attn off, KV f32] attn_norm vs reference: max NMSE over layers 3.0e-15 (<= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] Qcur_normed vs reference: max NMSE over layers 1.1e-14 (<= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] Kcur_normed vs reference: max NMSE over layers 1.1e-14 (<= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] Vcur vs reference: max NMSE over layers 8.6e-15 (<= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] Qcur_rope vs reference: max NMSE over layers 6.8e-10 (<= 1e-08)
-PASS CPU [batch, flash attn off, KV f32] Kcur_rope vs reference: max NMSE over layers 6.8e-10 (<= 1e-08)
-PASS CPU [batch, flash attn off, KV f32] kqv_out vs reference: max NMSE over layers 1.8e-14 (<= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] attn_out vs reference: max NMSE over layers 1.5e-13 (<= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] attn_post_norm vs reference: max NMSE over layers 3.1e-15 (<= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] ffn_inp vs reference: max NMSE over layers 7.5e-16 (<= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] kqv_out at positions 511: 2.7e-14, 512: 2.7e-14, 513: 2.7e-14, 514: 3.1e-14 (sliding layers, <= 1e-10)
-PASS CPU [batch, flash attn off, KV f32] window 513, not 512: from position 512 on, libllama moves +1.4e-08 of the way to the window-512 reference (|c| <= 0.1)
-PASS CPU [batch, flash attn off, KV f32] window 513, not 514: from position 513 on, libllama moves +1.6e-08 of the way to the window-514 reference (|c| <= 0.1)
-PASS CPU [batch, flash attn off, KV f32] no RoPE on the full layers: a rotated reference is off by NMSE 2.8e-02, the unrotated one by 2.9e-15 (>= 100x)
-PASS MTL0 [chunks of 64, SWA cache 768, flash attn on, KV f16] kqv_out vs reference: max NMSE over layers 1.2e-07 (<= 0.0001)
-PASS MTL0 [chunks of 64, SWA cache 768, flash attn on, KV f16] kqv_out at positions 511: 1.4e-07, 512: 1.4e-07, 513: 1.3e-07, 514: 1.3e-07 (sliding layers, <= 0.0001)
-PASS MTL0 [chunks of 64, SWA cache 768, flash attn on, KV f16] window 513, not 512: from position 512 on, libllama moves -3.3e-05 of the way to the window-512 reference (|c| <= 0.1)
-PASS MTL0 [chunks of 64, SWA cache 768, flash attn on, KV f16] window 513, not 514: from position 513 on, libllama moves +3.4e-05 of the way to the window-514 reference (|c| <= 0.1)
-PASS MTL0 [chunks of 64, SWA cache 768, flash attn on, KV f16] no RoPE on the full layers: a rotated reference is off by NMSE 2.8e-02, the unrotated one by 3.5e-09 (>= 100x)
+PASS CPU attn [batch, flash attn off, KV f32] KV cache layers {'non-SWA': 2, 'SWA': 4} (llama_kv_cache_iswa, no recurrent memory: 2 full, 4 sliding)
+PASS CPU attn [batch, flash attn off, KV f32] RoPE nodes in layers [0, 1, 2, 3] (sliding layers [0, 1, 2, 3])
+PASS CPU attn [batch, flash attn off, KV f32] attn_norm vs reference: max NMSE over layers 3.0e-15 (<= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] Qcur_normed vs reference: max NMSE over layers 1.1e-14 (<= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] Kcur_normed vs reference: max NMSE over layers 1.1e-14 (<= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] Vcur vs reference: max NMSE over layers 8.6e-15 (<= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] Qcur_rope vs reference: max NMSE over layers 6.8e-10 (<= 1e-08)
+PASS CPU attn [batch, flash attn off, KV f32] Kcur_rope vs reference: max NMSE over layers 6.8e-10 (<= 1e-08)
+PASS CPU attn [batch, flash attn off, KV f32] kqv_out vs reference: max NMSE over layers 1.8e-14 (<= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] attn_out vs reference: max NMSE over layers 1.5e-13 (<= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] attn_post_norm vs reference: max NMSE over layers 3.1e-15 (<= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] ffn_inp vs reference: max NMSE over layers 7.5e-16 (<= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] kqv_out at positions 511: 2.7e-14, 512: 2.7e-14, 513: 2.7e-14, 514: 3.1e-14 (sliding layers, <= 1e-10)
+PASS CPU attn [batch, flash attn off, KV f32] window 513, not 512: from position 512 on, libllama moves +1.4e-08 of the way to the window-512 reference (|c| <= 0.1)
+PASS CPU attn [batch, flash attn off, KV f32] window 513, not 514: from position 513 on, libllama moves +1.6e-08 of the way to the window-514 reference (|c| <= 0.1)
+PASS CPU attn [batch, flash attn off, KV f32] no RoPE on the full layers: a rotated reference is off by NMSE 2.8e-02, the unrotated one by 2.9e-15 (>= 100x)
+PASS CPU attn [batch, flash attn off, KV f32] Qcur_normed per head: one RMSNorm over all 48 heads is off by NMSE 3.7e-03, the per-head one by 1.1e-14 (>= 100x)
+PASS CPU attn [batch, flash attn off, KV f32] Kcur_normed per head: one RMSNorm over all 4 heads is off by NMSE 2.9e-03, the per-head one by 1.1e-14 (>= 100x)
+PASS CPU attn [batch, flash attn off, KV f32] GQA 48/4: query head h reads KV head h // 12; with h % 4 kqv_out is off by NMSE 1.5e+00, with h // 12 by 1.8e-14 (>= 100x)
+PASS CPU pattern [chunks of 64, SWA cache 768, flash attn off, KV f32] KV cache layers {'non-SWA': 10, 'SWA': 40} (llama_kv_cache_iswa, no recurrent memory: 10 full, 40 sliding)
+PASS CPU pattern [chunks of 64, SWA cache 768, flash attn off, KV f32] RoPE nodes in layers 11110111101111011110111101111011110111101111011110 (sliding layers 11110111101111011110111101111011110111101111011110)
+PASS CPU pattern [chunks of 64, SWA cache 768, flash attn off, KV f32] kqv_out vs reference: max NMSE over layers 1.6e-14 (<= 1e-10)
+PASS CPU pattern [chunks of 64, SWA cache 768, flash attn off, KV f32] kqv_out at positions 511: 2.4e-14, 512: 2.4e-14, 513: 2.9e-14, 514: 2.4e-14 (sliding layers, <= 1e-10)
+PASS CPU pattern [chunks of 64, SWA cache 768, flash attn off, KV f32] window 513, not 512: from position 512 on, libllama moves -1.5e-07 of the way to the window-512 reference (|c| <= 0.1)
+PASS CPU pattern [chunks of 64, SWA cache 768, flash attn off, KV f32] window 513, not 514: from position 513 on, libllama moves +1.5e-07 of the way to the window-514 reference (|c| <= 0.1)
+PASS CPU pattern [chunks of 64, SWA cache 768, flash attn off, KV f32] no RoPE on the full layers: a rotated reference is off by NMSE 1.0e-02, the unrotated one by 2.9e-15 (>= 100x)
+PASS CPU pattern [chunks of 64, SWA cache 768, flash attn off, KV f32] GQA 8/2: query head h reads KV head h // 4; with h % 2 kqv_out is off by NMSE 7.5e-01, with h // 4 by 1.6e-14 (>= 100x)
+PASS MTL0 attn [batch, flash attn on, KV f16] KV cache layers {'non-SWA': 2, 'SWA': 4} (llama_kv_cache_iswa, no recurrent memory: 2 full, 4 sliding)
+PASS MTL0 attn [batch, flash attn on, KV f16] Qcur_normed per head: one RMSNorm over all 48 heads is off by NMSE 3.7e-03, the per-head one by 4.8e-08 (>= 100x)
+PASS MTL0 attn [batch, flash attn on, KV f16] GQA 48/4: query head h reads KV head h // 12; with h % 4 kqv_out is off by NMSE 1.5e+00, with h // 12 by 1.2e-07 (>= 100x)
 ```
+
+The `-pattern` fixture adds 62 s and the GQA contrast about 35 s to the 76 s
+of the first version. The check keeps every configuration: the evicting run
+on the 40-layer SWA cache is the one that exercises the real layer split.
 
 With an F32 KV cache and flash attention off, the chunked and single-token
 runs give exactly the batch run's numbers. In the other configurations they
@@ -165,6 +218,48 @@ of its window.
 
 ## Answers to the plan items
 
+- **The 4:1 pattern for 50 layers (5.1):** the converter writes
+  `attention.sliding_window_pattern` and `attention.rope_pattern` from
+  `layer_types` (Phase 3, `check_metadata.py`). On the 50-layer `-pattern`
+  fixture, libllama has RoPE nodes in exactly the 40 sliding layers, a KV
+  cache split of 10 non-SWA and 40 SWA layers, and `kqv_out` matching the
+  window-513 reference on the sliding layers and the causal one on the full
+  layers, also with an evicting SWA cache.
+- **`load_swa_pattern()` (5.2):** not used; the required explicit array stays.
+  - `kolibri.cpp` reads `attention.sliding_window_pattern` with a required
+    `ml.get_arr` into `hparams.is_swa_impl`, and `rope_pattern` the same way.
+    There is no custom per-layer logic: the graph asks `hparams.is_swa(il)`
+    and `has_rope(il)`, and `build_attn_inp_kv_iswa` does the rest.
+  - `llama_model_base::load_swa_pattern` (`src/llama-model.cpp:3454`) runs
+    the same `get_arr`, but optional, and falls back to a period through
+    `set_swa_pattern` when the array is missing. The fallback serves
+    architectures whose older GGUFs stored only a period (gemma2/3, cohere2,
+    exaone4, afmoe, laguna). Recent architectures that always write the array
+    use the required `get_arr`, like Kolibri: gemma4, step35, granite-swa,
+    maple, dots3note, spark2-5, dflash.
+  - A period cannot express the reference's own fixture (SSSSFF): with
+    `set_swa_pattern(5)` (M7) the 50-layer model still passes, but the
+    6-layer fixture fails at layer 5. A Kolibri GGUF always carries the
+    array, and a missing one fails the load instead of silently using a
+    period.
+- **`llama_memory_hybrid_iswa` (5.4):** it does not apply. It pairs a
+  recurrent memory with an iSWA attention cache
+  (`src/llama-memory-hybrid-iswa.h`), for models whose layers are attention
+  or recurrent. Kolibri has no recurrent layers, `llm_arch_is_hybrid` is
+  false for it, and `llama_model::create_memory` gives it
+  `llama_kv_cache_iswa`: one cache for the full layers and one, window-sized,
+  for the sliding layers. The check asserts that split from the libllama log
+  in every run, with no recurrent memory, and the chunked runs show that the
+  evicting SWA cache hands each query exactly its window.
+- **GQA 48/4 (5.5):** the existing path (`build_qkv` with `n_head_kv`, then
+  `build_attn`) groups query heads contiguously: head h reads KV head h // 12,
+  as in FlashAttention. `kqv_out` matches that reference to 1.8e-14; the
+  strided mapping h % 4 is off by 1.5.
+- **Per-head Q/K RMSNorm (5.6):** `build_norm` on the `[head_dim, n_head,
+  n_tokens]` view with the `[head_dim]` weight is the reference's
+  `RMSNorm(head_dim)` on `q.view(..., n_heads, head_dim)`: `Qcur/Kcur_normed`
+  match to 1.1e-14. One RMSNorm over all heads is off by 3.7e-3 (Q) and
+  2.9e-3 (K). Without the Q or K norm (M8, M9) exactly that node fails.
 - **`LLAMA_SWA_TYPE_STANDARD` (5.3):** it matches. `kqv_out` on the sliding
   layers equals the reference with FlashAttention window `(512, 0)` in every
   run, and `CHUNKED` fails (M4).
@@ -193,7 +288,8 @@ of its window.
 ## Mutation tests
 
 Each mutation was run, then reverted. M1–M3 are kv overrides through the C
-API; M4–M6 are libllama variants built from an edited `src/models/kolibri.cpp`.
+API; M4–M9 are libllama variants built from an edited `src/models/kolibri.cpp`.
+M1–M6 ran on `-attn`, M7 on both fixtures.
 The table shows the strict CPU configuration (batch, flash attention off, F32
 KV); the F16 configurations fail in the same checks.
 
@@ -205,18 +301,17 @@ KV); the F16 configurations fail in the same checks.
 | M4 `swa_type = LLAMA_SWA_TYPE_CHUNKED` | FAIL: `kqv_out at positions 511: 2.7e-14, 512: 2.7e-14, 513: 1.6e+02`; `kqv_out` NMSE 1.0 |
 | M5 RoPE on every layer (`has_rope` ignored) | FAIL: `RoPE nodes in layers [0, 1, 2, 3, 4, 5]`; the full layers match a rotated reference (1.6e-12), not the unrotated one (3.4e-2) |
 | M6 RoPE type NORM instead of NEOX | FAIL: `Qcur_rope` NMSE 1.7, `Kcur_rope` 1.8 |
+| M7 `hparams.set_swa_pattern(5)` instead of the pattern array | `-attn` FAIL: `KV cache layers {'non-SWA': 1, 'SWA': 5}`, `kqv_out` NMSE 5.9e-2 (layer 5 gets the window), and as a consequence the full-layer RoPE and GQA contrasts; `-pattern` PASS (0 failures) |
+| M8 no `attn_q_norm` | FAIL: `Qcur_normed` NMSE 4.7e-1 and its per-head contrast; nothing else |
+| M9 no `attn_k_norm` | FAIL: `Kcur_normed` NMSE 4.7e-1 and its per-head contrast; nothing else |
 
 ## What stays open
 
-- **Phase 5 items 1, 2, 4, 5 and 6:**
-  - 1: the 4:1 pattern for 50 layers;
-  - 2: evaluate `load_swa_pattern`;
-  - 4: evaluate `llama_memory_hybrid_iswa`;
-  - 5: GQA 48/4;
-  - 6: Q/K RMSNorm.
-
-  The check already runs 48/4 heads and compares `Qcur/Kcur_normed`, but these
-  items were not part of this batch.
-- **Phase 5 item 11:** contexts of 8k, 16k, 64k and 262k. A float64 O(n²)
-  reference at 64k needs a different approach.
+- **Phase 5 item 11:** short contexts first, then 8k, 16k and 64k, before
+  262k. It needs its own design:
+  - a float64 reference over all positions costs O(n²), so it would compare
+    sampled query rows, with a capture that keeps only those rows;
+  - at large positions the RoPE angles in float32 (ggml, and vLLM's own
+    cos/sin cache) differ by up to about 1e-7 × position radians, so the
+    reference for long contexts has to be decided.
 - **Phase 6:** the same comparison against a vLLM run of the real checkpoint.

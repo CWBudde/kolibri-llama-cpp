@@ -325,10 +325,25 @@ and executes without tensor-shape or unsupported-op errors.
 This phase is now lower risk than originally assumed because llama.cpp
 already contains reusable hybrid-SWA machinery.
 
--   [ ] Model the Kolibri pattern as `SWA, SWA, SWA, SWA, FULL`,
+-   [x] Model the Kolibri pattern as `SWA, SWA, SWA, SWA, FULL`,
     repeating for 50 layers.
--   [ ] Evaluate `load_swa_pattern()` instead of introducing custom
+    (2026-10-04) — `kolibri-tiny -pattern` has the released 50-layer
+    `layer_types` (`TestGeneratePattern` compares it with
+    `inventory/bf16/config.json`). `check_attn.py` on it: "RoPE nodes in layers
+    11110111101111011110111101111011110111101111011110 (sliding layers
+    11110111101111011110111101111011110111101111011110)", "KV cache layers
+    {'non-SWA': 10, 'SWA': 40}", and "kqv_out vs reference: max NMSE over
+    layers 1.6e-14 (<= 1e-10)" with the window on the sliding and the causal
+    mask on the full layers, also with an evicting 768-cell SWA cache.
+-   [x] Evaluate `load_swa_pattern()` instead of introducing custom
     per-layer attention logic.
+    (2026-10-04) — evaluated, not adopted: `kolibri.cpp` reads the per-layer
+    array with a required `get_arr`, the same read as the helper's first
+    branch and the form of gemma4, step35 and granite-swa. The helper's period
+    fallback only serves older period-only GGUFs, and a period cannot express
+    the reference fixture SSSSFF: with `set_swa_pattern(5)` the 50-layer model
+    passes, the 6-layer fixture fails ("KV cache layers {'non-SWA': 1, 'SWA':
+    5}", `kqv_out` 5.9e-02). See `docs/phase5-attention.md`.
 -   [x] Use `LLAMA_SWA_TYPE_STANDARD` if its mask semantics match
     Kolibri's 512-preceding-token window.
     (2026-10-04) — it matches: vLLM v0.29.0 hands `sliding_window = 513` to
@@ -337,10 +352,24 @@ already contains reusable hybrid-SWA machinery.
     configurations): "kqv_out vs reference: max NMSE over layers 1.8e-14
     (<= 1e-10)" on the CPU with an F32 KV cache. With `CHUNKED` it fails
     ("kqv_out at positions … 513: 1.6e+02").
--   [ ] Evaluate `llama_memory_hybrid_iswa` for mixed SWA/full KV
+-   [x] Evaluate `llama_memory_hybrid_iswa` for mixed SWA/full KV
     storage.
--   [ ] Reuse existing GQA path for 48 Q heads / 4 KV heads.
--   [ ] Reuse existing per-head Q/K RMSNorm support.
+    (2026-10-04) — evaluated, not applicable: it pairs a recurrent memory with
+    an iSWA cache, and Kolibri has no recurrent layers, so libllama gives it
+    `llama_kv_cache_iswa`. `check_attn.py` asserts the split in every run:
+    "KV cache layers {'non-SWA': 2, 'SWA': 4} (llama_kv_cache_iswa, no
+    recurrent memory: 2 full, 4 sliding)", and {'non-SWA': 10, 'SWA': 40} on
+    50 layers.
+-   [x] Reuse existing GQA path for 48 Q heads / 4 KV heads.
+    (2026-10-04) — reused unchanged: "GQA 48/4: query head h reads KV head h
+    // 12; with h % 4 kqv_out is off by NMSE 1.5e+00, with h // 12 by 1.8e-14
+    (>= 100x)" (`check_attn.py`, `kolibri-tiny -attn`, CPU with an F32 KV
+    cache); every configuration, Metal included, keeps the 100x separation.
+-   [x] Reuse existing per-head Q/K RMSNorm support.
+    (2026-10-04) — reused unchanged: "Qcur_normed per head: one RMSNorm over
+    all 48 heads is off by NMSE 3.7e-03, the per-head one by 1.1e-14 (>=
+    100x)", and the same for K (2.9e-03 vs 1.1e-14). Without `attn_q_norm` or
+    `attn_k_norm` exactly that node fails (NMSE 4.7e-01).
 -   [x] Apply RoPE with base 10,000 on SWA layers only.
     (2026-10-04) — "RoPE nodes in layers [0, 1, 2, 3] (sliding layers [0, 1,
     2, 3])", and "Qcur_rope vs reference: max NMSE over layers 6.8e-10 (<=

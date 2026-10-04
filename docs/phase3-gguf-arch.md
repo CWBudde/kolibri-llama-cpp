@@ -226,8 +226,10 @@ hard-wrapped comments.
   same window, so the value is stored unchanged. Phase 5 tests the 511, 512 and
   513 boundaries numerically.
 - **Patterns.** Both arrays come from `layer_types`:
-  - `sliding_window_pattern` is read by `llama_model_base::load_swa_pattern`
-    (`get_arr` into `hparams.is_swa_impl`).
+  - `sliding_window_pattern` is read by a required `ml.get_arr` into
+    `hparams.is_swa_impl` in `llama_model_kolibri::load_arch_hparams`, not
+    by `load_swa_pattern`; see the evaluation in
+    [phase5-attention.md](phase5-attention.md).
   - `rope_pattern` is read into `hparams.rope_pattern` and used by
     `llama_hparams::has_rope`. It equals the SWA pattern, because the
     full-attention layers 4, 9, …, 49 use no positional encoding (RNoPE,
