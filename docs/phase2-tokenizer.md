@@ -210,6 +210,10 @@ adds `MODEL_ARCH.KOLIBRI`, regenerate the fixture with
 `convert_hf_to_gguf.py --vocab-only`. It should be token-for-token identical:
 same tokens, types, merges and special IDs.
 
+> Update (Phase 4): done. `vocab_gguf.py` now uses the converter's Kolibri
+> class and writes `general.architecture = kolibri`; tokens, types, merges and
+> special IDs are unchanged. See [Phase 4: router](phase4-router.md#vocab-gguf-under-kolibri-item-11).
+
 ## Reproducing
 
 ```sh

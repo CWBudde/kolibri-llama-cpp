@@ -13,6 +13,12 @@ The patch is also commit `e091df2c8` on `feat/kolibri-model` of
 that tree. The one exception is `models/ggml-vocab-kolibri.gguf`, which the
 fork commits and the patches do not.
 
+> Update: the fork PR was merged with a follow-up, `d5237ac15` "model : kolibri
+> uses the per-layer RoPE frequencies of the K-shift". It initializes the SWA
+> RoPE fields from the model's RoPE values and derives the graph's RoPE
+> parameters through `get_rope_freq_base/scale`. Patch 0007 now includes it;
+> see [Phase 4: router](phase4-router.md#patch-0007-re-exported).
+
 ## Changes (`patches/llama.cpp/0007-kolibri-model.patch`)
 
 | File | Change |
@@ -199,14 +205,12 @@ needs a reference:
 
 ## What stays open
 
-- **Phase 4 items 5, 6, 8 and 9:**
-  - Top-6;
-  - the gating flags;
-  - the routed + shared order against the reference;
-  - callbacks proven useful for debugging.
-- **Item 11:** the vocab GGUF regeneration. `check_arch.py` already expects the
-  model class: its empty probe now gets past the architecture and fails on the
-  missing vocabulary.
+> Update: Top-6, the gating flags, the routed + shared order, the MoE half of
+> the callbacks and the vocab GGUF are done; see
+> [Phase 4: router](phase4-router.md).
+
+- **Phase 4 item 9, attention half:** callbacks proven useful for debugging
+  the attention, which needs the Phase 5/6 reference.
 - **The Phase 4 Definition of Done:** the 50-layer graph. Only the 6-layer
   fixture and the `test-llama-archs` model have run.
 - **Phase 5.** The graph already contains iSWA, RoPE on the SWA layers only and

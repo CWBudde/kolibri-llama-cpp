@@ -14,6 +14,11 @@
 //   - matrices have standard deviation 0.02 instead of 1 (see initScale), so
 //     a forward pass is well-conditioned.
 //
+// With -router it writes the shape and magnitudes of the reference
+// test_routing_semantics instead: 384 experts, top 6, router logits with
+// standard deviation about 3 and a correction bias with standard deviation 5.
+// moe_intermediate_size drops to 16 to keep the 384 experts small.
+//
 // Tensor names and shapes come from internal/kolibri, the same source of
 // truth as the Phase 1 inventory. manifest.json lists every expected GGUF
 // tensor with its ggml shape and its HF sources in stacking order.
@@ -95,25 +100,46 @@ func main() {
 	out := flag.String("out", "", "output directory")
 	tokDir := flag.String("tokenizer-dir", "", "directory with tokenizer.json and tokenizer_config.json (optional)")
 	seed := flag.Uint64("seed", 1, "random seed")
+	router := flag.Bool("router", false, "384 experts, top 6, and the reference router test's magnitudes")
 	flag.Parse()
 	if *out == "" || flag.NArg() != 0 {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := generate(*out, *tokDir, *seed); err != nil {
+	if err := generate(*out, *tokDir, *seed, *router); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func generate(dir, tokDir string, seed uint64) error {
-	cfg, err := kolibri.ParseConfig([]byte(tinyConfig))
+// configJSON returns tinyConfig, or with router its 384-expert variant.
+func configJSON(router bool) ([]byte, error) {
+	if !router {
+		return []byte(tinyConfig), nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(tinyConfig), &m); err != nil {
+		return nil, err
+	}
+	m["num_experts"] = 384
+	m["num_experts_per_tok"] = 6
+	m["moe_intermediate_size"] = 16
+	raw, err := json.MarshalIndent(m, "", "  ")
+	return append(raw, '\n'), err
+}
+
+func generate(dir, tokDir string, seed uint64, router bool) error {
+	raw, err := configJSON(router)
+	if err != nil {
+		return err
+	}
+	cfg, err := kolibri.ParseConfig(raw)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(tinyConfig), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0o644); err != nil {
 		return err
 	}
 	for _, name := range tokenizerFiles {
@@ -137,7 +163,7 @@ func generate(dir, tokDir string, seed uint64) error {
 			return err
 		}
 		shape := cfg.ExpectedShape(e)
-		mean, std := initScale(e.Spec)
+		mean, std := initScale(e.Spec, router)
 		tensors = append(tensors, safetensors.WriteTensor{Name: name, DType: "BF16", Shape: shape, Data: randBF16(rng, shape, mean, std)})
 	}
 	if err := writeFile(filepath.Join(dir, "model.safetensors"), func(w *bufio.Writer) error {
@@ -146,7 +172,7 @@ func generate(dir, tokDir string, seed uint64) error {
 		return err
 	}
 
-	raw, err := json.MarshalIndent(manifest(cfg), "", "  ")
+	raw, err = json.MarshalIndent(manifest(cfg), "", "  ")
 	if err != nil {
 		return err
 	}
@@ -190,8 +216,15 @@ func manifest(cfg *kolibri.Config) []entry {
 // matrices the activations grow and tiny rounding differences flip the
 // top-k routing. The correction bias keeps unit scale, like the real one
 // (sampled ranges about [-7.6, 3.0]), so it decides the routing.
-func initScale(s *kolibri.Spec) (mean, std float64) {
+// With router, the router weights and the bias take the magnitudes of the
+// reference test_routing_semantics: logits with std 3 (3/16 on a unit-RMS
+// input of width 256) and a bias with std 5.
+func initScale(s *kolibri.Spec, router bool) (mean, std float64) {
 	switch {
+	case router && s.Class == "ffn_gate_inp":
+		return 0, 3.0 / 16
+	case router && s.Class == "exp_probs_b":
+		return 0, 5
 	case s.Group == kolibri.GroupBlockNorm || s.Group == kolibri.GroupQKNorm:
 		return 1, 0.1
 	case s.Class == "exp_probs_b":
