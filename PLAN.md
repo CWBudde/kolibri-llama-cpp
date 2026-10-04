@@ -259,29 +259,56 @@ novel MoE implementation.
     without the branch it fails (`ffn_moe_probs_biased-0 <- ffn_moe_probs-0`).
     With all experts active, CPU vs Metal NMSE is 1.7e-6. Numerics against
     the reference stay with the Top-6 and gating items.
--   [ ] Configure Top-6 selection.
--   [ ] Configure sigmoid expert gating; verify whether
+-   [x] Configure Top-6 selection.
+    (2026-10-04) — the count is the GGUF's `expert_used_count`
+    (`num_experts_per_tok`). `tools/gguf/check_moe.py`, on `kolibri-tiny
+    -router` (384 experts, top 6): "ffn_moe_topk is [(100, 6)]" and "selection
+    = top6(logits + bias) at 600/600 token-layers" on CPU and Metal, against a
+    verbatim port of the reference's `sigmoid_logit_add_routing`. Overriding
+    the count to 5 fails the check. See `docs/phase4-router.md`.
+-   [x] Configure sigmoid expert gating; verify whether
     normalization/scaling flags are required.
+    (2026-10-04) — `expert_gating_func` (sigmoid) is a required key;
+    `expert_weights_norm`/`_scale` are optional, with defaults equal to
+    Kolibri's (false / 1.0), and the converter writes them. libllama reads
+    them: overriding norm to true, scale to 2.5 or gating to softmax each
+    fails `check_moe.py`. As converted: "weights = sigmoid(logits[selected]):
+    max abs error 1.2e-07" and "experts weighted with ffn_moe_weights itself
+    (no norm, no scale)".
 -   [x] Add the shared expert path using existing shared-expert
     primitives if compatible.
     (2026-10-04) — `build_ffn` (SiLU, parallel gate), ungated, on the same
     input as the routed experts. The wiring check sees `ffn_out = ffn_moe_out
     + ffn_shexp` in every layer. If the shared expert is loaded but not
     added, the check fails; if it is not loaded, the load fails ("got 93").
--   [ ] Add routed + shared outputs in exactly the reference order.
+-   [x] Add routed + shared outputs in exactly the reference order.
+    (2026-10-04) — `ffn_out = ffn_moe_out + ffn_shexp`, then `post_ffw_norm`,
+    then the residual add, as `Kolibri1SparseMoeBlock` (`shared_output +
+    fused_output`) and `Kolibri1DecoderLayer` do. `check_moe.py` (CPU,
+    float64 reference, all 6 layers): `ffn_out` NMSE 3.0e-14, `ffn_post_norm`
+    3.3e-14, `l_out` 1.7e-14.
 -   [ ] Add graph callbacks/names useful for layer-by-layer debugging.
+    (2026-10-04) — partial: the MoE half is done. `check_moe.py` captures 10
+    named nodes per layer and localizes each MoE step against the reference.
+    The attention names (`Qcur_normed`, `Qcur_rope`, `attn_out`) exist but
+    still need a reference comparison (Phases 5/6).
 -   [x] Remove the `kolibri` skip from `arch_supported()` in
     `tests/test-llama-archs.cpp` (added in Phase 3).
     (2026-10-04) — skip removed; `kolibri` is MoE-only, and the fixture writes
     the SWA and RoPE patterns as arrays. `test-llama-archs -a '^kolibri$'`
     gives 4/4 OK (Metal NMSE 4.7e-07, roundtrip OK), 506 tests in total.
     Without the `moe_mandatory` entry, the row fails.
--   [ ] Regenerate `ggml-vocab-kolibri.gguf` under `MODEL_ARCH.KOLIBRI`
+-   [x] Regenerate `ggml-vocab-kolibri.gguf` under `MODEL_ARCH.KOLIBRI`
     instead of the `qwen3moe` placeholder, and update
     `tools/gguf/check_arch.py`, which expects "unsupported model architecture".
     (2026-10-04) — partial: `check_arch.py` now expects the model class (the
     empty probe gets past the architecture and fails on its missing
     vocabulary). Regenerating the vocab GGUF remains.
+    (2026-10-04) — `tools/tokenizer/vocab_gguf.py` writes it with the
+    converter's Kolibri class: `general.architecture = kolibri` plus the
+    hyperparameters, with tokens, merges and special IDs unchanged (fork
+    commit `1331f3f1b`). `test-tokenizer-0-kolibri` passes, `compare.py`
+    matches on all fuzz sets, and `check_arch.py` passes.
 
 **Definition of Done:** The complete 50-layer unquantized graph builds
 and executes without tensor-shape or unsupported-op errors.
@@ -440,7 +467,8 @@ conventions.
 - [x] Pin the reference to commit `049a6a7bd2405b27d6d280d256bd3d585191c7ae` in project notes/tests.
 - [x] Port the tiny synthetic checkpoint shape from `tests/checkpoints.py` into a llama.cpp conversion/inference fixture. This allows architecture work without downloading 156 GB.
   (2026-10-04) — `cmd/kolibri-tiny`: the reference shape (6 layers SSSSFF, 8 experts), BF16, random norms, the real 128k vocab; plus a manifest of the expected GGUF tensors. `check_tensors.py` converts it; the inference use comes with Phase 4.
-- [ ] Add a standalone router unit test using 384 experts / Top-6 and a non-zero correction bias, matching `test_routing_semantics()` from the official repo.
+- [x] Add a standalone router unit test using 384 experts / Top-6 and a non-zero correction bias, matching `test_routing_semantics()` from the official repo.
+  (2026-10-04) — `tools/gguf/check_moe.py` on `kolibri-tiny -router`: 384 experts, top 6, the reference test's magnitudes (logits std about 3, bias std 5). It checks libllama's selection and weights against the ported reference function, and repeats the test's non-vacuity assert: score-add selects differently at 592/600 token-layers. Without the Kolibri branch, selection matches at 8/600.
 - [ ] Add a tiny 6-layer hybrid-attention fixture so both SWA and full/RNoPE layers execute in one fast test.
 - [x] Make sandwich norms a first-class mapping requirement before any full-checkpoint conversion.
 - [ ] Treat BF16 as the initial source of truth; postpone direct FP8-source support until BF16 logits match.

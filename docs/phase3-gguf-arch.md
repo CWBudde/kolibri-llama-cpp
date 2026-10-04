@@ -78,6 +78,9 @@ For the same reason, `ggml-vocab-kolibri.gguf` keeps the `qwen3moe`
 placeholder architecture. `llama_model_create` runs even with `vocab_only`,
 so a vocab GGUF that declares `kolibri` does not load before Phase 4.
 
+> Update: the vocab GGUF is now written under `kolibri`; see
+> [Phase 4: router](phase4-router.md#vocab-gguf-under-kolibri-item-11).
+
 ## Check
 
 `tools/gguf/check_arch.py --llama-cpp third_party/llama.cpp` exits non-zero on
