@@ -154,8 +154,10 @@ is left needs the 156 GB BF16 checkpoint.
 -   [x] Build and execute the complete 50-layer unquantized graph.
     (2026-10-04) — BF16 GGUF, CPU-only (`-dev none`), greedy: "The capital of
     Germany is Berlin.", "1.45 tokens per second". Metal with `--cpu-moe`
-    crashes with SIGBUS for files above the Metal working set (generic
-    ggml-metal; README "Known upstream issues").
+    crashed with SIGBUS for files above the Metal working set; patch 0009
+    (2026-10-05) maps only the file ranges of each backend's tensors, and
+    Q8_0 and BF16 now run with `-ngl 99 --cpu-moe`, though no faster than
+    CPU-only ([docs/real-checkpoint.md](docs/real-checkpoint.md)).
 
 **Definition of Done:** A structurally correct unquantized GGUF is
 produced reproducibly, and the complete 50-layer unquantized graph builds
@@ -332,7 +334,7 @@ conventions.
 ## Immediate implementation tasks derived from the repository audit
 
 - [ ] Treat BF16 as the initial source of truth; postpone direct FP8-source support until BF16 logits match.
-- [ ] Report the upstream llama.cpp issues found along the way (invalid UTF-8 aborting `llama_tokenize`, overlong decoding, two test-tooling bugs, Metal `--cpu-moe` SIGBUS above the working set); see README "Known upstream issues", [docs/tokenizer.md](docs/tokenizer.md) and [docs/real-checkpoint.md](docs/real-checkpoint.md).
+- [ ] Report the upstream llama.cpp issues found along the way (invalid UTF-8 aborting `llama_tokenize`, overlong decoding, two test-tooling bugs, Metal `--cpu-moe` SIGBUS above the working set, fixed here by patch 0009); see README "Known upstream issues", [docs/tokenizer.md](docs/tokenizer.md) and [docs/real-checkpoint.md](docs/real-checkpoint.md).
 
 ## First actionable milestone
 
