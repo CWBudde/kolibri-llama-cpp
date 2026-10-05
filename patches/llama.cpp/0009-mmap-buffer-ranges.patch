@@ -104,7 +104,7 @@ index 9e51d0ce7..4d1d5b53a 100644
      // release a weight's mmap pages
      void unmap_weight(const llama_tensor_weight & w) const;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 83c8c7942..39df37553 100644
+index 83c8c7942..a15984663 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -38,6 +38,7 @@
@@ -115,7 +115,7 @@ index 83c8c7942..39df37553 100644
  #include <vector>
  
  static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
-@@ -1862,19 +1863,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1862,19 +1863,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                  // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
                  //     then we could just use metal for all layers
                  // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
@@ -125,8 +125,7 @@ index 83c8c7942..39df37553 100644
 -                if (first >= last) {
 -                    continue;
 -                }
-+                // the tensors of one context can be spread over the whole file, e.g. with the MoE experts kept on the CPU,
-+                //     so each run of nearby tensors gets its own buffer, and the gaps between them stay unmapped
++                // the tensors of one context can spread over the whole file (e.g. MoE experts kept on the CPU), so map each run of nearby tensors as its own buffer
 +                const size_t max_gap = 16u*1024*1024;
                  const size_t max_size = ggml_get_max_tensor_size(ctx);
 -                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
@@ -146,7 +145,7 @@ index 83c8c7942..39df37553 100644
              }
          } else {
              ggml_backend_buffer_t buf;
-@@ -1928,11 +1929,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1928,11 +1928,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
      }
  

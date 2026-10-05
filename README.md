@@ -225,5 +225,6 @@ which is in [docs/real-checkpoint.md](docs/real-checkpoint.md).
   matmul (`ggml_compute_forward_mul_mat_id`) then dies with SIGBUS
   (`KERN_PROTECTION_FAILURE`); the 79 GiB Q8_0 and 149 GiB BF16 files crash.
   The generic fix is patch 0009 (`0009-mmap-buffer-ranges.patch`), which
-  maps only the ranges that hold a backend's tensors. It is not yet proposed
-  upstream.
+  maps only the ranges that hold a backend's tensors. On the fork it is
+  [CWBudde/llama.cpp#10](https://github.com/CWBudde/llama.cpp/pull/10); it is
+  not yet proposed to ggml-org/llama.cpp.
