@@ -210,6 +210,15 @@ and executes without tensor-shape or unsupported-op errors.
     6th and 7th router scores within 0.01, so BF16 tolerances must allow
     expert flips.
 
+### Cross-implementation validation ideas
+
+Use independent community work only as a source of test ideas, not implementation code. All pass/fail decisions remain anchored to Aleph Alpha's pinned reference.
+
+-   [ ] Reproduce a larger fixed tokenizer case set independently and record exact token-ID agreement.
+-   [ ] Add a compact router probe that records logits, Top-1, Top-6 set overlap and near-tie margins per token/layer.
+-   [ ] Keep a small end-to-end corpus whose BF16 reference artifacts can be rerun after upstream llama.cpp changes.
+-   [ ] For every retained quantization, emit the same summary row: perplexity, KLD, same-top-token rate, Top-1 router agreement and Top-6 overlap.
+
 **Hard gate:** Do not diagnose quantization quality until the
 unquantized implementation passes this phase.
 
@@ -307,6 +316,21 @@ For each candidate:
 -   [ ] Expand context only if memory headroom permits.
 -   [ ] Test sustained generation and memory pressure.
 -   [ ] Compare quality and Top-6 routing agreement with BF16.
+-   [ ] Add an expert-locality workload suite with fixed, reproducible prompt/tool traces for four representative scenarios:
+    - coding tasks (including tasks outside Kolibri's expected strengths),
+    - research-heavy web workflows with repeated tool/result turns,
+    - HR tool use modelled on a Personio-style employee-data API workflow,
+    - MedTech QM/regulatory work with long standards/regulatory context and document-oriented questions.
+-   [ ] For each workload and per layer, record cumulative unique-expert coverage at fixed token counts, expert activation frequency, Top-N share, usage entropy/Gini, reuse distance and the fraction of experts never selected.
+-   [ ] Replay the recorded expert-selection traces through simulated LRU caches of several sizes and report hit rate, miss rate and estimated expert bytes loaded per token. Keep this simulation separate from the later real streaming benchmark so cache-policy questions can be answered before implementing I/O.
+-   [ ] Benchmark resident Metal inference against streamed/offloaded expert
+    execution using the same quantization, prompt corpus and context lengths.
+    Record prompt-processing and generation tokens/s, peak unified memory,
+    host/Metal buffer use, bytes transferred per generated token and, where
+    measurable, expert-cache hit rate. This should distinguish the cost of
+    keeping the quantized experts resident from exploiting Kolibri's sparse
+    Top-6-of-384 expert activation.
+
 
 **Target:** Prefer a configuration that leaves several GB of unified
 memory headroom rather than merely loading successfully.
