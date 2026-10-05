@@ -132,7 +132,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. `check_long.py` does the same for the attention at 8k, 16k, 64k and 262k tokens, on sampled positions. `check_real.py` checks a GGUF converted from the real BF16 checkpoint against the inventory: shard hashes, tensor set, shapes, dtypes and bit-exact data. |
 | `tools/quant/` | `calibration.py` builds the imatrix calibration text from English wikitext, German Wikipedia and source code, so the imatrix reaches the experts that English text alone leaves without data. |
 | `tools/chat/` | `check_chat.py` checks the chat template in the GGUFs and in llama-server, compares llama-server's rendered prompts with the reference renderer for every reasoning mode and tool-call shape, and checks the stop tokens. |
-| `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. |
+| `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. 0009 is a generic llama.cpp fix, not Kolibri code: it lets Metal run with `--cpu-moe` on files above the Metal working set. |
 | `docs/` | Reference docs per topic (checkpoint, tokenizer, conversion, model, attention, chat, real checkpoint), with findings, pitfalls and reproduction steps. |
 
 ## Setup
@@ -208,9 +208,9 @@ Network access:
 
 ## Known upstream issues
 
-These belong upstream, not in the Kolibri patches. Details are in
-[docs/tokenizer.md](docs/tokenizer.md), except the last, which is in
-[docs/real-checkpoint.md](docs/real-checkpoint.md).
+These belong upstream. Only the last has a fix here, as a generic patch.
+Details are in [docs/tokenizer.md](docs/tokenizer.md), except the last,
+which is in [docs/real-checkpoint.md](docs/real-checkpoint.md).
 
 - **Invalid UTF-8 can crash `llama_tokenize`.** Some inputs abort the whole
   process, for example the 4 bytes `F4 90 80 80` (U+110000). This affects
@@ -219,7 +219,12 @@ These belong upstream, not in the Kolibri patches. Details are in
   - its `LibLlamaModel` uses the pre-`llama_vocab` API;
   - under transformers 5 its word lists collapse into one string.
 - **Metal with `--cpu-moe` crashes on files larger than the Metal working set.**
-  The mmap'd GGUF is wrapped in no-copy Metal buffers, and the CPU expert
+  Upstream wraps one mmap range per backend, from its first tensor to its
+  last. With `--cpu-moe` that range covers nearly the whole file, so Metal
+  maps and requests residency for the routed experts too. The CPU expert
   matmul (`ggml_compute_forward_mul_mat_id`) then dies with SIGBUS
-  (`KERN_PROTECTION_FAILURE`). A 33.7 GiB file runs; the 79 GiB Q8_0 and
-  149 GiB BF16 files crash. CPU-only runs are unaffected.
+  (`KERN_PROTECTION_FAILURE`); the 79 GiB Q8_0 and 149 GiB BF16 files crash.
+  The generic fix is patch 0009 (`0009-mmap-buffer-ranges.patch`), which
+  maps only the ranges that hold a backend's tensors. On the fork it is
+  [CWBudde/llama.cpp#10](https://github.com/CWBudde/llama.cpp/pull/10); it is
+  not yet proposed to ggml-org/llama.cpp.

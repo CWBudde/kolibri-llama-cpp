@@ -136,10 +136,13 @@ prompt eval time =    7598.19 ms /     5 tokens ( 1519.64 ms per token,     0.66
   6 experts per layer, about 2.4 GB of expert weights. The OS page cache serves
   the experts it holds, and the SSD the rest.
 
-### Metal with `--cpu-moe` crashes with SIGBUS
+### Streaming the routed experts with `--cpu-moe`
 
-`-ngl 99 --cpu-moe` on the BF16 GGUF puts attention and the shared expert on
-Metal and keeps the routed experts on the CPU. It dies in the warmup decode:
+`-ngl 99 --cpu-moe` puts attention, the router and the shared expert on
+Metal. The routed experts stay on the CPU and are read on demand from the
+memory-mapped file. Without patch 0009 this dies in the warmup decode for
+every file above the Metal working set. The numbers with the patch are from
+fork commit `6d51eaf70`.
 
 ```text
 EXC_BAD_ACCESS (SIGBUS) KERN_PROTECTION_FAILURE
@@ -149,23 +152,89 @@ libllama      llama_context::decode
 libllama-common common_init_from_params
 ```
 
-Before the crash, Metal warns that its allocation exceeds the recommended
-working set. With mmap, `ggml-metal-device.m` wraps the whole mapped file in
-no-copy shared buffers (`newBufferWithBytesNoCopy`). Here that file is
-156 GB, against a working set of 37 GiB. The CPU then faults reading expert
-pages in the same mapping.
-
-The crash follows the file size, not the weight type:
-
-| GGUF | Size | `-ngl 99 --cpu-moe` |
+| GGUF | Size | `-ngl 99 --cpu-moe` without 0009 |
 |---|---|---|
 | Q3_K experts, rest Q8_0 | 33,717 MiB | runs, 17.6 tokens/s |
 | Q8_0 (with `--no-repack`) | 79,279 MiB | SIGBUS (exit 138) |
 | BF16 | 149,065 MiB | SIGBUS (exit 138) |
 
-CPU-only (`-dev none`) runs both large files fine. This is generic ggml-metal
-behaviour, not Kolibri code. It matters only for models larger than the Metal
-working set, and the quantized model that fits has no need for `--cpu-moe`.
+**Cause.** With mmap, llama.cpp gave each backend one buffer over the file
+range from its first tensor to its last. The Metal tensors sit in all 50
+layers, so the Metal range covered nearly the whole file, routed experts
+included. Two steps follow:
+
+- `ggml-metal-device.m` wraps that range in no-copy shared buffers
+  (`newBufferWithBytesNoCopy`).
+- A background thread requests residency for those buffers every 5 ms.
+
+Above the working set of 37 GiB, the CPU then faults on expert pages of the
+same mapping. With `GGML_METAL_NO_RESIDENCY=1` the Q8_0 run survives, at
+57 seconds per token.
+
+**Fix (patch 0009).** `get_mapping_ranges` splits a context's tensors into
+runs of nearby tensors, merging gaps up to 16 MiB, and each run gets its own
+buffer. The expert blocks between the runs stay outside every Metal buffer:
+
+| GGUF, flags | `MTL0_Mapped` without 0009 | with 0009 |
+|---|---|---|
+| Q8_0, `-ngl 99 --cpu-moe --no-repack` | nearly the whole 79 GiB file | 2,447 MiB in 152 buffers |
+| BF16, `-ngl 99 --cpu-moe` | nearly the whole 149 GiB file | 4,440 MiB in 52 buffers |
+| IQ3_XXS/IQ4_XS, `-ngl 99` | 33,904 MiB | 33,572 MiB in 2 buffers |
+
+- Both large files now run. Q8_0 and BF16 answer "Berlin".
+- The model that fits keeps its speed: `llama-bench` measures 1,347 / 63.7
+  tokens/s (pp512 / tg128), against 1,351 / 64.0 before.
+- Its 332 MiB token embeddings, which stay on the CPU, are no longer wrapped
+  by Metal as well.
+- The tiny-fixture checks (`check_model.py`, `check_moe.py`, `check_attn.py`)
+  and llama.cpp's 43 `ctest` tests pass.
+
+**Speed: streaming works, but Metal adds little.** Q8_0 with `--no-repack`,
+10 threads, a 21-token prompt and 128 greedy tokens:
+
+| Setup | Prompt tokens/s | Generation tokens/s |
+|---|---|---|
+| CPU only (`-dev none`) | 4.81 | 10.36 |
+| Metal, `--n-cpu-moe 50` (= `--cpu-moe`) | 4.82 | 9.49 |
+| Metal, `--n-cpu-moe 40` (10 layers of experts on Metal) | 4.73 | 11.25 |
+| Metal, `--n-cpu-moe 35` (15 layers) | 4.06 | 11.29 |
+
+- **Why so little:** the routed experts are 96.7% of the weights. The CPU
+  reads and multiplies them either way. Moving the rest to Metal saves
+  little and adds two CPU/GPU handoffs per layer.
+- **`llama-bench` agrees:** pp512 is 52.8 tokens/s CPU-only and 28.0 with
+  `--n-cpu-moe 50`, both with `-t 10`.
+- **BF16:** 2.07 tokens/s with `-ngl 99 --cpu-moe` and 2.50 CPU-only, both
+  with `-t 10` and 32 tokens.
+- **Partial offload:** experts on Metal for 10 to 15 layers gain about 9%.
+  That is within the run-to-run spread of the page cache, so these are single
+  runs, not a ranking.
+- **Thread count:** use `-t 10`. The default of 5 threads (the performance
+  cores) gives CPU-only Q8_0 15.0 instead of 20.9 tokens/s in `llama-bench`
+  tg32.
+- **`--no-repack` is required** for Q8_0 with `--cpu-moe`. Otherwise the CPU
+  experts land in the repack buffer, a 77 GB copy in RAM.
+
+`llama-server -m Kolibri-1-Q8_0.gguf -ngl 99 --cpu-moe --no-repack -t 10
+--jinja` answers "What is 17 * 23?" (`reasoning_effort: "none"`) with "391".
+It answers the German sky question in two sentences close to the Q3_K mix's
+answer below ("Da die Atmosphäre das blaue Licht stärker streut als andere
+Farben, erscheint der Himmel blau."), at 10.1 tokens/s over 479 tokens.
+
+The split across backends changes no result materially. KLD against this
+port's BF16, on the same 20 × 512 tokens as in "Quantization loss" below:
+
+| Q8_0 run | Mean KLD | 99% KLD | Same top token | PPL(Q)/PPL(base) |
+|---|---|---|---|---|
+| CPU, `--no-repack` | 0.050 ± 0.005 | 0.76 | 92.5 ± 0.4% | 1.003 ± 0.005 |
+| Metal, `--cpu-moe --no-repack -t 10 -ub 2048` | 0.055 ± 0.005 | 1.06 | 92.4 ± 0.4% | 0.999 ± 0.005 |
+
+The small rise fits the Metal near-tie note in PLAN Phase 6: the router runs
+on Metal here.
+
+For a 48 GB Mac, `--cpu-moe` streaming therefore makes Q8_0 and BF16 usable
+next to the CPU-only runs, but not faster. The quantized model that fits on
+Metal stays about six times faster.
 
 ## Quantization
 
