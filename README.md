@@ -45,7 +45,9 @@ See [`PLAN.md`](PLAN.md) for the full plan.
   needs only a name registration with "no BOS token":
   - 85 golden cases match the HF `tokenizers` reference;
   - about 1.35 million differential fuzz strings match as well, both token
-    IDs and detokenized bytes.
+    IDs and detokenized bytes;
+  - so does a fixed corpus of 10,673 English, German and code cases
+    (1.27 million tokens).
 - **The `kolibri` architecture is registered.** It is known to gguf-py and
   libllama.
 - **The converter writes the GGUF metadata.** `convert_hf_to_gguf.py` knows
@@ -128,7 +130,8 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `internal/` | Hugging Face client, safetensors header parser and writer, and the Kolibri tensor specs. `internal/kolibri/tensors.go` is the source of truth for the HF → GGUF mapping. |
 | `inventory/{bf16,fp8}/` | Committed inventories: `summary.json` and `tensors.jsonl.gz`. They pin the model revisions and the sha256 of every file. |
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
-| `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
+| `testdata/tokenizer/corpus.json` | Manifest of the fixed tokenizer corpus: sha256 of each text file, number of cases, token count and sha256 of the reference IDs. |
+| `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8, fixed corpus), vocab-only GGUF writer, pinned Python requirements. |
 | `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. `check_long.py` does the same for the attention at 8k, 16k, 64k and 262k tokens, on sampled positions. `check_real.py` checks a GGUF converted from the real BF16 checkpoint against the inventory: shard hashes, tensor set, shapes, dtypes and bit-exact data. |
 | `tools/ref/` | `kolibri_ref.py` is a whole-model forward in torch, ported from the reference's vLLM model code, that reads a Kolibri GGUF. `compare_real.py` validates it against libllama on the tiny fixture, then compares libllama with it on the real BF16 GGUF, layer by layer, on the CPU and with `--metal` on the GPU. `router_probe.py` records router logits, Top-1, Top-6 overlap and near-tie margins per token and layer. |
 | `tools/quant/` | `calibration.py` builds the imatrix calibration text from English wikitext, German Wikipedia and source code, so the imatrix reaches the experts that English text alone leaves without data. |
@@ -175,7 +178,7 @@ go vet ./... && go test ./...
 .venv/bin/python tools/tokenizer/vocab_gguf.py --llama-cpp third_party/llama.cpp \
     --out third_party/llama.cpp/models/ggml-vocab-kolibri.gguf
 .venv/bin/python tools/tokenizer/compare.py --llama-cpp third_party/llama.cpp \
-    --vocab third_party/llama.cpp/models/ggml-vocab-kolibri.gguf  # golden + fuzz + UTF-8 report
+    --vocab third_party/llama.cpp/models/ggml-vocab-kolibri.gguf  # golden + fuzz + UTF-8 report + corpus (skipped without ~/models/eval)
 .venv/bin/python tools/gguf/check_arch.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_metadata.py --llama-cpp third_party/llama.cpp
 .venv/bin/python tools/gguf/check_tensors.py --llama-cpp third_party/llama.cpp

@@ -12,7 +12,9 @@ Token IDs match the reference tokenizer on:
 - all 85 golden cases;
 - the 46 upstream test strings;
 - every vocab entry;
-- about 1.35 million differential fuzz strings.
+- about 1.35 million differential fuzz strings;
+- a fixed corpus of 10,673 cases (1,271,044 reference tokens) cut from
+  English, German and code text.
 
 Detokenization reproduces the input byte for byte.
 
@@ -142,6 +144,8 @@ reference decode. For every case the decode equals the input.
 | fuzz: added tokens with whitespace around them / random sequences of 500 added tokens | 25,088 / 10,000 identical |
 | fuzz: random texts from `random_chars`, `random_unicodes` and `random_vocab_chars` (1,024 vocab characters each) | 10,000 + 10,000 + 10,000 identical |
 | fuzz: `random_vocab_words`: every stripped vocab word, plus 5,000 texts of 300–400 random word groups | 132,193 identical |
+| corpus: wikitext-2 `wiki.test.raw`, English (lines, paragraphs, whole file) | 4,212 identical (887,355 tokens) |
+| corpus: imatrix calibration text, English, German and code (lines, paragraphs, whole file) | 6,461 identical (383,689 tokens) |
 
 Each count is a number of strings. A string passes only if llama.cpp produces
 the reference IDs **and** detokenizing those IDs gives back the input bytes. As
@@ -149,6 +153,52 @@ a negative control, the same runner on another BPE vocab (`ggml-vocab-qwen2.gguf
 fails on the first golden case and exits with status 1.
 
 The patch also leaves the other 15 `test-tokenizer-0-*` tests passing.
+
+### Fixed corpus
+
+The fuzz strings are random and the golden cases short. The corpus check
+(`compare.py --only corpus`) adds a large, fixed case set of natural text. It
+uses the two files the real-checkpoint evaluation already pins:
+
+- `~/models/eval/wikitext-2-raw/wiki.test.raw`: English, the KLD evaluation
+  text;
+- `~/models/eval/kolibri-calibration.txt`: about 45% English, 35% German and
+  20% code, built by `tools/quant/calibration.py`
+  ([docs/real-checkpoint.md](real-checkpoint.md)).
+
+Each file gives three kinds of cases: every non-blank line with its newline,
+every paragraph between blank lines, and the whole file as one input, up to
+887,355 tokens. The set was built for this repo, not copied from another
+port.
+
+`testdata/tokenizer/corpus.json` records per file:
+
+- the sha256 of the text;
+- the number of cases;
+- the reference token count;
+- the sha256 of the reference IDs.
+
+The run therefore fails in three cases:
+- llama.cpp disagrees with the reference;
+- the text differs from the pinned file;
+- the reference tokenizer itself changes.
+
+The texts and IDs stay out of the repo, and wikitext is CC BY-SA. A missing file
+is reported as `SKIP`. `--write-manifest` records new files.
+
+```
+corpus/wiki.test.raw: 4212/4212 ok (0.8s)
+  4212 cases, 887355 reference tokens, reference IDs sha256 13b4024dd14c2645…
+corpus/kolibri-calibration.txt: 6461/6461 ok (0.3s)
+  6461 cases, 383689 reference tokens, reference IDs sha256 82d14181b7d55f98…
+```
+
+Negative controls:
+- Set `tokenizer.ggml.pre` from `kolibri` to `default` in a copy of the vocab
+  GGUF. That gives a different split regex and `clean_spaces`. The run then
+  passes only `corpus/wiki.test.raw: 129/4212 ok` and exits with status 1.
+- Change one digit of an `ids_sha256` in the manifest. The run then fails with
+  `FAIL wiki.test.raw: ids_sha256 13b4… (manifest 03b4…)`.
 
 ### Invalid UTF-8
 
@@ -236,6 +286,10 @@ VIRTUAL_ENV=.venv uv pip install --index-strategy unsafe-best-match -r tools/tok
 third_party/llama.cpp/build/bin/test-tokenizer-0 third_party/llama.cpp/models/ggml-vocab-kolibri.gguf
 .venv/bin/python tools/tokenizer/compare.py --llama-cpp third_party/llama.cpp \
     --vocab third_party/llama.cpp/models/ggml-vocab-kolibri.gguf --iterations 10000
+# the fixed corpus alone (the default run includes it when the files exist)
+.venv/bin/python tools/tokenizer/compare.py --llama-cpp third_party/llama.cpp \
+    --vocab third_party/llama.cpp/models/ggml-vocab-kolibri.gguf --only corpus \
+    --corpus ~/models/eval/wikitext-2-raw/wiki.test.raw --corpus ~/models/eval/kolibri-calibration.txt
 ```
 
 The tools download only `config.json`, `tokenizer.json` and
