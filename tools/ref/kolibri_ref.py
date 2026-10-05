@@ -128,8 +128,8 @@ def swiglu(p: Precision, x, w_gate, w_up, w_down):
 def forward(W: Weights, tokens: list[int], dtype: str = "float32", dump: dict | None = None):
     """Logits [len(tokens), n_vocab] as float32. dump, if given, receives per layer the
     libllama-named activations attn_post_norm-il, ffn_moe_out-il, ffn_shexp-il, l_out-il
-    ([n_tokens, n_embd]), the selected experts ffn_moe_topk-il ([n_tokens, k]), the selection
-    scores router_sel-il (logits + bias, [n_tokens, n_expert]) and kv_absmax-il (max |k|, max |v|)."""
+    ([n_tokens, n_embd]), the selected experts ffn_moe_topk-il ([n_tokens, k]), the F32 router
+    logits ffn_moe_logits-il ([n_tokens, n_expert], before the bias) and kv_absmax-il (max |k|, max |v|)."""
     import torch
 
     p = Precision(dtype)
@@ -182,7 +182,7 @@ def forward(W: Weights, tokens: list[int], dtype: str = "float32", dump: dict | 
             dump[f"ffn_shexp-{il}"] = shexp.float().numpy()
             dump[f"l_out-{il}"] = h.float().numpy()
             dump[f"ffn_moe_topk-{il}"] = topk.numpy()
-            dump[f"router_sel-{il}"] = (logits + W.get(blk + "exp_probs_b.bias")).numpy()
+            dump[f"ffn_moe_logits-{il}"] = logits.float().numpy()
             dump[f"kv_absmax-{il}"] = torch.stack([k.abs().max(), v.abs().max()]).float().numpy()
 
     x = rms_norm(p, h, W.get("output_norm.weight"), W.eps)
