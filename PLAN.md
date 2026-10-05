@@ -210,6 +210,15 @@ and executes without tensor-shape or unsupported-op errors.
     6th and 7th router scores within 0.01, so BF16 tolerances must allow
     expert flips.
 
+### Cross-implementation validation ideas
+
+Use independent community work only as a source of test ideas, not implementation code. All pass/fail decisions remain anchored to Aleph Alpha's pinned reference.
+
+-   [ ] Reproduce a larger fixed tokenizer case set independently and record exact token-ID agreement.
+-   [ ] Add a compact router probe that records logits, Top-1, Top-6 set overlap and near-tie margins per token/layer.
+-   [ ] Keep a small end-to-end corpus whose BF16 reference artifacts can be rerun after upstream llama.cpp changes.
+-   [ ] For every retained quantization, emit the same summary row: perplexity, KLD, same-top-token rate, Top-1 router agreement and Top-6 overlap.
+
 **Hard gate:** Do not diagnose quantization quality until the
 unquantized implementation passes this phase.
 
