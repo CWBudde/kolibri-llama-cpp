@@ -316,6 +316,14 @@ For each candidate:
 -   [ ] Expand context only if memory headroom permits.
 -   [ ] Test sustained generation and memory pressure.
 -   [ ] Compare quality and Top-6 routing agreement with BF16.
+-   [ ] Benchmark resident Metal inference against streamed/offloaded expert
+    execution using the same quantization, prompt corpus and context lengths.
+    Record prompt-processing and generation tokens/s, peak unified memory,
+    host/Metal buffer use, bytes transferred per generated token and, where
+    measurable, expert-cache hit rate. This should distinguish the cost of
+    keeping the quantized experts resident from exploiting Kolibri's sparse
+    Top-6-of-384 expert activation.
+
 
 **Target:** Prefer a configuration that leaves several GB of unified
 memory headroom rather than merely loading successfully.
