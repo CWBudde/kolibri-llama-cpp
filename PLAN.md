@@ -125,6 +125,9 @@ below except the last bullet is checked on tiny synthetic checkpoints
     suitable hardware.
 -   [ ] Save a small deterministic reference corpus: token IDs, selected
     logits, generated tokens, and sampling settings.
+-   [ ] Extend the deterministic corpus with tokenizer edge cases (special
+    tokens, Unicode, whitespace, code, German/English text) and keep exact
+    token-ID/round-trip agreement as a regression gate.
 -   [ ] Use deterministic/greedy decoding for numerical validation
     before testing recommended sampling (`temperature=1.0`,
     `top_p=0.97`, `top_k=128`).
@@ -171,6 +174,11 @@ and executes without tensor-shape or unsupported-op errors.
 -   [ ] Compare attention output for one SWA layer.
 -   [ ] Compare attention output for one full layer.
 -   [ ] Compare router logits/probabilities and selected expert IDs.
+-   [ ] Report router agreement explicitly: Top-1 agreement, Top-6 set
+    agreement/overlap, and the rate of selection changes at near-ties.
+-   [ ] Report KL divergence for comparable output distributions alongside
+    NMSE/top-token agreement, so small numerical drift can be separated from
+    behavior-changing drift.
 -   [ ] Repeat the expert-ID comparison on Metal: its F32 matmul uses
     half-precision tiles (router logits off by a relative RMS of about
     4e-4), so Top-6 near-ties may pick different experts than vLLM. Decide
@@ -205,8 +213,13 @@ and executes without tensor-shape or unsupported-op errors.
 **Hard gate:** Do not diagnose quantization quality until the
 unquantized implementation passes this phase.
 
+-   [ ] Turn a compact subset of tokenizer, attention, router/expert,
+    layer-output and final-logit reference cases into an automated regression
+    suite that can be rerun after llama.cpp/upstream changes.
+
 **Definition of Done:** llama.cpp BF16/F16 inference is numerically
-consistent with the reference within documented tolerances.
+consistent with the reference within documented tolerances, with the key
+agreement metrics captured by repeatable regression tests.
 
 ## Phase 7 --- Quantization strategy
 
@@ -250,7 +263,10 @@ producing a generic Q4.
     Router agreement, task outputs and any judgment of quality wait for the
     Phase 6 gate.
 -   [ ] Specifically measure how often quantization changes Top-6 expert
-    selection.
+    selection, using the same Top-1/Top-6 agreement metrics as Phase 6.
+-   [ ] Run the same fixed evaluation corpus across BF16 and each retained
+    Q8/Q6/Q5/Q4/Q3 candidate and record KLD, top-token agreement, router
+    agreement and perplexity/task outputs in one comparable matrix.
 -   [ ] Explain why Q8_0 against BF16 reaches KLD 0.050 with 92.5% same top
     token on the same backend (CPU), about 50 times a dense model's Q8_0.
     The suspect is Top-6 flips at router near-ties. Investigate after
