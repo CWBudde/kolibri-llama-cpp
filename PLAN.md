@@ -316,6 +316,13 @@ For each candidate:
 -   [ ] Expand context only if memory headroom permits.
 -   [ ] Test sustained generation and memory pressure.
 -   [ ] Compare quality and Top-6 routing agreement with BF16.
+-   [ ] Add an expert-locality workload suite with fixed, reproducible prompt/tool traces for four representative scenarios:
+    - coding tasks (including tasks outside Kolibri's expected strengths),
+    - research-heavy web workflows with repeated tool/result turns,
+    - HR tool use modelled on a Personio-style employee-data API workflow,
+    - MedTech QM/regulatory work with long standards/regulatory context and document-oriented questions.
+-   [ ] For each workload and per layer, record cumulative unique-expert coverage at fixed token counts, expert activation frequency, Top-N share, usage entropy/Gini, reuse distance and the fraction of experts never selected.
+-   [ ] Replay the recorded expert-selection traces through simulated LRU caches of several sizes and report hit rate, miss rate and estimated expert bytes loaded per token. Keep this simulation separate from the later real streaming benchmark so cache-policy questions can be answered before implementing I/O.
 -   [ ] Benchmark resident Metal inference against streamed/offloaded expert
     execution using the same quantization, prompt corpus and context lengths.
     Record prompt-processing and generation tokens/s, peak unified memory,
