@@ -134,44 +134,52 @@ def node_lines(got: dict, ref: dict, W: Weights) -> list[tuple[float, str]]:
     """The PLAN Phase 6 nodes, each as (worst NMSE, text): the token embeddings; in the first sliding
     and the first full layer, Q and K after the QK norm, the attention output before (attn_out) and
     after (attn_post_norm) its sandwich norm, and the routed (ffn_moe_out) and shared (ffn_shexp) expert
-    output; and the worst layer of the routed and shared expert output among the layers that still
-    have such tokens. A layer's NMSE counts only the tokens whose experts agree in that layer and in
-    every earlier one; NaN if there are none."""
+    output; and the worst layer of the routed and shared expert output.
+
+    A node counts only the tokens whose experts agree in every layer it depends on: the earlier
+    layers for Q, K, the attention output and the shared expert, which a layer computes before its
+    router, and this layer too for the routed expert output. NaN if there are none; the worst layer
+    skips such layers."""
     import numpy as np
 
     def worst(*vals) -> float:
         return float(np.max(vals))  # NaN if any is NaN
 
+    def err(node: str, il: int, mask) -> float:
+        return nmse(ref[f"{node}-{il}"][mask], got[f"{node}-{il}"][mask]) if mask.any() else float("nan")
+
     v = nmse(ref[EMBD], got[EMBD])
     lines = [(v, f"token embeddings (embd): NMSE {v:.2e}")]
     first = {"sliding": next(il for il in range(W.n_layer) if W.is_swa[il]),
              "full": next(il for il in range(W.n_layer) if not W.is_swa[il])}
-    ok, top, last = None, {"ffn_moe_out": (float("nan"), -1), "ffn_shexp": (float("nan"), -1)}, -1
+    n = len(got[EMBD])
+    before = np.ones(n, dtype=bool)  # the same experts in every earlier layer
+    top = {"ffn_moe_out": (float("nan"), -1), "ffn_shexp": (float("nan"), -1)}
     for il in range(W.n_layer):
-        same = same_experts(got[f"ffn_moe_topk-{il}"], ref[f"ffn_moe_topk-{il}"])
-        ok = same if ok is None else ok & same
-        e = {node: nmse(ref[f"{node}-{il}"][ok], got[f"{node}-{il}"][ok]) if ok.any() else float("nan")
-             for node in NODES}
-        if ok.any():
-            last = il
-            for node, (val, _) in top.items():
-                if not e[node] <= val:  # the larger, or the first layer
-                    top[node] = (e[node], il)
+        through = before & same_experts(got[f"ffn_moe_topk-{il}"], ref[f"ffn_moe_topk-{il}"])
+        e = {node: err(node, il, before) for node in ("Qcur_normed", "Kcur_normed", "attn_out", "attn_post_norm",
+                                                      "ffn_shexp")}
+        e["ffn_moe_out"] = err("ffn_moe_out", il, through)
+        for node, (val, _) in top.items():
+            if not e[node] <= val and not np.isnan(e[node]):  # the larger, or the first layer
+                top[node] = (e[node], il)
         for kind, fil in first.items():
             if il != fil:
                 continue
-            where = f"layer {il} ({kind} attention, {int(ok.sum())} of {len(ok)} tokens on the same experts)"
+            nb, nt = int(before.sum()), int(through.sum())
             lines.append((worst(e["Qcur_normed"], e["Kcur_normed"], e["attn_out"], e["attn_post_norm"]),
-                          f"{where}: NMSE Q after QK norm {e['Qcur_normed']:.2e}, K after QK norm "
-                          f"{e['Kcur_normed']:.2e}, attention output attn_out {e['attn_out']:.2e}, "
-                          f"attn_post_norm {e['attn_post_norm']:.2e}"))
+                          f"layer {il} ({kind} attention), {nb} of {n} tokens on the same experts before it: NMSE "
+                          f"Q after QK norm {e['Qcur_normed']:.2e}, K after QK norm {e['Kcur_normed']:.2e}, "
+                          f"attention output attn_out {e['attn_out']:.2e}, attn_post_norm {e['attn_post_norm']:.2e}"))
             lines.append((worst(e["ffn_moe_out"], e["ffn_shexp"]),
-                          f"{where}: NMSE routed expert output ffn_moe_out {e['ffn_moe_out']:.2e}, shared "
-                          f"expert output ffn_shexp {e['ffn_shexp']:.2e}"))
+                          f"layer {il} ({kind} attention): NMSE routed expert output ffn_moe_out "
+                          f"{e['ffn_moe_out']:.2e} ({nt} tokens on the same experts up to this layer), shared "
+                          f"expert output ffn_shexp {e['ffn_shexp']:.2e} ({nb} tokens, before it)"))
+        before = through
     (moe, moe_il), (sh, sh_il) = top["ffn_moe_out"], top["ffn_shexp"]
-    lines.append((worst(moe, sh), f"worst layer of 0 to {last} (the layers with tokens on the same experts): NMSE "
-                                  f"routed expert output ffn_moe_out {moe:.2e} (layer {moe_il}), shared expert "
-                                  f"output ffn_shexp {sh:.2e} (layer {sh_il})"))
+    lines.append((worst(moe, sh), f"worst layer with tokens on the same experts: NMSE routed expert output "
+                                  f"ffn_moe_out {moe:.2e} (layer {moe_il}), shared expert output ffn_shexp "
+                                  f"{sh:.2e} (layer {sh_il})"))
     return lines
 
 
