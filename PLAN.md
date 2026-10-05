@@ -201,13 +201,13 @@ when both are.
     -   [ ] vLLM.
 -   [ ] Compare attention output for one SWA layer.
     -   [x] Torch port. (2026-10-05) — layer 0: "attention output attn_out
-        1.70e-07, attn_post_norm 1.13e-07" (torch port BF16 rounding: 3.06e-06,
-        8.23e-06).
+        1.71e-07, attn_post_norm 1.14e-07" (torch port BF16 rounding: 3.06e-06,
+        8.22e-06).
     -   [ ] vLLM.
 -   [ ] Compare attention output for one full layer.
-    -   [x] Torch port. (2026-10-05) — layer 4 (503 of 512 tokens on the same
-        experts): "attention output attn_out 2.04e-06, attn_post_norm
-        3.87e-06" (torch port BF16 rounding: 2.56e-05, 5.75e-05).
+    -   [x] Torch port. (2026-10-05) — layer 4 ("505 of 512 tokens on the
+        same experts before it"): "attention output attn_out 2.04e-06,
+        attn_post_norm 3.87e-06" (torch port BF16 rounding: 2.55e-05, 5.68e-05).
     -   [ ] vLLM.
 -   [ ] Compare router logits/probabilities and selected expert IDs.
     -   [x] Torch port. (2026-10-05) — router-logit NMSE from 2.05e-09 (layer 0)
@@ -246,9 +246,10 @@ when both are.
         reaches 2.77e-02.
     -   [ ] vLLM.
 -   [ ] Compare shared expert output.
-    -   [x] Torch port. (2026-10-05) — same tokens: "shared expert output
-        ffn_shexp 1.06e-06" (layer 0), 4.73e-07 (layer 4), worst "1.79e-03
-        (layer 49)"; the torch port's BF16 rounding reaches 3.03e-03.
+    -   [x] Torch port. (2026-10-05) — on tokens with the same experts in the
+        earlier layers: "shared expert output ffn_shexp 1.06e-06" (layer 0),
+        4.73e-07 (layer 4), worst "1.79e-03 (layer 49)"; the torch port's BF16
+        rounding reaches 8.08e-03.
     -   [ ] vLLM.
 -   [ ] Compare complete layer outputs.
     -   [x] Torch port. (2026-10-05) — `l_out` NMSE rises smoothly from 7.63e-08
