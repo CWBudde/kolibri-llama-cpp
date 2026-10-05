@@ -119,8 +119,18 @@ below except the last bullet is checked on tiny synthetic checkpoints
 
 ## Phase 0 --- Reproducible reference environment
 
--   [ ] Record exact Kolibri model revision/commit.
+-   [x] Record exact Kolibri model revision/commit. (2026-10-04) — BF16
+    `7a8f290e7858825c3cf5e4c447ba68345de9f1d3` and FP8
+    `e52eb4627d11516b0c01de49210ab5a4e4061444`, with every file's sha256, in
+    `inventory/{bf16,fp8}/summary.json` ("revision":
+    "7a8f290e7858825c3cf5e4c447ba68345de9f1d3"); the tokenizer tools download
+    from that revision only ([docs/checkpoint.md](docs/checkpoint.md)).
 -   [ ] Record exact `aleph-alpha-inference` and vLLM versions.
+    -   [x] `aleph-alpha-inference`: commit
+        `049a6a7bd2405b27d6d280d256bd3d585191c7ae` (release 1.0.0), see
+        "Repository audit baseline".
+    -   [ ] The exact vLLM version of the reference run. Only the plugin's range
+        `>=0.29.0,<0.30.0` is pinned; `kolibri_ref.py` ports v0.29.0.
 -   [ ] Run the official BF16 or FP8 reference implementation on
     suitable hardware.
 -   [ ] Save a small deterministic reference corpus: token IDs, selected
@@ -168,81 +178,111 @@ and executes without tensor-shape or unsupported-op errors.
 
 ## Phase 6 --- Numerical validation
 
+Each comparison has two steps. The first is against `tools/ref/kolibri_ref.py`,
+a torch port of the pinned vLLM model code, run by `compare_real.py --gguf` on
+the BF16 GGUF (CPU, wikitext-2 chunk 1 unless noted). The second is against
+vLLM itself, which needs the Phase 0 reference outputs. An item is done only
+when both are.
+
 -   [ ] Feed identical token IDs to vLLM/reference and llama.cpp.
--   [ ] Compare embedding output. (2026-10-05) — partial: against the torch
-    port, BF16 GGUF on the CPU, wikitext-2 chunk 1: "token embeddings (embd):
-    NMSE 0.00e+00"; `compare_real.py --tiny` checks it (mutation M19).
--   [ ] Compare Q/K after QK RMSNorm. (2026-10-05) — partial: against the
-    torch port, chunk 1, CPU: layer 0 "NMSE Q after QK norm 2.01e-06, K after
-    QK norm 1.76e-06", layer 4 "1.93e-06" and "2.78e-06". The torch port's
-    BF16 rounding against itself: 1.24e-05 / 1.18e-05 in layer 0. `--tiny`
-    checks it (mutation M18).
--   [ ] Compare attention output for one SWA layer. (2026-10-05) — partial:
-    against the torch port, chunk 1, CPU, layer 0: "attention output attn_out
-    1.70e-07, attn_post_norm 1.13e-07" (torch port BF16 rounding: 3.06e-06,
-    8.23e-06).
--   [ ] Compare attention output for one full layer. (2026-10-05) — partial:
-    against the torch port, chunk 1, CPU, layer 4 (503 of 512 tokens on the
-    same experts): "attention output attn_out 2.04e-06, attn_post_norm
-    3.87e-06" (torch port BF16 rounding: 2.56e-05, 5.75e-05).
+    -   [x] Torch port. (2026-10-05) — `compare_real.py` feeds both sides the
+        same IDs: the German prompt "[452, 22090, 493, 1678, 2459]" and the 512
+        tokens of chunk 1 from the KLD base file.
+    -   [ ] vLLM.
+-   [ ] Compare embedding output.
+    -   [x] Torch port. (2026-10-05) — "token embeddings (embd): NMSE
+        0.00e+00"; `compare_real.py --tiny` checks it (mutation M19).
+    -   [ ] vLLM.
+-   [ ] Compare Q/K after QK RMSNorm.
+    -   [x] Torch port. (2026-10-05) — layer 0 "NMSE Q after QK norm 2.01e-06,
+        K after QK norm 1.76e-06", layer 4 "1.93e-06" and "2.78e-06". The torch
+        port's BF16 rounding against itself: 1.24e-05 / 1.18e-05 in layer 0.
+        `--tiny` checks it (mutation M18).
+    -   [ ] vLLM.
+-   [ ] Compare attention output for one SWA layer.
+    -   [x] Torch port. (2026-10-05) — layer 0: "attention output attn_out
+        1.70e-07, attn_post_norm 1.13e-07" (torch port BF16 rounding: 3.06e-06,
+        8.23e-06).
+    -   [ ] vLLM.
+-   [ ] Compare attention output for one full layer.
+    -   [x] Torch port. (2026-10-05) — layer 4 (503 of 512 tokens on the same
+        experts): "attention output attn_out 2.04e-06, attn_post_norm
+        3.87e-06" (torch port BF16 rounding: 2.56e-05, 5.75e-05).
+    -   [ ] vLLM.
 -   [ ] Compare router logits/probabilities and selected expert IDs.
-    (2026-10-05) — partial: against the torch port, wikitext-2 chunk 1, BF16
-    GGUF on the CPU: router-logit NMSE from 2.05e-09 (layer 0) to at most
-    3.90e-03, "Top-1 same 97.09%, Top-6 set same 84.05%".
+    -   [x] Torch port. (2026-10-05) — router-logit NMSE from 2.05e-09 (layer 0)
+        to at most 3.90e-03, "Top-1 same 97.09%, Top-6 set same 84.05%".
+    -   [ ] vLLM.
 -   [ ] Report router agreement explicitly: Top-1 agreement, Top-6 set
     agreement/overlap, and the rate of selection changes at near-ties.
-    (2026-10-05) — partial: `compare_real.py --gguf` reports all three
-    against the torch port. Chunk 1, CPU: "mean overlap 5.817/6"; the set
-    changes for "< 0.001: 29.77% of 870; 0.001 to 0.01: 26.48% of 4838;
-    0.01 to 0.1: 15.46% of 15610; >= 0.1: 3.06% of 4282". The torch port's
-    BF16 rounding against itself: "Top-1 same 95.14%, Top-6 set same 75.88%".
+    -   [x] Torch port. (2026-10-05) — `compare_real.py --gguf` reports all
+        three: "mean overlap 5.817/6"; the set changes for "< 0.001: 29.77% of
+        870; 0.001 to 0.01: 26.48% of 4838; 0.01 to 0.1: 15.46% of 15610;
+        >= 0.1: 3.06% of 4282". The torch port's BF16 rounding against itself:
+        "Top-1 same 95.14%, Top-6 set same 75.88%".
+    -   [ ] vLLM.
 -   [ ] Report KL divergence for comparable output distributions alongside
     NMSE/top-token agreement, so small numerical drift can be separated from
-    behavior-changing drift. (2026-10-05) — partial: every final-logit
-    comparison in `compare_real.py --gguf` prints NMSE, KLD and same top token
-    together, against the torch port: "logits NMSE 2.02e-03, KLD 0.033408,
-    same top token 96.5%" (chunk 1, CPU).
+    behavior-changing drift.
+    -   [x] Torch port. (2026-10-05) — every final-logit comparison in
+        `compare_real.py --gguf` prints NMSE, KLD and same top token together:
+        "logits NMSE 2.02e-03, KLD 0.033408, same top token 96.5%".
+    -   [ ] vLLM.
 -   [ ] Repeat the expert-ID comparison on Metal: its F32 matmul uses
     half-precision tiles (router logits off by a relative RMS of about
     4e-4), so Top-6 near-ties may pick different experts than vLLM. Decide
     in Phase 8 whether the router logits need an F32 path on Metal.
-    (2026-10-05) — partial: BF16 GGUF on Metal with the experts on the CPU
-    (`compare_real.py --metal`), chunk 1, against the torch port: "Top-1 same 97.66%, Top-6 set same 87.17%"
-    (CPU: 84.05%). Against libllama on the CPU, layer 0's router logits differ
-    by NMSE 1.36e-07 and 1.4% of its Top-6 sets change, against 2.1% for the
-    torch port's own BF16 rounding. The Phase 8 decision remains.
--   [ ] Compare routed expert output. (2026-10-05) — partial: against the
-    torch port, chunk 1, CPU, on tokens with the same experts so far: "routed
-    expert output ffn_moe_out 6.15e-06" (layer 0), 3.28e-06 (layer 4), worst
-    "2.71e-03 (layer 33)"; the torch port's BF16 rounding reaches 2.77e-02.
--   [ ] Compare shared expert output. (2026-10-05) — partial: against the
-    torch port, chunk 1, CPU, same tokens: "shared expert output ffn_shexp
-    1.06e-06" (layer 0), 4.73e-07 (layer 4), worst "1.79e-03 (layer 49)";
-    the torch port's BF16 rounding reaches 3.03e-03.
--   [ ] Compare complete layer outputs. (2026-10-05) — partial: against
-    `tools/ref/kolibri_ref.py`, a torch port of the vLLM model code, not vLLM.
-    On wikitext-2 chunk 1 the BF16 GGUF's `l_out` NMSE rises smoothly from
-    1e-7 (layer 0) to at most 0.08 as the router picks other experts at
-    near-ties (same experts for 99.8% of tokens in layer 0, 64% in layer 49).
--   [ ] Compare final logits. (2026-10-05) — partial: against the torch port,
-    chunk 1: "PPL 15.1787 vs 15.1244, KLD 0.033408, same top token 96.5%".
--   [ ] Compare greedy next-token sequences. (2026-10-05) — partial: against
-    the torch port, "libllama greedy token along the reference continuation:
-    equal at 16/16" for the German prompt.
+    -   [x] Torch port. (2026-10-05) — BF16 GGUF on Metal with the experts on
+        the CPU (`compare_real.py --metal`): "Top-1 same 97.66%, Top-6 set same
+        87.17%" (CPU: 84.05%). Against libllama on the CPU, layer 0's router
+        logits differ by NMSE 1.36e-07 and 1.4% of its Top-6 sets change,
+        against 2.1% for the torch port's own BF16 rounding.
+    -   [ ] vLLM.
+    -   [ ] The Phase 8 decision on an F32 router path on Metal.
+-   [ ] Compare routed expert output.
+    -   [x] Torch port. (2026-10-05) — on tokens with the same experts so far:
+        "routed expert output ffn_moe_out 6.15e-06" (layer 0), 3.28e-06
+        (layer 4), worst "2.71e-03 (layer 33)"; the torch port's BF16 rounding
+        reaches 2.77e-02.
+    -   [ ] vLLM.
+-   [ ] Compare shared expert output.
+    -   [x] Torch port. (2026-10-05) — same tokens: "shared expert output
+        ffn_shexp 1.06e-06" (layer 0), 4.73e-07 (layer 4), worst "1.79e-03
+        (layer 49)"; the torch port's BF16 rounding reaches 3.03e-03.
+    -   [ ] vLLM.
+-   [ ] Compare complete layer outputs.
+    -   [x] Torch port. (2026-10-05) — `l_out` NMSE rises smoothly from 7.63e-08
+        (layer 0) to at most 7.60e-02 (layer 31) as the router picks other
+        experts at near-ties (same experts for 99.8% of tokens in layer 0,
+        64.3% in layer 49).
+    -   [ ] vLLM.
+-   [ ] Compare final logits.
+    -   [x] Torch port. (2026-10-05) — "PPL 15.1787 vs 15.1244, logits NMSE
+        2.02e-03, KLD 0.033408, same top token 96.5%".
+    -   [ ] vLLM.
+-   [ ] Compare greedy next-token sequences.
+    -   [x] Torch port. (2026-10-05) — "libllama greedy token along the
+        reference continuation: equal at 16/16" for the German prompt.
+    -   [ ] vLLM.
 -   [ ] Include raw German continuations in that comparison. In this
     port's BF16 (CPU), "Die Hauptstadt von Deutschland ist" continues
     greedily with " Deutschland Deutschland Deutschland …", while English
     raw prompts and German through the chat template stay coherent.
-    Tokenization matches the reference (2026-10-05). (2026-10-05) — partial:
-    the torch port of the vLLM model code continues the same way, in float32
-    and bfloat16, and an F32 KV cache or flash attention changes nothing. Only
-    vLLM itself can still contradict it.
+    Tokenization matches the reference (2026-10-05).
+    -   [x] Torch port. (2026-10-05) — it continues the same way: "reference
+        greedy, float32: 'Die Hauptstadt von Deutschland ist Deutschland
+        Deutschland …'", and so does bfloat16. An F32 KV cache or flash
+        attention changes nothing.
+    -   [ ] vLLM, the only one that can still contradict it.
 -   [ ] Establish tolerances separately for BF16 and any FP8 reference
-    run. (2026-10-05) — partial: the torch port rounded to BF16 (vLLM's
-    precision) against itself in float32: "PPL 15.3272 vs 15.1244, KLD
-    0.032722, same top token 93.7%". 22.3% of (token, layer) pairs have the
-    6th and 7th router scores within 0.01, so BF16 tolerances must allow
-    expert flips.
+    run.
+    -   [x] Measure how far BF16 rounding alone moves the torch port.
+        (2026-10-05) — BF16 (vLLM's precision) against float32: "PPL 15.3272
+        vs 15.1244, logits NMSE 2.56e-03, KLD 0.032722, same top token 93.7%".
+        22.3% of (token, layer) pairs have the 6th and 7th router scores within
+        0.01, so BF16 tolerances must allow expert flips.
+    -   [ ] Set the BF16 tolerances from a vLLM BF16 run.
+    -   [ ] Set the FP8 tolerances, if an FP8 reference run happens.
 
 ### Cross-implementation validation ideas
 
