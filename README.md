@@ -130,7 +130,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
 | `tools/tokenizer/` | Golden-file generator, llama.cpp ↔ reference comparison (golden, fuzz, invalid UTF-8), vocab-only GGUF writer, pinned Python requirements. |
 | `tools/gguf/` | `check_arch.py` checks the `kolibri` architecture registration in gguf-py and libllama. `check_metadata.py` checks the converter's GGUF metadata against `config.json`. `check_tensors.py` converts the `cmd/kolibri-tiny` checkpoint and checks every tensor's name, shape, dtype and data. `check_model.py` loads that checkpoint's GGUF in libllama, compares the logits across devices and ubatch sizes, and checks the graph's wiring. `check_moe.py` compares every MoE step per layer with the reference router, on the 384-expert variant. `check_attn.py` compares every attention step per layer with the reference attention (window, RoPE, KV cache, GQA, QK norm), on the `-attn` and `-pattern` variants. `check_long.py` does the same for the attention at 8k, 16k, 64k and 262k tokens, on sampled positions. `check_real.py` checks a GGUF converted from the real BF16 checkpoint against the inventory: shard hashes, tensor set, shapes, dtypes and bit-exact data. |
-| `tools/ref/` | `kolibri_ref.py` is a whole-model forward in torch, ported from the reference's vLLM model code, that reads a Kolibri GGUF. `compare_real.py` validates it against libllama on the tiny fixture, then compares libllama with it on the real BF16 GGUF, layer by layer. |
+| `tools/ref/` | `kolibri_ref.py` is a whole-model forward in torch, ported from the reference's vLLM model code, that reads a Kolibri GGUF. `compare_real.py` validates it against libllama on the tiny fixture, then compares libllama with it on the real BF16 GGUF, layer by layer, on the CPU and with `--metal` on the GPU. `router_probe.py` records router logits, Top-1, Top-6 overlap and near-tie margins per token and layer. |
 | `tools/quant/` | `calibration.py` builds the imatrix calibration text from English wikitext, German Wikipedia and source code, so the imatrix reaches the experts that English text alone leaves without data. |
 | `tools/chat/` | `check_chat.py` checks the chat template in the GGUFs and in llama-server, compares llama-server's rendered prompts with the reference renderer for every reasoning mode and tool-call shape, and checks the stop tokens. |
 | `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. 0009 is a generic llama.cpp fix, not Kolibri code: it lets Metal run with `--cpu-moe` on files above the Metal working set. |
@@ -198,7 +198,8 @@ On the real checkpoint (156 GB download, another 156 GB for the GGUF; see
 .venv/bin/python tools/gguf/check_metadata.py --llama-cpp third_party/llama.cpp \
     --gguf ~/models/Kolibri-1-BF16.gguf
 .venv/bin/python tools/ref/compare_real.py --llama-cpp third_party/llama.cpp \
-    --gguf ~/models/Kolibri-1-BF16.gguf --kld-base ~/models/eval/kld-bf16-c512-n20.bin  # about 15 min
+    --gguf ~/models/Kolibri-1-BF16.gguf --kld-base ~/models/eval/kld-bf16-c512-n20.bin \
+    --metal --probe-out /tmp/kolibri-router  # about 15 min, plus 3 min for --metal
 ```
 
 Network access:
