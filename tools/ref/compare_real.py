@@ -6,11 +6,15 @@ checkpoint converted to F32, against libllama on the CPU with an F32 KV cache
 and without flash attention, where check_moe.py and check_attn.py show every
 step to match the reference semantics:
 
-- with all experts active (no top-k discontinuity), the logits and every
-  layer's attn_post_norm, ffn_moe_out, ffn_shexp and l_out must be within
-  NMSE 1e-6 of the reference in float64;
+- with all experts active (no top-k discontinuity), the logits, the token
+  embeddings and every layer's Q and K after the QK norm, attention output
+  before and after its sandwich norm, routed and shared expert output and
+  l_out must be within NMSE 1e-6 of the reference in float64;
 - with the converted top-k routing, the same holds where both pick the same
   experts, which they must for at least 98% of the (token, layer) pairs;
+- in both runs the node lines (node_lines) must hold the same bound for the
+  embeddings, the first sliding and the first full layer and the worst layer
+  of the routed and shared expert output;
 - in both runs the router probe (router_probe.py) must find every layer's
   router logits within NMSE 1e-6 where all earlier layers pick the same
   experts, and the same experts for at least 98% of the pairs.
@@ -19,17 +23,18 @@ step to match the reference semantics:
 KV cache and flash-attention settings (those of llama-completion and
 llama-perplexity), against the reference in float32:
 
-- a German prompt: per-layer NMSE and expert agreement, logits NMSE, KLD and
-  same top token, the router probe, both top-5 next tokens, the reference's
-  greedy continuation, and whether libllama's greedy token agrees along that
-  continuation;
+- a German prompt: per-layer NMSE and expert agreement, the node lines,
+  logits NMSE, KLD and same top token, the router probe, both top-5 next
+  tokens, the reference's greedy continuation, and whether libllama's greedy
+  token agrees along that continuation;
 - wikitext-2 test chunk 1 (512 tokens, taken from a llama-perplexity
-  --kl-divergence-base file): per-layer NMSE and expert agreement, the router
-  probe per layer and in summary, PPL over the second half (as
-  llama-perplexity), and logits NMSE, KLD and same top token of libllama
+  --kl-divergence-base file): per-layer NMSE and expert agreement, the node
+  lines, the router probe per layer and in summary, PPL over the second half
+  (as llama-perplexity), and logits NMSE, KLD and same top token of libllama
   against the reference;
 - the sensitivity baseline: the reference in bfloat16 (vLLM's precision)
-  against the reference in float32, on the same chunk, with the router probe;
+  against the reference in float32, on the same chunk, with the node lines and
+  the router probe;
 - with --metal, the same chunk on the GPU with the routed experts on the CPU
   (as llama-cli -ngl 99 --cpu-moe), against the reference and against
   libllama on the CPU.
@@ -62,7 +67,8 @@ from router_probe import probe, same_experts, save, summary, table  # noqa: E402
 from tiny import convert, generate_tiny  # noqa: E402
 
 ARCH = "kolibri"
-NODES = ("attn_post_norm", "ffn_moe_out", "ffn_shexp", "l_out")
+NODES = ("Qcur_normed", "Kcur_normed", "attn_out", "attn_post_norm", "ffn_moe_out", "ffn_shexp", "l_out")
+EMBD = "embd"  # the token embeddings (ggml_get_rows of token_embd)
 ROUTER = ("ffn_moe_topk", "ffn_moe_logits")
 MAX_NMSE_TINY = 1e-6
 MIN_SAME_EXPERTS_TINY = 0.98
@@ -71,7 +77,7 @@ N_GREEDY = 16
 
 
 def capture_names(n_layer: int) -> dict:
-    return {f"{node}-{il}": None for il in range(n_layer) for node in NODES + ROUTER}
+    return {EMBD: None, **{f"{node}-{il}": None for il in range(n_layer) for node in NODES + ROUTER}}
 
 
 def flat(capture: dict, n_tokens: int) -> dict:
@@ -122,6 +128,51 @@ def layer_table(got: dict, ref: dict, n_layer: int, mask_rows: bool = False) -> 
                 for node in NODES]
         rows.append((il, *vals, float(same.mean())))
     return rows
+
+
+def node_lines(got: dict, ref: dict, W: Weights) -> list[tuple[float, str]]:
+    """The PLAN Phase 6 nodes, each as (worst NMSE, text): the token embeddings; in the first sliding
+    and the first full layer, Q and K after the QK norm, the attention output before (attn_out) and
+    after (attn_post_norm) its sandwich norm, and the routed (ffn_moe_out) and shared (ffn_shexp) expert
+    output; and the worst layer of the routed and shared expert output among the layers that still
+    have such tokens. A layer's NMSE counts only the tokens whose experts agree in that layer and in
+    every earlier one; NaN if there are none."""
+    import numpy as np
+
+    def worst(*vals) -> float:
+        return float(np.max(vals))  # NaN if any is NaN
+
+    v = nmse(ref[EMBD], got[EMBD])
+    lines = [(v, f"token embeddings (embd): NMSE {v:.2e}")]
+    first = {"sliding": next(il for il in range(W.n_layer) if W.is_swa[il]),
+             "full": next(il for il in range(W.n_layer) if not W.is_swa[il])}
+    ok, top, last = None, {"ffn_moe_out": (float("nan"), -1), "ffn_shexp": (float("nan"), -1)}, -1
+    for il in range(W.n_layer):
+        same = same_experts(got[f"ffn_moe_topk-{il}"], ref[f"ffn_moe_topk-{il}"])
+        ok = same if ok is None else ok & same
+        e = {node: nmse(ref[f"{node}-{il}"][ok], got[f"{node}-{il}"][ok]) if ok.any() else float("nan")
+             for node in NODES}
+        if ok.any():
+            last = il
+            for node, (val, _) in top.items():
+                if not e[node] <= val:  # the larger, or the first layer
+                    top[node] = (e[node], il)
+        for kind, fil in first.items():
+            if il != fil:
+                continue
+            where = f"layer {il} ({kind} attention, {int(ok.sum())} of {len(ok)} tokens on the same experts)"
+            lines.append((worst(e["Qcur_normed"], e["Kcur_normed"], e["attn_out"], e["attn_post_norm"]),
+                          f"{where}: NMSE Q after QK norm {e['Qcur_normed']:.2e}, K after QK norm "
+                          f"{e['Kcur_normed']:.2e}, attention output attn_out {e['attn_out']:.2e}, "
+                          f"attn_post_norm {e['attn_post_norm']:.2e}"))
+            lines.append((worst(e["ffn_moe_out"], e["ffn_shexp"]),
+                          f"{where}: NMSE routed expert output ffn_moe_out {e['ffn_moe_out']:.2e}, shared "
+                          f"expert output ffn_shexp {e['ffn_shexp']:.2e}"))
+    (moe, moe_il), (sh, sh_il) = top["ffn_moe_out"], top["ffn_shexp"]
+    lines.append((worst(moe, sh), f"worst layer of 0 to {last} (the layers with tokens on the same experts): NMSE "
+                                  f"routed expert output ffn_moe_out {moe:.2e} (layer {moe_il}), shared expert "
+                                  f"output ffn_shexp {sh:.2e} (layer {sh_il})"))
+    return lines
 
 
 def print_table(rows: list[tuple], what: str) -> None:
@@ -212,6 +263,8 @@ def run_tiny(runner: Runner, llama_cpp: Path, seed: int) -> list[str]:
                 report(same >= MIN_SAME_EXPERTS_TINY and worst <= MAX_NMSE_TINY,
                        f"tiny, {label}: same experts for {same:.1%} of (token, layer) pairs, worst layer node NMSE "
                        f"{worst:.2e} where they agree (bound {MAX_NMSE_TINY:g})")
+            for v, text in node_lines(got, ref, W):
+                report(v <= MAX_NMSE_TINY, f"tiny, {label}, {text} (bound {MAX_NMSE_TINY:g})")
             p = router(got, ref, W)
             worst = masked_router_nmse(p)
             report(worst <= MAX_NMSE_TINY and p["set_same"].mean() >= MIN_SAME_EXPERTS_TINY,
@@ -273,6 +326,7 @@ def run_real(runner: Runner, llama_cpp: Path, gguf: Path, kld_base: Path, metal:
     ids = tok.encode(GERMAN, add_special_tokens=False).ids
     got_logits, got, ref_logits, ref = both(ids, f"prompt {GERMAN!r} {ids}")
     print_table(layer_table(got, ref, W.n_layer), "prompt")
+    emit(f"prompt, libllama CPU vs reference float32, {text}" for _, text in node_lines(got, ref, W))
     maxima(ref, got)
     print(f"INFO prompt, libllama vs reference float32 at all {len(ids)} positions: "
           + stats_text(logit_stats(ref_logits, got_logits)))
@@ -299,6 +353,7 @@ def run_real(runner: Runner, llama_cpp: Path, gguf: Path, kld_base: Path, metal:
     got_logits, got, ref_logits, ref = both(tokens, f"wikitext-2 chunk 1 of {n_chunk} from {kld_base.name}")
     rows = layer_table(got, ref, W.n_layer)
     print_table(rows, "chunk 1")
+    emit(f"chunk 1, libllama CPU vs reference float32, {text}" for _, text in node_lines(got, ref, W))
     maxima(ref, got)
     p = router(got, ref, W)
     margins(p)
@@ -314,6 +369,7 @@ def run_real(runner: Runner, llama_cpp: Path, gguf: Path, kld_base: Path, metal:
     ref16d = {}
     ref16 = forward(W, tokens, "bfloat16", ref16d).numpy()
     chunk_line(ref_logits, ref16, f"reference bfloat16 vs float32 ({time.time() - t0:.0f} s)")
+    emit(f"chunk 1, reference bfloat16 vs float32, {text}" for _, text in node_lines(ref16d, ref, W))
     report_router(router(ref16d, ref, W), "bf16", "chunk 1, reference bfloat16 vs float32")
     del ref16d
 

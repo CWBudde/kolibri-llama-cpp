@@ -126,10 +126,13 @@ def swiglu(p: Precision, x, w_gate, w_up, w_down):
 
 
 def forward(W: Weights, tokens: list[int], dtype: str = "float32", dump: dict | None = None):
-    """Logits [len(tokens), n_vocab] as float32. dump, if given, receives per layer the
-    libllama-named activations attn_post_norm-il, ffn_moe_out-il, ffn_shexp-il, l_out-il
-    ([n_tokens, n_embd]), the selected experts ffn_moe_topk-il ([n_tokens, k]), the F32 router
-    logits ffn_moe_logits-il ([n_tokens, n_expert], before the bias) and kv_absmax-il (max |k|, max |v|)."""
+    """Logits [len(tokens), n_vocab] as float32. dump, if given, receives the libllama-named
+    activations: the token embeddings embd ([n_tokens, n_embd]), and per layer Q and K after the QK
+    norm, before RoPE, Qcur_normed-il and Kcur_normed-il ([n_tokens, n_head * head_dim]), the
+    attention output before and after its sandwich norm attn_out-il and attn_post_norm-il,
+    ffn_moe_out-il, ffn_shexp-il, l_out-il ([n_tokens, n_embd]), the selected experts
+    ffn_moe_topk-il ([n_tokens, k]), the F32 router logits ffn_moe_logits-il ([n_tokens, n_expert],
+    before the bias) and kv_absmax-il (max |k|, max |v|)."""
     import torch
 
     p = Precision(dtype)
@@ -142,6 +145,8 @@ def forward(W: Weights, tokens: list[int], dtype: str = "float32", dump: dict | 
         cos_sin = p.round(cos_sin.to(p.dtype))
 
     h = p.round(p.w(W.rows("token_embd.weight", tokens)))  # the residual stream
+    if dump is not None:
+        dump["embd"] = h.float().numpy()
     for il in range(W.n_layer):
         blk = f"blk.{il}."
         x = rms_norm(p, h, W.get(blk + "attn_norm.weight"), W.eps)
@@ -151,12 +156,13 @@ def forward(W: Weights, tokens: list[int], dtype: str = "float32", dump: dict | 
         v = p.mm(x, W.get(blk + "attn_v.weight")).view(n, W.n_head_kv, d)
         q = rms_norm(p, q, W.get(blk + "attn_q_norm.weight"), W.eps)
         k = rms_norm(p, k, W.get(blk + "attn_k_norm.weight"), W.eps)
+        q_normed, k_normed = q, k
         if W.has_rope[il]:
             q = p.round(rope(pos, q, cos_sin.to(p.dtype)))
             k = p.round(rope(pos, k, cos_sin.to(p.dtype)))
         a = p.round(attention(q, k, v, W.window if W.is_swa[il] else None))
-        a = p.mm(a, W.get(blk + "attn_output.weight"))
-        a = rms_norm(p, a, W.get(blk + "post_attention_norm.weight"), W.eps)
+        attn_out = p.mm(a, W.get(blk + "attn_output.weight"))
+        a = rms_norm(p, attn_out, W.get(blk + "post_attention_norm.weight"), W.eps)
         h = p.round(h + a)
 
         x = rms_norm(p, h, W.get(blk + "ffn_norm.weight"), W.eps)
@@ -177,6 +183,9 @@ def forward(W: Weights, tokens: list[int], dtype: str = "float32", dump: dict | 
         h = p.round(h + m)
 
         if dump is not None:
+            dump[f"Qcur_normed-{il}"] = q_normed.reshape(n, -1).float().numpy()
+            dump[f"Kcur_normed-{il}"] = k_normed.reshape(n, -1).float().numpy()
+            dump[f"attn_out-{il}"] = attn_out.float().numpy()
             dump[f"attn_post_norm-{il}"] = a.float().numpy()
             dump[f"ffn_moe_out-{il}"] = moe.float().numpy()
             dump[f"ffn_shexp-{il}"] = shexp.float().numpy()
