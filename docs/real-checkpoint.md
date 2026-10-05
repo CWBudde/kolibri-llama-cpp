@@ -521,7 +521,9 @@ PASS tiny, top-2 routing, router probe: worst layer router-logit NMSE 4.74e-13 w
 |---|---|
 | M15: no RoPE on the sliding layers | `FAIL tiny, all 8 experts: logits NMSE 5.86e-01` |
 | M16: `post_attn_norm` and `post_attention_layernorm` swapped | `FAIL tiny, all 8 experts: logits NMSE 7.93e-02` |
-| M17: reference router logits scaled by 1.01 | `FAIL tiny, top-2 routing, router probe: worst layer router-logit NMSE 1.06e-04 …` (all four lines fail) |
+| M17: reference router logits scaled by 1.01 | `FAIL tiny, top-2 routing, router probe: worst layer router-logit NMSE 1.06e-04 …` (12 of 16 lines fail: the four above, and every node line from layer 0's expert output on) |
+| M18: no Q norm in the reference | `FAIL tiny, all 8 experts, layer 0 (sliding attention, …): NMSE Q after QK norm 4.91e+00, K after QK norm 1.35e-14, …` |
+| M19: reference embedding rows shifted by one token ID | `FAIL tiny, all 8 experts, token embeddings (embd): NMSE 1.99e+00` |
 
 `compare_real.py --gguf` then runs the real BF16 GGUF on the CPU, with
 libllama's default KV cache and flash-attention settings, against the
@@ -564,6 +566,65 @@ partly in Low Power Mode on battery, with a peak footprint of 11.3 GB.
   of 0.51 over the 384 experts.
 - Activation maxima: |k| 38, |v| 0.9 and |`l_out`| 10,113. Nothing comes
   near the F16 limit of 65,504, and nothing is non-finite.
+
+### Per-node comparison
+
+`compare_real.py` also compares the nodes of PLAN Phase 6 one by one:
+- the token embeddings (libllama's `embd`, the `get_rows` of `token_embd`);
+- in the first sliding layer (0) and the first full layer (4):
+  - Q and K after the QK norm, before RoPE (`Qcur_normed`, `Kcur_normed`);
+  - the attention output before and after its sandwich norm (`attn_out`,
+    `attn_post_norm`);
+  - the routed and shared expert output (`ffn_moe_out`, `ffn_shexp`);
+- the worst layer of the routed and shared expert output.
+
+Each layer's NMSE counts only the tokens whose experts agree in that layer and
+in every earlier one. It measures the arithmetic of the node, not the effect
+of an expert flip.
+
+On the tiny fixture every node line is within NMSE 1e-6 of the float64
+reference, for example:
+
+```text
+PASS tiny, top-2 routing, token embeddings (embd): NMSE 0.00e+00 (bound 1e-06)
+PASS tiny, top-2 routing, layer 4 (full attention, 100 of 100 tokens on the same experts): NMSE Q after QK norm 3.68e-13, K after QK norm 3.17e-13, attention output attn_out 1.06e-13, attn_post_norm 1.01e-13 (bound 1e-06)
+PASS tiny, top-2 routing, worst layer of 0 to 5 (the layers with tokens on the same experts): NMSE routed expert output ffn_moe_out 6.57e-13 (layer 5), shared expert output ffn_shexp 7.19e-13 (layer 5) (bound 1e-06)
+```
+
+M18 and M19 in the mutation table above make them fail.
+
+The real BF16 GGUF on the CPU, against the reference in float32, wikitext-2
+chunk 1:
+
+| Node | libllama vs reference float32 | reference bfloat16 vs float32 |
+|---|---|---|
+| token embeddings | 0 | 0 |
+| layer 0 (sliding): Q / K after QK norm | 2.01e-06 / 1.76e-06 | 1.24e-05 / 1.18e-05 |
+| layer 0: `attn_out` / `attn_post_norm` | 1.70e-07 / 1.13e-07 | 3.06e-06 / 8.23e-06 |
+| layer 0: routed / shared expert output | 6.15e-06 / 1.06e-06 | 3.41e-05 / 7.60e-06 |
+| layer 4 (full): Q / K after QK norm | 1.93e-06 / 2.78e-06 | 2.75e-05 / 3.55e-05 |
+| layer 4: `attn_out` / `attn_post_norm` | 2.04e-06 / 3.87e-06 | 2.56e-05 / 5.75e-05 |
+| layer 4: routed / shared expert output | 3.28e-06 / 4.73e-07 | 2.72e-05 / 5.37e-06 |
+| worst layer: routed expert output | 2.71e-03 (layer 33) | 2.77e-02 (layer 45) |
+| worst layer: shared expert output | 1.79e-03 (layer 49) | 3.03e-03 (layer 47) |
+| tokens on the same experts through layer 0 / 4 | 511 / 503 of 512 | 501 / 449 of 512 |
+
+- **Embeddings.** Both sides widen the same BF16 rows to F32, exactly.
+- **Layers 0 and 4.** Every node is within 6.2e-6, 5 to 70 times below the
+  reference's own BF16 rounding.
+  - Q and K sit near 2e-6. That is consistent with libllama's CPU matmul,
+    which converts the F32 activations to BF16 for BF16 weights
+    (`vec_dot_type` BF16); the float32 reference does not round them.
+- **Deep layers.** The error grows through the layers but stays below the
+  BF16 baseline: on the tokens still on the same experts, the worst routed
+  expert output is 2.7e-3, against 2.8e-2 for the reference's BF16 rounding.
+- **German prompt** (5 tokens, every token on the same experts through layer 4):
+  - layer 0: Q / K after QK norm 1.75e-06 / 1.39e-06, `attn_out` 3.21e-07;
+  - layer 4: routed expert output 4.49e-06, shared 3.92e-07;
+  - worst layer: routed 4.16e-03 (layer 20), shared 1.24e-03 (layer 19).
+
+As everywhere in this file, the reference is the torch port of the vLLM model
+code, not vLLM itself.
 
 ### Router agreement
 

@@ -169,10 +169,22 @@ and executes without tensor-shape or unsupported-op errors.
 ## Phase 6 --- Numerical validation
 
 -   [ ] Feed identical token IDs to vLLM/reference and llama.cpp.
--   [ ] Compare embedding output.
--   [ ] Compare Q/K after QK RMSNorm.
--   [ ] Compare attention output for one SWA layer.
--   [ ] Compare attention output for one full layer.
+-   [ ] Compare embedding output. (2026-10-05) — partial: against the torch
+    port, BF16 GGUF on the CPU, wikitext-2 chunk 1: "token embeddings (embd):
+    NMSE 0.00e+00"; `compare_real.py --tiny` checks it (mutation M19).
+-   [ ] Compare Q/K after QK RMSNorm. (2026-10-05) — partial: against the
+    torch port, chunk 1, CPU: layer 0 "NMSE Q after QK norm 2.01e-06, K after
+    QK norm 1.76e-06", layer 4 "1.93e-06" and "2.78e-06". The torch port's
+    BF16 rounding against itself: 1.24e-05 / 1.18e-05 in layer 0. `--tiny`
+    checks it (mutation M18).
+-   [ ] Compare attention output for one SWA layer. (2026-10-05) — partial:
+    against the torch port, chunk 1, CPU, layer 0: "attention output attn_out
+    1.70e-07, attn_post_norm 1.13e-07" (torch port BF16 rounding: 3.06e-06,
+    8.23e-06).
+-   [ ] Compare attention output for one full layer. (2026-10-05) — partial:
+    against the torch port, chunk 1, CPU, layer 4 (503 of 512 tokens on the
+    same experts): "attention output attn_out 2.04e-06, attn_post_norm
+    3.87e-06" (torch port BF16 rounding: 2.56e-05, 5.75e-05).
 -   [ ] Compare router logits/probabilities and selected expert IDs.
     (2026-10-05) — partial: against the torch port, wikitext-2 chunk 1, BF16
     GGUF on the CPU: router-logit NMSE from 2.05e-09 (layer 0) to at most
@@ -199,8 +211,14 @@ and executes without tensor-shape or unsupported-op errors.
     (CPU: 84.05%). Against libllama on the CPU, layer 0's router logits differ
     by NMSE 1.36e-07 and 1.4% of its Top-6 sets change, against 2.1% for the
     torch port's own BF16 rounding. The Phase 8 decision remains.
--   [ ] Compare routed expert output.
--   [ ] Compare shared expert output.
+-   [ ] Compare routed expert output. (2026-10-05) — partial: against the
+    torch port, chunk 1, CPU, on tokens with the same experts so far: "routed
+    expert output ffn_moe_out 6.15e-06" (layer 0), 3.28e-06 (layer 4), worst
+    "2.71e-03 (layer 33)"; the torch port's BF16 rounding reaches 2.77e-02.
+-   [ ] Compare shared expert output. (2026-10-05) — partial: against the
+    torch port, chunk 1, CPU, same tokens: "shared expert output ffn_shexp
+    1.06e-06" (layer 0), 4.73e-07 (layer 4), worst "1.79e-03 (layer 49)";
+    the torch port's BF16 rounding reaches 3.03e-03.
 -   [ ] Compare complete layer outputs. (2026-10-05) — partial: against
     `tools/ref/kolibri_ref.py`, a torch port of the vLLM model code, not vLLM.
     On wikitext-2 chunk 1 the BF16 GGUF's `l_out` NMSE rises smoothly from
