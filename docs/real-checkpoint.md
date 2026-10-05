@@ -510,7 +510,9 @@ libllama on the tiny fixture (F32, CPU, F32 KV cache):
 
 ```text
 PASS tiny, all 8 experts: logits NMSE 4.75e-13, worst layer node NMSE 7.49e-13 (bound 1e-06)
+PASS tiny, all 8 experts, router probe: worst layer router-logit NMSE 5.44e-13 where every earlier layer picks the same experts (bound 1e-06), Top-1 same 100.0%, Top-8 set same 100.0%
 PASS tiny, top-2 routing: same experts for 100.0% of (token, layer) pairs, worst layer node NMSE 7.19e-13 where they agree (bound 1e-06)
+PASS tiny, top-2 routing, router probe: worst layer router-logit NMSE 4.74e-13 where every earlier layer picks the same experts (bound 1e-06), Top-1 same 100.0%, Top-2 set same 100.0%
 ```
 
 **Mutations of the reference**, each reverted:
@@ -519,10 +521,14 @@ PASS tiny, top-2 routing: same experts for 100.0% of (token, layer) pairs, worst
 |---|---|
 | M15: no RoPE on the sliding layers | `FAIL tiny, all 8 experts: logits NMSE 5.86e-01` |
 | M16: `post_attn_norm` and `post_attention_layernorm` swapped | `FAIL tiny, all 8 experts: logits NMSE 7.93e-02` |
+| M17: reference router logits scaled by 1.01 | `FAIL tiny, top-2 routing, router probe: worst layer router-logit NMSE 1.06e-04 …` (all four lines fail) |
 
 `compare_real.py --gguf` then runs the real BF16 GGUF on the CPU, with
 libllama's default KV cache and flash-attention settings, against the
-reference in float32. It takes 15 minutes, with a peak footprint of 11 GB.
+reference in float32. It took 15 minutes in its first run, with a peak
+footprint of 11 GB. With `--metal` it also runs chunk 1 on the GPU with the
+routed experts on the CPU (152 s). The run with `--metal` took 46 minutes,
+partly in Low Power Mode on battery, with a peak footprint of 11.3 GB.
 
 **German prompt** "Die Hauptstadt von Deutschland ist" (5 tokens):
 
@@ -530,6 +536,10 @@ reference in float32. It takes 15 minutes, with a peak footprint of 11 GB.
   token;
 - layer 13: one token picks a different expert set, and from there the
   differences grow with each further flip, up to `l_out` NMSE 0.52 (layer 37);
+- over all 5 positions: logits NMSE 1.88e-02, KLD 0.2446, same top token
+  at 5/5;
+- router: Top-1 same for 84.4% and the Top-6 set same for 61.2% of the 250
+  (token, layer) pairs, almost all after layer 13;
 - next token: both rank " Deutschland" first, and both top 5 hold
   " ein", " nicht" and " die";
 - the reference's greedy continuation, float32 and bfloat16 alike:
@@ -538,10 +548,12 @@ reference in float32. It takes 15 minutes, with a peak footprint of 11 GB.
 
 **wikitext-2 test, chunk 1** (512 tokens, from the KLD base file):
 
-| Comparison | PPL (test vs base) | KLD | Same top token |
-|---|---|---|---|
-| libllama BF16 vs reference float32 | 15.1787 vs 15.1244 | 0.0334 | 96.5% |
-| reference bfloat16 vs reference float32 | 15.3272 vs 15.1244 | 0.0327 | 93.7% |
+| Comparison | PPL (test vs base) | Logits NMSE | KLD | Same top token |
+|---|---|---|---|---|
+| libllama BF16 (CPU) vs reference float32 | 15.1787 vs 15.1244 | 2.02e-03 | 0.0334 | 96.5% |
+| reference bfloat16 vs reference float32 | 15.3272 vs 15.1244 | 2.56e-03 | 0.0327 | 93.7% |
+| libllama BF16 (Metal, experts on CPU) vs reference float32 | 14.9382 vs 15.1244 | 1.35e-03 | 0.0178 | 96.9% |
+| libllama BF16 (Metal) vs libllama BF16 (CPU) | 14.9382 vs 15.1787 | 1.98e-03 | 0.0487 | 93.3% |
 
 - The per-layer NMSE rises smoothly, from 1e-7 in layer 0 to at most 0.08
   (layer 31), with the share of tokens on the same experts falling from 99.8%
@@ -553,12 +565,57 @@ reference in float32. It takes 15 minutes, with a peak footprint of 11 GB.
 - Activation maxima: |k| 38, |v| 0.9 and |`l_out`| 10,113. Nothing comes
   near the F16 limit of 65,504, and nothing is non-finite.
 
+### Router agreement
+
+`tools/ref/router_probe.py` compares two routers per (token, layer):
+- the F32 router logits and their sigmoid;
+- the Top-1 expert (largest logits + bias);
+- the Top-6 set and its overlap (0 to 6 experts in common);
+- the second router's margin, its 6th minus 7th score of logits + bias.
+
+`--probe-out DIR` saves every probe as `router-<name>.npz`, with all per
+(token, layer) arrays and both sides' logits.
+
+Chunk 1, 25,600 (token, layer) pairs:
+
+| Comparison | Top-1 same | Top-6 set same | Mean overlap | Layer 0: logit NMSE, set same |
+|---|---|---|---|---|
+| libllama CPU vs reference float32 | 97.09% | 84.05% | 5.817 | 2.05e-09, 99.8% |
+| reference bfloat16 vs reference float32 | 95.14% | 75.88% | 5.711 | 2.07e-07, 97.9% |
+| libllama Metal vs reference float32 | 97.66% | 87.17% | 5.861 | 1.25e-07, 98.8% |
+| libllama Metal vs libllama CPU | 97.02% | 83.88% | 5.815 | 1.36e-07, 98.6% |
+
+Share of pairs whose Top-6 set changes, by the second router's margin:
+
+| Comparison | < 0.001 | 0.001 to 0.01 | 0.01 to 0.1 | ≥ 0.1 |
+|---|---|---|---|---|
+| (pairs, reference float32) | 870 | 4,838 | 15,610 | 4,282 |
+| libllama CPU vs reference float32 | 29.8% | 26.5% | 15.5% | 3.1% |
+| reference bfloat16 vs reference float32 | 36.4% | 37.7% | 23.4% | 8.9% |
+| libllama Metal vs reference float32 | 30.7% | 23.2% | 11.6% | 1.9% |
+
+- **CPU against the float32 reference.** libllama's experts match the float32 reference more often than the reference's own BF16 rounding does: 84.1% against 75.9% same sets.
+- **Where the flips happen.** They concentrate at near-ties.
+  - In layer 0, 99.8% of the sets agree and the router logits differ by NMSE 2e-9.
+  - 97% of the 4,084 flipped sets have a margin below 0.1.
+  - The 131 flips at margins of 0.1 and above start in layer 24, and each follows an earlier flip on the same token, which moved its hidden state.
+- **Metal against the CPU.** Metal's router logits differ from the CPU's by NMSE 1.36e-7 in layer 0.
+  - That is a relative RMS of about 3.7e-4, consistent with the half-precision tiles noted in PLAN Phase 6. It includes the difference of layer 0's attention on Metal.
+  - Layer 0's sets differ for 1.4% of the tokens.
+  - That is fewer than BF16 rounding of the reference changes (2.1%).
+  - For scale: over the chunk, the same BF16 file on Metal against the CPU gives KLD 0.0487. Q8_0 against BF16 on the CPU gives 0.050, though over 20 chunks rather than one (see "Quantization loss against this port's BF16").
+- **Metal against the reference.** Over the whole chunk, Metal sits closer to the float32 reference than the CPU does: KLD 0.0178 against 0.0334, and 87.2% against 84.1% same sets. This run does not show why.
+- **Phase 8 decision.** Whether the router needs an F32 path on Metal stays open. On these numbers, Metal's router error is smaller than the BF16 tolerance.
+
 **Conclusion.**
 
 - libllama BF16 sits as close to the float32 reference as BF16 rounding of the
   reference itself does (KLD 0.033 each).
 - The hidden states drift apart through expert flips at near-tie router scores,
-  not through a faulty step.
+  not through a faulty step. 97% of libllama's flipped sets have a margin
+  below 0.1, every larger-margin flip follows an earlier one on the same
+  token, and libllama on the CPU and on Metal flips fewer sets than BF16
+  rounding of the reference does.
 - The German repetition is therefore what the vLLM model code computes on
   these weights, not a llama.cpp defect.
 - The BF16 sensitivity makes router amplification a plausible cause of the
@@ -603,7 +660,8 @@ All files live outside the repo, in `~/models`.
    as in "Importance matrix and IQ3 variants". The imatrix takes 87 minutes;
    each IQ variant takes 14 to 22 minutes to quantize.
 7. Run `tools/ref/compare_real.py --tiny`, then with `--gguf` and the KLD base
-   file from "Quantization loss against this port's BF16" (15 minutes).
+   file from "Quantization loss against this port's BF16" (15 minutes), plus
+   `--metal --probe-out DIR` for the Metal pass and the router probes.
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.

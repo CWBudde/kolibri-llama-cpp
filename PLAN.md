@@ -174,15 +174,31 @@ and executes without tensor-shape or unsupported-op errors.
 -   [ ] Compare attention output for one SWA layer.
 -   [ ] Compare attention output for one full layer.
 -   [ ] Compare router logits/probabilities and selected expert IDs.
+    (2026-10-05) — partial: against the torch port, wikitext-2 chunk 1, BF16
+    GGUF on the CPU: router-logit NMSE from 2.05e-09 (layer 0) to at most
+    3.90e-03, "Top-1 same 97.09%, Top-6 set same 84.05%".
 -   [ ] Report router agreement explicitly: Top-1 agreement, Top-6 set
     agreement/overlap, and the rate of selection changes at near-ties.
+    (2026-10-05) — partial: `compare_real.py --gguf` reports all three
+    against the torch port. Chunk 1, CPU: "mean overlap 5.817/6"; the set
+    changes for "< 0.001: 29.77% of 870; 0.001 to 0.01: 26.48% of 4838;
+    0.01 to 0.1: 15.46% of 15610; >= 0.1: 3.06% of 4282". The torch port's
+    BF16 rounding against itself: "Top-1 same 95.14%, Top-6 set same 75.88%".
 -   [ ] Report KL divergence for comparable output distributions alongside
     NMSE/top-token agreement, so small numerical drift can be separated from
-    behavior-changing drift.
+    behavior-changing drift. (2026-10-05) — partial: every final-logit
+    comparison in `compare_real.py --gguf` prints NMSE, KLD and same top token
+    together, against the torch port: "logits NMSE 2.02e-03, KLD 0.033408,
+    same top token 96.5%" (chunk 1, CPU).
 -   [ ] Repeat the expert-ID comparison on Metal: its F32 matmul uses
     half-precision tiles (router logits off by a relative RMS of about
     4e-4), so Top-6 near-ties may pick different experts than vLLM. Decide
     in Phase 8 whether the router logits need an F32 path on Metal.
+    (2026-10-05) — partial: BF16 GGUF on Metal with the experts on the CPU
+    (`compare_real.py --metal`), chunk 1, against the torch port: "Top-1 same 97.66%, Top-6 set same 87.17%"
+    (CPU: 84.05%). Against libllama on the CPU, layer 0's router logits differ
+    by NMSE 1.36e-07 and 1.4% of its Top-6 sets change, against 2.1% for the
+    torch port's own BF16 rounding. The Phase 8 decision remains.
 -   [ ] Compare routed expert output.
 -   [ ] Compare shared expert output.
 -   [ ] Compare complete layer outputs. (2026-10-05) — partial: against
@@ -215,7 +231,7 @@ and executes without tensor-shape or unsupported-op errors.
 Use independent community work only as a source of test ideas, not implementation code. All pass/fail decisions remain anchored to Aleph Alpha's pinned reference.
 
 -   [ ] Reproduce a larger fixed tokenizer case set independently and record exact token-ID agreement.
--   [ ] Add a compact router probe that records logits, Top-1, Top-6 set overlap and near-tie margins per token/layer.
+-   [x] Add a compact router probe that records logits, Top-1, Top-6 set overlap and near-tie margins per token/layer. (2026-10-05) — `tools/ref/router_probe.py`, run by `compare_real.py`. `--tiny`: "PASS tiny, top-2 routing, router probe: worst layer router-logit NMSE 4.74e-13 …"; a 1.01 scale on the reference router logits fails it (M17). `--probe-out` saves each probe as `router-<name>.npz`, with both sides' logits and per (token, layer) Top-1, set, overlap and margin arrays.
 -   [ ] Keep a small end-to-end corpus whose BF16 reference artifacts can be rerun after upstream llama.cpp changes.
 -   [ ] For every retained quantization, emit the same summary row: perplexity, KLD, same-top-token rate, Top-1 router agreement and Top-6 overlap.
 
