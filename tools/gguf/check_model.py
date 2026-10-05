@@ -111,7 +111,7 @@ class Runner:
     def logits(self, path: Path, dev, tokens: list[int], n_ubatch: int, overrides: dict | None = None,
                nodes: dict[str, list[str]] | None = None, capture: dict | None = None,
                chunks: list[int] | None = None, n_ctx: int = 256, outputs: list[int] | None = None,
-               rows: dict[str, tuple[int, list[int]]] | None = None, **ctx_params):
+               rows: dict[str, tuple[int, list[int]]] | None = None, cpu_moe: bool = False, **ctx_params):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
         overrides maps GGUF keys to int, float or bool values that replace the file's.
         If nodes is given, it receives every graph node's name with the names of its inputs.
@@ -124,8 +124,10 @@ class Runner:
         given positions are kept, so a long context does not keep every activation.
         chunks are the sizes of consecutive llama_decode calls (default: one call), so the later
         calls read the KV cache the earlier ones wrote. outputs are the positions that get logits
-        (default: all), and the result has one row per output position, in order. ctx_params set
-        further llama_context_params fields (swa_full, flash_attn_type, type_k, ...)."""
+        (default: all), and the result has one row per output position, in order. cpu_moe keeps the
+        routed experts (ffn_*_exps) in CPU memory and computes them there, as llama-cli --cpu-moe,
+        while the rest stays on dev. ctx_params set further llama_context_params fields (swa_full,
+        flash_attn_type, type_k, ...)."""
         import numpy as np
 
         self.log.clear()
@@ -142,6 +144,13 @@ class Runner:
                 else:
                     o.tag, o.val_f64 = self.lib.LLAMA_KV_OVERRIDE_TYPE_FLOAT, val
             mparams.kv_overrides = kv
+        if cpu_moe:
+            cpu = next(d for _, d in self.devices()
+                       if self.lib.ggml_backend_dev_type(d) == self.lib.GGML_BACKEND_DEVICE_TYPE_CPU)
+            pattern = self.ffi.new("char[]", rb"\.ffn_(up|down|gate)_exps")
+            buft = self.ffi.new("struct llama_model_tensor_buft_override[]", 2)  # zeroed: the last ends the list
+            buft[0].pattern, buft[0].buft = pattern, self.lib.ggml_backend_dev_buffer_type(cpu)
+            mparams.tensor_buft_overrides = buft
         model = self.lib.llama_model_load_from_file(str(path).encode(), mparams)
         if not model:
             raise RuntimeError("load failed: " + self.errors())
