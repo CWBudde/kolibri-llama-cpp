@@ -289,7 +289,7 @@ when both are.
 
 Use independent community work only as a source of test ideas, not implementation code. All pass/fail decisions remain anchored to Aleph Alpha's pinned reference.
 
--   [ ] Reproduce a larger fixed tokenizer case set independently and record exact token-ID agreement.
+-   [x] Reproduce a larger fixed tokenizer case set independently and record exact token-ID agreement. (2026-10-05) — `compare.py --only corpus` cuts every line, every paragraph and the whole file from wikitext-2 `wiki.test.raw` and the imatrix calibration text (English, German, code): "corpus/wiki.test.raw: 4212/4212 ok", "corpus/kolibri-calibration.txt: 6461/6461 ok", 1,271,044 reference tokens, IDs and detokenized bytes identical. `testdata/tokenizer/corpus.json` pins each text's sha256 and the sha256 of the reference IDs, so a changed reference fails too. With `tokenizer.ggml.pre = default`, only 129/4212 pass.
 -   [x] Add a compact router probe that records logits, Top-1, Top-6 set overlap and near-tie margins per token/layer. (2026-10-05) — `tools/ref/router_probe.py`, run by `compare_real.py`. `--tiny`: "PASS tiny, top-2 routing, router probe: worst layer router-logit NMSE 4.74e-13 …"; a 1.01 scale on the reference router logits fails it (M17). `--probe-out` saves each probe as `router-<name>.npz`, with both sides' logits and per (token, layer) Top-1, set, overlap and margin arrays.
 -   [ ] Keep a small end-to-end corpus whose BF16 reference artifacts can be rerun after upstream llama.cpp changes.
 -   [ ] For every retained quantization, emit the same summary row: perplexity, KLD, same-top-token rate, Top-1 router agreement and Top-6 overlap.
