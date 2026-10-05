@@ -453,12 +453,12 @@ Greedy raw completions (`llama-completion -no-cnv --temp 0`, no chat
 template) of short German prompts fall into repetition on every file,
 including the unquantized BF16 on the CPU:
 
-| Prompt | BF16 (CPU) | Q8_0 (CPU) | IQ3_XXS/IQ4_XS (Metal) |
-|---|---|---|---|
-| "Die Hauptstadt von Deutschland ist" | " Deutschland Deutschland Deutschland …" | ", dass, dass, dass …" | " Deutschland Deutschland Deutschland …" |
-| "Der Rhein ist ein Fluss, der" | | | ", der, der, der …" |
-| "Frage: Was ist die Hauptstadt von Deutschland?\nAntwort:" | | | " Berlin\n\nDie Hauptstadt von Deutschland ist Berlin. Berlin ist die größte Stadt Deutschlands und liegt im Osten des Landes." |
-| "The capital of Germany is" | " Berlin." (see above) | " Berlin." | " Berlin. Berlin is the largest city in Germany and the capital." |
+| Prompt | BF16 (CPU) | Q8_0 (CPU) | Q8_0 (Metal, `--cpu-moe`) | IQ3_XXS/IQ4_XS (Metal) |
+|---|---|---|---|---|
+| "Die Hauptstadt von Deutschland ist" | " Deutschland Deutschland Deutschland …" | ", dass, dass, dass …" | " Deutschland Deutschland Deutschland …" | " Deutschland Deutschland Deutschland …" |
+| "Der Rhein ist ein Fluss, der" | | | " ist ein Fluss, der ist ein Fluss, der …" | ", der, der, der …" |
+| "Frage: Was ist die Hauptstadt von Deutschland?\nAntwort:" | | | | " Berlin\n\nDie Hauptstadt von Deutschland ist Berlin. Berlin ist die größte Stadt Deutschlands und liegt im Osten des Landes." |
+| "The capital of Germany is" | " Berlin." (see above) | " Berlin." | " Berlin.\n\nWe need to answer the question: \"What is the capital of Germany?\" …" | " Berlin. Berlin is the largest city in Germany and the capital." |
 
 What is ruled out:
 
@@ -467,17 +467,22 @@ What is ruled out:
 - **A missing BOS:** neither side adds one. The reference has
   `add_bos_token: False` and no `bos_token`, and the GGUF has
   `tokenizer.ggml.add_bos_token = False`.
-
 - **The KV cache and flash attention:** on the IQ3_XXS/IQ4_XS file,
   `-fa off`, `-fa on`, and `-ctk f32 -ctv f32` with flash attention off and on,
   all give the same two repeating continuations.
+- **Patch 0009 and the split across backends:** Q8_0 with
+  `-ngl 99 --cpu-moe --no-repack -t 10` repeats as well. Its first row
+  matches BF16 rather than Q8_0 on the CPU, probably because the router runs
+  on Metal there and flips experts at the near-tie router scores described
+  in "Reference forward on the real weights".
 - **llama.cpp itself:** the torch reference below continues
   " Deutschland Deutschland …" too, in float32 and in bfloat16.
 
 German through the chat template works: the 528-token German answer below
-is coherent. Kolibri is a post-trained reasoning model, and on these weights
-the vLLM model code computes the same raw continuation. Only a run of vLLM
-itself (PLAN Phase 6) can still contradict that.
+is coherent, and so is the Q8_0 `--cpu-moe` answer in "Streaming the
+routed experts with `--cpu-moe`". Kolibri is a post-trained reasoning model,
+and on these weights the vLLM model code computes the same raw continuation.
+Only a run of vLLM itself (PLAN Phase 6) can still contradict that.
 
 ## Reference forward on the real weights
 
