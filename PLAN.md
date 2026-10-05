@@ -177,16 +177,30 @@ and executes without tensor-shape or unsupported-op errors.
     in Phase 8 whether the router logits need an F32 path on Metal.
 -   [ ] Compare routed expert output.
 -   [ ] Compare shared expert output.
--   [ ] Compare complete layer outputs.
--   [ ] Compare final logits.
--   [ ] Compare greedy next-token sequences.
+-   [ ] Compare complete layer outputs. (2026-10-05) — partial: against
+    `tools/ref/kolibri_ref.py`, a torch port of the vLLM model code, not vLLM.
+    On wikitext-2 chunk 1 the BF16 GGUF's `l_out` NMSE rises smoothly from
+    1e-7 (layer 0) to at most 0.08 as the router picks other experts at
+    near-ties (same experts for 99.8% of tokens in layer 0, 64% in layer 49).
+-   [ ] Compare final logits. (2026-10-05) — partial: against the torch port,
+    chunk 1: "PPL 15.1787 vs 15.1244, KLD 0.033408, same top token 96.5%".
+-   [ ] Compare greedy next-token sequences. (2026-10-05) — partial: against
+    the torch port, "libllama greedy token along the reference continuation:
+    equal at 16/16" for the German prompt.
 -   [ ] Include raw German continuations in that comparison. In this
     port's BF16 (CPU), "Die Hauptstadt von Deutschland ist" continues
     greedily with " Deutschland Deutschland Deutschland …", while English
     raw prompts and German through the chat template stay coherent.
-    Tokenization matches the reference (2026-10-05).
+    Tokenization matches the reference (2026-10-05). (2026-10-05) — partial:
+    the torch port of the vLLM model code continues the same way, in float32
+    and bfloat16, and an F32 KV cache or flash attention changes nothing. Only
+    vLLM itself can still contradict it.
 -   [ ] Establish tolerances separately for BF16 and any FP8 reference
-    run.
+    run. (2026-10-05) — partial: the torch port rounded to BF16 (vLLM's
+    precision) against itself in float32: "PPL 15.3272 vs 15.1244, KLD
+    0.032722, same top token 93.7%". 22.3% of (token, layer) pairs have the
+    6th and 7th router scores within 0.01, so BF16 tolerances must allow
+    expert flips.
 
 **Hard gate:** Do not diagnose quantization quality until the
 unquantized implementation passes this phase.

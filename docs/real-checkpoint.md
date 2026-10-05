@@ -16,7 +16,8 @@ to the real weights.
 reference (PLAN Phase 0 and Phase 6), a coherent answer and a low KL divergence
 cannot tell a port bug from quantization damage. Every quality number below
 compares llama.cpp with llama.cpp: a quantized GGUF against this port's own BF16
-GGUF.
+GGUF. The exception is "Reference forward on the real weights", which compares
+the BF16 GGUF with a torch port of the vLLM reference code, not with vLLM.
 
 Measured on a Mac17,9 (Apple M5 Pro, 15 cores, 48 GB) at fork commit
 `e1a553f5f` (`feat/kolibri` after the chat-template merge).
@@ -330,8 +331,18 @@ the same backend as its reference. For dense models, Q8_0 usually lands near
 KLD 0.001 with over 99% same top token. A likely amplifier is the router: a small error in a
 router logit that sits near the top-6 boundary swaps an expert. That fits the
 PLAN Phase 6 note on Metal near-ties and the Phase 7 item "measure how often
-quantization changes Top-6 expert selection". Per the Phase 6 hard gate, this
-stays undiagnosed until the BF16 port matches vLLM.
+quantization changes Top-6 expert selection".
+
+The reference forward (below) makes that amplification plausible:
+
+- On the reference's own routing, the 6th and 7th expert scores lie within
+  0.01 of each other for 22% of the (token, layer) pairs.
+- Rounding the reference itself to BF16 already costs KLD 0.033 against its
+  float32 run. Q8_0's 0.050 on top of BF16 is in that range.
+
+It does not run the Q8_0 GGUF or its quantization path, though, so it cannot
+rule out an additional Q8_0 defect. That stays open until Q8_0's expert
+selections are measured against BF16 (the Phase 7 Top-6 item).
 
 **Q8_0 on the CPU: use `--no-repack`.** The first Q8_0 run used the CPU
 backend's default weight repacking. macOS killed it (exit 137) after 8 chunks,
@@ -457,11 +468,98 @@ What is ruled out:
   `add_bos_token: False` and no `bos_token`, and the GGUF has
   `tokenizer.ggml.add_bos_token = False`.
 
+- **The KV cache and flash attention:** on the IQ3_XXS/IQ4_XS file,
+  `-fa off`, `-fa on`, and `-ctk f32 -ctv f32` with flash attention off and on,
+  all give the same two repeating continuations.
+- **llama.cpp itself:** the torch reference below continues
+  " Deutschland Deutschland …" too, in float32 and in bfloat16.
+
 German through the chat template works: the 528-token German answer below
-is coherent. Kolibri is a post-trained reasoning model, so raw continuation
-may be its genuine behavior, but only the reference can tell. Per the
-Phase 6 gate, this goes to the greedy-sequence comparison against vLLM,
-not into a diagnosis here.
+is coherent. Kolibri is a post-trained reasoning model, and on these weights
+the vLLM model code computes the same raw continuation. Only a run of vLLM
+itself (PLAN Phase 6) can still contradict that.
+
+## Reference forward on the real weights
+
+`tools/ref/kolibri_ref.py` is a whole-model forward of Kolibri-1 in torch. It
+ports `kolibri1.py` at the pinned commit and the vLLM v0.29.0 Qwen3Moe pieces
+it inherits:
+
+- embedding, then 50 decoder layers, then the final norm;
+- per layer: input norm, attention, `post_attn_norm`, the residual add,
+  `post_attention_layernorm`, the MoE block, `post_ffn_norm`, the residual add;
+- attention: per-head Q/K RMSNorm, RoPE on the sliding layers only, window
+  513, GQA 48/4;
+- MoE: F32 router logits, `sigmoid_logit_add_routing`, SwiGLU experts plus
+  the ungated shared expert;
+- LM head in F32.
+
+It reads the weights from the BF16 GGUF, whose tensors are bit-exact to the
+safetensors, and touches only the experts a token is routed to. It reuses the
+RoPE, attention and routing ports of `check_attn.py` and `check_moe.py`.
+`--dtype bfloat16` emulates vLLM's precision: BF16 matmul inputs and outputs,
+norm outputs and residual stream; F32 router logits and LM head.
+
+`tools/ref/compare_real.py --tiny` first validates the reference against
+libllama on the tiny fixture (F32, CPU, F32 KV cache):
+
+```text
+PASS tiny, all 8 experts: logits NMSE 4.75e-13, worst layer node NMSE 7.49e-13 (bound 1e-06)
+PASS tiny, top-2 routing: same experts for 100.0% of (token, layer) pairs, worst layer node NMSE 7.19e-13 where they agree (bound 1e-06)
+```
+
+**Mutations of the reference**, each reverted:
+
+| Mutation | Result |
+|---|---|
+| M15: no RoPE on the sliding layers | `FAIL tiny, all 8 experts: logits NMSE 5.86e-01` |
+| M16: `post_attn_norm` and `post_attention_layernorm` swapped | `FAIL tiny, all 8 experts: logits NMSE 7.93e-02` |
+
+`compare_real.py --gguf` then runs the real BF16 GGUF on the CPU, with
+libllama's default KV cache and flash-attention settings, against the
+reference in float32. It takes 15 minutes, with a peak footprint of 11 GB.
+
+**German prompt** "Die Hauptstadt von Deutschland ist" (5 tokens):
+
+- layers 0 to 12: `l_out` NMSE at most 2.7e-6, the same experts for every
+  token;
+- layer 13: one token picks a different expert set, and from there the
+  differences grow with each further flip, up to `l_out` NMSE 0.52 (layer 37);
+- next token: both rank " Deutschland" first, and both top 5 hold
+  " ein", " nicht" and " die";
+- the reference's greedy continuation, float32 and bfloat16 alike:
+  " Deutschland Deutschland Deutschland …";
+- libllama's greedy token along that continuation: equal at 16/16.
+
+**wikitext-2 test, chunk 1** (512 tokens, from the KLD base file):
+
+| Comparison | PPL (test vs base) | KLD | Same top token |
+|---|---|---|---|
+| libllama BF16 vs reference float32 | 15.1787 vs 15.1244 | 0.0334 | 96.5% |
+| reference bfloat16 vs reference float32 | 15.3272 vs 15.1244 | 0.0327 | 93.7% |
+
+- The per-layer NMSE rises smoothly, from 1e-7 in layer 0 to at most 0.08
+  (layer 31), with the share of tokens on the same experts falling from 99.8%
+  to 64%. No single node or layer jumps.
+- Router margin on the reference: the 6th and 7th scores (logits + bias)
+  differ by a median of 0.033, by less than 0.01 for 22.3% and by less than
+  0.1 for 83.3% of the (token, layer) pairs, against a median score spread
+  of 0.51 over the 384 experts.
+- Activation maxima: |k| 38, |v| 0.9 and |`l_out`| 10,113. Nothing comes
+  near the F16 limit of 65,504, and nothing is non-finite.
+
+**Conclusion.**
+
+- libllama BF16 sits as close to the float32 reference as BF16 rounding of the
+  reference itself does (KLD 0.033 each).
+- The hidden states drift apart through expert flips at near-tie router scores,
+  not through a faulty step.
+- The German repetition is therefore what the vLLM model code computes on
+  these weights, not a llama.cpp defect.
+- The BF16 sensitivity makes router amplification a plausible cause of the
+  high Q8_0 KLD. Q8_0 itself was not run here, so that stays open.
+- What this cannot rule out is a misreading of the vLLM code shared by the port
+  and this reference. Only running vLLM itself covers that (PLAN Phases 0 and 6).
 
 ## Chat on the quantized model
 
@@ -499,6 +597,8 @@ All files live outside the repo, in `~/models`.
 6. Build the calibration text and the imatrix, then quantize the IQ variants,
    as in "Importance matrix and IQ3 variants". The imatrix takes 87 minutes;
    each IQ variant takes 14 to 22 minutes to quantize.
+7. Run `tools/ref/compare_real.py --tiny`, then with `--gguf` and the KLD base
+   file from "Quantization loss against this port's BF16" (15 minutes).
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
