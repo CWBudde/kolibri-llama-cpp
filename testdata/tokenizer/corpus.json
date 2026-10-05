@@ -1,0 +1,16 @@
+{
+  "wiki.test.raw": {
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08",
+    "bytes": 1290590,
+    "cases": 4212,
+    "tokens": 887355,
+    "ids_sha256": "13b4024dd14c26457a099bc879cbc95a55d956f1b8f58e2e78ec0b1a71578935"
+  },
+  "kolibri-calibration.txt": {
+    "sha256": "e6fc52c95d9d2ae2600fecc7ade6bdd10ea640ca7628a494f12fe668080c0168",
+    "bytes": 522320,
+    "cases": 6461,
+    "tokens": 383689,
+    "ids_sha256": "82d14181b7d55f98d2a55f82e49aead58171f26bea1f4e9ad8da3e9643449c99"
+  }
+}

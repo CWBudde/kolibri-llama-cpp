@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SUMMARY = ROOT / "inventory" / "bf16" / "summary.json"
 GOLDEN = ROOT / "testdata" / "tokenizer" / "golden.jsonl"
+CORPUS = ROOT / "testdata" / "tokenizer" / "corpus.json"
 TOKENIZER_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 
 

@@ -13,20 +13,35 @@ tests/test-tokenizer-random.py and checks, with vocab_only=true:
           it at all: vLLM tokenizes Python str. Each case runs in a forked
           child so that a llama.cpp abort is reported instead of ending the run;
           the output is compared with the reference on the U+FFFD-replaced
-          text (Python's errors="replace").
+          text (Python's errors="replace");
+  corpus  a fixed case set cut from text files outside the repo: every
+          non-blank line, every paragraph between blank lines, and the whole
+          file at once. testdata/tokenizer/corpus.json pins each file by its
+          sha256 and records the number of cases, the token count and the
+          sha256 of the reference IDs, so a change of the reference tokenizer
+          fails as well. Defaults to wiki.test.raw (English) and the imatrix
+          calibration text (English, German, code) in ~/models/eval; a missing
+          file is skipped.
 
     compare.py --llama-cpp third_party/llama.cpp --vocab ggml-vocab-kolibri.gguf [--iterations N]
+    compare.py ... --only corpus --corpus FILE [--corpus FILE ...] [--write-manifest]
 """
 
 import argparse
+import hashlib
+import json
 import multiprocessing
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
 
-from common import libllama, load_golden, load_upstream, tokenizer_dir
+from common import CORPUS, libllama, load_golden, load_upstream, tokenizer_dir
+
+EVAL = Path.home() / "models" / "eval"
+DEFAULT_CORPUS = [EVAL / "wikitext-2-raw" / "wiki.test.raw", EVAL / "kolibri-calibration.txt"]
 
 
 class Llama:
@@ -169,12 +184,60 @@ def run_utf8(llama: Llama, ref) -> None:
     print(f"utf8 (report only): {same}/{len(cases)} identical to the reference on U+FFFD-replaced text")
 
 
+def corpus_cases(text: str) -> list[tuple[str, str]]:
+    """Every non-blank line with its newline, every paragraph between blank
+    lines, and the whole text."""
+    lines = [m.group() for m in re.finditer(r"[^\n]*\n|[^\n]+$", text) if m.group().strip()]
+    paragraphs = [p for p in re.split(r"\n[ \t]*\n", text) if p.strip()]
+    return ([(f"line {i}", t) for i, t in enumerate(lines)]
+            + [(f"paragraph {i}", t) for i, t in enumerate(paragraphs)]
+            + [("whole file", text)])
+
+
+def run_corpus(llama: Llama, ref, paths: list[Path], write: bool) -> bool:
+    manifest = json.loads(CORPUS.read_text()) if CORPUS.exists() else {}
+    ok = True
+    for path in paths:
+        if not path.exists():
+            print(f"corpus/{path.name}: SKIP ({path} not found)")
+            continue
+        raw = path.read_bytes()
+        sha = hashlib.sha256(raw).hexdigest()
+        cases = corpus_cases(raw.decode("utf-8"))
+        want = [e.ids for e in ref.encode_batch([t for _, t in cases], add_special_tokens=False)]
+        digest = hashlib.sha256()
+        for ids in want:
+            digest.update(json.dumps(ids).encode() + b"\n")
+        entry = {"sha256": sha, "bytes": len(raw), "cases": len(cases),
+                 "tokens": sum(map(len, want)), "ids_sha256": digest.hexdigest()}
+        if write:
+            manifest[path.name] = entry
+        elif path.name not in manifest:
+            print(f"  FAIL {path.name}: not in {CORPUS.name}; record it with --write-manifest")
+            ok = False
+        elif diff := [f"{k} {v} (manifest {manifest[path.name].get(k)})"
+                      for k, v in entry.items() if manifest[path.name].get(k) != v]:
+            print(f"  FAIL {path.name}: {'; '.join(diff)}")
+            ok = False
+        r = Report(f"corpus/{path.name}")
+        for (label, text), ids in zip(cases, want):
+            r.check_text(llama, label, text, ids, text)
+        ok = r.done() and ok
+        print(f"  {entry['cases']} cases, {entry['tokens']} reference tokens, reference IDs sha256 {entry['ids_sha256'][:16]}…")
+    if write:
+        CORPUS.write_text(json.dumps(manifest, indent=2) + "\n")
+    return ok
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llama-cpp", type=Path, required=True)
     ap.add_argument("--vocab", type=Path, required=True, help="vocab-only Kolibri GGUF")
     ap.add_argument("--iterations", type=int, default=1000, help="iterations per random fuzz generator")
-    ap.add_argument("--only", choices=["golden", "fuzz", "utf8"], action="append")
+    ap.add_argument("--only", choices=["golden", "fuzz", "utf8", "corpus"], action="append")
+    ap.add_argument("--corpus", type=Path, action="append", help="corpus text file (default: wiki.test.raw "
+                    "and kolibri-calibration.txt in ~/models/eval)")
+    ap.add_argument("--write-manifest", action="store_true", help="record the corpus files in " + str(CORPUS))
     args = ap.parse_args()
 
     import tokenizers
@@ -185,7 +248,7 @@ def main() -> None:
     up = load_upstream(args.llama_cpp)
     llama = Llama(up, args.llama_cpp, args.vocab)
 
-    only = set(args.only or ["golden", "fuzz", "utf8"])
+    only = set(args.only or ["golden", "fuzz", "utf8", "corpus"])
     ok = True
     if "golden" in only:
         ok = run_golden(llama) and ok
@@ -193,6 +256,8 @@ def main() -> None:
         run_utf8(llama, ref)
     if "fuzz" in only:
         ok = run_fuzz(up, llama, ref, d, args.iterations) and ok
+    if "corpus" in only:
+        ok = run_corpus(llama, ref, args.corpus or DEFAULT_CORPUS, args.write_manifest) and ok
     sys.exit(0 if ok else 1)
 
 
