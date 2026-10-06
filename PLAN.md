@@ -297,9 +297,34 @@ Use independent community work only as a source of test ideas, not implementatio
 **Hard gate:** Do not diagnose quantization quality until the
 unquantized implementation passes this phase.
 
--   [ ] Turn a compact subset of tokenizer, attention, router/expert,
+-   [x] Turn a compact subset of tokenizer, attention, router/expert,
     layer-output and final-logit reference cases into an automated regression
-    suite that can be rerun after llama.cpp/upstream changes.
+    suite that can be rerun after llama.cpp/upstream changes. (2026-10-06) —
+    `tools/ref/regress.py` runs three gated parts:
+    - the tokenizer golden cases and the fixed corpus (exact IDs against the
+      reference);
+    - `compare_real.py --tiny` (embeddings, Q/K, attention, router, experts,
+      `l_out` and logits within NMSE 1e-6 of the reference);
+    - `e2e.py` on the BF16 GGUF.
+
+    `e2e.py` now captures all 451 libllama nodes per case. A case passes only
+    when every node's sha256 and the logits' equal the recorded run; otherwise
+    it fails and names the first changed node in graph order. `--record`
+    accepts a reviewed change. The metrics against the reference stay INFO
+    until tolerances exist. wiki-c1 and de-long also store a compact set of
+    reference nodes: layers 0 and 4 attention and expert outputs, every
+    layer's `l_out`, and for wiki-c1 the embeddings and every layer's expert
+    outputs. The per-node comparison then reruns without the torch pass, e.g.
+    de-long "layer 0 (sliding attention), 1024 of 1024 tokens on the same
+    experts before it: NMSE Q after QK norm 2.03e-06, K after QK norm
+    1.75e-06, attention output attn_out 1.59e-07, attn_post_norm 1.12e-07".
+    Run, 27 min: "PASS de-long: bit-identical to the recorded libllama run
+    (451 nodes and the logits)", likewise for all six cases, and "PASS
+    regression suite: tokenizer, tiny reference, real weights". Controls:
+    - a tampered `l_out-20` hash gives "first changed node l_out-20" and
+      "FAIL regression suite: real weights", exit 1;
+    - an RMS-norm epsilon override gives "first changed node Qcur_normed-0",
+      exit 1.
 
 **Definition of Done:** llama.cpp BF16/F16 inference is numerically
 consistent with the reference within documented tolerances, with the key
