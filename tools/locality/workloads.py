@@ -39,20 +39,25 @@ and pins the sha256 of the resolved text:
 Any of them may add "chars": n to keep only the first n characters.
 
 The default mode checks each workload and fails (exit 1) on any difference:
-every source against its sha256; every answer slot filled; the rendered
-conversation tokenized by the pinned reference tokenizer and by libllama on
-the vocab GGUF, which must agree; each answer's prompt and text a prefix of
-the whole, the prompt as long as when the answer was generated, and the
-answer's generated token IDs (stored with it) decoding to its text; the
-length within the workload's range; and the sha256 of the rendered text and of the token IDs
-against testdata/locality/manifest.json. It writes the token IDs to
+every source against its sha256; every answer slot (each assistant message
+without tool calls) generated; the rendered conversation tokenized by the
+pinned reference tokenizer and by libllama on the vocab GGUF, which must
+agree; each answer's prompt and text a prefix of the whole, the prompt's IDs
+those the answer was generated from, and the answer's generated token IDs
+(stored with it) decoding to its text; the token IDs, answers as generated,
+decoding to the conversation; the length within the workload's range; and
+the sha256 of the rendered text and of the token IDs against
+testdata/locality/manifest.json. It writes the token IDs to
 ~/models/eval/locality/<name>.tokens.npy for the locality measurements and
 prints the token count by role.
 
-The conversation holds each answer as text, tokenized afresh, as a server
-prefills the history of the next turn. A model can generate a split the
-tokenizer would not choose; where it did, an INFO line names the answer and
-the first differing token.
+The token IDs hold each answer as generated, not as the tokenizer would split
+its text afresh: a model can generate a split the tokenizer would not choose
+(an INFO line names the answer and the first differing token). Each answer
+was generated from the IDs of the conversation before it, earlier answers as
+generated, and records that prompt's length and sha256; the check fails
+unless the conversation's IDs start with exactly that prompt, so one prefill
+reproduces every generation's context.
 
     workloads.py --fetch
     workloads.py --answer --gguf ~/models/Kolibri-1-Q8_0.gguf
@@ -60,6 +65,7 @@ the first differing token.
 """
 
 import argparse
+import bisect
 import copy
 import hashlib
 import json
@@ -266,8 +272,48 @@ def render(template: str, trace: dict, upto: int | None = None, prompt: bool = F
 
 
 def slots(trace: dict) -> list[int]:
-    """The indices of the generated answers."""
-    return [i for i, m in enumerate(trace["messages"]) if "answer" in m]
+    """The indices of the generated answers: the assistant messages without tool calls, whether generated yet or
+    not."""
+    return [i for i, m in enumerate(trace["messages"]) if m["role"] == "assistant" and "tool_calls" not in m]
+
+
+def first_difference(a: list[int], b: list[int]) -> int | None:
+    """The first index at which a and b differ, the shorter length if one is a prefix of the other, or None."""
+    if a == b:
+        return None
+    return next((k for k, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+
+
+class Boundary(Exception):
+    """An answer that does not start and end on token boundaries of the fresh tokenization."""
+
+
+def tokens(template: str, trace: dict, tok, upto: int | None = None, prompt: bool = False):
+    """The conversation's token IDs as generated (with upto and prompt, those of that answer's prompt): the text
+    tokenized afresh, then each recorded answer's span replaced by the IDs the model generated, which can be a
+    split the tokenizer would not choose. Returns the text, the IDs, each ID's start offset in the text, and per
+    recorded answer its index, fresh IDs and generated IDs."""
+    text = render(template, trace, upto, prompt)
+    enc = tok.encode(text, add_special_tokens=False)
+    fresh, starts = enc.ids, [s for s, _ in enc.offsets]
+    ids, id_starts, spans, prev = [], [], [], 0
+    for i in slots(trace):
+        m = trace["messages"][i]
+        if upto is not None and i >= upto:
+            break
+        if "answer" not in m:
+            continue
+        begin = len(render(template, trace, i, prompt=True))
+        end = begin + len(m["content"])
+        s, e = bisect.bisect_left(starts, begin), bisect.bisect_left(starts, end)
+        if starts[s:s + 1] != [begin] or starts[e:e + 1] not in ([end], []):
+            raise Boundary(i)
+        gen = [t for t in m["answer"]["tokens"] if t not in EOS]
+        ids += fresh[prev:s] + gen
+        id_starts += starts[prev:s] + [begin] * len(gen)
+        spans.append((i, fresh[s:e], gen))
+        prev = e
+    return text, ids + fresh[prev:], id_starts + starts[prev:], spans
 
 
 def load(name: str) -> dict:
@@ -319,14 +365,15 @@ def answer(args, template: str, tok) -> None:
             trace = load(name)
             for i in slots(trace):
                 m = trace["messages"][i]
-                if m.get("content") is not None:
+                if "answer" in m:
                     continue
-                ids = tok.encode(render(template, trace, i, prompt=True), add_special_tokens=False).ids
+                _, ids, _, _ = tokens(template, trace, tok, i, prompt=True)
                 t0 = time.monotonic()
                 r = complete(server.port, ids)
                 gen = r["tokens"]
                 m["content"] = r["content"]
-                m["answer"] = {"n_prompt": len(ids), "stop": r.get("stop_type"), "tokens": gen,
+                m["answer"] = {"n_prompt": len(ids), "prompt_sha256": ids_sha256(ids), "stop": r.get("stop_type"),
+                               "tokens": gen,
                                "prompt_per_second": round(r["timings"]["prompt_per_second"], 2),
                                "predicted_per_second": round(r["timings"]["predicted_per_second"], 2)}
                 save(name, trace)
@@ -342,17 +389,17 @@ def answer(args, template: str, tok) -> None:
     MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
 
 
-def by_role(template: str, trace: dict, enc) -> str:
-    """Token counts by the message a token starts in: system (with the tools), user, tool, assistant (scripted
-    tool calls) and answer (generated)."""
-    msgs = trace["messages"]
+def by_role(template: str, trace: dict, starts: list[int]) -> str:
+    """Token counts by the message a token starts in, given each token's start offset: system (with the tools),
+    user, tool, assistant (scripted tool calls) and answer (generated)."""
+    msgs, answers = trace["messages"], set(slots(trace))
     ends = [len(render(template, trace, k + 1)) for k in range(len(msgs))]
     counts: dict[str, int] = {}
     k = 0
-    for start, _ in enc.offsets:
+    for start in starts:
         while k < len(msgs) - 1 and start >= ends[k]:
             k += 1
-        role = "answer" if "answer" in msgs[k] else msgs[k]["role"]
+        role = "answer" if k in answers else msgs[k]["role"]
         counts[role] = counts.get(role, 0) + 1
     return ", ".join(f"{r} {n}" for r, n in counts.items())
 
@@ -376,44 +423,48 @@ def check(args, template: str, tok) -> int:
         trace = load(name)
         n_errs, same = len(errs), 0
         try:
-            text = render(template, trace)
+            text, ids, starts, spans = tokens(template, trace, tok)
         except SourceChanged as e:
             fail(f"{name}: source changed: {e}")
             continue
-        enc = tok.encode(text, add_special_tokens=False)
-        ids = enc.ids
-        if (got := llama.encode(text)) != ids:
-            first = next((k for k, (a, b) in enumerate(zip(got, ids)) if a != b), min(len(got), len(ids)))
-            fail(f"{name}: libllama's tokens differ from the reference's from token {first}")
+        except Boundary as e:
+            fail(f"{name} message {e}: the answer does not start and end on token boundaries")
+            continue
+        fresh = tok.encode(text, add_special_tokens=False).ids
+        if (k := first_difference(llama.encode(text), fresh)) is not None:
+            fail(f"{name}: libllama's tokens differ from the reference's from token {k}")
+        if tok.decode(ids, skip_special_tokens=False) != text:
+            fail(f"{name}: the token IDs with the generated answers do not decode to the conversation")
         for i in slots(trace):
             m = trace["messages"][i]
-            if m.get("content") is None:
-                fail(f"{name} message {i}: no answer yet (run --answer)")
+            if "answer" not in m or m.get("content") is None:
+                fail(f"{name} message {i}: no recorded generation (run --answer)")
                 continue
-            prompt = render(template, trace, i, prompt=True)
+            prompt, p_ids, _, _ = tokens(template, trace, tok, i, prompt=True)
             if not text.startswith(prompt + m["content"]):
                 fail(f"{name} message {i}: prompt and answer are not a prefix of the conversation")
                 continue
             a = m["answer"]
-            n = len(tok.encode(prompt, add_special_tokens=False).ids)
-            if n != a["n_prompt"]:
-                fail(f"{name} message {i}: the prompt is {n} tokens, {a['n_prompt']} when the answer was generated")
+            # Each answer must sit in the conversation on exactly the prompt it was generated from, every earlier
+            # answer included as generated, so one prefill of the IDs reproduces every generation's context.
+            if len(p_ids) != a["n_prompt"] or ids_sha256(p_ids) != a.get("prompt_sha256"):
+                fail(f"{name} message {i}: the prompt is not the one the answer was generated from")
             gen = [t for t in a["tokens"] if t not in EOS]
             if tok.decode(gen, skip_special_tokens=False) != m["content"]:
                 fail(f"{name} message {i}: the generated tokens do not decode to the answer")
-            # The conversation holds the answer as text, tokenized afresh, as a server prefills the history of
-            # the next turn. The model may have generated a split the tokenizer would not choose.
-            if (got := ids[n:n + len(gen)]) == gen:
+            elif ids[len(p_ids):len(p_ids) + len(gen)] != gen:
+                fail(f"{name} message {i}: the conversation does not hold the generated tokens after the prompt")
+        for i, f, gen in spans:
+            if (k := first_difference(f, gen)) is None:
                 same += 1
             else:
-                k = next(j for j, (x, y) in enumerate(zip(got, gen)) if x != y)
-                print(f"INFO {name} message {i}: the conversation tokenizes the answer differently from how it was "
-                      f"generated, from token {k} of {len(gen)}")
+                print(f"INFO {name} message {i}: replayed as generated; the tokenizer splits the answer differently "
+                      f"from token {k} ({len(f)} tokens afresh, {len(gen)} generated)")
         lo, hi = LENGTH[name]
         if not lo <= len(ids) <= hi:
             fail(f"{name}: {len(ids)} tokens, outside [{lo}, {hi}]")
         np.save(OUT / f"{name}.tokens.npy", np.array(ids, dtype=np.int32))
-        print(f"{name}: {len(ids)} tokens: {by_role(template, trace, enc)}")
+        print(f"{name}: {len(ids)} tokens: {by_role(template, trace, starts)}")
         entry = {"n_tokens": len(ids), "text_sha256": sha256_text(text), "tokens_sha256": ids_sha256(ids)}
         if args.record:
             recorded[name] = entry
@@ -421,7 +472,8 @@ def check(args, template: str, tok) -> int:
             fail(f"{name}: {entry} differs from the manifest's {recorded.get(name)}")
         elif len(errs) == n_errs:
             print(f"PASS {name}: text and token IDs as recorded, libllama's tokens identical, "
-                  f"{len(slots(trace))} answers in place, {same} of them tokenized as generated")
+                  f"{len(slots(trace))} answers on the prompts they were generated from, {same} of them split as "
+                  f"the tokenizer would")
     if args.record and not errs:
         MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
         print(f"recorded {MANIFEST.relative_to(ROOT)}")

@@ -26,14 +26,14 @@
  },
  "workloads": {
   "coding": {
-   "n_tokens": 11145,
-   "text_sha256": "e733094f2b3048964f411873e8af264431bcc52e81dbe19b00f8f044f42a2364",
-   "tokens_sha256": "d2605211ca153cf673a4323992c767e173f6dd728988026d372935983e744048"
+   "n_tokens": 11146,
+   "text_sha256": "744f2a438b217cf588e0be16b2b2fc8fa7b064fde41c52b57107a77b47fb5186",
+   "tokens_sha256": "4e0a77cca373d7a1e0f665b79404b8ca2ac1ee33b74cd14d1f2a50e7cae13360"
   },
   "research": {
-   "n_tokens": 10654,
+   "n_tokens": 10645,
    "text_sha256": "35344be8ce0bfe1bb0857dac8b7c3c0f762dcaf6764bd8e7ff70d6bd68ce929c",
-   "tokens_sha256": "6b2d694459fec585b3340a8f002baaa9f4c62a17444b4426c163bccc924f49de"
+   "tokens_sha256": "b35d11c77c5e658bfe796370db53102e0dd219263b7d959c4dd4c76d2a35655a"
   },
   "hr": {
    "n_tokens": 10959,

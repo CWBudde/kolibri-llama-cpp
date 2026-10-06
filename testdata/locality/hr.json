@@ -752,6 +752,7 @@
    "content": "Hallo Thomas,\n\nhier ist die Übersicht der Abwesenheiten in deiner Abteilung (Produktion) für Oktober 2026 sowie der aktuelle Urlaubsstand jedes Mitarbeiters:\n\n## Abwesende Mitarbeiter im Oktober 2026\n\n| Mitarbeiter | Position | Abwesenheitszeitraum | Typ | Status |\n|-------------|----------|----------------------|------|--------|\n| **Murat Yilmaz** (ID 1003) | Laserbediener | 12.10. – 16.10.2026 (5 Tage) | Urlaub | Genehmigt |\n| **Jonas Becker** (ID 1005) | Feinmechaniker | 05.10. – 07.10.2026 (3 Tage) | Krankheit | Genehmigt |\n| **Aylin Demir** (ID 1006) | Schichtleiterin | 26.10. – 30.10.2026 (5 Tage) | Urlaub | Genehmigt |\n| **Piotr Kowalski** (ID 1007) | Elektropolierer | 02.10.2026 (1 Tag) | Urlaub | Genehmigt |\n| **Lena Wagner** (ID 1004) | Feinmechanikerin | 19.10. – 21.10.2026 (2,5 Tage) | Urlaub | **Ausstehend** |\n\n**Hinweis:** Krankheitsgründe gebe ich aus Datenschutzgründen nicht weiter. Nur dass Jonas Becker krankgeschrieben ist.\n\n## Aktueller Urlaubsstand (Resturlaubstage)\n\n| Mitarbeiter | Resturlaubstage |\n|-------------|-----------------|\n| Thomas Richter (Leiter Produktion) | 11,0 Tage |\n| Murat Yilmaz (Laserbediener) | 9,0 Tage |\n| Lena Wagner (Feinmechanikerin) | ",
    "answer": {
     "n_prompt": 4150,
+    "prompt_sha256": "72346e246f5fed6918cd0e150f4245cbc706a66bd1c962f066aa80096003d5c3",
     "stop": "limit",
     "tokens": [
      38241,
@@ -1234,6 +1235,7 @@
    "content": "Vielen Dank für die Freigabe, Thomas. Ich habe beide Punkte umgesetzt:\n\n1. **Lena Wagner – Urlaub vom 2. bis 6. November 2026 eingetragen**  \n   - 4 volle Tage + 1 halber Tag (6. November, nur vormittags)  \n   - Status: Genehmigt  \n   - Abwesenheits-ID: 552142\n\n2. **Lena Wagner – Antrag vom 19. bis 21. Oktober 2026 genehmigt**  \n   - Der bestehende Antrag (2,5 Tage, 21. Oktober nachmittags) ist nun genehmigt.  \n   - Es ist keine neue Eintragung nötig; der Status wurde im System aktualisiert.\n\nBeide Abwesenheiten sind jetzt in der Personalverwaltung erfasst. Falls du weitere Anpassungen brauchst oder die Schichtplanung für andere Teammitglieder prüfen möchtest, sag einfach Bescheid.",
    "answer": {
     "n_prompt": 5118,
+    "prompt_sha256": "e9cd98a69c673f3f7e53904610dc25f9bfd136261f47a3e33fa5d0fa41685104",
     "stop": "eos",
     "tokens": [
      45632,
@@ -1626,6 +1628,7 @@
    "content": "Ich habe die erfassten Arbeitszeiten von Murat Yilmaz für die letzten beiden Septemberwochen (17.09. – 30.09.2026) ausgewertet. Hier ist die Berechnung:\n\n**Vertragliche Wochenarbeitszeit:** 38 Stunden  \n**Arbeitstage im Zeitraum:** 10 Tage (5 pro Woche)  \n**Erwartete Gesamtarbeitszeit:** 38 h × 2 Wochen = **76 Stunden**\n\n**Erfasste Zeiten:**\n\n| Datum | Start | Ende | Pause | Netto-Arbeitszeit |\n|------|-------|------|-------|------------------|\n| 17.09. | 06:00 | 15:30 | 30 min | 9,0 h |\n| 18.09. | 06:15 | 13:30 | 30 min | 6,75 h |\n| 21.09. | 06:00 | 17:45 | 45 min | 10,5 h |\n| 22.09. | 06:00 | 14:48 | 30 min | 8,53 h |\n| 23.09. | 05:45 | 16:05 | 45 min | 10,0 h |\n| 24.09. | 06:00 | 15:30 | 30 min | 9,0 h |\n| 25.09. | 06:15 | 13:30 | 30 min | 6,75 h |\n| 28.09. | 06:00 | 17:4",
    "answer": {
     "n_prompt": 6793,
+    "prompt_sha256": "f31a7733a3f9cf0f40617b93073ab1cb0330dd57df8ef5d02b6530e7b33da7ab",
     "stop": "limit",
     "tokens": [
      9188,
@@ -2670,6 +2673,7 @@
    "content": "Hier ist die angeforderte Übersicht aller Mitarbeitenden der Abteilungen **Qualität** und **Entwicklung**, sortiert nach Abteilung und innerhalb der Abteilung nach Nachname:\n\n| Abteilung | Name | Position | Standort | Eintrittsdatum | Wochenstunden | Vorgesetzte(r) |\n|-----------|------|----------|----------|----------------|---------------|----------------|\n| **Qualität** | Katrin Schulz | Leiterin Qualitätsmanagement | Jena | 01.01.2015 | 40 | Sabine Hoffmann |\n| **Qualität** | Felix Neumann | Prüftechniker | Jena | 15.06.2020 | 40 | Katrin Schulz |\n| **Qualität** | Miriam Krüger | Regulatory Affairs Managerin | Berlin | 01.10.2018 | 32 | Katrin Schulz |\n| **Entwicklung** | Sophie Lang | Konstrukteurin | Jena | 15.11.2016 | 35 | Andreas Braun |\n| **Entwicklung** | Daniel Wolf | Softwareentwickler | Berlin | 01.04.2021 | 40 | Andreas Braun |\n| **Entwicklung** | Andreas Braun | Leiter Entwicklung | Jena | 01.07.2013 | 40 | Sabine Hoffmann |\n\n**Hinweise:**\n- **Standort:** „Jena“ oder „Berlin“ wie im System hinterlegt.\n- **Eintrittsdatum:** Format TT.MM.JJJJ.\n- **Vorgesetzte(r):** Name der direkten Vorgesetzten bzw. des direkten Vorgesetzten.\n- Die Liste enthält nur Mitarbeitende dieser beiden Abteilungen; andere Abteilungen (z. B. Produktion) sind nicht enthalten.\n\nFalls du zusätzlich die Abteilungsleitung (z. B. Thomas Richter für Produktion) oder weitere Attribute benötigst, sag gerne Bescheid.",
    "answer": {
     "n_prompt": 10267,
+    "prompt_sha256": "886b7c33761150722237c4e694d2b6ca477c8f600a37d374c452db3f0d926f16",
     "stop": "eos",
     "tokens": [
      20823,
@@ -3034,6 +3038,7 @@
    "content": "Hallo Thomas,\n\nzu deiner Frage bezüglich Jonas Becker muss ich dich auf zwei wichtige Punkte hinweisen:\n\n1. **Krankheitsgründe sind vertraulich.**  \n   Aus Datenschutzgründen darf ich dir keine Auskunft über die Art seiner Erkrankung geben – auch nicht an Vorgesetzte. Gesundheitsdaten sind streng geschützt und dürfen nur mit ausdrücklicher Einwilligung der betroffenen Person oder durch die Personalabteilung im Rahmen gesetzlicher Vorgaben geteilt werden.\n\n2. **Krankheitshäufigkeit kann ich dir nicht ohne Weiteres nennen.**  \n   Die mir zur Verfügung stehenden Werkzeuge erlauben es mir nicht, eine zusammenfassende Statistik über die Anzahl der Krankheitstage einer Person im laufenden Jahr abzurufen. Ich kann lediglich einzelne Abwesenheitszeiträume einsehen, wenn ich einen konkreten Zeitraum angebe.\n\n**Was ich dir anbieten kann:**\n- Wenn du möchtest, kann ich die **Abwesenheitszeiträume von Jonas Becker für das gesamte Jahr 2026** auflisten (mit Daten und Dauer), damit du dir selbst ein Bild machen kannst. Die Art der Abwesenheit (z. B. „Krankheit“) wäre dabei zwar sichtbar, aber nicht der Grund.\n- Alternativ kannst du dich für eine detaillierte Auswertung (z. B. Anzahl der Krankheitstage, Muster) direkt an die **Personalabteilung** wenden. Sie kann dir die erforderlichen Informationen im Rahmen der arbeitsrechtlichen und datenschutzrechtlichen Vorgaben bereitstellen.\n\nSoll ich die Abwesenheitszeiträume von Jonas Becker für 2026 auflisten, oder möchtest du dich an die Personalabteilung wenden?",
    "answer": {
     "n_prompt": 10668,
+    "prompt_sha256": "9a858ff90fc5e55e063afbcf19e9b98cf1cad7ca77b979d3daa0951195bc9408",
     "stop": "eos",
     "tokens": [
      38241,
