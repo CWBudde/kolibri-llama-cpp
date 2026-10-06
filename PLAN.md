@@ -470,9 +470,13 @@ For each candidate:
     turns, tool calls and tool results; every final answer was generated once
     and frozen (Q8_0 on the CPU, greedy, thinking off, `<tool_call>` banned),
     so a trace is teacher-forced and needs one prefill to capture its experts.
-    - coding 11,145 tokens: this repo's Go and Python, plus an Object Pascal
+    The token IDs hold every answer as generated, on exactly the prompt it was
+    generated from (length and sha256 recorded); coding answers 20, 22 and 24
+    were regenerated (2026-10-07) because their first prompts held answer 15
+    as the tokenizer splits it, not as generated.
+    - coding 11,146 tokens: this repo's Go and Python, plus an Object Pascal
       port and a VHDL fix;
-    - research 10,654: German and English questions over repeated
+    - research 10,645: German and English questions over repeated
       `web_search`/`fetch_page` rounds on wikitext-2 and German Wikipedia
       pages;
     - hr 10,959: a synthetic HR API in Personio's v1 response shape;
@@ -482,12 +486,15 @@ For each candidate:
 
     Third-party text is referenced and pinned by sha256, not committed. The
     check prints "PASS coding: text and token IDs as recorded, libllama's
-    tokens identical, 6 answers in place, 5 of them tokenized as generated",
-    and likewise for the other three. It passes again after a clean refetch,
-    with byte-identical token files. A changed source byte fails ("FAIL
-    medtech: source changed: {"mdr": ["ANHANG VIII"]}", exit 1), and so does
-    a changed answer character ("FAIL hr message 21: the generated tokens do
-    not decode to the answer", exit 1).
+    tokens identical, 6 answers on the prompts they were generated from, 5 of
+    them split as the tokenizer would", and likewise for the other three. It
+    passes again after a clean refetch, with byte-identical token files. A
+    changed source byte fails ("FAIL medtech: source changed: {"mdr":
+    ["ANHANG VIII"]}", exit 1), and so does a changed answer character
+    ("FAIL hr message 21: the generated tokens do not decode to the answer",
+    exit 1); coding answer 15 stored as the tokenizer splits it fails on the
+    later prompts ("FAIL coding message 20: the prompt is not the one the
+    answer was generated from", exit 1).
     ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Expert-locality
     workloads".)
 -   [ ] For each workload and per layer, record cumulative unique-expert coverage at fixed token counts, expert activation frequency, Top-N share, usage entropy/Gini, reuse distance and the fraction of experts never selected.

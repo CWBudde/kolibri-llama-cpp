@@ -669,8 +669,8 @@ released chat template, with tools:
 
 | Workload | Content | Tokens |
 |---|---|---|
-| `coding` | Explain Go code, find a failing test's cause, review Python and show a diff (in English), write a table-driven Go test; outside Kolibri's expected strengths, port an Object Pascal unit to Go and fix a VHDL FIR filter. Tools `read_file`, `grep`, `run_tests`; the files come from this repo at commit 05bf1e5. | 11,145 |
-| `research` | German and English research questions with repeated `web_search` and `fetch_page` rounds. The pages are wikitext-2 test articles and German Wikipedia articles from the calibration cache. | 10,654 |
+| `coding` | Explain Go code, find a failing test's cause, review Python and show a diff (in English), write a table-driven Go test; outside Kolibri's expected strengths, port an Object Pascal unit to Go and fix a VHDL FIR filter. Tools `read_file`, `grep`, `run_tests`; the files come from this repo at commit 05bf1e5. | 11,146 |
+| `research` | German and English research questions with repeated `web_search` and `fetch_page` rounds. The pages are wikitext-2 test articles and German Wikipedia articles from the calibration cache. | 10,645 |
 | `hr` | German questions about absences, a new absence, overtime and an employee overview, against a synthetic HR API whose responses follow Personio's v1 JSON shape, and a data-protection question. All people and data are invented. | 10,959 |
 | `medtech` | German QM and regulatory work on the EU Medical Device Regulation (EU) 2017/745: obligations, the classification of an ECG analysis software, the GSPR, a review of a draft PMS procedure, PMCF and an action list. The first turn carries Art. 10, Art. 83–86 and Annexes I–III; tools return Annex VIII, Art. 87/88, Art. 61 with Annex XIV, and the (invented) procedure. | 28,450 |
 
@@ -689,6 +689,12 @@ released chat template, with tools:
   tokens before it, so prefilling a trace selects the experts that
   generating it did. The locality measurements therefore need one prefill
   per trace, on any backend.
+- **The token IDs hold each answer as generated.** A model can generate a
+  split the tokenizer would not choose. Each answer was generated from the
+  IDs of the conversation before it, earlier answers as generated, and
+  records that prompt's length and sha256. The check requires the
+  conversation's IDs to start with exactly that prompt, so the one prefill
+  reproduces every generation's context token for token.
 - **The template:** it runs with `enable_thinking` false and
   `preserve_thinking` true, as llama-server does by default. Each answer's
   prompt is therefore a prefix of the whole conversation.
@@ -710,18 +716,22 @@ tools/locality/workloads.py [--record]     # the check
 The check fails (exit 1) on any of these:
 
 - a source whose text no longer matches its sha256;
-- an empty answer slot;
+- an answer slot (an assistant message without tool calls) without a
+  recorded generation;
 - token IDs from libllama (on the vocab GGUF) that differ from the
   reference tokenizer's;
-- an answer whose prompt and text are not a prefix of the conversation, or
-  whose prompt has changed length;
+- an answer whose prompt and text are not a prefix of the conversation;
+- an answer whose prompt IDs (length and sha256) are not those it was
+  generated from;
 - an answer whose stored generated token IDs don't decode to its text;
+- token IDs, answers as generated, that don't decode to the conversation;
 - a length outside the workload's range (8,192 to 32,768 tokens; at least
   24,576 for MedTech);
 - a rendered text or token IDs whose hash differs from
   `testdata/locality/manifest.json`.
 
-It also writes the token IDs to `~/models/eval/locality/<name>.tokens.npy`.
+It also writes the token IDs, answers as generated, to
+`~/models/eval/locality/<name>.tokens.npy`.
 
 The recorded run:
 
@@ -735,33 +745,58 @@ The recorded run:
     0.07 tokens/s.
 - **Determinism:** an interrupted first run and the final run produced the
   same six coding answers word for word ("text_sha256" e733094f… both
-  times).
+  times, before the regeneration below).
+- **Regenerated (2026-10-07):** coding messages 20, 22 and 24, the answers
+  after the one non-canonical split (below). The first run had built each
+  prompt from the fresh tokenization, so these three had seen coding answer
+  15 as 383 tokens, not the 384 the model generated. Now their prompts carry
+  answer 15 as generated (8,714, 9,784 and 10,760 tokens, one more each).
+  - All three answers changed: greedy output diverged after 88 to 221
+    characters. One different split about 3k tokens earlier was enough.
+  - 21 min by the client's clock (863, 202 and 189 s; the first includes
+    the prefill of the 8.7k-token prompt), generation 2.95 to 3.42 tokens/s.
+    All three again stopped at the cap, so 17 of 22 still do.
+  - The other 19 answers were kept. Their prompts contain no earlier
+    non-canonical split, so the IDs sent were the fresh tokenization of the
+    prompt text. Their recorded `prompt_sha256` is computed from that,
+    asserted equal to the replayed prompt.
 - **The check:**
 
   ```
-  PASS coding: text and token IDs as recorded, libllama's tokens identical, 6 answers in place, 5 of them tokenized as generated
-  PASS research: text and token IDs as recorded, libllama's tokens identical, 5 answers in place, 4 of them tokenized as generated
-  PASS hr: text and token IDs as recorded, libllama's tokens identical, 5 answers in place, 5 of them tokenized as generated
-  PASS medtech: text and token IDs as recorded, libllama's tokens identical, 6 answers in place, 6 of them tokenized as generated
+  PASS coding: text and token IDs as recorded, libllama's tokens identical, 6 answers on the prompts they were generated from, 5 of them split as the tokenizer would
+  PASS research: text and token IDs as recorded, libllama's tokens identical, 5 answers on the prompts they were generated from, 4 of them split as the tokenizer would
+  PASS hr: text and token IDs as recorded, libllama's tokens identical, 5 answers on the prompts they were generated from, 5 of them split as the tokenizer would
+  PASS medtech: text and token IDs as recorded, libllama's tokens identical, 6 answers on the prompts they were generated from, 6 of them split as the tokenizer would
   ```
 
-- **Two answers tokenize differently** from how they were generated:
-  - coding message 15 from token 65 (" Run" + "s" generated, " Runs" in the
-    conversation);
-  - research message 34 from token 116.
+- **Two answers were generated with a split the tokenizer would not
+  choose:**
+  - coding message 15 from token 65 (" Run" + "s" generated, " Runs" afresh;
+    384 tokens generated, 383 afresh);
+  - research message 34 from token 116 (384 generated, 393 afresh), the
+    workload's last answer.
 
-  The conversation keeps the fresh tokenization: a server also tokenizes the
-  history afresh for the next turn.
+  The token files carry both as generated (INFO lines).
 - **Reproducible:** after deleting `~/models/eval/locality/` and the two
   Wikipedia row files and running `--fetch`, the check passes again with
   byte-identical token files. The downloads are byte-identical too.
+  Repeated after the regeneration, with the same result.
 - **Negative controls:**
   - one changed byte in Annex VIII of the XHTML fails ("FAIL medtech: source
     changed: {"mdr": ["ANHANG VIII"]}: sha256 7a58e9c3…, pinned acb5c8bb…",
     exit 1);
   - one changed character in an HR answer fails ("FAIL hr message 21: the
     generated tokens do not decode to the answer", plus the manifest
-    mismatch, exit 1).
+    mismatch, exit 1);
+  - HR message 21 without its generation record fails ("FAIL hr message
+    21: no recorded generation (run --answer)", exit 1);
+  - coding answer 15 stored as the tokenizer splits it fails. The text is
+    the same, but "FAIL coding message 20: the prompt is not the one the
+    answer was generated from" appears, likewise for 22 and 24, plus the
+    token hash (exit 1);
+  - one changed generated ID in coding answer 15 fails ("FAIL coding: the
+    token IDs with the generated answers do not decode to the
+    conversation", plus messages 15, 20, 22 and 24, exit 1).
 - **Not measured here:** the expert coverage, reuse and cache simulations
   that these traces feed (PLAN Phase 8, next items), and the answers'
   quality, which waits for Phases 6 and 7.
