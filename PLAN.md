@@ -459,11 +459,44 @@ For each candidate:
     ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Sustained
     generation").
 -   [ ] Compare quality and Top-6 routing agreement with BF16.
--   [ ] Add an expert-locality workload suite with fixed, reproducible prompt/tool traces for four representative scenarios:
+-   [x] Add an expert-locality workload suite with fixed, reproducible prompt/tool traces for four representative scenarios:
     - coding tasks (including tasks outside Kolibri's expected strengths),
     - research-heavy web workflows with repeated tool/result turns,
     - HR tool use modelled on a Personio-style employee-data API workflow,
     - MedTech QM/regulatory work with long standards/regulatory context and document-oriented questions.
+
+    (2026-10-06) — `testdata/locality/` holds the four conversations, checked by
+    `tools/locality/workloads.py`. Each fixes the system prompt, tools, user
+    turns, tool calls and tool results; every final answer was generated once
+    and frozen (Q8_0 on the CPU, greedy, thinking off, `<tool_call>` banned),
+    so a trace is teacher-forced and needs one prefill to capture its experts.
+    The token IDs hold every answer as generated, on exactly the prompt it was
+    generated from (length and sha256 recorded); coding answers 20, 22 and 24
+    were regenerated (2026-10-07) because their first prompts held answer 15
+    as the tokenizer splits it, not as generated.
+    - coding 11,146 tokens: this repo's Go and Python, plus an Object Pascal
+      port and a VHDL fix;
+    - research 10,645: German and English questions over repeated
+      `web_search`/`fetch_page` rounds on wikitext-2 and German Wikipedia
+      pages;
+    - hr 10,959: a synthetic HR API in Personio's v1 response shape;
+    - medtech 28,450: the German EU MDR 2017/745 (Art. 10, 61, 83–88, Annexes
+      I–III, VIII, XIV) from the Publications Office. ISO standards are
+      excluded as copyrighted.
+
+    Third-party text is referenced and pinned by sha256, not committed. The
+    check prints "PASS coding: text and token IDs as recorded, libllama's
+    tokens identical, 6 answers on the prompts they were generated from, 5 of
+    them split as the tokenizer would", and likewise for the other three. It
+    passes again after a clean refetch, with byte-identical token files. A
+    changed source byte fails ("FAIL medtech: source changed: {"mdr":
+    ["ANHANG VIII"]}", exit 1), and so does a changed answer character
+    ("FAIL hr message 21: the generated tokens do not decode to the answer",
+    exit 1); coding answer 15 stored as the tokenizer splits it fails on the
+    later prompts ("FAIL coding message 20: the prompt is not the one the
+    answer was generated from", exit 1).
+    ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Expert-locality
+    workloads".)
 -   [ ] For each workload and per layer, record cumulative unique-expert coverage at fixed token counts, expert activation frequency, Top-N share, usage entropy/Gini, reuse distance and the fraction of experts never selected.
 -   [ ] Replay the recorded expert-selection traces through simulated LRU caches of several sizes and report hit rate, miss rate and estimated expert bytes loaded per token. Keep this simulation separate from the later real streaming benchmark so cache-policy questions can be answered before implementing I/O.
 -   [ ] Benchmark resident Metal inference against streamed/offloaded expert

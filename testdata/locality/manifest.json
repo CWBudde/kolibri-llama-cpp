@@ -1,0 +1,49 @@
+{
+ "answers": {
+  "gguf": "Kolibri-1-Q8_0.gguf",
+  "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+  "llama-server flags": [
+   "-dev",
+   "none",
+   "--no-repack",
+   "-t",
+   "10",
+   "-c",
+   "32768",
+   "-np",
+   "1"
+  ],
+  "request": {
+   "n_predict": 384,
+   "temperature": 0,
+   "logit_bias": [
+    [
+     127909,
+     false
+    ]
+   ]
+  }
+ },
+ "workloads": {
+  "coding": {
+   "n_tokens": 11146,
+   "text_sha256": "744f2a438b217cf588e0be16b2b2fc8fa7b064fde41c52b57107a77b47fb5186",
+   "tokens_sha256": "4e0a77cca373d7a1e0f665b79404b8ca2ac1ee33b74cd14d1f2a50e7cae13360"
+  },
+  "research": {
+   "n_tokens": 10645,
+   "text_sha256": "35344be8ce0bfe1bb0857dac8b7c3c0f762dcaf6764bd8e7ff70d6bd68ce929c",
+   "tokens_sha256": "b35d11c77c5e658bfe796370db53102e0dd219263b7d959c4dd4c76d2a35655a"
+  },
+  "hr": {
+   "n_tokens": 10959,
+   "text_sha256": "0b0248a726e7bc363abc33ee867b4250c34e12339ab3cd9c2ab60bd45af34240",
+   "tokens_sha256": "05dcdd3f3da552dbb4085cc6cb6dbf62d67034233324a9ddbd7f026fb36fbfe2"
+  },
+  "medtech": {
+   "n_tokens": 28450,
+   "text_sha256": "17d68608fd518c7316afbfa57afd69daf0b023d62132c5df013b01e2fc84627c",
+   "tokens_sha256": "00b2baebe5fd343ebff4462cfaf392e15934137270efc686b8d1370fe244f98b"
+  }
+ }
+}
