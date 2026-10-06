@@ -139,7 +139,10 @@ def node_lines(got: dict, ref: dict, W: Weights) -> list[tuple[float, str]]:
     A node counts only the tokens whose experts agree in every layer it depends on: the earlier
     layers for Q, K, the attention output and the shared expert, which a layer computes before its
     router, and this layer too for the routed expert output. NaN if there are none; the worst layer
-    skips such layers."""
+    skips such layers.
+
+    ref may hold fewer nodes than got (e2e.py stores a compact set): a line is left out when ref lacks
+    the embeddings, and the worst-layer line when ref lacks a layer's expert outputs."""
     import numpy as np
 
     def worst(*vals) -> float:
@@ -148,17 +151,23 @@ def node_lines(got: dict, ref: dict, W: Weights) -> list[tuple[float, str]]:
     def err(node: str, il: int, mask) -> float:
         return nmse(ref[f"{node}-{il}"][mask], got[f"{node}-{il}"][mask]) if mask.any() else float("nan")
 
-    v = nmse(ref[EMBD], got[EMBD])
-    lines = [(v, f"token embeddings (embd): NMSE {v:.2e}")]
+    lines = []
+    if EMBD in ref:
+        v = nmse(ref[EMBD], got[EMBD])
+        lines.append((v, f"token embeddings (embd): NMSE {v:.2e}"))
     first = {"sliding": next(il for il in range(W.n_layer) if W.is_swa[il]),
              "full": next(il for il in range(W.n_layer) if not W.is_swa[il])}
     n = len(got[EMBD])
     before = np.ones(n, dtype=bool)  # the same experts in every earlier layer
     top = {"ffn_moe_out": (float("nan"), -1), "ffn_shexp": (float("nan"), -1)}
+    every = all(f"{node}-{il}" in ref for node in top for il in range(W.n_layer))
     for il in range(W.n_layer):
         through = before & same_experts(got[f"ffn_moe_topk-{il}"], ref[f"ffn_moe_topk-{il}"])
-        e = {node: err(node, il, before) for node in ("Qcur_normed", "Kcur_normed", "attn_out", "attn_post_norm",
-                                                      "ffn_shexp")}
+        if il not in first.values() and not every:
+            before = through
+            continue
+        attn = ("Qcur_normed", "Kcur_normed", "attn_out", "attn_post_norm") if il in first.values() else ()
+        e = {node: err(node, il, before) for node in attn + ("ffn_shexp",)}
         e["ffn_moe_out"] = err("ffn_moe_out", il, through)
         for node, (val, _) in top.items():
             if not e[node] <= val and not np.isnan(e[node]):  # the larger, or the first layer
@@ -177,9 +186,10 @@ def node_lines(got: dict, ref: dict, W: Weights) -> list[tuple[float, str]]:
                           f"expert output ffn_shexp {e['ffn_shexp']:.2e} ({nb} tokens, before it)"))
         before = through
     (moe, moe_il), (sh, sh_il) = top["ffn_moe_out"], top["ffn_shexp"]
-    lines.append((worst(moe, sh), f"worst layer with tokens on the same experts: NMSE routed expert output "
-                                  f"ffn_moe_out {moe:.2e} (layer {moe_il}), shared expert output ffn_shexp "
-                                  f"{sh:.2e} (layer {sh_il})"))
+    if every:
+        lines.append((worst(moe, sh), f"worst layer with tokens on the same experts: NMSE routed expert output "
+                                      f"ffn_moe_out {moe:.2e} (layer {moe_il}), shared expert output ffn_shexp "
+                                      f"{sh:.2e} (layer {sh_il})"))
     return lines
 
 

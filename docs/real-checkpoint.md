@@ -748,7 +748,8 @@ bfloat16:
 
 Last, per case, it states whether libllama's logits are bit-identical to the
 recorded run, or how its metrics moved. The metrics are not gated, since the
-real model has no tolerance yet.
+real model has no tolerance yet. The bit-identity itself is gated since
+"Regression suite" below.
 
 Results, libllama BF16 on the CPU. The default mode took 13 minutes, with a
 peak footprint of 10.8 GB, and every case came out bit-identical to the run
@@ -795,9 +796,98 @@ Rerun after an upstream llama.cpp change:
 .venv/bin/python tools/ref/e2e.py --llama-cpp third_party/llama.cpp --gguf ~/models/Kolibri-1-BF16.gguf
 ```
 
-`unchanged` means libllama's logits are bit-identical to the recorded run.
-`CHANGED` lists how each metric moved; `--record` makes that run the
-recorded one.
+The results above are those of the first version of the tool. The current
+one gates the comparison with the recorded run; see "Regression suite".
+
+## Regression suite
+
+`tools/ref/regress.py` reruns a compact subset of the reference comparisons
+with one command, after a llama.cpp or upstream change. It fails if any of its
+three parts fails:
+
+| Part | What | Gate |
+|---|---|---|
+| tokenizer | `compare.py --only golden --only corpus` on a fresh vocab-only GGUF | token IDs and detokenized bytes identical to the pinned reference tokenizer: 85 golden cases, 4,212 + 6,461 corpus cases |
+| tiny reference | `compare_real.py --tiny` | token embeddings, Q and K after the QK norm, attention output, router logits and experts, routed and shared expert output, `l_out` and logits of the F32 tiny model within NMSE 1e-6 of the torch reference |
+| real weights | `e2e.py` on the BF16 GGUF, all six corpus cases | every captured libllama node and the logits bit-identical to the recorded libllama run |
+
+The first two parts compare with the reference itself, the third with a
+reviewed earlier libllama run. The real model has no tolerance yet, so a
+change there fails until someone has looked at it.
+
+`e2e.py` captures 451 nodes per case:
+- the token embeddings;
+- per layer, Q and K after the QK norm, the attention output before and after
+  its sandwich norm, the router logits and selected experts, the routed and
+  shared expert output, and `l_out`.
+
+The manifest records the sha256 of each, next to the logits'. With the
+recorded GGUF and thread count, a case passes only if all of them are
+identical. Otherwise it fails and names the first changed node in graph order,
+with the metrics' movement against the recorded run. A GGUF or thread count
+other than the recorded one is reported as `INFO` and not gated. That is the
+way to look at a quantized GGUF. `regress.py` runs `e2e.py` with `--strict`,
+where such a case fails, and so does a case without a recorded run.
+
+`--record` accepts a reviewed change. Capturing every node leaves libllama's
+logits as they were: the six logits hashes equal those recorded without the
+node capture.
+
+For two cases, `--write` also stores a compact set of the float32
+reference's nodes, so the per-node comparison of "Per-node comparison" reruns
+without the torch pass:
+
+| Case | Stored nodes | Artifact |
+|---|---|---|
+| `wiki-c1` | token embeddings; Q, K, attention output and expert outputs in layers 0 and 4; expert outputs and `l_out` in all 50 layers | 1.40 GB (564 MB before) |
+| `de-long` | Q, K, attention output and expert outputs in layers 0 and 4, past the 513-token window; `l_out` in all 50 layers | 1.79 GB (1.13 GB before) |
+
+Writing both took 46 minutes, with a peak footprint of 17.3 GB. The other
+arrays came out with the same sha256 as before.
+
+libllama against these nodes (`INFO`):
+
+| Node | `wiki-c1` | `de-long` |
+|---|---|---|
+| token embeddings | 0.00e+00 | |
+| layer 0 (sliding): Q, K after QK norm | 2.01e-06, 1.76e-06 | 2.03e-06, 1.75e-06 |
+| layer 0: attn_out, attn_post_norm | 1.71e-07, 1.14e-07 | 1.59e-07, 1.12e-07 |
+| layer 0: ffn_moe_out, ffn_shexp | 6.15e-06, 1.06e-06 | 6.03e-06, 1.11e-06 |
+| layer 4 (full): Q, K after QK norm | 1.93e-06, 2.78e-06 | 1.86e-06, 2.66e-06 |
+| layer 4: attn_out, attn_post_norm | 2.04e-06, 3.87e-06 | 1.97e-06, 2.34e-06 |
+| layer 4: ffn_moe_out, ffn_shexp | 3.28e-06, 4.73e-07 | 2.33e-06, 4.64e-07 |
+| worst layer: ffn_moe_out, ffn_shexp | 2.71e-03 (33), 1.79e-03 (49) | |
+| `l_out`: layer 0, 4, worst, 49 | 7.63e-08, 2.74e-06, 7.60e-02 (31), 1.17e-02 | 8.12e-08, 2.09e-06, 2.81e-02 (43), 1.18e-02 |
+
+These numbers are the NMSE over the tokens whose experts agree in the earlier
+layers (all tokens for `l_out`). `wiki-c1` repeats the numbers of
+"Per-node comparison" exactly. In `de-long`, the sliding layer 0 drops keys
+past the window, and it stays as close to the reference as on the shorter
+chunk.
+
+The suite took 27 minutes:
+- tokenizer: 8 s;
+- tiny reference: 10 s;
+- real weights: 26.5 minutes.
+
+The real-weights time depends on how much of the 156 GB GGUF is in the page
+cache. libllama took between 205 s and 792 s on `wiki-c1` across runs.
+
+Negative controls:
+
+| Change | Result |
+|---|---|
+| a copy of the manifest with the recorded sha256 of `wiki-c1`'s `l_out-20` changed, through `regress.py --cases wiki-c1 --manifest COPY` | `FAIL wiki-c1: changed since the recorded libllama run, first changed node l_out-20; …`, `FAIL regression suite: real weights`, exit 1 |
+| `e2e.py --cases wiki-c1 --override kolibri.attention.layer_norm_rms_epsilon=1e-4` (1e-6 in the GGUF) | `FAIL wiki-c1: changed since the recorded libllama run, first changed node Qcur_normed-0; vs_float32 kld 1.934355 (recorded 0.033408), …`, exit 1. The token embeddings stay identical; Q after the QK norm is the first captured node after layer 0's attention norm, the first RMS norm |
+
+Run after an upstream llama.cpp change:
+
+```sh
+.venv/bin/python tools/ref/regress.py --llama-cpp third_party/llama.cpp [--gguf ~/models/Kolibri-1-BF16.gguf]
+```
+
+After reviewing a failed real-weights case, accept the change with
+`e2e.py … --record`.
 
 ## Chat on the quantized model
 
@@ -839,8 +929,9 @@ All files live outside the repo, in `~/models`.
    file from "Quantization loss against this port's BF16" (15 minutes), plus
    `--metal --probe-out DIR` for the Metal pass and the router probes.
 8. Run `tools/ref/e2e.py --write` once to store the end-to-end corpus's
-   reference (2 h 23 min), then `tools/ref/e2e.py` after each llama.cpp
-   change (13 minutes), as in "End-to-end corpus".
+   reference (2 h 23 min), as in "End-to-end corpus". After each llama.cpp
+   change, run `tools/ref/regress.py`, about 27 minutes, as in "Regression
+   suite".
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.

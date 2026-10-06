@@ -19,25 +19,41 @@ their token IDs from the pinned tokenizer:
 --write runs the reference on the BF16 GGUF in float32 and in bfloat16 (vLLM's
 precision) and writes one .npz per case to the artifact directory (default
 ~/models/eval/e2e, outside the repo): the logits of both, the float32 run's
-router logits and selected experts per layer, and the router bias. For the
-prompts, the sequence is the prompt plus the float32 greedy continuation. It
-records in testdata/e2e/manifest.json the sha256 of every array, the greedy
+router logits and selected experts per layer, and the router bias. For
+wiki-c1 and de-long it also stores a compact set of the float32 run's nodes
+(REF_NODES): the attention and expert outputs of the first sliding and the
+first full layer and every layer's output l_out, and for wiki-c1 the token
+embeddings and every layer's expert outputs too. For the prompts, the sequence
+is the prompt plus the float32 greedy continuation. It records in
+testdata/e2e/manifest.json the sha256 of every array, the greedy
 continuations, the reference's bfloat16-vs-float32 metrics, and the libllama
-run it then does as --check does.
+run it then does as the default mode does.
 
---check verifies the corpus against its sources (when they are present) and
-every artifact against the manifest (FAIL, exit 1, on any difference). It then
-runs libllama on the CPU on each case, with libllama's default KV cache and
-flash-attention settings, and prints INFO lines against the reference in
-float32 and in bfloat16: logits NMSE, KLD and same top token (for wiki-c1 and
-de-long over the second half, with PPL, as llama-perplexity), router Top-1 and
-Top-6 set agreement, and for the prompts libllama's greedy token along the
-reference continuation. Last, per case, whether libllama's logits are
-bit-identical to the recorded run, or how its metrics moved. --record makes
-the current run the recorded one.
+The default mode verifies the corpus against its sources (when they are
+present) and every artifact against the manifest (FAIL, exit 1, on any
+difference). It then runs libllama on the CPU on each case, with libllama's
+default KV cache and flash-attention settings, captures every node (the token
+embeddings and, per layer, Q and K after the QK norm, the attention output
+before and after its sandwich norm, the router logits and selected experts,
+the routed and shared expert output and l_out) and prints INFO lines against
+the reference in float32 and in bfloat16: logits NMSE, KLD and same top token
+(for wiki-c1 and de-long over the second half, with PPL, as
+llama-perplexity), router Top-1 and Top-6 set agreement, for the prompts
+libllama's greedy token along the reference continuation, and where nodes are
+stored, their NMSE (compare_real.node_lines) and l_out's.
 
-The metrics are INFO, not PASS/FAIL: the real model has no tolerance yet (PLAN
-Phase 6), and the reference is a port of the vLLM code, not vLLM.
+Last, per case, the gate: with the recorded GGUF and thread count, every
+captured node and the logits must be bit-identical to the recorded libllama
+run, or the case fails and names the first changed node in graph order. With
+another GGUF or thread count, the comparison is INFO; with --strict (as
+regress.py runs it) such a case fails, and so does a case without a recorded
+run. --record makes the current run the recorded one, after a change has been
+reviewed. --override KEY=VALUE changes a GGUF metadata value for libllama, as
+a negative control.
+
+The metrics against the reference are INFO, not PASS/FAIL: the real model has
+no tolerance yet (PLAN Phase 6), and the reference is a port of the vLLM code,
+not vLLM.
 
     e2e.py --llama-cpp third_party/llama.cpp --gguf ~/models/Kolibri-1-BF16.gguf --write
     e2e.py --llama-cpp third_party/llama.cpp --gguf ~/models/Kolibri-1-BF16.gguf [--record]
@@ -60,9 +76,10 @@ sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
 sys.path.insert(0, str(ROOT / "tools" / "chat"))
 sys.path.insert(0, str(ROOT / "tools" / "quant"))
 
-from check_model import Runner  # noqa: E402
+from check_model import Runner, nmse  # noqa: E402
 from common import tokenizer_dir  # noqa: E402
-from compare_real import GERMAN, N_GREEDY, chunk_stats, flat, logit_stats, stats_text  # noqa: E402
+from compare_real import (EMBD, GERMAN, N_GREEDY, capture_names, chunk_stats, flat, logit_stats,  # noqa: E402
+                          node_lines, stats_text)
 from router_probe import probe  # noqa: E402
 
 CORPUS = ROOT / "testdata" / "e2e" / "corpus.json"
@@ -80,6 +97,17 @@ CHAT = [{"role": "user", "content": "Erkläre in zwei Sätzen, was ein Mixture-o
 CHAT_VARIABLES = {"enable_thinking": False}
 N_LONG = 1024
 N_CTX = 1024
+# the order of a layer's nodes in the graph, after the token embeddings (embd)
+ORDER = ("Qcur_normed", "Kcur_normed", "attn_out", "attn_post_norm", "ffn_moe_logits", "ffn_moe_topk",
+         "ffn_moe_out", "ffn_shexp", "l_out")
+ATTN = ("Qcur_normed", "Kcur_normed", "attn_out", "attn_post_norm")
+EXPERTS = ("ffn_moe_out", "ffn_shexp")
+# the float32 reference nodes --write stores, per case: whether the token embeddings, the nodes in the
+# first sliding and the first full layer, and the nodes in every layer
+REF_NODES = {
+    "wiki-c1": (True, ATTN + EXPERTS, EXPERTS + ("l_out",)),
+    "de-long": (False, ATTN + EXPERTS, ("l_out",)),  # past the window
+}
 
 
 def sha256(path: Path) -> str:
@@ -135,6 +163,37 @@ def build_corpus(tok, kld_base: Path, calibration: Path) -> dict:
     return {"sources": sources, "cases": cases}
 
 
+def ref_node_names(name: str, is_swa: list[bool]) -> list[str]:
+    """The reference nodes stored for a case, in graph order (none for a case not in REF_NODES)."""
+    if name not in REF_NODES:
+        return []
+    embd, first, every = REF_NODES[name]
+    firsts = (is_swa.index(True), is_swa.index(False))
+    names = [EMBD] if embd else []
+    for il in range(len(is_swa)):
+        names += [f"{node}-{il}" for node in ORDER if node in every or (il in firsts and node in first)]
+    return names
+
+
+def graph_key(name: str) -> tuple[int, int]:
+    """Sort key of a captured node in graph order."""
+    if name == EMBD:
+        return -1, 0
+    node, il = name.rsplit("-", 1)
+    return int(il), ORDER.index(node)
+
+
+def first_changed(old: dict, new: dict) -> str | None:
+    """The first node in graph order whose hash differs between two libllama records (or the logits),
+    None if they are bit-identical. A record without node hashes compares only the logits."""
+    if "nodes_sha256" in old:
+        a, b = old["nodes_sha256"], new["nodes_sha256"]
+        for name in sorted(set(a) | set(b), key=graph_key):
+            if a.get(name) != b.get(name):
+                return name if name in a and name in b else f"{name} (only in one run)"
+    return None if old["logits_sha256"] == new["logits_sha256"] else "the logits"
+
+
 def sequence(case: dict, entry: dict | None) -> list[int]:
     """The evaluated tokens: a chunk, or a prompt plus the reference's float32 greedy continuation."""
     return case["tokens"] + (entry["greedy_float32"] if case["kind"] == "prompt" else [])
@@ -152,7 +211,7 @@ def text_of(s: dict) -> str:
     return ppl + stats_text(s)
 
 
-def write_reference(gguf: Path, llama_cpp: Path, case: dict) -> tuple[dict, dict]:
+def write_reference(gguf: Path, llama_cpp: Path, name: str, case: dict) -> tuple[dict, dict]:
     """The reference arrays of a case and its manifest entry (without the libllama run)."""
     import numpy as np
 
@@ -171,6 +230,12 @@ def write_reference(gguf: Path, llama_cpp: Path, case: dict) -> tuple[dict, dict
     arrays["router_logits"] = np.stack([dump[f"ffn_moe_logits-{il}"] for il in range(W.n_layer)])
     arrays["router_topk"] = np.stack([dump[f"ffn_moe_topk-{il}"] for il in range(W.n_layer)]).astype(np.int32)
     arrays["router_bias"] = np.stack([W.get(f"blk.{il}.exp_probs_b.bias").float().numpy() for il in range(W.n_layer)])
+    is_swa = [bool(x) for x in W.is_swa]
+    nodes = ref_node_names(name, is_swa)
+    if nodes:
+        arrays["is_swa"] = np.asarray(is_swa)
+        arrays.update({f"node.{node}": dump[node] for node in nodes})
+    del dump
     s = stats(case, arrays["ref_float32"], arrays["ref_bfloat16"], tokens)
     entry["reference_bfloat16_vs_float32"] = s
     entry["reference_seconds"] = round(time.time() - t0)
@@ -178,25 +243,33 @@ def write_reference(gguf: Path, llama_cpp: Path, case: dict) -> tuple[dict, dict
     return arrays, entry
 
 
-def run_libllama(runner: Runner, gguf: Path, threads: int, case: dict, arrays) -> tuple[dict, list[str]]:
-    """libllama on the CPU against the stored reference: the record of the run and its INFO lines."""
+def run_libllama(runner: Runner, gguf: Path, threads: int, case: dict, arrays,
+                 overrides: dict | None = None) -> tuple[dict, list[str]]:
+    """libllama on the CPU against the stored reference: the record of the run and its INFO lines.
+    It captures every node of compare_real.capture_names and records the sha256 of each."""
+    import types
+
     import numpy as np
 
     tokens = arrays["tokens"].tolist()
     n_layer = arrays["router_topk"].shape[0]
-    capture = {f"{node}-{il}": None for il in range(n_layer) for node in ("ffn_moe_logits", "ffn_moe_topk")}
+    capture = capture_names(n_layer)
     _, cpu = runner.devices()[0]
     t0 = time.time()
-    got = runner.logits(gguf, cpu, tokens, len(tokens), capture=capture, n_ctx=N_CTX, n_threads=threads,
-                        n_threads_batch=threads)
+    got = runner.logits(gguf, cpu, tokens, len(tokens), overrides=overrides, capture=capture, n_ctx=N_CTX,
+                        n_threads=threads, n_threads_batch=threads)
     seconds = time.time() - t0
     nodes = flat(capture, len(tokens))
+    del capture
     p = probe(np.stack([nodes[f"ffn_moe_logits-{il}"] for il in range(n_layer)]),
               np.stack([nodes[f"ffn_moe_topk-{il}"] for il in range(n_layer)]),
               arrays["router_logits"], arrays["router_topk"], arrays["router_bias"])
     rec = {
         "gguf": gguf.name,
+        "gguf_bytes": gguf.stat().st_size,
+        "threads": threads,
         "logits_sha256": array_sha256(got.astype(np.float32)),
+        "nodes_sha256": {name: array_sha256(nodes[name]) for name in sorted(nodes, key=graph_key)},
         "vs_float32": stats(case, arrays["ref_float32"], got, tokens),
         "vs_bfloat16": stats(case, arrays["ref_bfloat16"], got, tokens),
         "router_top1_same": float(p["top1_same"].mean()),
@@ -212,6 +285,17 @@ def run_libllama(runner: Runner, gguf: Path, threads: int, case: dict, arrays) -
         router += f"; libllama greedy token along the reference continuation: equal at {rec['greedy_equal']}/{len(cont)}"
     lines = [f"libllama vs reference float32: {text_of(rec['vs_float32'])}; {router} ({seconds:.0f} s)",
              f"libllama vs reference bfloat16: {text_of(rec['vs_bfloat16'])}"]
+    if "is_swa" in arrays:  # the stored reference nodes
+        ref = {name[len("node."):]: a for name, a in arrays.items() if name.startswith("node.")}
+        ref.update({f"ffn_moe_topk-{il}": arrays["router_topk"][il] for il in range(n_layer)})
+        is_swa = arrays["is_swa"].tolist()
+        lines += [f"libllama vs reference float32, {text}"
+                  for _, text in node_lines(nodes, ref, types.SimpleNamespace(n_layer=n_layer, is_swa=is_swa))]
+        lout = [nmse(ref[f"l_out-{il}"], nodes[f"l_out-{il}"]) for il in range(n_layer)]
+        full, top = is_swa.index(False), int(np.argmax(lout))
+        lines.append(f"libllama vs reference float32, layer output l_out over all tokens: NMSE {lout[0]:.2e} "
+                     f"(layer 0), {lout[full]:.2e} (layer {full}), {lout[top]:.2e} (layer {top}, the worst), "
+                     f"{lout[-1]:.2e} (layer {n_layer - 1})")
     if rec["non_finite"]:
         lines.append(f"libllama: {rec['non_finite']} non-finite logits")
     return rec, lines
@@ -254,7 +338,18 @@ def main() -> None:
     ap.add_argument("--kld-base", type=Path, default=KLD_BASE)
     ap.add_argument("--calibration", type=Path, default=CALIBRATION)
     ap.add_argument("--threads", type=int, default=10, help="libllama CPU threads")
+    ap.add_argument("--override", action="append", default=[], metavar="KEY=VALUE",
+                    help="a GGUF metadata override for libllama (int, float or true/false), for negative controls")
+    ap.add_argument("--strict", action="store_true", help="fail every case the gate cannot check (no recorded "
+                    "run, another GGUF or thread count); regress.py sets it")
     args = ap.parse_args()
+    overrides = {}
+    for o in args.override:
+        key, _, val = o.partition("=")
+        overrides[key] = (val == "true" if val in ("true", "false") else
+                          int(val) if val.lstrip("-").isdigit() else float(val))
+    if overrides and (args.write or args.record):
+        raise SystemExit("--override changes the model: it cannot be written or recorded")
 
     errs = []
 
@@ -309,7 +404,7 @@ def main() -> None:
         if args.write:
             import numpy as np
 
-            arrays, entry = write_reference(args.gguf, args.llama_cpp, case)
+            arrays, entry = write_reference(args.gguf, args.llama_cpp, name, case)
             np.savez(path, **arrays)
             manifest["cases"][name] = entry
             print(f"INFO {name}: reference written to {path} ({entry['reference_seconds']} s), bfloat16 vs "
@@ -338,20 +433,39 @@ def main() -> None:
         print(f"PASS {name}: {n} tokens, artifacts match the manifest; reference bfloat16 vs float32: "
               f"{text_of(entry['reference_bfloat16_vs_float32'])}")
 
-        rec, lines = run_libllama(runner, args.gguf, args.threads, case, arrays)
+        rec, lines = run_libllama(runner, args.gguf, args.threads, case, arrays, overrides)
+        del arrays
         for line in lines:
             print(f"INFO {name}, {line}")
         old = entry.get("libllama")
         if args.write or args.record:
             entry["libllama"] = rec
-            print(f"INFO {name}: recorded this libllama run")
-        elif old is None:
-            print(f"INFO {name}: no recorded libllama run; record one with --record")
-        elif old["logits_sha256"] == rec["logits_sha256"]:
-            print(f"INFO {name}: unchanged, logits bit-identical to the recorded libllama run ({old['gguf']})")
+            print(f"INFO {name}: recorded this libllama run ({len(rec['nodes_sha256'])} nodes and the logits)")
+            continue
+        if old is None:
+            what = f"{name}: no recorded libllama run; record one with --record"
+            if args.strict:
+                fail(what)
+            else:
+                print("INFO " + what)
+            continue
+        changed = first_changed(old, rec)
+        # the gate: the same GGUF with the same thread count must give the recorded bits
+        other = [f"recorded with {old[k]}, this run {rec[k]}" for k in ("gguf", "gguf_bytes", "threads")
+                 if old.get(k, manifest.get("libllama", {}).get(k, rec[k])) != rec[k]]
+        nodes = f"{len(old['nodes_sha256'])} nodes and the logits" if "nodes_sha256" in old else "the logits"
+        if other:
+            state = "unchanged" if changed is None else f"CHANGED (first changed node {changed}): {moved(old, rec)}"
+            what = f"{name}, not gated ({'; '.join(other)}): {state}"
+            if args.strict:
+                fail(what + "; --strict needs the recorded GGUF and thread count")
+            else:
+                print("INFO " + what)
+        elif changed is None:
+            print(f"PASS {name}: bit-identical to the recorded libllama run ({nodes})")
         else:
-            gguf = f"; recorded with {old['gguf']}, this run {rec['gguf']}" if old["gguf"] != rec["gguf"] else ""
-            print(f"INFO {name}: CHANGED since the recorded libllama run{gguf}: {moved(old, rec)}")
+            fail(f"{name}: changed since the recorded libllama run, first changed node {changed}; {moved(old, rec)}; "
+                 "accept a reviewed change with --record")
 
     if args.record and errs:
         # a partly recorded baseline would report later regressions as unchanged
