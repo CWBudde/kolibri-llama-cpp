@@ -395,15 +395,24 @@ For each candidate:
 -   [x] Measure GGUF file size. (2026-10-05) — `llama-quantize` "quant
     size" for every candidate: Q3_K and IQ3_S 33,717 MiB, IQ3_XXS 30,342 MiB,
     IQ3_XXS/IQ4_XS 33,904 MiB.
--   [ ] Measure actual unified-memory use after load. (2026-10-04) —
-    partial, Q3 mix at 32k: "MTL0 ... 34384 = 33384 + 740 + 260", host 418 MiB.
-    IQ3_XXS/IQ4_XS at 32k (2026-10-05): "MTL0 ... 34904 = 33904 + 740 + 260",
-    host 375 MiB. IQ3_S and IQ3_XXS remain.
--   [ ] Measure Metal buffers/runtime overhead. (2026-10-04) — partial,
-    Q3 mix: compute buffer 260 MiB on MTL0 and 43 MiB on CPU.
--   [ ] Measure SWA and full-attention KV-cache memory separately.
-    (2026-10-04) — partial, Q3 mix at 32k: full attention "640.00 MiB (32768
-    cells, 10 layers)", SWA "100.00 MiB (1280 cells, 40 layers)".
+-   [x] Measure actual unified-memory use after load. (2026-10-06) — Q3 mix
+    at 32k (2026-10-04): "MTL0 ... 34384 = 33384 + 740 + 260", host 418 MiB.
+    With patch 0009 at 32k: IQ3_XXS "MTL0 (Apple M5 Pro) | 38338 = 6995 +
+    (31009 = 30009 + 740 + 260)", IQ3_XXS/IQ4_XS "38338 = 3433 + (34572 =
+    33572 + 740 + 260)", host 375 MiB each; also at 8k and 16k
+    ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Context length and
+    memory on Metal"). IQ3_S is not measured: it was superseded by the two
+    IQ3_XXS files and deleted.
+-   [x] Measure Metal buffers/runtime overhead. (2026-10-06) — "MTL0 compute
+    buffer size = 260.00 MiB" for both IQ3_XXS files at every context, as for
+    the Q3 mix at 32k; the CPU compute buffer is 19.27, 27.27 and 43.27 MiB at
+    8k, 16k and 32k. The breakdown leaves 332 MiB unaccounted on MTL0, the size of the
+    token embeddings' host buffer.
+-   [x] Measure SWA and full-attention KV-cache memory separately.
+    (2026-10-06) — full attention "160.00 MiB ( 8192 cells, 10 layers", "320.00
+    MiB ( 16384 cells" and "640.00 MiB ( 32768 cells", i.e. 20 KiB per token;
+    SWA "100.00 MiB ( 1280 cells, 40 layers" at every context, on both IQ3_XXS
+    files (F16 cache); the Q3 mix at 32k gives the same.
 -   [x] Measure prompt-processing tokens/s. (2026-10-05) — `llama-bench
     -ngl 99 -p 512 -r 3` on Metal: Q3 mix "pp512 | 1223.02 ± 10.95",
     IQ3_S 1331.99, IQ3_XXS 1367.29, IQ3_XXS/IQ4_XS "pp512 | 1350.55 ± 7.73".
@@ -411,8 +420,15 @@ For each candidate:
     -n 128 -r 3` on Metal: Q3 mix "tg128 | 60.67 ± 0.08", IQ3_S 61.78,
     IQ3_XXS 63.03, IQ3_XXS/IQ4_XS "tg128 | 64.00 ± 0.07". `llama-server` chat
     on the Q3 mix: 58.7 tokens/s.
--   [ ] Measure expert-routing overhead.
--   [ ] Test 8k, 16k, and 32k contexts first.
+-   [ ] Measure expert-routing overhead. Needs a definition first (which ops
+    count, which backend) before it can be measured.
+-   [x] Test 8k, 16k, and 32k contexts first. (2026-10-06) — both IQ3_XXS files
+    load at `-c 8192/16384/32768` on Metal, answer "Berlin" and keep at least
+    3.4 GiB free (above). `llama-bench -ngl 99 -p 512 -n 128 -d
+    0,8192,16384,32256 -r 3` runs with a filled cache: IQ3_XXS/IQ4_XS "pp512 @
+    d32256 | 530.12 ± 39.01", "tg128 @ d32256 | 41.22 ± 0.50" (61.03 at depth
+    0); IQ3_XXS "tg128 @ d32256 | 39.23 ± 1.03". Long-context quality is not
+    measured; it waits for Phases 6 and 7.
 -   [ ] Expand context only if memory headroom permits.
 -   [ ] Test sustained generation and memory pressure.
 -   [ ] Compare quality and Top-6 routing agreement with BF16.
