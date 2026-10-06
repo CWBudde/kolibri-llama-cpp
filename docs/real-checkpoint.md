@@ -660,6 +660,112 @@ The output files:
 - **The text:** `--ignore-eos` forces generation past the end of the answer,
   so its tail repeats "(End of response.)". It is not a quality signal.
 
+### Expert-locality workloads
+
+Streaming or caching experts pays off only if a workload keeps returning to
+a small set of experts. Four fixed chat traces in `testdata/locality/` are
+the input for measuring that. Each is a complete conversation through the
+released chat template, with tools:
+
+| Workload | Content | Tokens |
+|---|---|---|
+| `coding` | Explain Go code, find a failing test's cause, review Python and show a diff (in English), write a table-driven Go test; outside Kolibri's expected strengths, port an Object Pascal unit to Go and fix a VHDL FIR filter. Tools `read_file`, `grep`, `run_tests`; the files come from this repo at commit 05bf1e5. | 11,145 |
+| `research` | German and English research questions with repeated `web_search` and `fetch_page` rounds. The pages are wikitext-2 test articles and German Wikipedia articles from the calibration cache. | 10,654 |
+| `hr` | German questions about absences, a new absence, overtime and an employee overview, against a synthetic HR API whose responses follow Personio's v1 JSON shape, and a data-protection question. All people and data are invented. | 10,959 |
+| `medtech` | German QM and regulatory work on the EU Medical Device Regulation (EU) 2017/745: obligations, the classification of an ECG analysis software, the GSPR, a review of a draft PMS procedure, PMCF and an action list. The first turn carries Art. 10, Art. 83–86 and Annexes I–III; tools return Annex VIII, Art. 87/88, Art. 61 with Annex XIV, and the (invented) procedure. | 28,450 |
+
+- **What is scripted:** the system prompts, user turns, tool calls and tool
+  results.
+- **What is generated:** each turn's final answer, once, then frozen in the
+  trace:
+  - `Kolibri-1-Q8_0.gguf` on the CPU, greedy, thinking off, at most 384
+    tokens, with the `<tool_call>` token banned. Without the ban the model
+    answered the first question with another `read_file` call, but the tool
+    rounds are fixed.
+  - BF16 was the first choice but too slow on this Mac: pp512 5.78 and tg16
+    1.05 tokens/s CPU-only.
+  - Q8_0 is 0.050 KLD from BF16.
+- **Why frozen answers suffice:** a token's experts depend only on the
+  tokens before it, so prefilling a trace selects the experts that
+  generating it did. The locality measurements therefore need one prefill
+  per trace, on any backend.
+- **The template:** it runs with `enable_thinking` false and
+  `preserve_thinking` true, as llama-server does by default. Each answer's
+  prompt is therefore a prefix of the whole conversation.
+- **No third-party text is committed.** A trace names each source and pins
+  the sha256 of the text taken from it:
+  - a file at a commit (`git show`);
+  - a wikitext-2 article;
+  - a German Wikipedia row of the calibration cache;
+  - articles and annexes of the regulation's German XHTML from the EU
+    Publications Office (`publications.europa.eu/resource/celex/32017R0745`,
+    pinned by its own sha256; EU legal texts may be reused).
+
+```sh
+tools/locality/workloads.py --fetch        # the regulation, missing Wikipedia rows
+tools/locality/workloads.py --answer --gguf ~/models/Kolibri-1-Q8_0.gguf  # empty answer slots only
+tools/locality/workloads.py [--record]     # the check
+```
+
+The check fails (exit 1) on any of these:
+
+- a source whose text no longer matches its sha256;
+- an empty answer slot;
+- token IDs from libllama (on the vocab GGUF) that differ from the
+  reference tokenizer's;
+- an answer whose prompt and text are not a prefix of the conversation, or
+  whose prompt has changed length;
+- an answer whose stored generated token IDs don't decode to its text;
+- a length outside the workload's range (8,192 to 32,768 tokens; at least
+  24,576 for MedTech);
+- a rendered text or token IDs whose hash differs from
+  `testdata/locality/manifest.json`.
+
+It also writes the token IDs to `~/models/eval/locality/<name>.tokens.npy`.
+
+The recorded run:
+
+- **Generation:** 22 answers, 17 of them stopped at the 384-token cap.
+  - About 107 min of compute, by the client's monotonic clock, which stops
+    during sleep.
+  - 3.5 h of wall time, because the Mac slept several times, once with the
+    lid closed; `llama-server` resumed after each sleep.
+  - Each answer records the server's prompt and generation rates. Rates for
+    answers that spanned a sleep are meaningless; research message 6 shows
+    0.07 tokens/s.
+- **Determinism:** an interrupted first run and the final run produced the
+  same six coding answers word for word ("text_sha256" e733094f… both
+  times).
+- **The check:**
+
+  ```
+  PASS coding: text and token IDs as recorded, libllama's tokens identical, 6 answers in place, 5 of them tokenized as generated
+  PASS research: text and token IDs as recorded, libllama's tokens identical, 5 answers in place, 4 of them tokenized as generated
+  PASS hr: text and token IDs as recorded, libllama's tokens identical, 5 answers in place, 5 of them tokenized as generated
+  PASS medtech: text and token IDs as recorded, libllama's tokens identical, 6 answers in place, 6 of them tokenized as generated
+  ```
+
+- **Two answers tokenize differently** from how they were generated:
+  - coding message 15 from token 65 (" Run" + "s" generated, " Runs" in the
+    conversation);
+  - research message 34 from token 116.
+
+  The conversation keeps the fresh tokenization: a server also tokenizes the
+  history afresh for the next turn.
+- **Reproducible:** after deleting `~/models/eval/locality/` and the two
+  Wikipedia row files and running `--fetch`, the check passes again with
+  byte-identical token files. The downloads are byte-identical too.
+- **Negative controls:**
+  - one changed byte in Annex VIII of the XHTML fails ("FAIL medtech: source
+    changed: {"mdr": ["ANHANG VIII"]}: sha256 7a58e9c3…, pinned acb5c8bb…",
+    exit 1);
+  - one changed character in an HR answer fails ("FAIL hr message 21: the
+    generated tokens do not decode to the answer", plus the manifest
+    mismatch, exit 1).
+- **Not measured here:** the expert coverage, reuse and cache simulations
+  that these traces feed (PLAN Phase 8, next items), and the answers'
+  quality, which waits for Phases 6 and 7.
+
 ## Raw German completions repeat, BF16 included
 
 Greedy raw completions (`llama-completion -no-cnv --temp 0`, no chat
@@ -1154,6 +1260,10 @@ All files live outside the repo, in `~/models`.
     - three `llama-bench` runs at depth 64,768 or 130,304, about 15 minutes;
     - a 32,000-token `llama-server` run with `cmd/kolibri-stream`, 22 minutes
       on a loaded machine.
+11. For the expert-locality workloads, run `tools/locality/workloads.py
+    --fetch`, then the check, as in "Expert-locality workloads". The answers
+    are committed; regenerating them (`--answer`, after emptying the slots)
+    takes about 2 h with Q8_0 on the CPU.
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
