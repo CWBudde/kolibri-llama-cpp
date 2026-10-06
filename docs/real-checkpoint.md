@@ -447,6 +447,83 @@ build/bin/llama-quantize --imatrix ~/models/eval/kolibri-imatrix.gguf \
     ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf Q8_0
 ```
 
+## Context length and memory on Metal
+
+The two IQ3 files at 8k, 16k and 32k context:
+
+- IQ3_XXS for all experts;
+- IQ3_XXS/IQ4_XS, the chat candidate.
+
+The IQ3_S file was superseded by these two and is not measured. The Q3 mix
+is in "The quantized model on Metal".
+
+Setup:
+
+- fork build with patch 0009;
+- default Metal limit (38,338 MiB working set);
+- F16 KV cache;
+- flash attention `auto`, which resolves to on (`FLASH_ATTN_EXT` nodes).
+
+```sh
+build/bin/llama-completion -m ~/models/Kolibri-1-IQ3_XXS-exps-imx.gguf -ngl 99 -c 32768 -v \
+    -n 8 --temp 0 --seed 1 -no-cnv -p "The capital of Germany is"
+```
+
+Every run loads, answers "Berlin" and exits cleanly. All sizes are in MiB, from
+the `llama_kv_cache`, `sched_reserve` and memory breakdown lines after the
+load:
+
+| File | Context | KV full (10 layers) | KV sliding (40 layers) | MTL0 compute | CPU compute | MTL0 self (model + context + compute) | MTL0 free | Host |
+|---|---|---|---|---|---|---|---|---|
+| IQ3_XXS | 8,192 | 160 | 100 | 260 | 19.3 | 30,529 = 30,009 + 260 + 260 | 7,475 | 351 |
+| IQ3_XXS | 16,384 | 320 | 100 | 260 | 27.3 | 30,689 = 30,009 + 420 + 260 | 7,315 | 359 |
+| IQ3_XXS | 32,768 | 640 | 100 | 260 | 43.3 | 31,009 = 30,009 + 740 + 260 | 6,995 | 375 |
+| IQ3_XXS/IQ4_XS | 8,192 | 160 | 100 | 260 | 19.3 | 34,092 = 33,572 + 260 + 260 | 3,913 | 351 |
+| IQ3_XXS/IQ4_XS | 16,384 | 320 | 100 | 260 | 27.3 | 34,252 = 33,572 + 420 + 260 | 3,753 | 359 |
+| IQ3_XXS/IQ4_XS | 32,768 | 640 | 100 | 260 | 43.3 | 34,572 = 33,572 + 740 + 260 | 3,433 | 375 |
+
+- **The KV cache:** only the full-attention cache grows, at 20 KiB per
+  token. The sliding cache stays at 1,280 cells (100 MiB) at every context.
+- **The Metal compute buffer:** it stays at 260 MiB.
+- **The CPU compute buffer:** it grows by 1 MiB per 1,024 tokens.
+- **Unaccounted memory:** the breakdown reports 332 MiB on MTL0 in every
+  run. That equals the host buffer of the token embeddings.
+- **Headroom at 32k:**
+  - IQ3_XXS/IQ4_XS: 3.4 GiB free;
+  - IQ3_XXS: 6.8 GiB free.
+- **The IQ3_XXS/IQ4_XS model buffer:** it is 332 MiB smaller than in the
+  32k breakdown above (33,904 MiB), so free memory is 332 MiB larger. That
+  breakdown predates patch 0009, which maps only the file ranges of each
+  backend's own tensors.
+
+Speed with a filled cache, from `llama-bench -ngl 99 -p 512 -n 128 -d
+0,8192,16384,32256 -r 3` (tokens/s):
+
+| File | Depth | pp512 | tg128 |
+|---|---|---|---|
+| IQ3_XXS | 0 | 1,203 ± 17 | 60.7 ± 1.2 |
+| IQ3_XXS | 8,192 | 920 ± 7 | 51.3 ± 2.3 |
+| IQ3_XXS | 16,384 | 725 ± 15 | 46.1 ± 1.6 |
+| IQ3_XXS | 32,256 | 529 ± 16 | 39.2 ± 1.0 |
+| IQ3_XXS/IQ4_XS | 0 | 1,221 ± 13 | 61.0 ± 1.6 |
+| IQ3_XXS/IQ4_XS | 8,192 | 909 ± 51 | 53.6 ± 0.7 |
+| IQ3_XXS/IQ4_XS | 16,384 | 584 ± 104 | 41.4 ± 4.1 |
+| IQ3_XXS/IQ4_XS | 32,256 | 530 ± 39 | 41.2 ± 0.5 |
+
+- **32k is the tested limit.** At depth 32,256, pp512 fills the cache to
+  32,768 tokens.
+- **Speed with a filled cache:** at that depth, generation keeps about two
+  thirds of its empty-cache speed (39 to 41 tokens/s), and prompt
+  processing keeps about 44%.
+- **Background load:** another process kept the CPU busy during these runs,
+  at a median of 99% total CPU (one core) with peaks of 694%. The depth-0 rows
+  lie 5 to 10% below the Variants table. The spread at 16,384 on
+  IQ3_XXS/IQ4_XS most likely comes from those peaks.
+- **A first run under full load:** a vitest run with 14 workers and full swap
+  gave 383 pp512 and 42 tg128 at depth 0. Benchmark only on an idle machine.
+- **Not measured here:** long-context quality waits for the numerical
+  validation (PLAN Phases 6 and 7).
+
 ## Raw German completions repeat, BF16 included
 
 Greedy raw completions (`llama-completion -no-cnv --temp 0`, no chat
@@ -932,6 +1009,9 @@ All files live outside the repo, in `~/models`.
    reference (2 h 23 min), as in "End-to-end corpus". After each llama.cpp
    change, run `tools/ref/regress.py`, about 27 minutes, as in "Regression
    suite".
+9. On an idle machine, measure memory and speed at 8k to 32k context as in
+   "Context length and memory on Metal": six loads and two `llama-bench`
+   depth sweeps, about 15 minutes.
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
