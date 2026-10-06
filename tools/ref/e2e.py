@@ -45,9 +45,11 @@ stored, their NMSE (compare_real.node_lines) and l_out's.
 Last, per case, the gate: with the recorded GGUF and thread count, every
 captured node and the logits must be bit-identical to the recorded libllama
 run, or the case fails and names the first changed node in graph order. With
-another GGUF or thread count, the comparison is INFO. --record makes the
-current run the recorded one, after a change has been reviewed. --override
-KEY=VALUE changes a GGUF metadata value for libllama, as a negative control.
+another GGUF or thread count, the comparison is INFO; with --strict (as
+regress.py runs it) such a case fails, and so does a case without a recorded
+run. --record makes the current run the recorded one, after a change has been
+reviewed. --override KEY=VALUE changes a GGUF metadata value for libllama, as
+a negative control.
 
 The metrics against the reference are INFO, not PASS/FAIL: the real model has
 no tolerance yet (PLAN Phase 6), and the reference is a port of the vLLM code,
@@ -338,6 +340,8 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=10, help="libllama CPU threads")
     ap.add_argument("--override", action="append", default=[], metavar="KEY=VALUE",
                     help="a GGUF metadata override for libllama (int, float or true/false), for negative controls")
+    ap.add_argument("--strict", action="store_true", help="fail every case the gate cannot check (no recorded "
+                    "run, another GGUF or thread count); regress.py sets it")
     args = ap.parse_args()
     overrides = {}
     for o in args.override:
@@ -439,7 +443,11 @@ def main() -> None:
             print(f"INFO {name}: recorded this libllama run ({len(rec['nodes_sha256'])} nodes and the logits)")
             continue
         if old is None:
-            print(f"INFO {name}: no recorded libllama run; record one with --record")
+            what = f"{name}: no recorded libllama run; record one with --record"
+            if args.strict:
+                fail(what)
+            else:
+                print("INFO " + what)
             continue
         changed = first_changed(old, rec)
         # the gate: the same GGUF with the same thread count must give the recorded bits
@@ -448,7 +456,11 @@ def main() -> None:
         nodes = f"{len(old['nodes_sha256'])} nodes and the logits" if "nodes_sha256" in old else "the logits"
         if other:
             state = "unchanged" if changed is None else f"CHANGED (first changed node {changed}): {moved(old, rec)}"
-            print(f"INFO {name}, not gated ({'; '.join(other)}): {state}")
+            what = f"{name}, not gated ({'; '.join(other)}): {state}"
+            if args.strict:
+                fail(what + "; --strict needs the recorded GGUF and thread count")
+            else:
+                print("INFO " + what)
         elif changed is None:
             print(f"PASS {name}: bit-identical to the recorded libllama run ({nodes})")
         else:

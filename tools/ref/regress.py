@@ -13,7 +13,9 @@ Runs three parts, each gated, and fails if any of them fails:
 - real weights: e2e.py on the BF16 GGUF, every libllama node and the logits
   of each corpus case bit-identical to the run recorded in
   testdata/e2e/manifest.json, with the metrics against the stored reference
-  artifacts as INFO.
+  artifacts as INFO. It runs with --strict, so a case the gate cannot check
+  (no recorded run, or a GGUF or thread count other than the recorded ones)
+  fails as well.
 
 A change that e2e.py reports is accepted with e2e.py --record after review.
 
@@ -41,7 +43,8 @@ def main() -> None:
 
     py, llama_cpp = sys.executable, str(args.llama_cpp)
     vocab = str(args.llama_cpp / "models" / "ggml-vocab-kolibri.gguf")
-    e2e = [py, str(ROOT / "tools" / "ref" / "e2e.py"), "--llama-cpp", llama_cpp, "--gguf", str(args.gguf)]
+    e2e = [py, str(ROOT / "tools" / "ref" / "e2e.py"), "--llama-cpp", llama_cpp, "--gguf", str(args.gguf),
+           "--strict"]
     for flag, val in (("--cases", args.cases), ("--manifest", args.manifest), ("--threads", args.threads)):
         if val is not None:
             e2e += [flag, str(val)]

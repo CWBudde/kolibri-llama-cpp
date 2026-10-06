@@ -826,7 +826,8 @@ recorded GGUF and thread count, a case passes only if all of them are
 identical. Otherwise it fails and names the first changed node in graph order,
 with the metrics' movement against the recorded run. A GGUF or thread count
 other than the recorded one is reported as `INFO` and not gated. That is the
-way to look at a quantized GGUF.
+way to look at a quantized GGUF. `regress.py` runs `e2e.py` with `--strict`,
+where such a case fails, and so does a case without a recorded run.
 
 `--record` accepts a reviewed change. Capturing every node leaves libllama's
 logits as they were: the six logits hashes equal those recorded without the
