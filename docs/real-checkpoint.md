@@ -488,6 +488,8 @@ load:
 - **The CPU compute buffer:** it grows by 1 MiB per 1,024 tokens.
 - **Unaccounted memory:** the breakdown reports 332 MiB on MTL0 in every
   run. That equals the host buffer of the token embeddings.
+- **The breakdown sums:** free, self and unaccounted add up to the 38,338 MiB
+  total within 1 to 2 MiB, because each term is rounded to whole MiB.
 - **Headroom at 32k:**
   - IQ3_XXS/IQ4_XS: 3.4 GiB free;
   - IQ3_XXS: 6.8 GiB free.

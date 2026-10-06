@@ -398,8 +398,10 @@ For each candidate:
 -   [x] Measure actual unified-memory use after load. (2026-10-06) — Q3 mix
     at 32k (2026-10-04): "MTL0 ... 34384 = 33384 + 740 + 260", host 418 MiB.
     With patch 0009 at 32k: IQ3_XXS "MTL0 (Apple M5 Pro) | 38338 = 6995 +
-    (31009 = 30009 + 740 + 260)", IQ3_XXS/IQ4_XS "38338 = 3433 + (34572 =
-    33572 + 740 + 260)", host 375 MiB each; also at 8k and 16k
+    (31009 = 30009 + 740 + 260) + 332", IQ3_XXS/IQ4_XS "38338 = 3433 + (34572
+    = 33572 + 740 + 260) + 332" (332 MiB unaccounted, the size of the token
+    embeddings; the terms sum to 1 to 2 MiB less than the total because each
+    one is rounded), host 375 MiB each; also at 8k and 16k
     ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Context length and
     memory on Metal"). IQ3_S is not measured: it was superseded by the two
     IQ3_XXS files and deleted.
