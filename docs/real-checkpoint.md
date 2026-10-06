@@ -608,17 +608,29 @@ these numbers as a lower bound:
 ### Sustained generation
 
 The chat candidate at 32k context with an F16 KV cache generates 32,000 tokens
-through `llama-server`. A small client streams `/completion` (`n_predict`
-32000, `ignore_eos`, temperature 0, `return_tokens`) and timestamps every
-token. Every 10 s, a sampler logs:
+through `llama-server`. `cmd/kolibri-stream` streams `/completion`
+(`n_predict` 32000, `ignore_eos`, temperature 0, `return_tokens`,
+`cache_prompt` off) and timestamps every token. Every 10 s it also logs:
 
-- the server's RSS and `phys_footprint`;
+- the server's RSS (`ps`) and `phys_footprint` (`footprint`);
 - `vm.swapusage`;
 - `kern.memorystatus_vm_pressure_level`.
 
+At the end it prints the server's timings and the tokens/s per 2,048 tokens:
+
 ```sh
-build/bin/llama-server -m ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf -ngl 99 -c 32768 -np 1 --port 8099
+build/bin/llama-server -m ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf -ngl 99 -c 32768 -np 1 --port 8099 &
+until curl -sf http://127.0.0.1:8099/health >/dev/null; do sleep 2; done
+go run ./cmd/kolibri-stream -n 32000 -pid $! -out sustain/ \
+    -p "Write a detailed, multi-chapter history of the city of Berlin, from its founding to the present day."
+kill %1
 ```
+
+The output files:
+
+- `sustain/tokens.log`: one line of `unix_ms count` per streamed chunk;
+- `sustain/text.txt`: the generated text;
+- `sustain/samples.txt`: the 10 s samples.
 
 - **The run completes without errors.** The server reports "eval time =
   1325773.74 ms / 32000 tokens ( 41.43 ms per token, 24.14 tokens per second)",
@@ -1140,7 +1152,8 @@ All files live outside the repo, in `~/models`.
     "Sustained generation":
     - 12 loads at 64k to 256k, about 5 minutes;
     - three `llama-bench` runs at depth 64,768 or 130,304, about 15 minutes;
-    - a 32,000-token `llama-server` run, 22 minutes on a loaded machine.
+    - a 32,000-token `llama-server` run with `cmd/kolibri-stream`, 22 minutes
+      on a loaded machine.
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.

@@ -127,6 +127,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `cmd/kolibri-inventory` | Builds the tensor inventory from Hugging Face. It reads only the safetensors headers, through HTTP range requests, so no payload is downloaded. |
 | `cmd/kolibri-peek` | Fetches individual small tensors through range requests and prints value statistics. |
 | `cmd/kolibri-tiny` | Writes a tiny random-weight checkpoint with the reference fixture's shape, plus a manifest of the expected GGUF tensors, for converter and model tests. `-router` writes the reference router test's shape instead (384 experts, top 6); `-attn` writes the real attention heads and sliding window (48/4 heads, head_dim 128, window 513); `-pattern` writes the real 50-layer SWA/full pattern. |
+| `cmd/kolibri-stream` | Streams one long `/completion` from a running `llama-server`, timestamps every token and samples the server's memory and the system's memory pressure (macOS). It backs "Sustained generation" in [docs/real-checkpoint.md](docs/real-checkpoint.md). |
 | `internal/` | Hugging Face client, safetensors header parser and writer, and the Kolibri tensor specs. `internal/kolibri/tensors.go` is the source of truth for the HF → GGUF mapping. |
 | `inventory/{bf16,fp8}/` | Committed inventories: `summary.json` and `tensors.jsonl.gz`. They pin the model revisions and the sha256 of every file. |
 | `testdata/tokenizer/golden.jsonl` | Tokenizer golden cases: IDs and decoded text from the reference tokenizer. |
