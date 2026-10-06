@@ -1,0 +1,378 @@
+{
+ "cases": {
+  "de-raw": {
+   "greedy_float32": [
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678
+   ],
+   "greedy_bfloat16": [
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678,
+    1678
+   ],
+   "reference_bfloat16_vs_float32": {
+    "nmse": 0.014733253046870232,
+    "kld": 0.15083043310840974,
+    "same_top": 0.9047619047619048
+   },
+   "reference_seconds": 123,
+   "arrays": {
+    "ref_bfloat16": "ba3112f868040ac8eba34629fed1ff96e0c16cc0709b77f9b83f6f03500d8536",
+    "ref_float32": "26f36bade78f8c50f6061ce3883c75b4fe75f958593062c6567350f06b5b918a",
+    "router_bias": "1aea97cabbc6e09926bbdfd6cc3419f8be3ecc68cdc5c14b6729f7aab56fc4f8",
+    "router_logits": "34f0afca920e5471e92746ee760bdc76faa463be85a77a2272901f2d9e36700c",
+    "router_topk": "32f24136e73e5a3d8f4daf6928c57ba30854fe87d3d36cb81e25e188350f083a",
+    "tokens": "d5a0a0124c63a3837281b55c00c138efc0990160b6ec6bf303aea9ea12fb2886"
+   },
+   "libllama": {
+    "gguf": "Kolibri-1-BF16.gguf",
+    "logits_sha256": "d036a59a96bf875386e832c4999b83f33c3633501e49b75c10281e2237eef5c3",
+    "vs_float32": {
+     "nmse": 0.00955851562321186,
+     "kld": 0.11253896084817615,
+     "same_top": 1.0
+    },
+    "vs_bfloat16": {
+     "nmse": 0.013058383017778397,
+     "kld": 0.09104792699012292,
+     "same_top": 0.9047619047619048
+    },
+    "router_top1_same": 0.8542857142857143,
+    "router_set_same": 0.5647619047619048,
+    "non_finite": 0,
+    "greedy_equal": 16
+   }
+  },
+  "en-raw": {
+   "greedy_float32": [
+    5513,
+    275,
+    2380,
+    1026,
+    318,
+    3515,
+    262,
+    2554,
+    58,
+    946,
+    1798,
+    735,
+    262,
+    9255,
+    279,
+    6905
+   ],
+   "greedy_bfloat16": [
+    5513,
+    275,
+    2380,
+    1026,
+    318,
+    3515,
+    262,
+    2554,
+    58,
+    946,
+    1798,
+    735,
+    262,
+    9255,
+    279,
+    6905
+   ],
+   "reference_bfloat16_vs_float32": {
+    "nmse": 0.0004757335118483752,
+    "kld": 0.007872711365265284,
+    "same_top": 1.0
+   },
+   "reference_seconds": 1038,
+   "arrays": {
+    "ref_bfloat16": "69ede7c69d52fe06b2041322e995694d0869dc87c479ff17da41769afc4a336e",
+    "ref_float32": "44565487f813951106ff64619c46a9c8e87f70c9879c42cd2a888f652413366d",
+    "router_bias": "1aea97cabbc6e09926bbdfd6cc3419f8be3ecc68cdc5c14b6729f7aab56fc4f8",
+    "router_logits": "395f3c404bff37955440665b77cddd16ff8d2577e2a87b150f22321e079a8cca",
+    "router_topk": "66321d807a9c178b9a040a1c0b1aecda413278992d5238e8d7d3eb24073a157e",
+    "tokens": "ad8ad6122d9a1159e1cf55cd16cd40ee1dc34317d04ee63d2a83656aa8b01240"
+   },
+   "libllama": {
+    "gguf": "Kolibri-1-BF16.gguf",
+    "logits_sha256": "99da0933e9b78fd2b887c8b9928b7962ceb1411b66583389262461eadf5f5671",
+    "vs_float32": {
+     "nmse": 0.00015905473264865577,
+     "kld": 0.0015282079725326364,
+     "same_top": 0.9523809523809523
+    },
+    "vs_bfloat16": {
+     "nmse": 0.0005443196860142052,
+     "kld": 0.009090764059882668,
+     "same_top": 0.9523809523809523
+    },
+    "router_top1_same": 0.9771428571428571,
+    "router_set_same": 0.9028571428571428,
+    "non_finite": 0,
+    "greedy_equal": 15
+   }
+  },
+  "code": {
+   "greedy_float32": [
+    14141,
+    16527,
+    8050,
+    262,
+    14163,
+    120331,
+    28651,
+    1343,
+    62743,
+    14141,
+    16527,
+    8050,
+    262,
+    14163,
+    120331,
+    28651
+   ],
+   "greedy_bfloat16": [
+    14141,
+    16527,
+    8050,
+    262,
+    14163,
+    120331,
+    28651,
+    1343,
+    62743,
+    14141,
+    16527,
+    8050,
+    262,
+    14163,
+    120331,
+    28651
+   ],
+   "reference_bfloat16_vs_float32": {
+    "nmse": 0.016598043963313103,
+    "kld": 0.2868313637344009,
+    "same_top": 0.9310344827586207
+   },
+   "reference_seconds": 1130,
+   "arrays": {
+    "ref_bfloat16": "65b0fe89356fee1e472b2a6e64f385b2bd3de43b9c5118fd9cff934bd7e8e231",
+    "ref_float32": "8420b2a4dc0e90746e357f3409e1ec62cb6bf6ddb08250f78e2acd1c35ff55e9",
+    "router_bias": "1aea97cabbc6e09926bbdfd6cc3419f8be3ecc68cdc5c14b6729f7aab56fc4f8",
+    "router_logits": "496916fb75cb3240592165964fa950b319a41f8031626efdb1aca7ef60730658",
+    "router_topk": "72e8608685cd5e5cb0347bc80741699aa58a683557de0bd2307a8cd7ec84c52f",
+    "tokens": "b625d6d0e9c3d39a28b1ed4b7015d2ec081ac6636612207f2a2df34ec8626e4c"
+   },
+   "libllama": {
+    "gguf": "Kolibri-1-BF16.gguf",
+    "logits_sha256": "837cb3e7677192a5738457752981bc4f40e55515b7c5b8d3e526ed3d4db5dbc0",
+    "vs_float32": {
+     "nmse": 0.000960797187872231,
+     "kld": 0.002625910379078822,
+     "same_top": 1.0
+    },
+    "vs_bfloat16": {
+     "nmse": 0.015371214598417282,
+     "kld": 0.2675259344788509,
+     "same_top": 0.9310344827586207
+    },
+    "router_top1_same": 0.9662068965517241,
+    "router_set_same": 0.8524137931034482,
+    "non_finite": 0,
+    "greedy_equal": 16
+   }
+  },
+  "de-chat": {
+   "greedy_float32": [
+    1113,
+    85402,
+    15821,
+    45,
+    112758,
+    27243,
+    2459,
+    922,
+    17747,
+    6676,
+    6124,
+    44,
+    518,
+    1953,
+    9914,
+    47886
+   ],
+   "greedy_bfloat16": [
+    1113,
+    85402,
+    15821,
+    45,
+    112758,
+    27243,
+    2459,
+    922,
+    17747,
+    6676,
+    6124,
+    44,
+    518,
+    1953,
+    9914,
+    47886
+   ],
+   "reference_bfloat16_vs_float32": {
+    "nmse": 0.0008178554126061499,
+    "kld": 0.002345539804423127,
+    "same_top": 0.9705882352941176
+   },
+   "reference_seconds": 4613,
+   "arrays": {
+    "ref_bfloat16": "a85b69e68a3404b2e9ab81012fc9951dace3e4800de38b2cd4bd2ea031624ca8",
+    "ref_float32": "d3b965a3082cee6c53e999ffc26b3616b9ebf1e8a05881bde557622be9063f5f",
+    "router_bias": "1aea97cabbc6e09926bbdfd6cc3419f8be3ecc68cdc5c14b6729f7aab56fc4f8",
+    "router_logits": "b6c32fe916884b97fad5b1cd1af58943c7129ea085989addd189b054af168b86",
+    "router_topk": "73cad480ad5a8fae77f90a1bafb10d54a7eaa50f24cc37fe927204d8b0a51ebb",
+    "tokens": "0c11edc59d0708ae28f8688f1d081a3ed94d748430cdfce1e1bc1c1536baa352"
+   },
+   "libllama": {
+    "gguf": "Kolibri-1-BF16.gguf",
+    "logits_sha256": "69223263835c21d0d44f12eff8bb7d08c704368c568b890ed4f72d306a47c563",
+    "vs_float32": {
+     "nmse": 0.000251293764449656,
+     "kld": 0.0021276614193727512,
+     "same_top": 0.9705882352941176
+    },
+    "vs_bfloat16": {
+     "nmse": 0.0007861640187911689,
+     "kld": 0.0011818828033943473,
+     "same_top": 1.0
+    },
+    "router_top1_same": 0.9938235294117647,
+    "router_set_same": 0.9470588235294117,
+    "non_finite": 0,
+    "greedy_equal": 16
+   }
+  },
+  "wiki-c1": {
+   "reference_bfloat16_vs_float32": {
+    "ppl_base": 15.12440332845463,
+    "ppl_test": 15.327215044071895,
+    "nmse": 0.0025568208657205105,
+    "kld": 0.032721778650219004,
+    "same_top": 0.9372549019607843
+   },
+   "reference_seconds": 357,
+   "arrays": {
+    "ref_bfloat16": "f96c40fe1f3cafa20f093cfa2c24c389fb27020feb939c5cf6bc35c18a2643ea",
+    "ref_float32": "5814af0c2da1ab65043c16c1f83aaece444d26868fbd1561a1cc06a8a3e5b265",
+    "router_bias": "1aea97cabbc6e09926bbdfd6cc3419f8be3ecc68cdc5c14b6729f7aab56fc4f8",
+    "router_logits": "57d1d1f35a43271af0e0cf63b7d11e75a55915787ad03f37f9892489261c7647",
+    "router_topk": "6c4725a06a28a3eb8c3cd1e66df02a62f77147bb385a83a172f4eebf25897c7e",
+    "tokens": "5ffba7491647248e5d12187ed416f15c30fcc5725f46c14d7fe2ea402ab51ba3"
+   },
+   "libllama": {
+    "gguf": "Kolibri-1-BF16.gguf",
+    "logits_sha256": "3ffff87bf8bc63f6c1bd99415c9e111c6f0eb7c215315724887675321e78353b",
+    "vs_float32": {
+     "ppl_base": 15.12440332845463,
+     "ppl_test": 15.17870464424672,
+     "nmse": 0.002022778382524848,
+     "kld": 0.0334075622113851,
+     "same_top": 0.9647058823529412
+    },
+    "vs_bfloat16": {
+     "ppl_base": 15.327215044071895,
+     "ppl_test": 15.17870464424672,
+     "nmse": 0.0024909134954214096,
+     "kld": 0.03340085869596499,
+     "same_top": 0.9490196078431372
+    },
+    "router_top1_same": 0.9709375,
+    "router_set_same": 0.84046875,
+    "non_finite": 0
+   }
+  },
+  "de-long": {
+   "reference_bfloat16_vs_float32": {
+    "ppl_base": 26.514546789828877,
+    "ppl_test": 26.10700370267782,
+    "nmse": 0.00318954698741436,
+    "kld": 0.10248325711187446,
+    "same_top": 0.9178082191780822
+   },
+   "reference_seconds": 494,
+   "arrays": {
+    "ref_bfloat16": "26a6646faec327945ac02c32c3e724b1b78357bce13415f4acf57a6019c470ff",
+    "ref_float32": "a223d6434971225ed95c682e0c704c133d63183d4df8d8a964ff7c4218961ab4",
+    "router_bias": "1aea97cabbc6e09926bbdfd6cc3419f8be3ecc68cdc5c14b6729f7aab56fc4f8",
+    "router_logits": "13820938d91f310cdd4eb14b8cf9b3d8b8a880a4dc657c5972b94f6c1bc30abd",
+    "router_topk": "c3f61a34ff849243d4efe6fffa8caa6703c6755c2b210e815973b5bb4776428f",
+    "tokens": "3694d775a053d81683355096e5daca96ee52c4b19887ffdfe52bbb07fc9b22e3"
+   },
+   "libllama": {
+    "gguf": "Kolibri-1-BF16.gguf",
+    "logits_sha256": "2d62e6865d83579d2e4c26e9c5d442040944d90a26e4b66d745ff4a7b87dc063",
+    "vs_float32": {
+     "ppl_base": 26.514546789828877,
+     "ppl_test": 26.36476582921445,
+     "nmse": 0.0016543968813493848,
+     "kld": 0.046278223754914916,
+     "same_top": 0.9510763209393346
+    },
+    "vs_bfloat16": {
+     "ppl_base": 26.10700370267782,
+     "ppl_test": 26.36476582921445,
+     "nmse": 0.0024969992227852345,
+     "kld": 0.0725458567720762,
+     "same_top": 0.9373776908023483
+    },
+    "router_top1_same": 0.97322265625,
+    "router_set_same": 0.85546875,
+    "non_finite": 0
+   }
+  }
+ },
+ "reference": {
+  "gguf": "Kolibri-1-BF16.gguf",
+  "gguf_bytes": 156310433312,
+  "code": "tools/ref/kolibri_ref.py",
+  "dtypes": [
+   "float32",
+   "bfloat16"
+  ]
+ },
+ "libllama": {
+  "llama_cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+  "device": "CPU",
+  "threads": 10,
+  "n_ctx": 1024,
+  "context": "libllama defaults (KV cache type, flash attention)"
+ }
+}
