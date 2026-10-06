@@ -686,6 +686,119 @@ Share of pairs whose Top-6 set changes, by the second router's margin:
 - What this cannot rule out is a misreading of the vLLM code shared by the port
   and this reference. Only running vLLM itself covers that (PLAN Phases 0 and 6).
 
+## End-to-end corpus
+
+`compare_real.py --gguf` recomputes the reference on every run, which takes
+about 15 minutes, and covers only two inputs, both shorter than the sliding
+window. `tools/ref/e2e.py` stores the reference once for a small fixed corpus,
+so that a new llama.cpp build can be checked against it in minutes.
+
+The corpus, `testdata/e2e/corpus.json`, holds six cases with their token IDs
+from the pinned tokenizer:
+
+| Case | Input | Tokens |
+|---|---|---|
+| `de-raw` | "Die Hauptstadt von Deutschland ist" + 16 greedy tokens | 5 + 16 |
+| `en-raw` | "The capital of Germany is" + 16 greedy tokens | 5 + 16 |
+| `code` | a Python function header with its docstring + 16 greedy tokens | 13 + 16 |
+| `de-chat` | one German user turn through the released chat template, thinking off + 16 greedy tokens | 52 + 16 |
+| `wiki-c1` | wikitext-2 test chunk 1, from the KLD base file | 512 |
+| `de-long` | the start of the German part of the calibration text | 1024 |
+
+`de-long` is the only case longer than the 513-token window, so it is the only
+one in which the sliding layers actually drop keys.
+
+`--write` runs the reference in float32 and in bfloat16 and writes one `.npz`
+per case to `~/models/eval/e2e`:
+- the logits of both runs;
+- the float32 run's router logits and selected experts in every layer;
+- the router bias.
+
+For the prompts, the sequence is the prompt plus the float32 greedy
+continuation. The artifacts take 1.85 GB, of which `de-long` is 1.13 GB.
+`testdata/e2e/manifest.json` records:
+- the sha256 of every array;
+- the greedy continuations;
+- the reference's bfloat16-vs-float32 metrics;
+- the libllama run that `--write` then does, with a sha256 of its logits.
+
+The write took 2 h 23 min, with a peak footprint of 21.1 GB:
+
+| Case | `de-raw` | `en-raw` | `code` | `de-chat` | `wiki-c1` | `de-long` |
+|---|---|---|---|---|---|---|
+| Reference, both dtypes | 123 s | 1038 s | 1130 s | 4613 s | 357 s | 494 s |
+
+The prompts are slow because each greedy token recomputes the whole sequence,
+since the reference has no KV cache. The run is disk-bound: with 52 tokens or
+more, every forward reads about half of the experts from the 156 GB file. A
+second write of `en-raw` gave the same sha256 for every array, so the
+reference is deterministic.
+
+The default mode checks:
+- the corpus against its sources, wherever those are present;
+- every artifact against the manifest.
+
+Any difference is a `FAIL`, with exit 1. It then runs libllama on the CPU on
+each case and prints `INFO` lines, against the reference in float32 and in
+bfloat16:
+- logits NMSE, KLD and same top token, over the second half for the chunks, with
+  PPL as in `llama-perplexity`;
+- router Top-1 and Top-6 set agreement;
+- for the prompts, libllama's greedy token along the reference continuation.
+
+Last, per case, it states whether libllama's logits are bit-identical to the
+recorded run, or how its metrics moved. The metrics are not gated, since the
+real model has no tolerance yet.
+
+Results, libllama BF16 on the CPU. The default mode took 13 minutes, with a
+peak footprint of 10.8 GB, and every case came out bit-identical to the run
+that `--write` recorded:
+
+| Case | Reference bfloat16 vs float32: KLD | libllama vs float32: NMSE, KLD, same top | libllama vs bfloat16: KLD | Router Top-1 / Top-6 set same | Greedy along the reference |
+|---|---|---|---|---|---|
+| `de-raw` | 0.1508 | 9.56e-03, 0.1125, 100.0% | 0.0910 | 85.43% / 56.48% | 16/16 |
+| `en-raw` | 0.0079 | 1.59e-04, 0.0015, 95.2% | 0.0091 | 97.71% / 90.29% | 15/16 |
+| `code` | 0.2868 | 9.61e-04, 0.0026, 100.0% | 0.2675 | 96.62% / 85.24% | 16/16 |
+| `de-chat` | 0.0023 | 2.51e-04, 0.0021, 97.1% | 0.0012 | 99.38% / 94.71% | 16/16 |
+| `wiki-c1` | 0.0327 (PPL 15.3272 vs 15.1244) | 2.02e-03, 0.0334, 96.5% (PPL 15.1787) | 0.0334 | 97.09% / 84.05% | |
+| `de-long` | 0.1025 (PPL 26.1070 vs 26.5145) | 1.65e-03, 0.0463, 95.1% (PPL 26.3648) | 0.0725 | 97.32% / 85.55% | |
+
+What the results show:
+- **`wiki-c1` matches the earlier comparison.** It gives exactly the numbers of
+  `compare_real.py --gguf` on the same chunk (see "Reference forward on the real
+  weights" and "Router agreement").
+- **`de-long` is past the window.** libllama sits closer to the float32
+  reference (KLD 0.046) than the reference's own bfloat16 run does (0.102).
+  Nothing in it points at the sliding-window mask.
+- **`de-raw` repeats as before.** It is the known repetition case. Its router
+  diverges about as much as in "Reference forward on the real weights": the
+  Top-6 set is the same for 56.5% of the pairs over 21 tokens here, against
+  61.2% over the 5 prompt tokens there.
+- **`code`.** libllama sits much closer to float32 (KLD 0.0026) than the
+  bfloat16 reference does (0.287).
+
+Negative controls, each on a scratch copy:
+
+| Change | Result |
+|---|---|
+| one array of `de-raw.npz` re-saved with one router logit changed by 1e-3 | `FAIL de-raw: router_logits in de-raw.npz differ from the manifest's sha256`, exit 1 |
+| one byte of `de-raw.npz` flipped | `FAIL de-raw: de-raw.npz is unreadable (Bad CRC-32 for file 'ref_float32.npy'); recreate it with --write`, exit 1 |
+| one token ID of `en-raw` changed in the corpus | `FAIL corpus/en-raw: token IDs differ from its source at position 2 (5 vs 5 tokens)` and `FAIL en-raw: the artifact's tokens differ from the corpus`, exit 1 |
+| the IQ3_XXS/IQ4_XS chat candidate, not Q8_0, which needs `--no-repack` on this machine while the tool keeps libllama's defaults, (`Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`) in place of the BF16 GGUF, on `en-raw` and `wiki-c1` | `INFO wiki-c1: CHANGED since the recorded libllama run; recorded with Kolibri-1-BF16.gguf, this run Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf: vs_float32 kld 0.090176 (recorded 0.033408), …`, router Top-6 set same 60.85% (recorded 84.05%); `en-raw` also CHANGED, KLD 0.0097 (recorded 0.0015), greedy 13/16 (recorded 15/16) |
+
+The reference is the torch port, not vLLM. Logits from a vLLM BF16 run can
+replace these artifacts later, in the same `.npz` layout.
+
+Rerun after an upstream llama.cpp change:
+
+```sh
+.venv/bin/python tools/ref/e2e.py --llama-cpp third_party/llama.cpp --gguf ~/models/Kolibri-1-BF16.gguf
+```
+
+`unchanged` means libllama's logits are bit-identical to the recorded run.
+`CHANGED` lists how each metric moved; `--record` makes that run the
+recorded one.
+
 ## Chat on the quantized model
 
 ```sh
@@ -725,6 +838,9 @@ All files live outside the repo, in `~/models`.
 7. Run `tools/ref/compare_real.py --tiny`, then with `--gguf` and the KLD base
    file from "Quantization loss against this port's BF16" (15 minutes), plus
    `--metal --probe-out DIR` for the Metal pass and the router probes.
+8. Run `tools/ref/e2e.py --write` once to store the end-to-end corpus's
+   reference (2 h 23 min), then `tools/ref/e2e.py` after each llama.cpp
+   change (13 minutes), as in "End-to-end corpus".
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
