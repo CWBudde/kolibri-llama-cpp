@@ -526,6 +526,128 @@ Speed with a filled cache, from `llama-bench -ngl 99 -p 512 -n 128 -d
 - **Not measured here:** long-context quality waits for the numerical
   validation (PLAN Phases 6 and 7).
 
+### Beyond 32k
+
+The model's trained context is 262,144 tokens. The same load runs at 64k,
+128k and 256k, with the KV cache at F16 and at q8_0 (`-ctk q8_0 -ctv q8_0`):
+
+```sh
+build/bin/llama-completion -m ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf -ngl 99 -c 131072 \
+    -ctk q8_0 -ctv q8_0 -v -n 8 --temp 0 -no-cnv -p "The capital of Germany is"
+```
+
+A context counts as usable when the file loads, answers "Berlin" and leaves at
+least 2 GiB (2,048 MiB) free on MTL0. `-c` and `-ngl` are set explicitly, so
+`--fit` (on by default) changes nothing: it logs "no changes needed", or for
+the one config that does not fit, "n_gpu_layers already set by user to 99,
+abort" and runs it as given. Sizes are in MiB:
+
+| File | Context | KV type | KV full | KV sliding | MTL0 compute | CPU compute | MTL0 self (model + context + compute) | MTL0 free | Usable |
+|---|---|---|---|---|---|---|---|---|---|
+| IQ3_XXS | 65,536 | F16 | 1,280 | 100 | 266 | 75.3 | 31,656 = 30,009 + 1,380 + 266 | 6,349 | yes |
+| IQ3_XXS | 65,536 | q8_0 | 680 | 53.1 | 255 | 75.4 | 30,998 = 30,009 + 733 + 255 | 7,007 | yes |
+| IQ3_XXS | 131,072 | F16 | 2,560 | 100 | 458 | 139.3 | 33,128 = 30,009 + 2,660 + 458 | 4,877 | yes |
+| IQ3_XXS | 131,072 | q8_0 | 1,360 | 53.1 | 445 | 139.4 | 31,868 = 30,009 + 1,413 + 445 | 6,137 | yes |
+| IQ3_XXS | 262,144 | F16 | 5,120 | 100 | 842 | 267.3 | 36,072 = 30,009 + 5,220 + 842 | 1,933 | no, < 2 GiB |
+| IQ3_XXS | 262,144 | q8_0 | 2,720 | 53.1 | 829 | 267.4 | 33,612 = 30,009 + 2,773 + 829 | 4,393 | yes |
+| IQ3_XXS/IQ4_XS | 65,536 | F16 | 1,280 | 100 | 266 | 75.3 | 35,218 = 33,572 + 1,380 + 266 | 2,787 | yes |
+| IQ3_XXS/IQ4_XS | 65,536 | q8_0 | 680 | 53.1 | 255 | 75.4 | 34,560 = 33,572 + 733 + 255 | 3,445 | yes |
+| IQ3_XXS/IQ4_XS | 131,072 | F16 | 2,560 | 100 | 458 | 139.3 | 36,690 = 33,572 + 2,660 + 458 | 1,315 | no, < 2 GiB |
+| IQ3_XXS/IQ4_XS | 131,072 | q8_0 | 1,360 | 53.1 | 445 | 139.4 | 35,430 = 33,572 + 1,413 + 445 | 2,575 | yes |
+| IQ3_XXS/IQ4_XS | 262,144 | F16 | 5,120 | 100 | 842 (projected) | | 39,634 projected | none | no, out of memory |
+| IQ3_XXS/IQ4_XS | 262,144 | q8_0 | 2,720 | 53.1 | 829 | 267.4 | 37,174 = 33,572 + 2,773 + 829 | 831 | no, < 2 GiB |
+
+- **The largest usable context:**
+  - IQ3_XXS/IQ4_XS (the chat candidate): 64k with F16, 128k with q8_0;
+  - IQ3_XXS: 128k with F16, the full 256k with q8_0.
+- **The one failure:** IQ3_XXS/IQ4_XS at 256k with F16. `--fit` projects
+  "39634 MiB of device memory vs. 38338 MiB of free device memory". The run
+  loads, then the first compute fails with "Insufficient Memory
+  (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)", exit code 1.
+- **Every other run** answers "Berlin" and exits cleanly.
+- **The full KV cache:** still 20 KiB per token at F16. q8_0 takes 17/32 of
+  that, 34 bytes per 32 values.
+- **The Metal compute buffer:** it is no longer constant. 260 MiB up to 32k,
+  then 266, 458 and 842 MiB at 64k, 128k and 256k with F16; 11 to 13 MiB
+  less with q8_0.
+- **q8_0 quality:** not measured. A quantized KV cache is a second lossy step
+  on top of the weights. Judging it waits for PLAN Phases 6 and 7, like
+  long-context quality.
+
+Speed with a filled cache, at the chat candidate's largest usable contexts
+(tokens/s, one repetition each):
+
+```sh
+build/bin/llama-bench -m ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf -ngl 99 -p 512 -n 128 -d 64768 -r 1
+build/bin/llama-bench -m ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf -ngl 99 -p 512 -n 128 -d 130304 -r 1 \
+    -ctk q8_0 -ctv q8_0
+```
+
+| KV type | Depth | pp512 | tg128 |
+|---|---|---|---|
+| F16 | 64,768 | 323.46 | 32.61 |
+| q8_0 | 64,768 | | 16.33 |
+| q8_0 | 130,304 | 123.44 | 4.21 |
+
+Both configurations run with the cache filled to the context limit, but treat
+these numbers as a lower bound:
+
+- **The machine was under memory pressure.** Other processes held about 24 GiB
+  of anonymous memory (1,572,852 anonymous pages of 16 KiB in `vm_stat`, read
+  after the server stopped). Swap was 15 GB, and the pressure level was 2
+  ("warn") during the sustained run below.
+- **A control after these runs** gave tg128 at depth 0 of 28.19 ± 1.49,
+  against 61.0 in the table above.
+- **The F16 row fits the trend from 8k to 32k:** 41 tokens/s at 32k, 33 at
+  64k.
+- **The q8_0 rows are uncertain:** they came about 10 minutes later and may
+  already be slowed.
+- **Whether q8_0 itself halves generation speed** (16.33 against 32.61 at the
+  same depth) needs a rerun on a machine without memory pressure.
+
+### Sustained generation
+
+The chat candidate at 32k context with an F16 KV cache generates 32,000 tokens
+through `llama-server`. A small client streams `/completion` (`n_predict`
+32000, `ignore_eos`, temperature 0, `return_tokens`) and timestamps every
+token. Every 10 s, a sampler logs:
+
+- the server's RSS and `phys_footprint`;
+- `vm.swapusage`;
+- `kern.memorystatus_vm_pressure_level`.
+
+```sh
+build/bin/llama-server -m ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf -ngl 99 -c 32768 -np 1 --port 8099
+```
+
+- **The run completes without errors.** The server reports "eval time =
+  1325773.74 ms / 32000 tokens ( 41.43 ms per token, 24.14 tokens per second)",
+  22 min.
+- **Memory stays flat after the load:**
+  - RSS 30,412 to 30,760 MiB, which is the mapped model;
+  - `phys_footprint` from 848 to 918 MiB, so 70 MiB over 32,000 tokens;
+  - system swap between 14.7 and 15.8 GB.
+- **The pressure level was 2 ("warn") in all 122 samples.** That is real
+  memory pressure, from the model plus the other processes' memory.
+- **Simulated pressure was refused.** `memory_pressure -S -l warn` needs root
+  ("kern.memorypressure_manual_trigger failed : Operation not permitted") and
+  was not run with sudo.
+- **Speed over the run,** in tokens/s per 2,048-token window:
+
+  | Tokens | 0–8k | 8k–16k | 16k–24k | 24k–32k |
+  |---|---|---|---|---|
+  | Windows | 29.1, 28.8, 30.7, 26.7 | 25.2, 22.4, 22.9, 21.0 | 22.2, 22.6, 22.0, 24.2 | 25.1, 24.3, 23.1, 19.4 (last 1,280) |
+
+- **The drop from about 29 to 22 to 25** is smaller than the drop with depth
+  in the table above (61 to 41).
+- **The server is not the cause of the low level.** A control under the same
+  conditions gives the same speed: `llama-completion -n 2048 --ignore-eos`
+  with the same prompt at 24.83 tokens/s, and `llama-bench` tg128 at
+  28.19 ± 1.49. This is what the chat candidate delivers on a 48 GB Mac that
+  is also running other work.
+- **The text:** `--ignore-eos` forces generation past the end of the answer,
+  so its tail repeats "(End of response.)". It is not a quality signal.
+
 ## Raw German completions repeat, BF16 included
 
 Greedy raw completions (`llama-completion -no-cnv --temp 0`, no chat
@@ -1014,6 +1136,11 @@ All files live outside the repo, in `~/models`.
 9. On an idle machine, measure memory and speed at 8k to 32k context as in
    "Context length and memory on Metal": six loads and two `llama-bench`
    depth sweeps, about 15 minutes.
+10. For longer contexts and sustained generation, follow "Beyond 32k" and
+    "Sustained generation":
+    - 12 loads at 64k to 256k, about 5 minutes;
+    - three `llama-bench` runs at depth 64,768 or 130,304, about 15 minutes;
+    - a 32,000-token `llama-server` run, 22 minutes on a loaded machine.
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
