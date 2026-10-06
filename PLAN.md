@@ -431,8 +431,33 @@ For each candidate:
     d32256 | 530.12 ± 39.01", "tg128 @ d32256 | 41.22 ± 0.50" (61.03 at depth
     0); IQ3_XXS "tg128 @ d32256 | 39.23 ± 1.03". Long-context quality is not
     measured; it waits for Phases 6 and 7.
--   [ ] Expand context only if memory headroom permits.
--   [ ] Test sustained generation and memory pressure.
+-   [x] Expand context only if memory headroom permits. (2026-10-06) — at
+    least 2 GiB free on MTL0 counts as headroom. Both IQ3_XXS files were
+    loaded at 64k, 128k and 256k with F16 and q8_0 KV. The largest usable
+    context:
+    - IQ3_XXS/IQ4_XS: 64k with F16, "38338 = 2787 + (35218 = 33572 + 1380 +
+      266) + 332"; 128k with q8_0, "38338 = 2575 + (35430 = 33572 + 1413 +
+      445) + 332";
+    - IQ3_XXS: 128k with F16 (4,877 MiB free), 256k with q8_0 (4,393 MiB free).
+
+    IQ3_XXS/IQ4_XS at 256k with F16 runs out of memory ("Insufficient Memory
+    (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"). With a filled
+    cache: "tg128 @ d64768 | 32.61" (F16) and "tg128 @ d130304 | 4.21"
+    (q8_0), measured under memory pressure. The q8_0 KV quality is not
+    validated (Phases 6/7).
+    ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Beyond 32k".)
+-   [ ] Test sustained generation and memory pressure. (2026-10-06) —
+    partial. IQ3_XXS/IQ4_XS at 32k through `llama-server` generated "32000
+    tokens ( 41.43 ms per token, 24.14 tokens per second)" without errors:
+    - RSS stayed between 30,412 and 30,760 MiB;
+    - the pressure level was 2 (warn) in all 122 samples, under real system
+      pressure.
+
+    Remaining: the simulated warn (`memory_pressure -S -l warn`) needs root
+    ("Operation not permitted"). Also missing is a rerun of the speed on a
+    machine without other load (control: tg128 28.19 against 61.0 at depth 0)
+    ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Sustained
+    generation").
 -   [ ] Compare quality and Top-6 routing agreement with BF16.
 -   [ ] Add an expert-locality workload suite with fixed, reproducible prompt/tool traces for four representative scenarios:
     - coding tasks (including tasks outside Kolibri's expected strengths),
