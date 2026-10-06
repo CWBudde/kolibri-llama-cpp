@@ -353,7 +353,11 @@ def main() -> None:
             gguf = f"; recorded with {old['gguf']}, this run {rec['gguf']}" if old["gguf"] != rec["gguf"] else ""
             print(f"INFO {name}: CHANGED since the recorded libllama run{gguf}: {moved(old, rec)}")
 
-    if args.write or args.record:
+    if args.record and errs:
+        # a partly recorded baseline would report later regressions as unchanged
+        print(f"INFO {args.manifest.name} not written: --record records nothing after a FAIL")
+    elif args.write or args.record:
+        # --write keeps writing: the manifest must describe the artifacts it already stored
         if args.record:
             commit = subprocess.run(["git", "-C", str(args.llama_cpp), "rev-parse", "HEAD"], capture_output=True,
                                     text=True).stdout.strip()
