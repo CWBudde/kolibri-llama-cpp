@@ -108,9 +108,11 @@ def run_tokenizer_random(tree: Path, c: Checks) -> None:
 
     truth = up.TokenizerGroundtruth(str(tokenizer_dir()))
     n_vocab, n_added = len(truth.model.get_vocab()), len(truth.model.added_tokens_encoder)
-    c.report(len(truth.vocab) == 1 and n_vocab > 1, "test-tokenizer-random TokenizerGroundtruth",
-             f"transformers {transformers.__version__}: {len(truth.vocab)} vocab entry for {n_vocab} tokens, "
-             f"{len(truth.added_tokens)} added-token entry for {n_added} added tokens")
+    entries = lambda n: f"{n} {'entry' if n == 1 else 'entries'}"  # noqa: E731
+    c.report(len(truth.vocab) == 1 and n_vocab > 1, "test-tokenizer-random TokenizerGroundtruth vocab",
+             f"transformers {transformers.__version__}: {entries(len(truth.vocab))} for {n_vocab} tokens")
+    c.report(len(truth.added_tokens) == 1 and n_added > 1, "test-tokenizer-random TokenizerGroundtruth added_tokens",
+             f"transformers {transformers.__version__}: {entries(len(truth.added_tokens))} for {n_added} added tokens")
 
 
 def run_cpu_moe(tree: Path, gguf: Path, expect: str, c: Checks) -> None:
