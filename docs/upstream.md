@@ -35,7 +35,7 @@ runtime files apply; only the converter's Python files and
 
 ```sh
 git -C /tmp/upstream apply '--exclude=conversion/*' --exclude=convert_hf_to_gguf_update.py \
-  --exclude=tests/test-llama-archs.cpp patches/llama.cpp/000[1-8]-*.patch
+  --exclude=tests/test-llama-archs.cpp "$PWD"/patches/llama.cpp/000[1-8]-*.patch
 ```
 
 ## 1. Invalid UTF-8 in `llama_tokenize`
@@ -74,7 +74,8 @@ without a comment. Overlong forms and surrogates have no report.
 
 ```text
 REPRODUCED test-tokenizer-random LibLlamaModel: tokenize('Hello') raised TypeError: initializer for ctype 'struct llama_vocab *' must be a pointer to same type, not cdata 'struct llama_model *'
-REPRODUCED test-tokenizer-random TokenizerGroundtruth: transformers 5.18.0: 1 vocab entry for 127998 tokens, 1 added-token entry for 98 added tokens
+REPRODUCED test-tokenizer-random TokenizerGroundtruth vocab: transformers 5.18.0: 1 entry for 127998 tokens
+REPRODUCED test-tokenizer-random TokenizerGroundtruth added_tokens: transformers 5.18.0: 1 entry for 98 added tokens
 ```
 
 - **`LibLlamaModel`:** its `tokenize` and `detokenize` pass `self.model`
@@ -84,7 +85,8 @@ REPRODUCED test-tokenizer-random TokenizerGroundtruth: transformers 5.18.0: 1 vo
   `batch_decode` of a flat ID list. Under transformers 5 that returns a
   single string, so the vocab and added-token fuzzers each test one
   concatenated string. The check uses the pinned Kolibri tokenizer; the
-  cause is the transformers call, not the model.
+  cause is the transformers call, not the model. `vocab` and
+  `added_tokens` are separate checks, so a fix of only one of them shows.
 
 **Upstream:** no report. The open
 [#10276](https://github.com/ggml-org/llama.cpp/issues/10276) is about the
@@ -156,3 +158,4 @@ Each was applied to the upstream worktree, run, and reverted.
 | M23: `unicode_cpt_to_utf8` returns U+FFFD instead of throwing | `utf8`: "NOT REPRODUCED utf8 abort: F4 90 80 80 (U+110000) returned [5691]", rc 1 |
 | M24: `test-tokenizer-random.py` passes `llama_model_get_vocab(self.model)` | `tokenizer-random`: "NOT REPRODUCED test-tokenizer-random LibLlamaModel: tokenize('Hello') returned [9707]", rc 1 |
 | M25: `cpu-moe` without `--expect ok` on master plus 0001–0009 | "NOT REPRODUCED cpu-moe: GGUF 79,284 MiB, Metal maps 2,447 MiB of it: exit 0", rc 1 |
+| M26: `test-tokenizer-random.py` decodes the added tokens one by one (only `vocab` still collapses) | `tokenizer-random`: "NOT REPRODUCED test-tokenizer-random TokenizerGroundtruth added_tokens: transformers 5.18.0: 98 entries for 98 added tokens", rc 1 |
