@@ -636,8 +636,27 @@ Template, reasoning modes, tool calls, parsers and stop tokens are done
     Alpha's recommended sampling parameters.
 -   [ ] Decide whether to propose the `reasoning_effort: "none"` fix
     (one line in llama-server's `server-common.cpp`) upstream.
--   [ ] Test `continue_final_message` with thinking; the reference parser
-    itself has a known gap there.
+-   [x] Test `continue_final_message` with thinking; the reference parser
+    itself has a known gap there. (2026-10-07) — `check_chat.py` continues
+    four final assistant messages through llama-server's default
+    `--prefill-assistant` and every `continue_final_message` mode, in every
+    reasoning mode, against transformers' `continue_final_message=True`:
+    "PASS chat continue [default] content: 93/124 prompts equal the
+    reference, reasoning continued in an open think block 31/124 (the
+    reference closes it)", 53 PASS in all, rc 0. A content continuation is
+    byte-identical with thinking on and off. Only a reasoning continuation
+    differs: `"reasoning_content"`, or a message with reasoning only. There
+    llama.cpp leaves the think block open, the reference closes it. That
+    prompt is checked exactly. Patch 0010 adds Kolibri continuation cases to
+    `test-chat`:
+    - a content continuation parses as content, also ending in a tool call;
+    - a reasoning continuation runs until `</think>`.
+
+    Result: "[chat] All tests passed!" (rc 0), and `ctest -R test-chat` "100% tests
+    passed out of 1". vLLM's parser files a content continuation as
+    reasoning with thinking on (the documented gap); llama.cpp does not.
+    Controls M20 to M22 each fail with rc ≠ 0
+    ([docs/chat.md](docs/chat.md), "Continuing an assistant message").
 
 **Definition of Done:** `llama-cli`/`llama-server` can reproduce
 ordinary chat behavior and, where feasible, Kolibri reasoning/tool-call
