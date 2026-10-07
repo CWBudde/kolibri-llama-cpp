@@ -1283,6 +1283,95 @@ routed experts with `--cpu-moe`". Kolibri is a post-trained reasoning model,
 and on these weights the vLLM model code computes the same raw continuation.
 Only a run of vLLM itself (PLAN Phase 6) can still contradict that.
 
+### Where the German numbers come from
+
+Two German numbers in "End-to-end corpus" stand out:
+- **`de-raw`:** libllama against float32 gives KLD 0.1125 and the same Top-6
+  set for only 56.5% of the pairs. `en-raw` gives 0.0015 and 90.3%.
+- **`de-long`:** PPL 26.5, against 15.1 for `wiki-c1`.
+
+`tools/ref/lang_stats.py` takes both apart from the stored reference artifacts,
+without running a model.
+
+```text
+de-raw: router margin < 0.01 for 27.1%, < 0.1 for 91.2% of 1050 (token, layer) pairs, median 0.027
+de-raw: generated [1678, 1678, 1678, 1678]…; per position from the last prompt token, KLD float32 || bfloat16 0.182 0.690 0.002 0.003 0.001 0.003 0.003 0.002 0.009 0.016 0.009 0.007 0.012 0.011 0.014 0.008 0.004
+de-raw: float32 top probability 0.88 0.51 1.00 0.99 1.00 0.99 0.99 0.99 0.99 0.99 0.99 0.99 0.99 0.98 0.98 0.99 0.99
+en-raw: router margin < 0.01 for 23.5%, < 0.1 for 81.6% of 1050 (token, layer) pairs, median 0.034
+code: router margin < 0.01 for 28.1%, < 0.1 for 90.6% of 1450 (token, layer) pairs, median 0.026
+code: generated [14141, 16527, 8050, 262]…; per position from the last prompt token, KLD float32 || bfloat16 1.294 0.024 0.002 …
+wiki-c1: PPL 15.1244 over 255 tokens, 971 bytes (3.81 per token), 1.029 bits per byte
+de-long: PPL 26.5145 over 511 tokens, 2220 bytes (4.34 per token), 1.088 bits per byte
+```
+
+- **The repetition is not a precision effect.** In float32 the reference itself
+  gives " Deutschland" (1678) a probability of 0.88 after the prompt, then 0.99
+  in the loop. The high mean KLD of `de-raw` comes from two positions (0.182 and
+  0.690); `code` has one such position too (1.294). Over 21 tokens, 16 of them
+  the same token, a few such positions decide the mean, and so does the low
+  Top-6 agreement: a flip on one repeated token recurs at every repetition.
+- **German routing has no more near-ties than English or code:** the share of
+  margins below 0.01 is 27.1% for `de-raw`, 23.5% for `en-raw`, 28.1% for
+  `code`, and 21.3% for `de-long`.
+- **The German PPL is a matter of token length:** a German token covers 4.34
+  bytes here, an English one 3.81. Per byte, the loss is 1.088 bits for German
+  and 1.029 for English, 6% apart (different texts).
+
+### Raw prompts past the first sentence
+
+These runs used greedy decoding (`llama-completion -no-cnv --temp 0 -n 40`) on
+the IQ3_XXS/IQ4_XS chat candidate on Metal, which repeats like BF16 on the
+first prompt. They show where raw German degenerates:
+
+| Prompt | Continuation |
+|---|---|
+| "Die Hauptstadt von Frankreich ist Paris. Die Hauptstadt von Italien ist Rom. Die Hauptstadt von Deutschland ist" | " Berlin. Die Hauptstadt von Frankreich ist Paris. Die Hauptstadt von Italien ist Rom. …" |
+| "The capital of France is Paris. The capital of Italy is Rome. The capital of Germany is" | " Berlin. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital of Greece is Athens. …" |
+| "Berlin ist die Hauptstadt und ein Land der Bundesrepublik Deutschland. Mit rund 3,7 Millionen Einwohnern ist Berlin" | " die größte Stadt Deutschlands und ein Land der Bundesrepublik Deutschland. Mit rund 3,7 Millionen Einwohnern ist Berlin die größte Stadt …" |
+| "The Rhine is a river in Central Europe. It rises in the Swiss Alps and flows into the North Sea. On its way" | ", it passes through several countries, including Germany, France, and the Netherlands. The Rhine is one of the longest rivers in Europe. …" |
+| "<\|endoftext\|>Die Hauptstadt von Deutschland ist" | " die Hauptstadt von Deutschland ist die Hauptstadt von Deutschland …" |
+| "<\|endoftext\|>The capital of Germany is" | " a capital of a capital of a capital of …" |
+
+With some context, raw German gets the facts right (" Berlin", "die größte
+Stadt Deutschlands") and then copies the prompt back. English continues with new
+content of the same kind. A leading `<|endoftext|>` (the pad token, the likely
+document separator) makes both languages worse, so a missing document start
+does not explain it.
+
+### vLLM itself on slices of the real weights
+
+The remaining doubt above was a misreading of the vLLM code that the port and
+libllama share. Copy loops are an attention behavior, so a shared attention
+error would be a plausible cause.
+
+To test this, vLLM itself ran slices of the real weights on the CPU in float32
+([vllm-reference.md](vllm-reference.md), "Slices of the real weights"):
+- layers 0 and 4, the first sliding and the first full layer;
+- layers 48 and 49, the last ones before the final norm and the head.
+
+Each slice ran all six e2e cases, including `de-raw` and `de-long`, which goes
+past the 513-token window. The torch port and libllama agree with vLLM at
+1e-12 to 2e-10 NMSE in every node. Every case picks the same experts in every
+(token, layer) pair. For example, in slice [0,4]:
+
+```text
+PASS de-raw, libllama vs vLLM, router probe: worst layer router-logit NMSE 5.79e-13 where every earlier layer picks the same experts, Top-1 same 100.0%, Top-6 set same 100.0%
+PASS de-long, libllama vs vLLM, layer 0 (sliding attention), 1024 of 1024 tokens on the same experts before it: NMSE Q after QK norm 6.92e-13, K after QK norm 6.83e-13, attention output attn_out 1.67e-12, attn_post_norm 1.59e-12
+```
+
+A window one key short in vLLM's config (control M28) moves `de-long`'s
+attention output to 1.7e-07 and fails.
+
+**Assessment:**
+- **Raw greedy German degenerates in the model itself.** vLLM computes the same
+  layers on the real weights, and the port computes the whole model the same
+  way. Only the full-model vLLM run can still contradict that (PLAN Phase 6),
+  and nothing left points at llama.cpp.
+- **For German, use the chat template.** There the output is coherent
+  (`de-chat`, and the 528-token German answer this section refers to).
+- **Recommended sampling is not a fix yet.** It stays unvalidated until greedy
+  inference passes the reference (PLAN Phase 0/9).
+
 ## Reference forward on the real weights
 
 `tools/ref/kolibri_ref.py` is a whole-model forward of Kolibri-1 in torch. It
