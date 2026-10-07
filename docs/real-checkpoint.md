@@ -797,9 +797,120 @@ The recorded run:
   - one changed generated ID in coding answer 15 fails ("FAIL coding: the
     token IDs with the generated answers do not decode to the
     conversation", plus messages 15, 20, 22 and 24, exit 1).
-- **Not measured here:** the expert coverage, reuse and cache simulations
-  that these traces feed (PLAN Phase 8, next items), and the answers'
-  quality, which waits for Phases 6 and 7.
+- **Not measured here:** the answers' quality, which waits for Phases 6
+  and 7. The expert coverage and reuse are in "Expert locality per layer"
+  below; the cache simulations are the next Phase 8 item.
+
+### Expert locality per layer
+
+Which experts do the four workloads select, layer by layer, and how much do
+they come back to the same ones? This is the input for deciding whether a
+cache of streamed experts can work.
+
+**Capture.** `tools/locality/experts.py` prefills each workload's token IDs
+(answers as generated) through libllama. It records every layer's selected
+experts per token (the `ffn_moe_topk` node), int16 [50, n_tokens, 6], in
+`~/models/eval/locality/<name>.<model>.experts.npy`, and pins their sha256
+in `testdata/locality/experts.json`. Two models:
+
+| Model | Device | Time for the four workloads (61,200 tokens) |
+|---|---|---|
+| `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf` (the 48 GB chat candidate) | Metal, ubatch 512 | 2 min (450–590 tokens/s) |
+| `Kolibri-1-Q8_0.gguf` (KLD 0.050 to BF16) | CPU, `--no-repack`, 10 threads, ubatch 512 | 86 min (9.4–13.1 tokens/s) |
+
+- **Every position is an output.** Otherwise llama.cpp computes only the
+  output rows in the last layer, and layer 49 would show a single token.
+  The Runner in `tools/gguf/check_model.py` gained `return_logits=False`
+  (compute, but do not keep 28k × 128k logits) and `no_repack`.
+- **The check fails (exit 1)** when:
+  - the token IDs differ from the workloads manifest;
+  - a token's selection in some layer is not 6 distinct experts in
+    [0, 384);
+  - the selections' sha256 differs from the recorded one, or the token
+    IDs' sha256 they were captured from does. That catches a changed trace
+    of the same length, `--verify` included.
+
+  `--verify` re-hashes the stored files without running the model.
+- **A rejected capture changes nothing:** it does not replace the stored
+  selections; it is kept as `<name>.<model>.experts.rejected.npy` instead.
+  `--record` writes files and manifest only when every requested workload
+  is valid. The manifest records per workload the run that captured it
+  (GGUF, llama.cpp commit, device, batch, threads), so a partial
+  re-recording does not relabel the others.
+
+```sh
+tools/locality/experts.py --gguf ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf --device metal [--record]
+tools/locality/experts.py --gguf ~/models/Kolibri-1-Q8_0.gguf --device cpu --no-repack --threads 10 [--record]
+go run ./cmd/kolibri-locality -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx,Kolibri-1-Q8_0 -md docs/expert-locality.md
+```
+
+**Measures.** `cmd/kolibri-locality` computes, per model, workload and layer
+(`internal/locality`, where they are defined and unit-tested):
+- coverage, the share of the 384 experts selected at least once, after 1k,
+  2k, 4k, 8k, 16k and 24k tokens and at the end;
+- each expert's activation count, the top expert's share and the median
+  count;
+- the Top-6/24/96 share, and how many experts take 50, 90 and 99% of the
+  activations;
+- the entropy of the frequencies (also normalized by log2 384) and their
+  Gini coefficient;
+- the reuse distance in tokens, and the stack distance: how many other
+  experts the layer selected between two selections of an expert, which is
+  what an LRU cache must hold besides it to hit. Both as median, p90 and
+  p99, plus the share of first selections;
+- the share of experts never selected.
+
+All 50 layers are in [docs/expert-locality.md](expert-locality.md) (generated)
+and in `~/models/eval/locality/stats-<model>.json` (with the 384 counts).
+
+**Results** (means over the 50 layers, IQ3_XXS/IQ4_XS):
+
+| Workload | Coverage 1k / 8k / end | Never selected (layer range) | Top-24 share | Experts for 90% | Median stack distance |
+|---|---|---|---|---|---|
+| coding (11,146 tokens) | 73.3 / 89.3 / 90.6% | 9.4% (1.3–75.5) | 40.2% | 163 | 18 |
+| research (10,645) | 67.0 / 86.1 / 89.2% | 10.8% (3.6–76.3) | 44.7% | 162 | 13 |
+| hr (10,959) | 66.6 / 82.3 / 84.1% | 15.9% (4.9–78.9) | 54.6% | 114 | 15 |
+| medtech (28,450) | 66.2 / 80.6 / 87.7% | 12.3% (3.1–73.2) | 58.2% | 116 | 11 |
+
+- **A long session touches almost every expert.** Two thirds of a layer's
+  experts are selected within the first 1k tokens, 84–91% by the end.
+  There is no small per-session working set to keep resident.
+- **The use is concentrated nonetheless.** The 24 most selected experts per
+  layer (6%) take 40–58% of the activations. The median stack distance,
+  averaged over the layers, is 11–18: half of the repeat selections come
+  back after that many other experts or fewer. An
+  LRU cache of a few dozen experts per layer could therefore catch a large
+  share. The next Phase 8 item simulates that.
+- **Layers 0 and 1 use about a quarter of the experts** (69–79% never
+  selected, in every workload), layer 2 about 60%. In layers 3 to 49 the
+  median layer leaves 5.5% (coding) to 11.5% (hr) unused; the most
+  concentrated of them are layer 4 (20–27% unused) and the last layers
+  (medtech layer 49: 28%).
+- **HR and MedTech concentrate more than coding and research:** a higher
+  Top-24 share, 114–116 instead of 162–163 experts for 90%, and a Gini
+  of 0.78 instead of 0.67–0.69.
+- **Quantization barely changes these figures,** although it changes the
+  individual choices. Q8_0 gives the same means to within 0.3 percentage
+  points (coverage at the end, for example, 90.6/89.3/83.9/87.6%). Yet both
+  models select the same 6 experts for only 57.3% (hr) to 70.0% (medtech)
+  of the (layer, token) pairs, per layer between 27.3% and 98.9%. Where
+  they differ, mostly in a single expert: 68% (hr) to 90% (medtech) of the
+  differing pairs. In any layer, at most 2.2% of the activations go to a
+  different expert. Locality is a property of the workload here, not of
+  the quantization. This is not
+  the Top-6 agreement with BF16 that Phase 8 still asks for.
+- **Reproducible:** recapturing gives identical sha256 for all four
+  workloads with IQ3 on Metal ("PASS medtech: 50 layers x 28450 tokens x 6
+  distinct experts, as recorded"), and for hr with Q8_0 on the CPU
+  (733 s).
+- **Negative controls** (exit 1, then restored):
+  - one changed expert ID in the stored hr selections ("FAIL hr: {…
+    'experts_sha256': '1a0f40d9…'} differs from the recorded {…
+    'faf613dd…'}");
+  - a duplicated expert ("FAIL hr: layer 17 token 4000 selects an expert
+    twice: [367, 104, 104, 219, 318, 161]");
+  - one changed token ID in hr's token file ("FAIL hr: the token IDs
+    differ from testdata/locality/manifest.json (run workloads.py)").
 
 ## Raw German completions repeat, BF16 included
 
@@ -1299,6 +1410,9 @@ All files live outside the repo, in `~/models`.
     --fetch`, then the check, as in "Expert-locality workloads". The answers
     are committed; regenerating them (`--answer`, after emptying the slots)
     takes about 2 h with Q8_0 on the CPU.
+12. For the expert locality per layer, run `tools/locality/experts.py` for
+    both models, then `cmd/kolibri-locality`, as in "Expert locality per
+    layer": 2 min on Metal, 86 min for Q8_0 on the CPU.
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
