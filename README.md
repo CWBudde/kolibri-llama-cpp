@@ -142,8 +142,9 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `tools/quant/` | `calibration.py` builds the imatrix calibration text from English wikitext, German Wikipedia and source code, so the imatrix reaches the experts that English text alone leaves without data. |
 | `tools/locality/` | `workloads.py` checks the four fixed chat traces for the expert-locality measurements (coding, research, HR tool use, MedTech QM on the EU MDR) in `testdata/locality/`: pinned sources, frozen answers, identical token IDs from the reference tokenizer and libllama, hashes as recorded. It also fetches the sources and generates the answers. `experts.py` prefills the traces through libllama and records each layer's selected experts per token, pinned by sha256 in `testdata/locality/experts.json`. `expert_bytes.py` records the bytes of one expert per layer from a GGUF in `testdata/locality/expert-bytes.json`. |
 | `tools/chat/` | `check_chat.py` checks the chat template in the GGUFs and in llama-server, compares llama-server's rendered prompts with the reference renderer for every reasoning mode and tool-call shape and for a continued final assistant message (`continue_final_message`), and checks the stop tokens. |
+| `tools/upstream/` | `repro.py` reproduces the upstream llama.cpp issues against any llama.cpp tree, typically current ggml-org master: invalid UTF-8 in `llama_tokenize`, the broken `tests/test-tokenizer-random.py`, and Metal with `--cpu-moe` above the working set. It exits 1 once an issue no longer reproduces. |
 | `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. 0009 is a generic llama.cpp fix, not Kolibri code: it lets Metal run with `--cpu-moe` on files above the Metal working set. 0010 adds only tests (Kolibri continuation cases in `test-chat`); it is on the fork branch `feat/kolibri-continuation`, not yet in `feat/kolibri`. |
-| `docs/` | Reference docs per topic (checkpoint, tokenizer, conversion, model, attention, chat, real checkpoint), with findings, pitfalls and reproduction steps. |
+| `docs/` | Reference docs per topic (checkpoint, tokenizer, conversion, model, attention, chat, real checkpoint, upstream issues), with findings, pitfalls and reproduction steps. |
 
 ## Setup
 
@@ -226,14 +227,23 @@ Network access:
 
 These belong upstream. Only the last has a fix here, as a generic patch.
 Details are in [docs/tokenizer.md](docs/tokenizer.md), except the last,
-which is in [docs/real-checkpoint.md](docs/real-checkpoint.md).
+which is in [docs/real-checkpoint.md](docs/real-checkpoint.md). All three
+still reproduce on upstream master `988190680d5a` (2026-10-07):
+[docs/upstream.md](docs/upstream.md) has the repro, the output and the
+existing upstream reports. No report or PR has been filed from here; upstream
+forbids AI-written ones.
 
 - **Invalid UTF-8 can crash `llama_tokenize`.** Some inputs abort the whole
-  process, for example the 4 bytes `F4 90 80 80` (U+110000). This affects
-  every model that uses llama.cpp's byte-level BPE tokenizer.
+  process, for example the 4 bytes `F4 90 80 80` (U+110000). Overlong forms
+  and surrogates are decoded instead of rejected. This affects every model
+  that uses llama.cpp's byte-level BPE tokenizer. The abort is
+  [ggml-org/llama.cpp#29713](https://github.com/ggml-org/llama.cpp/issues/29713),
+  closed as not planned.
 - **`tests/test-tokenizer-random.py` is broken:**
   - its `LibLlamaModel` uses the pre-`llama_vocab` API;
   - under transformers 5 its word lists collapse into one string.
+
+  No upstream report.
 - **Metal with `--cpu-moe` crashes on files larger than the Metal working set.**
   Upstream wraps one mmap range per backend, from its first tensor to its
   last. With `--cpu-moe` that range covers nearly the whole file, so Metal
@@ -243,4 +253,9 @@ which is in [docs/real-checkpoint.md](docs/real-checkpoint.md).
   The generic fix is patch 0009 (`0009-mmap-buffer-ranges.patch`), which
   maps only the ranges that hold a backend's tensors. On the fork it is
   [CWBudde/llama.cpp#10](https://github.com/CWBudde/llama.cpp/pull/10); it is
-  not yet proposed to ggml-org/llama.cpp.
+  not yet proposed to ggml-org/llama.cpp. On current master the crash
+  alternates between SIGBUS and a failed decode after the Metal OOM, and
+  0009 still applies and fixes it. The mechanism and the crash are
+  [#24510](https://github.com/ggml-org/llama.cpp/issues/24510) and
+  [#27822](https://github.com/ggml-org/llama.cpp/issues/27822), both closed
+  as not planned.
