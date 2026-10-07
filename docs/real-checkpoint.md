@@ -643,7 +643,9 @@ The output files:
   memory pressure, from the model plus the other processes' memory.
 - **Simulated pressure was refused.** `memory_pressure -S -l warn` needs root
   ("kern.memorypressure_manual_trigger failed : Operation not permitted") and
-  was not run with sudo.
+  was not run with sudo, neither then nor in the rerun below. Since the
+  model alone holds the level at warn, `-l critical` would be the stronger
+  test.
 - **Speed over the run,** in tokens/s per 2,048-token window:
 
   | Tokens | 0–8k | 8k–16k | 16k–24k | 24k–32k |
@@ -657,6 +659,29 @@ The output files:
   with the same prompt at 24.83 tokens/s, and `llama-bench` tg128 at
   28.19 ± 1.49. This is what the chat candidate delivers on a 48 GB Mac that
   is also running other work.
+- **Rerun on a quiet machine** (2026-10-07), with the same command:
+  - **Before:** load average 3.25, 3.72 GB swap used, pressure level 1.
+    The busiest processes were this session at 9.7% CPU and a VM at 9.2%.
+  - **Control:** `llama-bench` tg128 gives 63.05 ± 0.99, against 28.19
+    before. The server reports "eval time = 672747.12 ms / 32000 tokens (
+    21.02 ms per token, 47.56 tokens per second)", 11 minutes, twice the
+    speed of the loaded run.
+  - **Speed per 2,048-token window:** 60.4, 58.6, 57.3, 56.6, 55.3, 53.3,
+    49.3, 47.0, 44.5, 43.8, 43.1, 42.5, 41.7, 40.8, 40.1 and 39.4 tokens/s
+    (last 1,280 tokens). The fall follows the depth curve above (61 to 41).
+    So the loaded run's 29 to 22 to 25 came from the other work, not from
+    long generation.
+  - **Memory:**
+    - RSS 34,401 to 34,517 MiB: the mapped model is now fully resident,
+      against 30.4 GB under the earlier pressure;
+    - `phys_footprint` 909 to 918 MiB;
+    - swap 3.70 to 3.95 GB;
+    - 1,826 MiB of system page-ins over the 32,000 tokens.
+  - **Pressure:** level 2 ("warn") in all 68 samples, against 1 before the
+    load. The model alone puts the 48 GB Mac at warn.
+  - **A second run** 15 minutes later, again without simulated pressure,
+    gives 49.14 tokens/s, with swap rising from 3.79 to 5.31 GB. The editor
+    crashed during it, so it is a repeat of the speed only.
 - **The text:** `--ignore-eos` forces generation past the end of the answer,
   so its tail repeats "(End of response.)". It is not a quality signal.
 
@@ -1005,6 +1030,214 @@ all 300 of its experts, 510 MB):
   - a simulator that keeps a key's previous mark (`go test
     ./internal/locality`: "trial 0, 17 keys, capacity 2: 26 hits, the LRU
     simulation 27").
+
+### Resident against streamed experts
+
+What does keeping the routed experts resident on Metal cost, against
+reading them on demand? This is the real counterpart to the simulation
+above (PLAN 469). Same GGUF (IQ3_XXS/IQ4_XS), same corpus, same contexts,
+`-ngl 99 -t 10`, three ways to place the routed experts:
+- **resident:** all of them on Metal;
+- **`--n-cpu-moe 25`:** the first 25 layers' experts on the CPU;
+- **`--n-cpu-moe 50`:** all of them on the CPU.
+
+Experts on the CPU stay in the memory-mapped file (`CPU_Mapped`, no
+repack copy). The page cache keeps them in memory or reads them from disk
+on demand ("Streaming the routed experts with `--cpu-moe`" above).
+
+**Measured per placement:**
+- **Speed:** `llama-bench -p 512 -n 128 -r 3`.
+- **Corpus:** the four locality workloads through `llama-server` and
+  `cmd/kolibri-stream -tokens` (temperature 0, 128 tokens, no prompt
+  cache):
+  - their first 8,000 tokens at `-c 8192`;
+  - medtech in full, 28,450 tokens, at `-c 32768`.
+- **Prompt checks:** `-tokens` checks each file against
+  `testdata/locality/manifest.json` before it sends anything. One changed
+  ID fails with exit 1: "FAIL hr: 10959 token IDs with sha256 9ba08817…,
+  the manifest records 10959 with 05dcdd3f…".
+- **Memory:** the server's RSS and `phys_footprint` every 2 s, and the
+  memory breakdown llama.cpp prints at load.
+- **Bytes transferred per generated token:** the system's page-ins
+  (`vm_stat`) from the first generated token to the last.
+  - Calibration: reading 1 GiB of an uncached GGUF gives 66,565 page-ins
+    (65,536 expected at 16 KiB), the same GiB again 16.
+  - An idle machine gives about 56 page-ins per second, so a few hundred
+    pages per run are background.
+
+The driver loops over the three placements:
+
+```sh
+B=third_party/llama.cpp/build/bin; M=~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf; N=50  # 0, 25, 50
+$B/llama-bench -m $M -ngl 99 -t 10 -ncmoe $N -p 512 -n 128 -r 3 -o json > bench.json
+$B/llama-server -m $M -ngl 99 -t 10 -ncmoe $N -c 8192 -v --port 8099 > server-8192.log 2>&1 &
+for w in coding research hr medtech; do
+    go run ./cmd/kolibri-stream -tokens ~/models/eval/locality/$w.tokens.npy -first 8000 -n 128 \
+        -pid $! -every 2s -out $w-8k > $w-8k.txt
+done
+kill -INT %1   # then medtech in full at -c 32768, without -first
+```
+
+The three placements take about 10 minutes; results are in `~/models/eval/stream/`.
+
+**`llama-bench`** (tokens/s):
+
+| Placement | pp512 | tg128 |
+|---|--:|--:|
+| resident | 1342.90 ± 12.53 | 62.85 ± 0.46 |
+| `--n-cpu-moe 25` | 517.19 ± 24.46 | 40.89 ± 0.15 |
+| `--n-cpu-moe 50` | 318.38 ± 12.81 | 18.06 ± 0.04 |
+
+**Corpus** (server timings, tokens/s):
+
+| Placement | Prompt, four 8k prefixes | Generation after them | medtech 28,450: prompt | generation |
+|---|--:|--:|--:|--:|
+| resident | 1038.6–1065.3 | 54.62–54.69 | 819.9 | 43.47 |
+| `--n-cpu-moe 25` | 310.7–442.1 | 36.26–38.29 | 347.7 | 32.45 |
+| `--n-cpu-moe 50` | 214.6–283.7 | 16.14–17.08 | 247.9 | 15.50 |
+
+**Memory** (MiB, from llama.cpp's memory breakdown at load):
+
+| Placement | Context | Metal: model + context + compute | Metal free | Host (mapped experts + compute) | Peak RSS | Pressure |
+|---|---|--:|--:|--:|--:|--:|
+| resident | 8k | 34,058 = 33,572 + 380 + 106 | 3,947 | 352 | 34,478–35,115 | 1–2 (warn) |
+| resident | 32k | 34,604 = 33,572 + 860 + 171 | 3,401 | 376 | 34,941 | 2 |
+| `--n-cpu-moe 25` | 8k | 18,931 = 18,009 + 380 + 541 | 19,405 | 16,075 | 33,477–33,918 | 1 (normal) |
+| `--n-cpu-moe 25` | 32k | 19,435 = 18,009 + 860 + 565 | 18,901 | 16,099 | 33,754 | 1 |
+| `--n-cpu-moe 50` | 8k | 3,369 = 2,447 + 380 + 541 | 34,966 | 31,798 | 33,308–34,028 | 1 |
+| `--n-cpu-moe 50` | 32k | 3,873 = 2,447 + 860 + 565 | 34,462 | 31,822 | 33,587 | 1 |
+
+**Transfers** while generating (system page-ins over 127 tokens):
+
+| Placement | coding | research | hr | medtech 8k | medtech full | Expert bytes the CPU reads per token |
+|---|--:|--:|--:|--:|--:|--:|
+| resident | 0.033 MiB | 0.177 | 0.042 | 0.019 | 0.107 | none |
+| `--n-cpu-moe 25` | 0.047 | 0.036 | 0.029 | 0.115 | 0.010 | 243.2 MiB |
+| `--n-cpu-moe 50` | 1.682 | 0.618 | 0.292 | 0.074 | 0.718 | 486.3 MiB |
+
+- **Resident is 2.8 to 3.5 times faster.** It generates 54.7 tokens/s after
+  8k tokens, against 16.1–17.1 with all experts on the CPU. Prompt
+  processing is 3.3 to 4.9 times faster. Half and half lands in between
+  (36–38 tokens/s).
+- **Streaming moves memory, it doesn't save it.** The 31 GB of experts
+  leave Metal's working set (34,966 MiB free instead of 3,947) but sit in
+  the page cache instead. RSS stays at 33–35 GB either way, because the
+  mapped file pages count in it.
+  - What changes is the kind of memory: Metal's buffers are wired, the
+    page cache can be reclaimed.
+  - The system's pressure level shows it: 2 (warn) in 39 of 41 resident
+    samples (1 in the other two), 1 (normal) in all 236 streamed ones.
+- **Nothing is streamed from disk here.** The IQ3 file (33 GB) fits in the
+  48 GB of RAM, so the page cache serves the experts. Generating reads
+  0.01–1.7 MiB per token from disk, against the 243 or 486 MiB of expert
+  rows the CPU reads per token (6 experts × 1,699,840 bytes per CPU layer).
+  The largest value, coding with every expert on the CPU, is the first run
+  after the load, when some experts were not yet in the cache.
+- **Expert-cache hit rate:** llama.cpp has no expert cache; the page cache
+  plays that role. Taking hits as 1 − (bytes paged in ÷ expert bytes read),
+  it serves 99.65% (coding, `--n-cpu-moe 50`) to 100.00% of the reads.
+  - The expert cache simulation above predicts this: a cache of all 384
+    experts per layer misses only an expert's first use.
+  - A file larger than RAM (Q8_0, BF16) is where real streaming would
+    start. Those files can't run resident, so they don't fit this
+    same-quantization comparison; their CPU numbers are in "Streaming the
+    routed experts with `--cpu-moe`".
+- **CPU↔Metal handoffs:** a decode step has 2 graph splits resident, 52 at
+  `--n-cpu-moe 25` and 102 at 50, so two per CPU layer. Each moves one
+  token's hidden state (2,560 × 4 bytes) plus the 6 selected IDs and
+  weights. That is about 1 MiB per token with all experts on the CPU,
+  negligible against the expert reads. The cost is the synchronization, not
+  the bytes.
+- **Limits:**
+  - one run per workload (the four 8k prefixes give the spread);
+  - background pages count in the page-ins;
+  - load average 1.6 to 4.8 during the runs, with a VM and an editor open
+    (the quiet checks are in `quiet.txt`).
+
+### Routing overhead
+
+How much of a token does routing cost? **Definition** (PLAN 425): the router
+ops are the nodes llama.cpp's `build_moe_ffn` computes before the expert
+matmuls. For Kolibri these are five per layer:
+- the router logits `ffn_moe_logits` (an F32 matmul, 2560 × 384);
+- their sigmoid `ffn_moe_probs`;
+- the selection bias `ffn_moe_probs_biased`;
+- the Top-6 sort `ffn_moe_argsort` (`ffn_moe_topk` is a view of it);
+- the gathered weights `ffn_moe_weights`.
+
+Kolibri does not normalize the weights, so the graph has no
+`ffn_moe_weights_sum`/`_norm` nodes. Scaling the expert outputs by the
+weights (`ffn_moe_weighted`) belongs to combining them and is reported
+apart. The overhead is the summed time of the router ops per decoded token
+and per 512-token ubatch on Metal, and their share of the measured
+`llama-bench` time.
+
+**Measurement** on IQ3_XXS/IQ4_XS, all on Metal:
+- **Shapes:** `test-export-graph-ops` writes every op of the model's
+  prompt and decode graphs with its real shapes (64 unique ops; 3,186
+  nodes per graph, 2,136 after the views).
+- **Times:** `test-backend-ops perf -b MTL0` times each of them on Metal.
+- **Counts:** `llama-eval-callback` with a one-token prompt lists every
+  node of the decode graph, and so how often each op occurs.
+- **Speed:** `llama-bench` measures it in the same session.
+- **Sum:** `cmd/kolibri-routing` adds up the router ops: count × time
+  per node.
+  - It fails (exit 1) when a router op has no timing of its shapes or does
+    not occur once per layer.
+  - Other ops that occur with the same shapes in different strides, which
+    the listing does not show, get the mean of their timings.
+
+```sh
+cd ~/models/eval/routing
+B=~/Code/kolibri-llama-cpp/third_party/llama.cpp/build/bin
+M=~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
+$B/test-export-graph-ops -m $M -c 4096 -ub 512 --no-repack -o ops.txt
+$B/test-backend-ops perf -b MTL0 --test-file ops.txt > perf.txt
+$B/llama-eval-callback -m $M -ngl 99 -t 10 -c 4096 -ub 512 -p "Berlin" > evalcb.txt
+$B/llama-bench -m $M -ngl 99 -t 10 -p 512 -n 128 -r 5 -o json > bench.json
+go run ./cmd/kolibri-routing -perf perf.txt -nodes evalcb.txt -bench bench.json -layers 50 -out routing.json
+```
+
+The whole measurement takes about 5 minutes. The node listing and the
+export must use the same context, or the KV-cache writes have no timing of
+their shapes.
+
+| Router op | Op | µs per node, 1 token | µs per node, 512-token ubatch | Nodes |
+|---|---|--:|--:|--:|
+| `ffn_moe_logits` | MUL_MAT (F32) | 6.81 | 115.56 | 50 |
+| `ffn_moe_probs` | SIGMOID | 1.69 | 3.28 | 50 |
+| `ffn_moe_probs_biased` | ADD | 1.93 | 3.54 | 50 |
+| `ffn_moe_argsort` | ARGSORT | 9.66 | 162.75 | 50 |
+| `ffn_moe_weights` | GET_ROWS | 2.01 | 4.49 | 50 |
+| *combine:* `ffn_moe_weighted` | MUL | 3.79 | 226.88 | 50 |
+
+- **Routing takes 7.0% of a decoded token:** "router per token: 1.105 ms
+  of 15.685 ms measured (tg 63.76 tokens/s)".
+- **And 3.8% of prompt processing:** "router per 512-token ubatch: 14.481
+  ms of 379.673 ms measured (pp 1348.53 tokens/s)".
+- **The Top-6 sort and the router matmul dominate:** 16.5 of the 22.1 µs
+  per layer and token. The sort over 384 entries costs more than the
+  2560 × 384 F32 matmul. At 512 tokens both grow about 17-fold, while the
+  element-wise ops stay near their fixed cost.
+- **Combining the outputs** adds 0.19 ms per token (1.2%).
+- **Cross-check of the isolated timings:** the 2,086 timed nodes of a
+  token sum to 13.67 ms, 87% of the measured 15.69 ms. The 50
+  flash-attention nodes are untimed, since at decode time they read the 256
+  KV cells in use while the export reserves the whole cache. The remainder
+  is attention plus the graph's dispatch.
+- **Limits:**
+  - each op is timed in isolation, as a sequence of identical launches. In
+    the real graph Metal can overlap small ops and fuse some, so 7.0% is an
+    upper estimate for these five ops;
+  - the measurement is Metal only; the CPU is not measured.
+- **Negative controls** (exit 1):
+  - the ARGSORT lines removed from `perf.txt` ("FAIL routing overhead:
+    ffn_moe_argsort-0 (ARGSORT [384 1 1 1]): 0 matching timings, want 1");
+  - layer 49 removed from the node listing ("FAIL routing overhead:
+    ffn_moe_logits: 49 nodes, want one per layer (50)").
+- **Build:** `libllama` and `libggml` are from fork commit `6d51eaf70`
+  (patch 0009). The executables report `e1a553f5f`, the build string of
+  their older `libllama-common`.
 
 ## Raw German completions repeat, BF16 included
 
@@ -1498,8 +1731,8 @@ All files live outside the repo, in `~/models`.
     "Sustained generation":
     - 12 loads at 64k to 256k, about 5 minutes;
     - three `llama-bench` runs at depth 64,768 or 130,304, about 15 minutes;
-    - a 32,000-token `llama-server` run with `cmd/kolibri-stream`, 22 minutes
-      on a loaded machine.
+    - a 32,000-token `llama-server` run with `cmd/kolibri-stream`, 11 minutes
+      on a quiet machine (22 on a loaded one).
 11. For the expert-locality workloads, run `tools/locality/workloads.py
     --fetch`, then the check, as in "Expert-locality workloads". The answers
     are committed; regenerating them (`--answer`, after emptying the slots)
@@ -1510,6 +1743,13 @@ All files live outside the repo, in `~/models`.
 13. For the expert cache simulation, run `tools/locality/expert_bytes.py`
     for both models, then `cmd/kolibri-cache`, as in "Expert cache
     simulation" (3 s, after step 12).
+14. For the resident and streamed placements, run `llama-bench`, then
+    `llama-server` with `cmd/kolibri-stream -tokens` at `--n-cpu-moe` 0, 25
+    and 50, as in "Resident against streamed experts" (about 10 minutes,
+    after step 11).
+15. For the routing overhead, run `test-export-graph-ops`, `test-backend-ops
+    perf`, `llama-eval-callback` and `llama-bench`, then `cmd/kolibri-routing`,
+    as in "Routing overhead" (about 5 minutes).
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
