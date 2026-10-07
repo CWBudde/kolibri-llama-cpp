@@ -14,19 +14,24 @@ on the captured tokens, with the experts per token the capture ran with:
   (a chunk: PPL and the rest over its second half, as e2e.py);
 - whether the torch port's or libllama's argmax follows vLLM's greedy tokens.
 
---tiny gates the cmd/kolibri-tiny checkpoint, captured in float32, with
-compare_real.py's bounds: NMSE 1e-6 for the logits (all experts), every
-layer's nodes, the node lines and the masked router logits, and the same
-experts for 98% of the (token, layer) pairs. It exits 1 on a FAIL. On the
-real checkpoint the lines are INFO: its tolerances (PLAN Phase 6) are still to
-be set from this comparison.
+--gate (alias --tiny) gates a float32 capture with compare_real.py --tiny's
+bounds: NMSE 1e-6 for the logits (with top-k routing over the tokens whose
+experts agree in every layer), every layer's nodes, the node lines and the
+masked router logits, and the same experts for 98% of the
+(token, layer) pairs. It exits 1 on a FAIL. It applies to the cmd/kolibri-tiny
+checkpoint and to slices of the real weights (slice.py), both captured in
+float32. --max-nmse tightens the NMSE bound: on a real-weight slice the three
+agree to about 1e-11, and a window one key short (docs/vllm-reference.md, M28)
+moves the attention output only to about 1e-7, inside 1e-6. On the full real
+checkpoint in bfloat16 the lines are INFO: its tolerances (PLAN Phase 6) are
+still to be set from this comparison.
 
 The torch port runs in float64 against a float32 capture and in its bfloat16
 emulation against a bfloat16 one. libllama runs with an F32 KV cache and
-without flash attention under --tiny, as compare_real.py --tiny, and with its
+without flash attention under --gate, as compare_real.py --tiny, and with its
 defaults otherwise, as e2e.py.
 
-    compare_vllm.py --llama-cpp third_party/llama.cpp --capture DIR --model DIR --tiny --libllama
+    compare_vllm.py --llama-cpp third_party/llama.cpp --capture DIR --model DIR --gate --libllama
     compare_vllm.py --llama-cpp third_party/llama.cpp --capture DIR --gguf ~/models/Kolibri-1-BF16.gguf --libllama
 """
 
@@ -77,7 +82,7 @@ def layer_table(got: dict, ref: dict, n_layer: int, mask_rows: bool) -> list[tup
 
 
 def compare(label: str, got: dict, got_logits, cap: dict, entry: dict, W: Weights, all_experts: bool,
-            report) -> None:
+            report, bound: float) -> None:
     import numpy as np
 
     ref, tokens = cap["nodes"], cap["tokens"]
@@ -94,12 +99,17 @@ def compare(label: str, got: dict, got_logits, cap: dict, entry: dict, W: Weight
         s = logit_stats(cap["logits"], got_logits)
         text = stats_text(s)
     if all_experts:
-        report(s["nmse"] <= MAX_NMSE_TINY and worst <= MAX_NMSE_TINY,
+        report(s["nmse"] <= bound and worst <= bound,
                f"{label}: {text}, worst layer node NMSE {worst:.2e}")
     else:
-        report(same >= MIN_SAME_EXPERTS_TINY and worst <= MAX_NMSE_TINY,
+        # an expert flip changes the logits legitimately, so they are gated over the tokens whose experts agree
+        # in every layer, as the nodes are
+        ok = np.all([same_experts(got[f"ffn_moe_topk-{il}"], ref[f"ffn_moe_topk-{il}"])
+                     for il in range(W.n_layer)], axis=0)
+        v = nmse(cap["logits"][ok], got_logits[ok]) if ok.any() else float("nan")
+        report(same >= MIN_SAME_EXPERTS_TINY and worst <= bound and v <= bound,
                f"{label}: {text}; same experts for {same:.1%} of (token, layer) pairs, worst layer node NMSE "
-               f"{worst:.2e} where they agree")
+               f"{worst:.2e} and logits NMSE {v:.2e} ({int(ok.sum())} of {len(ok)} tokens) where they agree")
     # node_lines reads the attention nodes of the first sliding and the first full layer
     first = {list(W.is_swa).index(True), list(W.is_swa).index(False)}
     missing = sorted(il for il in first if f"Qcur_normed-{il}" not in ref)
@@ -107,10 +117,10 @@ def compare(label: str, got: dict, got_logits, cap: dict, entry: dict, W: Weight
         print(f"INFO {label}: node lines skipped, the capture lacks the attention nodes of layer(s) {missing}")
     else:
         for v, line in node_lines(got, ref, W):
-            report(v <= MAX_NMSE_TINY, f"{label}, {line}")
+            report(v <= bound, f"{label}, {line}")
     p = router(got, ref, W)
     v = masked_router_nmse(p)
-    report(v <= MAX_NMSE_TINY and p["set_same"].mean() >= MIN_SAME_EXPERTS_TINY,
+    report(v <= bound and p["set_same"].mean() >= MIN_SAME_EXPERTS_TINY,
            f"{label}, router probe: worst layer router-logit NMSE {v:.2e} where every earlier layer picks the "
            f"same experts, Top-1 same {p['top1_same'].mean():.1%}, Top-{W.n_expert_used} set same "
            f"{p['set_same'].mean():.1%}")
@@ -132,7 +142,10 @@ def main() -> None:
     src.add_argument("--gguf", type=Path, help="the GGUF of the captured checkpoint")
     src.add_argument("--model", type=Path, help="the captured checkpoint, converted here to an F32 GGUF")
     ap.add_argument("--libllama", action="store_true", help="also compare libllama on the CPU")
-    ap.add_argument("--tiny", action="store_true", help="gate with compare_real.py --tiny's bounds")
+    ap.add_argument("--gate", "--tiny", dest="gate", action="store_true",
+                    help="gate a float32 capture with compare_real.py --tiny's bounds")
+    ap.add_argument("--max-nmse", type=float, default=MAX_NMSE_TINY,
+                    help=f"--gate: the NMSE bound (default {MAX_NMSE_TINY:g}, compare_real.py --tiny's)")
     ap.add_argument("--threads", type=int, default=10)
     args = ap.parse_args()
 
@@ -155,7 +168,7 @@ def main() -> None:
     errs = []
 
     def report(ok: bool, what: str) -> None:
-        if args.tiny:
+        if args.gate:
             print(("PASS " if ok else "FAIL ") + what)
             if not ok:
                 errs.append(what)
@@ -172,11 +185,12 @@ def main() -> None:
               f"{entry['logprobs_max_abs_diff']:.2e}")
         port = {}
         port_logits = forward(W, tokens, dtype, port).numpy()
-        compare(f"{name}, torch port vs vLLM", port, port_logits, cap, entry, W, all_experts, report)
+        compare(f"{name}, torch port vs vLLM", port, port_logits, cap, entry, W, all_experts, report,
+                args.max_nmse)
         if runner:
             lib = runner.lib
             ctx = dict(flash_attn_type=lib.LLAMA_FLASH_ATTN_TYPE_DISABLED, type_k=lib.GGML_TYPE_F32,
-                       type_v=lib.GGML_TYPE_F32) if args.tiny else {}
+                       type_v=lib.GGML_TYPE_F32) if args.gate else {}
             capture = capture_names(W.n_layer)
             overrides = {f"{ARCH}.expert_used_count": k} if k != converted else None
             _, cpu = runner.devices()[0]
@@ -185,11 +199,12 @@ def main() -> None:
                                        n_threads_batch=args.threads, **ctx)
             got = flat(capture, len(tokens))
             assert EMBD in got
-            compare(f"{name}, libllama vs vLLM", got, got_logits, cap, entry, W, all_experts, report)
+            compare(f"{name}, libllama vs vLLM", got, got_logits, cap, entry, W, all_experts, report,
+                    args.max_nmse)
 
-    if args.tiny:
+    if args.gate:
         print(("FAIL" if errs else "PASS") + f" vLLM capture, {k} of {n_expert} experts: "
-              + (f"{len(errs)} check(s) failed" if errs else "torch port and libllama within the tiny bounds"))
+              + (f"{len(errs)} check(s) failed" if errs else f"torch port and libllama within NMSE {args.max_nmse:g}"))
         sys.exit(1 if errs else 0)
 
 
