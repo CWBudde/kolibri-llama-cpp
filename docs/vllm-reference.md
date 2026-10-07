@@ -232,6 +232,13 @@ short:
 
 Without the mutation, the slices stay at least 50 times below 1e-8.
 
+With top-k routing the logits are gated over the tokens whose experts agree in
+every layer, as the nodes are. An expert flip changes them legitimately. Control
+M29 scales `de-raw`'s captured logits by 1.01 and leaves every node alone, a
+fault confined to the head. It fails, with exit 1: "FAIL de-raw, torch port vs
+vLLM: logits NMSE 9.80e-05, … worst layer node NMSE 4.66e-12 and logits NMSE
+9.80e-05 (21 of 21 tokens) where they agree".
+
 ## On the real checkpoint
 
 ```sh

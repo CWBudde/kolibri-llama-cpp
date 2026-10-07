@@ -15,8 +15,9 @@ on the captured tokens, with the experts per token the capture ran with:
 - whether the torch port's or libllama's argmax follows vLLM's greedy tokens.
 
 --gate (alias --tiny) gates a float32 capture with compare_real.py --tiny's
-bounds: NMSE 1e-6 for the logits (all experts), every layer's nodes, the node
-lines and the masked router logits, and the same experts for 98% of the
+bounds: NMSE 1e-6 for the logits (with top-k routing over the tokens whose
+experts agree in every layer), every layer's nodes, the node lines and the
+masked router logits, and the same experts for 98% of the
 (token, layer) pairs. It exits 1 on a FAIL. It applies to the cmd/kolibri-tiny
 checkpoint and to slices of the real weights (slice.py), both captured in
 float32. --max-nmse tightens the NMSE bound: on a real-weight slice the three
@@ -101,9 +102,14 @@ def compare(label: str, got: dict, got_logits, cap: dict, entry: dict, W: Weight
         report(s["nmse"] <= bound and worst <= bound,
                f"{label}: {text}, worst layer node NMSE {worst:.2e}")
     else:
-        report(same >= MIN_SAME_EXPERTS_TINY and worst <= bound,
+        # an expert flip changes the logits legitimately, so they are gated over the tokens whose experts agree
+        # in every layer, as the nodes are
+        ok = np.all([same_experts(got[f"ffn_moe_topk-{il}"], ref[f"ffn_moe_topk-{il}"])
+                     for il in range(W.n_layer)], axis=0)
+        v = nmse(cap["logits"][ok], got_logits[ok]) if ok.any() else float("nan")
+        report(same >= MIN_SAME_EXPERTS_TINY and worst <= bound and v <= bound,
                f"{label}: {text}; same experts for {same:.1%} of (token, layer) pairs, worst layer node NMSE "
-               f"{worst:.2e} where they agree")
+               f"{worst:.2e} and logits NMSE {v:.2e} ({int(ok.sum())} of {len(ok)} tokens) where they agree")
     # node_lines reads the attention nodes of the first sliding and the first full layer
     first = {list(W.is_swa).index(True), list(W.is_swa).index(False)}
     missing = sorted(il for il in first if f"Qcur_normed-{il}" not in ref)
