@@ -6,17 +6,27 @@
 //	kolibri-stream -n 32000 -pid $(pgrep -n llama-server) -out run/ \
 //	    -p "Write a detailed, multi-chapter history of the city of Berlin, from its founding to the present day."
 //
+// With -tokens the prompt is a locality workload's token IDs instead
+// (<workload>.tokens.npy of tools/locality/workloads.py), checked against
+// testdata/locality/manifest.json and cut to the first -first tokens:
+//
+//	kolibri-stream -tokens ~/models/eval/locality/hr.tokens.npy -first 8000 -n 128 -pid $! -out run/
+//
 // It writes run/tokens.log (one "unix_ms count" line per streamed chunk),
 // run/text.txt (the generated text) and run/samples.txt (every -every: time,
 // RSS and phys_footprint in MiB, system swap used in MiB, the
-// kern.memorystatus_vm_pressure_level and the token count). At the end it
-// prints the server's timings and the tokens/s per -window tokens. The
-// sampler uses ps, footprint and sysctl, so it is macOS only.
+// kern.memorystatus_vm_pressure_level, the token count and the system's
+// page-ins so far). At the end it prints the server's timings, the tokens/s per
+// -window tokens and the system's page-ins from the first generated token to
+// the last, the pages read from disk while generating. The sampler uses ps,
+// footprint, sysctl and vm_stat, so it is macOS only.
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,6 +42,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"kolibri-llm/internal/locality"
 )
 
 type chunk struct {
@@ -137,6 +149,62 @@ func parseSwapUsed(out string) (float64, error) {
 	return strconv.ParseFloat(m[1], 64)
 }
 
+var pageinsRe = regexp.MustCompile(`(?m)^Pageins:\s+(\d+)\.`)
+
+// parsePageins returns the system's page-ins so far (pages read from disk) from vm_stat.
+func parsePageins(out string) (int64, error) {
+	m := pageinsRe.FindStringSubmatch(out)
+	if m == nil {
+		return 0, errors.New("no Pageins line")
+	}
+	return strconv.ParseInt(m[1], 10, 64)
+}
+
+// pageins runs vm_stat; -1 if that fails.
+func pageins() int64 {
+	out, err := command("vm_stat")
+	if err != nil {
+		return -1
+	}
+	n, err := parsePageins(out)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// idsSHA256 hashes token IDs as tools/locality/workloads.py does: the decimal IDs joined by commas.
+func idsSHA256(ids []int32) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.Itoa(int(id))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, ",")))
+	return hex.EncodeToString(sum[:])
+}
+
+// checkTokens compares a workload's token IDs with its entry in testdata/locality/manifest.json.
+func checkTokens(workload string, ids []int32, manifest io.Reader) error {
+	var m struct {
+		Workloads map[string]struct {
+			NTokens      int    `json:"n_tokens"`
+			TokensSHA256 string `json:"tokens_sha256"`
+		} `json:"workloads"`
+	}
+	if err := json.NewDecoder(manifest).Decode(&m); err != nil {
+		return fmt.Errorf("manifest: %w", err)
+	}
+	w, ok := m.Workloads[workload]
+	if !ok {
+		return fmt.Errorf("%s: no such workload in the manifest", workload)
+	}
+	if got := idsSHA256(ids); len(ids) != w.NTokens || got != w.TokensSHA256 {
+		return fmt.Errorf("%s: %d token IDs with sha256 %s, the manifest records %d with %s",
+			workload, len(ids), got, w.NTokens, w.TokensSHA256)
+	}
+	return nil
+}
+
 func command(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).Output()
 	return strings.TrimSpace(string(out)), err
@@ -156,22 +224,51 @@ func sample(w io.Writer, pid int, tokens int) bool {
 	swOut, _ := command("sysctl", "-n", "vm.swapusage")
 	sw, _ := parseSwapUsed(swOut)
 	level, _ := command("sysctl", "-n", "kern.memorystatus_vm_pressure_level")
-	fmt.Fprintf(w, "%s %.0f %.0f %.0f %s %d\n", time.Now().Format("15:04:05"), rssKiB/1024, fp, sw, level, tokens)
+	fmt.Fprintf(w, "%s %.0f %.0f %.0f %s %d %d\n", time.Now().Format("15:04:05"), rssKiB/1024, fp, sw, level, tokens, pageins())
 	return true
 }
 
 func main() {
 	url := flag.String("url", "http://127.0.0.1:8099/completion", "llama-server /completion endpoint")
 	prompt := flag.String("p", "", "prompt")
+	tokens := flag.String("tokens", "", "a workload's <name>.tokens.npy, sent as the prompt instead of -p")
+	first := flag.Int("first", 0, "with -tokens: send only the first tokens (0: all)")
+	manifestPath := flag.String("manifest", "testdata/locality/manifest.json", "with -tokens: the workloads' recorded token IDs")
 	n := flag.Int("n", 32000, "tokens to generate (n_predict, with ignore_eos)")
 	pid := flag.Int("pid", 0, "llama-server PID to sample; 0 disables sampling")
 	every := flag.Duration("every", 10*time.Second, "sampling interval")
 	size := flag.Int("window", 2048, "tokens per reported window")
 	dir := flag.String("out", ".", "output directory")
 	flag.Parse()
-	if *prompt == "" {
+	if (*prompt == "") == (*tokens == "") {
 		flag.Usage()
 		os.Exit(2)
+	}
+	var promptValue any = *prompt
+	if *tokens != "" {
+		f, err := os.Open(*tokens)
+		if err != nil {
+			log.Fatal(err)
+		}
+		ids, err := locality.ReadTokens(f)
+		f.Close()
+		if err != nil {
+			log.Fatalf("%s: %v", *tokens, err)
+		}
+		mf, err := os.Open(*manifestPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = checkTokens(strings.TrimSuffix(filepath.Base(*tokens), ".tokens.npy"), ids, mf)
+		mf.Close()
+		if err != nil {
+			log.Fatalf("FAIL %v", err)
+		}
+		if *first > 0 && *first < len(ids) {
+			ids = ids[:*first]
+		}
+		promptValue = ids
+		fmt.Printf("prompt: %d token IDs of %s, as recorded\n", len(ids), *tokens)
 	}
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		log.Fatal(err)
@@ -193,7 +290,7 @@ func main() {
 	if *pid > 0 {
 		samples := create("samples.txt")
 		defer samples.Close()
-		fmt.Fprintln(samples, "time rss_mib footprint_mib swap_used_mib pressure tokens")
+		fmt.Fprintln(samples, "time rss_mib footprint_mib swap_used_mib pressure tokens pageins")
 		go func() {
 			defer close(sampled)
 			tick := time.NewTicker(*every)
@@ -211,7 +308,7 @@ func main() {
 	}
 
 	body, err := json.Marshal(map[string]any{
-		"prompt": *prompt, "n_predict": *n, "ignore_eos": true, "temperature": 0,
+		"prompt": promptValue, "n_predict": *n, "ignore_eos": true, "temperature": 0,
 		"stream": true, "return_tokens": true, "cache_prompt": false,
 	})
 	if err != nil {
@@ -228,7 +325,11 @@ func main() {
 	}
 
 	var stamps []stamp
+	firstPageins := int64(-1)
 	timings, err := readStream(resp.Body, func(c int, content string) {
+		if len(stamps) == 0 {
+			firstPageins = pageins()
+		}
 		now := time.Now()
 		count.Store(int64(c))
 		stamps = append(stamps, stamp{c, now})
@@ -240,7 +341,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	lastPageins := pageins()
 	fmt.Printf("tokens %d, timings %s\n", count.Load(), timings)
+	if firstPageins >= 0 && lastPageins >= 0 && len(stamps) > 1 {
+		pages, gen := lastPageins-firstPageins, stamps[len(stamps)-1].count-stamps[0].count
+		fmt.Printf("system page-ins while generating: %d pages of 16 KiB (%.1f MiB) over %d tokens, %.3f MiB per token\n",
+			pages, float64(pages)/64, gen, float64(pages)/64/float64(gen))
+	}
 	for _, w := range windowRates(stamps, *size) {
 		fmt.Printf("%6d-%6d %.1f tokens/s\n", w.from, w.to, w.rate)
 	}
