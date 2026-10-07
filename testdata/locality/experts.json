@@ -1,0 +1,106 @@
+{
+ "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx": {
+  "workloads": {
+   "coding": {
+    "n_tokens": 11146,
+    "experts_sha256": "b192238cfea1fd281384e68a3de9d3ef4bf7c5b028df2ce0c252ae629cdebc78",
+    "gguf": "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
+    "gguf_bytes": 35556257600,
+    "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+    "device": "MTL0",
+    "n_ubatch": 512,
+    "n_ctx": 32768,
+    "threads": null,
+    "no_repack": false
+   },
+   "research": {
+    "n_tokens": 10645,
+    "experts_sha256": "d962beb1bec3c893f7dbcc50bbccf1bc2a3e650668a41241a460a9172cf7a2aa",
+    "gguf": "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
+    "gguf_bytes": 35556257600,
+    "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+    "device": "MTL0",
+    "n_ubatch": 512,
+    "n_ctx": 32768,
+    "threads": null,
+    "no_repack": false
+   },
+   "hr": {
+    "n_tokens": 10959,
+    "experts_sha256": "faf613ddd8e4f913efebfb5d5bf1e0ce7b8b1ea01eef41343d11cdc223fca3ea",
+    "gguf": "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
+    "gguf_bytes": 35556257600,
+    "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+    "device": "MTL0",
+    "n_ubatch": 512,
+    "n_ctx": 32768,
+    "threads": null,
+    "no_repack": false
+   },
+   "medtech": {
+    "n_tokens": 28450,
+    "experts_sha256": "411dba4e92af4e8494fd35768d42b0927b93d3f4d92860da4860d9f71ce51550",
+    "gguf": "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
+    "gguf_bytes": 35556257600,
+    "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+    "device": "MTL0",
+    "n_ubatch": 512,
+    "n_ctx": 32768,
+    "threads": null,
+    "no_repack": false
+   }
+  }
+ },
+ "Kolibri-1-Q8_0": {
+  "workloads": {
+   "coding": {
+    "n_tokens": 11146,
+    "experts_sha256": "a2c61ec9a884b3ebe3d8b0be4ed75b7631548b922c71bc8a237ac291516e7dd4",
+    "gguf": "Kolibri-1-Q8_0.gguf",
+    "gguf_bytes": 83135393312,
+    "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+    "device": "CPU",
+    "n_ubatch": 512,
+    "n_ctx": 32768,
+    "threads": 10,
+    "no_repack": true
+   },
+   "research": {
+    "n_tokens": 10645,
+    "experts_sha256": "09b9d9fb1818b9d445bdedecdec5c1db4c466c6df6c15a1932621e0ecd640ed1",
+    "gguf": "Kolibri-1-Q8_0.gguf",
+    "gguf_bytes": 83135393312,
+    "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+    "device": "CPU",
+    "n_ubatch": 512,
+    "n_ctx": 32768,
+    "threads": 10,
+    "no_repack": true
+   },
+   "hr": {
+    "n_tokens": 10959,
+    "experts_sha256": "b77e449b1b2eaec28473c765651fc4192378470722d6a02e058db371a8577ee3",
+    "gguf": "Kolibri-1-Q8_0.gguf",
+    "gguf_bytes": 83135393312,
+    "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+    "device": "CPU",
+    "n_ubatch": 512,
+    "n_ctx": 32768,
+    "threads": 10,
+    "no_repack": true
+   },
+   "medtech": {
+    "n_tokens": 28450,
+    "experts_sha256": "e3b46fde5454ae9648a3f455c71dea0be4f242deec54b10e850e56bcb9182707",
+    "gguf": "Kolibri-1-Q8_0.gguf",
+    "gguf_bytes": 83135393312,
+    "llama.cpp": "2447bf31acf1f19a0211d9a43ce473612508df6a",
+    "device": "CPU",
+    "n_ubatch": 512,
+    "n_ctx": 32768,
+    "threads": 10,
+    "no_repack": true
+   }
+  }
+ }
+}
