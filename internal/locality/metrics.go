@@ -19,6 +19,8 @@
 //     besides it to hit; both as nearest-rank median, 90th and 99th percentiles. ColdShare is
 //     the share of activations that are an expert's first;
 //   - NeverSelected: the share of experts the layer never selects.
+//
+// StackDistances and Hits (lru.go) replay the same selections through simulated LRU caches.
 package locality
 
 import (
