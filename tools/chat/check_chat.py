@@ -21,6 +21,14 @@ template with its own Jinja engine, behind llama-server's request handling.
   --reasoning-preserve (preserve_thinking=true) and with
   --no-reasoning-preserve. The prompt ends in the prefilled empty think block
   exactly when the reference's thinking_enabled() is false;
+- continue: continuing a final assistant message (content, reasoning and
+  content, reasoning only, after a tool loop) through llama-server's default
+  --prefill-assistant and every continue_final_message mode, in every reasoning
+  mode. A content continuation gives the reference's continue_final_message
+  prompt, with the think block closed whatever the mode. A reasoning
+  continuation ("reasoning_content", or a message with reasoning only) has no
+  reference: llama.cpp leaves the think block open after the reasoning, the
+  reference closes it. That prompt is checked exactly;
 - stop tokens: in both GGUFs, libllama ends generation on exactly the two
   eos_token_id of generation_config.json, <|im_end|> and <|endoftext|>; the
   six tag tokens (<think>, <tool_call>, ...) are text, so they reach the chat
@@ -142,12 +150,37 @@ def reference_messages(messages: list[dict]) -> list[dict]:
     return out
 
 
-def render_reference(template: str, messages: list[dict], tools, variables: dict) -> str:
+def render_reference(template: str, messages: list[dict], tools, variables: dict,
+                     continue_final: bool = False, add_generation_prompt: bool = True) -> str:
+    """continue_final: vLLM's continue_final_message, which also turns the generation prompt off."""
     from transformers.utils.chat_template_utils import render_jinja_template
 
     rendered, _ = render_jinja_template(conversations=[reference_messages(messages)], tools=tools,
-                                        chat_template=template, add_generation_prompt=True, **variables)
+                                        chat_template=template,
+                                        add_generation_prompt=add_generation_prompt and not continue_final,
+                                        continue_final_message=continue_final, **variables)
     return rendered[0]
+
+
+# (name, messages): continuing the final assistant message
+CONTINUE_MESSAGES = [
+    ("content", USER + [{"role": "assistant", "content": "Hallo, ich"}]),
+    ("reasoning_content", USER + [
+        {"role": "assistant", "content": "Hallo, ich", "reasoning_content": "Der Nutzer grüßt."}]),
+    ("reasoning_only", USER + [{"role": "assistant", "content": "", "reasoning_content": "Der Nutzer"}]),
+    ("after_tool_loop", MESSAGES[1][1] + [{"role": "assistant", "content": "Das Ergebnis"}]),
+]
+# how a request continues it: llama-server's default --prefill-assistant (a final assistant
+# message), vLLM's continue_final_message, and llama.cpp's two explicit modes
+CONTINUATIONS = [{}] + [{"continue_final_message": c, "add_generation_prompt": False}
+                        for c in (True, "content", "reasoning_content")]
+
+
+def continued_in_reasoning(message: dict, how: dict) -> bool:
+    """common_chat_templates_apply: "reasoning_content", or AUTO on a message with reasoning but no content."""
+    c = how.get("continue_final_message", True)
+    return c == "reasoning_content" or (c is True and bool(message.get("reasoning_content"))
+                                        and not message.get("content"))
 
 
 def gguf_template(llama_cpp: Path, path: Path) -> str:
@@ -232,6 +265,44 @@ def check_render(server: Server, template: str, label: str, preserve: bool, defa
     return res
 
 
+def check_continue(server: Server, template: str, label: str, preserve: bool, defaults: dict,
+                   requests: list[dict]) -> list[tuple[bool, str]]:
+    """Continuing the final assistant message, for every way to choose the reasoning mode.
+    A content continuation must equal the reference's continue_final_message render. A
+    reasoning continuation has no reference: vLLM always renders the message with its think
+    block closed, while llama.cpp leaves it open after the reasoning. That prompt is checked
+    exactly, and the reference must still close the block."""
+    res = []
+    for name, messages in CONTINUE_MESSAGES:
+        final = messages[-1]
+        equal = known = 0
+        bad = []
+        for extra in requests:
+            official = (defaults | vllm_template_kwargs(extra)
+                        | ({"preserve_thinking": True} if preserve else {}))
+            want = render_reference(template, messages, None, official, continue_final=True)
+            for how in CONTINUATIONS:
+                got = server.post("/apply-template", {"messages": messages, **extra, **how})["prompt"]
+                if continued_in_reasoning(final, how):
+                    open_block = (render_reference(template, messages[:-1], None, official, add_generation_prompt=False)
+                                  + "<|im_start|>assistant\n<think>\n" + (final.get("reasoning_content") or ""))
+                    ok = got == open_block and want.endswith("\n</think>\n\n" + final["content"])
+                    known += ok
+                    diff = first_diff(got, open_block) if got != open_block else f"reference {want[-60:]!r}"
+                else:
+                    ok = got == want
+                    equal += ok
+                    diff = first_diff(got, want)
+                if not ok and len(bad) < 2:
+                    bad.append(f"{json.dumps(extra | how)}: {diff}")
+        n = len(requests) * len(CONTINUATIONS)
+        res.append((equal + known == n,
+                    f"continue [{label}] {name}: {equal}/{n} prompts equal the reference"
+                    + (f", reasoning continued in an open think block {known}/{n} (the reference closes it)"
+                       if known else "") + (f"; {' | '.join(bad)}" if bad else "")))
+    return res
+
+
 def check_stop_tokens(llama_cpp: Path, gguf: Path, what: str) -> list[tuple[bool, str]]:
     ll = libllama(llama_cpp)
     lib, ffi = ll.lib, ll.ffi
@@ -313,6 +384,7 @@ def main() -> None:
                                     "template: " + ", ".join(f"{k} {v[:12]}" for k, v in sha.items())
                                     + f" (released {TEMPLATE_SHA256[:12]}, {len(template)} chars)"))
                 results += check_render(server, template, label, preserve, defaults, requests)
+                results += check_continue(server, template, label, preserve, defaults, requests)
             finally:
                 server.close()
 
