@@ -497,7 +497,37 @@ For each candidate:
     answer was generated from", exit 1).
     ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Expert-locality
     workloads".)
--   [ ] For each workload and per layer, record cumulative unique-expert coverage at fixed token counts, expert activation frequency, Top-N share, usage entropy/Gini, reuse distance and the fraction of experts never selected.
+-   [x] For each workload and per layer, record cumulative unique-expert coverage at fixed token counts, expert activation frequency, Top-N share, usage entropy/Gini, reuse distance and the fraction of experts never selected.
+
+    (2026-10-07) — `tools/locality/experts.py` prefills the four traces
+    through libllama, records every layer's selected experts per token and
+    pins them in `testdata/locality/experts.json`:
+    - IQ3_XXS/IQ4_XS on Metal, 2 min;
+    - Q8_0 on the CPU, 86 min.
+
+    `cmd/kolibri-locality` computes the measures per layer (`internal/locality`,
+    unit-tested) and writes [docs/expert-locality.md](docs/expert-locality.md):
+    coverage at 1k–24k tokens, counts, Top-6/24/96 share, entropy, Gini,
+    token and stack reuse distance, never selected. IQ3 means:
+    - coverage 66–73% after 1k tokens and 84–91% at the end;
+    - the top 24 experts take 40–58% of activations;
+    - median stack distance 11–18;
+    - layers 0–1 never select 69–79% of their experts.
+
+    Q8_0 gives the same means to within 0.3 points, although both models
+    choose the same 6 experts for only 57.3–70.0% of (layer, token) pairs
+    (INFO). Recapturing reproduces the hashes ("PASS medtech: 50 layers x
+    28450 tokens x 6 distinct experts, as recorded"; hr also on Q8_0). These
+    fail with exit 1:
+    - a flipped expert ID ("FAIL hr: {… '1a0f40d9…'} differs from the
+      recorded");
+    - a duplicated one ("FAIL hr: layer 17 token 4000 selects an expert
+      twice");
+    - a changed token ID ("FAIL hr: the token IDs differ from
+      testdata/locality/manifest.json").
+
+    ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Expert locality per
+    layer".)
 -   [ ] Replay the recorded expert-selection traces through simulated LRU caches of several sizes and report hit rate, miss rate and estimated expert bytes loaded per token. Keep this simulation separate from the later real streaming benchmark so cache-policy questions can be answered before implementing I/O.
 -   [ ] Benchmark resident Metal inference against streamed/offloaded expert
     execution using the same quantization, prompt corpus and context lengths.

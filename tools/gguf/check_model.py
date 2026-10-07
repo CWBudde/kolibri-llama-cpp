@@ -111,7 +111,8 @@ class Runner:
     def logits(self, path: Path, dev, tokens: list[int], n_ubatch: int, overrides: dict | None = None,
                nodes: dict[str, list[str]] | None = None, capture: dict | None = None,
                chunks: list[int] | None = None, n_ctx: int = 256, outputs: list[int] | None = None,
-               rows: dict[str, tuple[int, list[int]]] | None = None, cpu_moe: bool = False, **ctx_params):
+               rows: dict[str, tuple[int, list[int]]] | None = None, cpu_moe: bool = False, no_repack: bool = False,
+               return_logits: bool = True, **ctx_params):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
         overrides maps GGUF keys to int, float or bool values that replace the file's.
         If nodes is given, it receives every graph node's name with the names of its inputs.
@@ -126,13 +127,16 @@ class Runner:
         calls read the KV cache the earlier ones wrote. outputs are the positions that get logits
         (default: all), and the result has one row per output position, in order. cpu_moe keeps the
         routed experts (ffn_*_exps) in CPU memory and computes them there, as llama-cli --cpu-moe,
-        while the rest stays on dev. ctx_params set further llama_context_params fields (swa_full,
-        flash_attn_type, type_k, ...)."""
+        while the rest stays on dev. no_repack keeps the weights in their file layout, as llama-cli
+        --no-repack, so a CPU model larger than memory stays mmapped. With return_logits false the
+        output positions are still computed (the last layer keeps only their rows) but their logits
+        are not kept, and the result is None. ctx_params set further
+        llama_context_params fields (swa_full, flash_attn_type, type_k, ...)."""
         import numpy as np
 
         self.log.clear()
         devs = self.ffi.new("ggml_backend_dev_t[]", [dev, self.ffi.NULL])
-        mparams = self.ll.model_default_params(devices=devs, n_gpu_layers=-1)
+        mparams = self.ll.model_default_params(devices=devs, n_gpu_layers=-1, use_extra_bufts=not no_repack)
         if overrides:
             kv = self.ffi.new("struct llama_model_kv_override[]", len(overrides) + 1)  # zeroed: the last ends the list
             for o, (key, val) in zip(kv, overrides.items()):
@@ -205,10 +209,11 @@ class Runner:
                     computation[0] += 1
                 if (rc := self.lib.llama_decode(ctx, batch)) != 0:
                     raise RuntimeError(f"llama_decode returned {rc} at position {start}: " + self.errors())
-                out += [np.frombuffer(self.ffi.buffer(self.lib.llama_get_logits_ith(ctx, i), 4 * n_vocab),
-                                      dtype=np.float32).copy() for i in range(n) if batch.logits[i]]
+                if return_logits:
+                    out += [np.frombuffer(self.ffi.buffer(self.lib.llama_get_logits_ith(ctx, i), 4 * n_vocab),
+                                          dtype=np.float32).copy() for i in range(n) if batch.logits[i]]
                 start += n
-            return np.stack(out)
+            return np.stack(out) if return_logits else None
         finally:
             self.lib.llama_batch_free(batch)
             self.lib.llama_free(ctx)
