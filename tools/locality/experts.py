@@ -15,6 +15,11 @@ fails (exit 1) when:
 - the sha256 of the selections (their int16 little-endian bytes) differs from
   testdata/locality/experts.json, which --record writes.
 
+A capture replaces the stored selections only once it passes (or, with
+--record, once every requested workload is valid); a rejected one is kept as
+<name>.<gguf stem>.experts.rejected.npy. The manifest records per workload the
+run that captured it (GGUF, llama.cpp commit, device, batch, threads).
+
 --verify re-hashes the stored selection files without running the model.
 
     experts.py --gguf ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf --device metal [--record]
@@ -122,7 +127,13 @@ def main() -> None:
         kind = {"cpu": runner.lib.GGML_BACKEND_DEVICE_TYPE_CPU, "metal": runner.lib.GGML_BACKEND_DEVICE_TYPE_GPU}
         kind = kind[args.device]
         dev_name, dev = next((n, d) for n, d in runner.devices() if runner.lib.ggml_backend_dev_type(d) == kind)
-    entries = {}
+    if not args.verify:
+        commit = subprocess.run(["git", "-C", str(args.llama_cpp), "rev-parse", "HEAD"], capture_output=True,
+                                text=True).stdout.strip()
+        provenance = {"gguf": args.gguf.name, "gguf_bytes": args.gguf.stat().st_size, "llama.cpp": commit,
+                      "device": dev_name, "n_ubatch": N_UBATCH, "n_ctx": N_CTX, "threads": args.threads,
+                      "no_repack": args.no_repack}
+    accepted = {}  # name: (selections, manifest entry), written only once accepted
     for name in args.workloads:
         path = selections_path(name, args.gguf)
         if args.verify:
@@ -138,34 +149,41 @@ def main() -> None:
             t0 = time.monotonic()
             sel = capture(runner, args.gguf, dev, tokens, n_layer, args)
             seconds = time.monotonic() - t0
-            np.save(path, sel)
             print(f"{name}: {len(tokens)} tokens in {seconds:.0f} s ({len(tokens) / seconds:.1f} tokens/s) on "
                   f"{dev_name}", flush=True)
-        if sel.shape != (n_layer, tokens_manifest[name]["n_tokens"], n_used):
-            fail(f"{name}: selections of shape {sel.shape}, not {(n_layer, tokens_manifest[name]['n_tokens'], n_used)}")
-            continue
-        if why := invalid(sel, n_expert):
-            fail(f"{name}: {why}")
-            continue
+        n_tokens = tokens_manifest[name]["n_tokens"]
         entry = {"n_tokens": int(sel.shape[1]), "experts_sha256": selections_sha256(sel)}
-        entries[name] = entry
-        if args.record:
+        if sel.shape != (n_layer, n_tokens, n_used):
+            fail(f"{name}: selections of shape {sel.shape}, not {(n_layer, n_tokens, n_used)}")
+        elif why := invalid(sel, n_expert):
+            fail(f"{name}: {why}")
+        elif args.record:
+            accepted[name] = sel, {**entry, **provenance}
             continue
-        if recorded.get(name) != entry:
-            fail(f"{name}: {entry} differs from the recorded {recorded.get(name)}")
+        elif {k: recorded.get(name, {}).get(k) for k in entry} != entry:
+            fail(f"{name}: {entry} differs from the recorded "
+                 f"{ {k: recorded[name][k] for k in entry} if name in recorded else None}")
         else:
             print(f"PASS {name}: {n_layer} layers x {entry['n_tokens']} tokens x {n_used} distinct experts, "
                   f"as recorded ({args.gguf.name})", flush=True)
-    if args.record and not errs:
-        commit = subprocess.run(["git", "-C", str(args.llama_cpp), "rev-parse", "HEAD"], capture_output=True,
-                                text=True).stdout.strip()
-        model = manifest.setdefault(args.gguf.stem, {})
-        model.update({"gguf": args.gguf.name, "gguf_bytes": args.gguf.stat().st_size, "llama.cpp": commit,
-                      "device": dev_name, "n_ubatch": N_UBATCH, "n_ctx": N_CTX, "threads": args.threads,
-                      "no_repack": args.no_repack})
-        model.setdefault("workloads", {}).update(entries)
-        EXPERTS.write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
-        print(f"recorded {EXPERTS.relative_to(ROOT)}")
+            if not args.verify:
+                accepted[name] = sel, None
+            continue
+        # a rejected capture never replaces the stored selections; it is kept beside them for inspection
+        if not args.verify:
+            rejected = path.with_suffix(".rejected.npy")
+            np.save(rejected, sel)
+            print(f"{name}: kept the rejected capture as {rejected.name}; {path.name} is unchanged", flush=True)
+    if args.record and errs:
+        print("recorded nothing: every workload must pass to be recorded", flush=True)
+    elif accepted:
+        for name, (sel, entry) in accepted.items():
+            np.save(selections_path(name, args.gguf), sel)
+            if entry is not None:
+                manifest.setdefault(args.gguf.stem, {}).setdefault("workloads", {})[name] = entry
+        if args.record:
+            EXPERTS.write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
+            print(f"recorded {', '.join(accepted)} in {EXPERTS.relative_to(ROOT)}")
     sys.exit(1 if errs else 0)
 
 

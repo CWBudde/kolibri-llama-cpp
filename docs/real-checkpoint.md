@@ -829,6 +829,12 @@ in `testdata/locality/experts.json`. Two models:
   - the selections' sha256 differs from the recorded one.
 
   `--verify` re-hashes the stored files without running the model.
+- **A rejected capture changes nothing:** it does not replace the stored
+  selections; it is kept as `<name>.<model>.experts.rejected.npy` instead.
+  `--record` writes files and manifest only when every requested workload
+  is valid. The manifest records per workload the run that captured it
+  (GGUF, llama.cpp commit, device, batch, threads), so a partial
+  re-recording does not relabel the others.
 
 ```sh
 tools/locality/experts.py --gguf ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf --device metal [--record]
