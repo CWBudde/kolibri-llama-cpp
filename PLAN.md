@@ -695,7 +695,13 @@ conventions.
 ## Immediate implementation tasks derived from the repository audit
 
 - [ ] Treat BF16 as the initial source of truth; postpone direct FP8-source support until BF16 logits match.
-- [ ] Report the upstream llama.cpp issues found along the way (invalid UTF-8 aborting `llama_tokenize`, overlong decoding, two test-tooling bugs, Metal `--cpu-moe` SIGBUS above the working set, fixed here by patch 0009); see README "Known upstream issues", [docs/tokenizer.md](docs/tokenizer.md) and [docs/real-checkpoint.md](docs/real-checkpoint.md).
+- [ ] Report the upstream llama.cpp issues found along the way (invalid UTF-8 aborting `llama_tokenize`, overlong decoding, two test-tooling bugs, Metal `--cpu-moe` SIGBUS above the working set, fixed here by patch 0009); see README "Known upstream issues", [docs/tokenizer.md](docs/tokenizer.md) and [docs/real-checkpoint.md](docs/real-checkpoint.md). (2026-10-07) — partial: `tools/upstream/repro.py` reproduces all of them on upstream master `988190680d5a`, rc 0 each:
+    - utf8, with upstream's qwen2 vocab: "REPRODUCED utf8 abort: F4 90 80 80 (U+110000) killed the process with signal 6", plus the overlong and surrogate lines;
+    - tokenizer-random: "REPRODUCED test-tokenizer-random LibLlamaModel: tokenize('Hello') raised TypeError …" and "… TokenizerGroundtruth vocab: transformers 5.18.0: 1 entry for 127998 tokens", likewise for the 98 added tokens;
+    - cpu-moe, on master plus the runtime parts of 0001–0008: "REPRODUCED cpu-moe: GGUF 79,284 MiB, Metal maps 79,279 MiB of it: killed by signal 10", or exit 1 after the Metal OOM;
+    - with 0009, which applies alone to master: "RUNS cpu-moe: … Metal maps 2,447 MiB of it: exit 0".
+
+    Controls M23–M26 each give rc 1. Upstream already has [#29713](https://github.com/ggml-org/llama.cpp/issues/29713) (the abort), [#24510](https://github.com/ggml-org/llama.cpp/issues/24510) and [#27822](https://github.com/ggml-org/llama.cpp/issues/27822) (mapping and crash), all closed as not planned; the overlong forms, surrogates and the test script have no report ([docs/upstream.md](docs/upstream.md)). Remaining: the reports and the 0009 PR themselves. Upstream's CONTRIBUTING.md forbids AI-written reports and PR descriptions, so they are written by hand.
 
 ## First actionable milestone
 
