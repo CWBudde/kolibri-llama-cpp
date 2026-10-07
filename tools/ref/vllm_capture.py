@@ -20,8 +20,9 @@ Each case is run twice:
   - ffn_moe_logits-il: mlp.gate, the F32 router logits before the bias;
     ffn_moe_topk-il: the top k of those logits plus gate.e_score_correction_bias,
     as sigmoid_logit_add_routing selects them;
-  - ffn_shexp-il: mlp.shared_experts; ffn_moe_out-il: the mlp output minus the
-    shared expert output (vLLM's MoE runner returns their sum);
+  - ffn_shexp-il: mlp.shared_experts; ffn_moe_out-il: the routed output as the
+    MoE runner adds it to the shared output (its apply_routed_output_transform),
+    so a bfloat16 run keeps it apart from the rounding of that sum;
   - l_out-il: the sum of the hidden state and residual the decoder layer returns
     (vLLM adds them in the next layer's norm);
   - logits for every position: model.compute_logits (the plugin's LogitsProcessor,
@@ -93,6 +94,19 @@ def _install(worker, attn_layers):
     def hook(module, name, fn=first):
         hooks.append(module.register_forward_hook(lambda m, args, out: keep(name, fn(out))))
 
+    def routed(runner, name):
+        # The MoE runner returns shared_output + fused_output, rounded in the model dtype; the routed
+        # output is taken as the summand, from apply_routed_output_transform (an identity for Kolibri),
+        # the last step before that addition.
+        transform = runner.apply_routed_output_transform
+
+        def keep_routed(x):
+            y = transform(x)
+            keep(name, y)
+            return y
+
+        runner.apply_routed_output_transform = keep_routed
+
     from vllm.model_executor.models.utils import PPMissingLayer
 
     if not isinstance(inner.embed_tokens, PPMissingLayer):
@@ -108,7 +122,7 @@ def _install(worker, attn_layers):
             hook(layer.post_attn_norm, f"attn_post_norm-{il}")
         hook(mlp.gate, f"ffn_moe_logits-{il}")
         hook(mlp.shared_experts, f"ffn_shexp-{il}")
-        hook(mlp, f"ffn_moe_sum-{il}")
+        routed(mlp.experts, f"ffn_moe_out-{il}")
         hook(layer, f"l_out-{il}", fn=lambda out: out[0] + out[1])
         layers.append({"il": il, "swa": attn.rotary_emb is not None,
                        "bias": mlp.gate.e_score_correction_bias.detach().to("cpu", torch.float32).numpy()})
@@ -188,11 +202,18 @@ def main() -> None:
     longest = max(len(c["tokens"]) + c["n_greedy"] for c in cases.values())
     config = json.loads((args.model / "config.json").read_text())
     overrides = {"num_experts_per_tok": args.experts_used} if args.experts_used else None
+    attn_layers = [int(x) for x in args.attn_layers.split(",")] if args.attn_layers else None
+    if attn_layers is not None:
+        # compare_vllm.py's node lines need the first sliding and the first full layer
+        types = config["layer_types"]
+        need = {types.index("sliding_attention"), types.index("full_attention")}
+        if not need <= set(attn_layers):
+            raise SystemExit(f"--attn-layers must include the first sliding and the first full layer, "
+                             f"{sorted(need)}")
     llm = LLM(model=str(args.model), dtype=args.dtype, seed=0, enforce_eager=True, enable_prefix_caching=False,
               max_model_len=longest + 16, max_num_batched_tokens=max(2048, longest + 16), max_num_seqs=1,
               pipeline_parallel_size=args.pipeline_parallel, tensor_parallel_size=1, hf_overrides=overrides,
               compilation_config={"mode": 0}, gpu_memory_utilization=args.gpu_memory_utilization)
-    attn_layers = [int(x) for x in args.attn_layers.split(",")] if args.attn_layers else None
     layers = sorted((x for part in llm.collective_rpc(_install, args=(attn_layers,)) for x in part),
                     key=lambda x: x["il"])
     n_layer = len(layers)
@@ -240,8 +261,6 @@ def main() -> None:
         bias = np.stack([x["bias"] for x in layers])
         router_logits = np.stack([cap.pop(f"ffn_moe_logits-{il}") for il in range(n_layer)])
         router_topk = np.argsort(-(router_logits + bias[:, None, :]), axis=-1, kind="stable")[..., :k]
-        for il in range(n_layer):
-            cap[f"ffn_moe_out-{il}"] = cap.pop(f"ffn_moe_sum-{il}") - cap[f"ffn_shexp-{il}"]
         arrays = {
             "tokens": np.asarray(tokens, dtype=np.int32),
             "logits": logits.astype(np.float32),
