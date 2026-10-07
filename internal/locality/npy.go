@@ -32,6 +32,9 @@ func (s Selections) Layer(l int) [][]int {
 	return out
 }
 
+// maxIDs bounds the IDs a file may declare (8 GiB as int32); the workloads hold under 10 million.
+const maxIDs = 1 << 31
+
 var (
 	descrRe   = regexp.MustCompile(`'descr':\s*'([^']*)'`)
 	fortranRe = regexp.MustCompile(`'fortran_order':\s*(True|False)`)
@@ -93,8 +96,16 @@ func ReadNPY(r io.Reader) (Selections, error) {
 	if len(dims) != 3 {
 		return s, fmt.Errorf("npy: shape (%s), want 3 dimensions", shape[1])
 	}
+	// the shape comes from the file: check it before it sizes an allocation
+	size := 1
+	for _, d := range dims {
+		if d <= 0 || size > maxIDs/d {
+			return s, fmt.Errorf("npy: shape (%s), want positive dimensions of at most %d IDs", shape[1], maxIDs)
+		}
+		size *= d
+	}
 	s.Layers, s.Tokens, s.K = dims[0], dims[1], dims[2]
-	s.IDs = make([]int32, s.Layers*s.Tokens*s.K)
+	s.IDs = make([]int32, size)
 	switch descr[1] {
 	case "<i2":
 		ids := make([]int16, len(s.IDs))

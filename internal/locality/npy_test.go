@@ -49,11 +49,16 @@ func TestReadNPYInt32(t *testing.T) {
 
 func TestReadNPYRejects(t *testing.T) {
 	for name, file := range map[string][]byte{
-		"fortran order": npy("{'descr': '<i2', 'fortran_order': True, 'shape': (1, 1, 2), }", []int16{1, 2}),
-		"float data":    npy("{'descr': '<f4', 'fortran_order': False, 'shape': (1, 1, 1), }", []float32{1}),
-		"2-D":           npy("{'descr': '<i2', 'fortran_order': False, 'shape': (1, 2), }", []int16{1, 2}),
-		"short data":    npy("{'descr': '<i2', 'fortran_order': False, 'shape': (1, 2, 2), }", []int16{1, 2}),
-		"not npy":       []byte("PK\x03\x04 a zip file"),
+		"fortran order":      npy("{'descr': '<i2', 'fortran_order': True, 'shape': (1, 1, 2), }", []int16{1, 2}),
+		"float data":         npy("{'descr': '<f4', 'fortran_order': False, 'shape': (1, 1, 1), }", []float32{1}),
+		"2-D":                npy("{'descr': '<i2', 'fortran_order': False, 'shape': (1, 2), }", []int16{1, 2}),
+		"short data":         npy("{'descr': '<i2', 'fortran_order': False, 'shape': (1, 2, 2), }", []int16{1, 2}),
+		"not npy":            []byte("PK\x03\x04 a zip file"),
+		"negative dimension": npy("{'descr': '<i2', 'fortran_order': False, 'shape': (1, -2, 2), }", []int16{1, 2}),
+		"zero dimension":     npy("{'descr': '<i2', 'fortran_order': False, 'shape': (1, 0, 2), }", []int16{}),
+		"overflowing size": npy("{'descr': '<i2', 'fortran_order': False, 'shape': (4294967296, 4294967296, 6), }",
+			[]int16{1}),
+		"oversized": npy("{'descr': '<i2', 'fortran_order': False, 'shape': (1048576, 1048576, 6), }", []int16{1}),
 	} {
 		if _, err := ReadNPY(bytes.NewReader(file)); err == nil {
 			t.Errorf("%s: no error", name)
