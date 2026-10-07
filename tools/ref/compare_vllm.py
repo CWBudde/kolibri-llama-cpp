@@ -100,8 +100,14 @@ def compare(label: str, got: dict, got_logits, cap: dict, entry: dict, W: Weight
         report(same >= MIN_SAME_EXPERTS_TINY and worst <= MAX_NMSE_TINY,
                f"{label}: {text}; same experts for {same:.1%} of (token, layer) pairs, worst layer node NMSE "
                f"{worst:.2e} where they agree")
-    for v, line in node_lines(got, ref, W):
-        report(v <= MAX_NMSE_TINY, f"{label}, {line}")
+    # node_lines reads the attention nodes of the first sliding and the first full layer
+    first = {list(W.is_swa).index(True), list(W.is_swa).index(False)}
+    missing = sorted(il for il in first if f"Qcur_normed-{il}" not in ref)
+    if missing:
+        print(f"INFO {label}: node lines skipped, the capture lacks the attention nodes of layer(s) {missing}")
+    else:
+        for v, line in node_lines(got, ref, W):
+            report(v <= MAX_NMSE_TINY, f"{label}, {line}")
     p = router(got, ref, W)
     v = masked_router_nmse(p)
     report(v <= MAX_NMSE_TINY and p["set_same"].mean() >= MIN_SAME_EXPERTS_TINY,
