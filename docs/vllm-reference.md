@@ -61,9 +61,16 @@ script, the checkpoint and, for the corpus, `testdata/e2e/corpus.json`.
 | `ffn_moe_logits-il` | `mlp.gate`: F32 router logits, before the bias |
 | `ffn_moe_topk-il` | Top-k of those logits plus `gate.e_score_correction_bias`, as `sigmoid_logit_add_routing` selects |
 | `ffn_shexp-il` | `mlp.shared_experts` |
-| `ffn_moe_out-il` | `mlp` output minus `ffn_shexp`: vLLM's MoE runner returns their sum |
+| `ffn_moe_out-il` | the routed output as the MoE runner adds it to the shared output (`shared_output + fused_output`), taken from its `apply_routed_output_transform`, an identity for Kolibri |
 | `l_out-il` | the decoder layer's hidden state plus residual: vLLM adds them in the next layer's norm |
 | logits | `model.compute_logits` on the output of `model.norm`: the plugin's `LogitsProcessor`, in the config's `head_dtype` |
+
+**Why `ffn_moe_out` is the summand:** the block's output is that sum,
+already rounded in the model dtype. In bfloat16, subtracting the shared output
+from it would not recover the routed branch. On the tiny corpus capture in
+bfloat16, that difference gave an NMSE of about 1e-5 per layer against the
+summand, and its values were not even BF16-representable. In float32 the two
+agree (NMSE 2.5e-15).
 
 Hooks copy their tensor, because the rotary embedding rotates q and k in
 place after `q_norm` and `k_norm` return. Without the copy, the sliding layers'
@@ -90,7 +97,9 @@ same position. `capture.json` records the result as `logprobs_max_abs_diff`.
 - per case the greedy tokens and the sha256 of every array (as `e2e.py`).
 
 `--attn-layers 0,4` keeps the attention nodes of those layers only, as
-`e2e.py`'s compact set does. From the shapes, de-long's capture is still about
+`e2e.py`'s compact set does. The set must include the first sliding and the
+first full layer, which `compare_vllm.py`'s node lines read, and the capture
+checks that before it loads the model. From the shapes, de-long's capture is still about
 2.3 GB on the real checkpoint:
 - 1.57 GB for `l_out`, `ffn_moe_out` and `ffn_shexp` in all 50 layers;
 - 0.52 GB of logits;
@@ -192,8 +201,12 @@ bound by `VLLM_CPU_OMP_THREADS_BIND='0-3|4-7'`. A single GPU is the verified
 path. Tensor parallelism would split heads and experts across workers and is
 not offered.
 
-**What the run closes in PLAN:**
-- **Phase 0:** the vLLM version (128/132), the reference run (134) and the
-  corpus (136);
-- **Phase 6:** the "vLLM" leaves;
-- **The tolerances** (285).
+**What is open in PLAN:**
+- **Done:** only the capture tooling, verified on the tiny checkpoint.
+- **Still open, waiting for the real run:**
+  - the vLLM version of the reference run (128/132);
+  - the run itself (134) and its corpus (136);
+  - the Phase 6 "vLLM" leaves;
+  - the tolerances (285).
+- **Once the run exists:** its output and the comparison above are the
+  evidence those items need.
