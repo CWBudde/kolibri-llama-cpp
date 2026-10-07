@@ -19,7 +19,8 @@
 // of its decode shape (the exported graph reads the whole cache) and is counted as untimed.
 //
 // Ops are timed in isolation, so fusion and the graph's dispatch overhead are not modeled. It
-// fails when a router op has no timing or does not occur once per layer.
+// fails when a router op has no timing of its one-token or ubatch shapes, or when a router op or
+// one of the stages -router requires does not occur once per layer.
 package main
 
 import (
@@ -44,6 +45,11 @@ var routerNames = []string{
 	"ffn_moe_weights", "ffn_moe_weights_softmax", "ffn_moe_weights_sum",
 	"ffn_moe_weights_sum_clamped", "ffn_moe_weights_norm", "ffn_moe_weights_scaled",
 }
+
+// kolibriRouter are the router stages Kolibri's graph has: no weight normalization or scaling.
+// Each must occur once per layer, so that a stage missing from the listing fails instead of
+// lowering the overhead.
+var kolibriRouter = []string{"ffn_moe_logits", "ffn_moe_probs", "ffn_moe_probs_biased", "ffn_moe_argsort", "ffn_moe_weights"}
 
 const combineName = "ffn_moe_weighted"
 
@@ -262,11 +268,35 @@ func timings(perf []Perf, n Node) []Perf {
 	return cands
 }
 
-// ubatchTiming finds the timing of a router op's other shape: the same op and name, the ubatch.
-func ubatchTiming(perf []Perf, name, op string, tgNE [4]int) (Perf, bool) {
+// scaled reports whether a ubatch shape is a one-token shape with its token dimension, the
+// dimensions of 1, grown to ubatch tokens; at least one of them must have grown if grow is set.
+func scaled(token, batch [4]int, ubatch int, grow bool) bool {
+	grown := false
+	for i := range token {
+		switch {
+		case batch[i] == token[i]:
+		case token[i] == 1 && batch[i] == ubatch:
+			grown = true
+		default:
+			return false
+		}
+	}
+	return grown || !grow
+}
+
+// ubatchTiming finds the timing of a router node's ubatch shape: the same op and name, its output
+// and sources the node's grown to the ubatch.
+func ubatchTiming(perf []Perf, name string, n Node, ubatch int) (Perf, bool) {
 	var cands []Perf
 	for _, p := range perf {
-		if base(p.Name) == name && p.Op == op && p.NE != tgNE {
+		if base(p.Name) != name || p.Op != n.Op || !scaled(n.NE, p.NE, ubatch, true) || len(p.Src) < len(n.Src) {
+			continue
+		}
+		ok := true
+		for i, src := range n.Src {
+			ok = ok && scaled(src, p.Src[i], ubatch, false)
+		}
+		if ok {
 			cands = append(cands, p)
 		}
 	}
@@ -276,7 +306,8 @@ func ubatchTiming(perf []Perf, name, op string, tgNE [4]int) (Perf, bool) {
 	return cands[0], true
 }
 
-func analyze(perf []Perf, nodes []Node, b Bench, layers int) (Report, error) {
+// analyze sums the router ops of a one-token graph; every stage in required must occur in it.
+func analyze(perf []Perf, nodes []Node, b Bench, layers int, required []string) (Report, error) {
 	r := Report{Layers: layers, Nodes: len(nodes), Ubatch: min(b.NPrompt, b.NUbatch)}
 	isRouter := map[string]bool{}
 	for _, n := range routerNames {
@@ -306,9 +337,9 @@ func analyze(perf []Perf, nodes []Node, b Bench, layers int) (Report, error) {
 		}
 		i, seen := index[name]
 		if !seen {
-			pp, ok := ubatchTiming(perf, name, n.Op, n.NE)
+			pp, ok := ubatchTiming(perf, name, n, r.Ubatch)
 			if !ok && isRouter[name] {
-				return r, fmt.Errorf("%s (%s): no single ubatch-shaped timing", name, n.Op)
+				return r, fmt.Errorf("%s (%s): no single timing for a %d-token ubatch", name, n.Op, r.Ubatch)
 			}
 			t := OpTime{Name: name, Op: n.Op, NE: n.NE, PPNE: pp.NE, TG: p.US, PP: pp.US}
 			if name == combineName {
@@ -331,15 +362,17 @@ func analyze(perf []Perf, nodes []Node, b Bench, layers int) (Report, error) {
 	if len(r.Router) == 0 {
 		return r, errors.New("no router op among the nodes")
 	}
+	for _, name := range required {
+		if _, ok := index[name]; !ok {
+			return r, fmt.Errorf("router stage %s: no nodes, want one per layer (%d)", name, layers)
+		}
+	}
 	for _, t := range r.Router {
 		if t.Count != layers {
 			return r, fmt.Errorf("%s: %d nodes, want one per layer (%d)", t.Name, t.Count, layers)
 		}
 		r.RouterTG += float64(t.Count) * t.TG
 		r.RouterPP += float64(t.Count) * t.PP
-	}
-	if logits := r.Router[0]; logits.Name == "ffn_moe_logits" && logits.PPNE[1] != r.Ubatch {
-		return r, fmt.Errorf("the timings are for a ubatch of %d tokens, llama-bench ran %d", logits.PPNE[1], r.Ubatch)
 	}
 	r.TokenUS = 1e6 / b.TG
 	r.UbatchUS = float64(r.Ubatch) * 1e6 / b.PP
@@ -361,6 +394,7 @@ func main() {
 	nodesPath := flag.String("nodes", "", "llama-eval-callback output for a one-token prompt")
 	benchPath := flag.String("bench", "", "llama-bench -o json output with one pp and one tg test")
 	layers := flag.Int("layers", 50, "layers; every router op must occur once per layer")
+	router := flag.String("router", strings.Join(kolibriRouter, ","), "router stages the graph must have")
 	out := flag.String("out", "", "write the report as JSON here")
 	flag.Parse()
 	if *perfPath == "" || *nodesPath == "" || *benchPath == "" {
@@ -379,7 +413,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	r, err := analyze(perf, nodes, b, *layers)
+	r, err := analyze(perf, nodes, b, *layers, strings.Split(*router, ","))
 	if err != nil {
 		log.Fatalf("FAIL routing overhead: %v", err)
 	}

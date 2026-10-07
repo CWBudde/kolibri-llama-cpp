@@ -1182,8 +1182,13 @@ and per 512-token ubatch on Metal, and their share of the measured
 - **Speed:** `llama-bench` measures it in the same session.
 - **Sum:** `cmd/kolibri-routing` adds up the router ops: count × time
   per node.
-  - It fails (exit 1) when a router op has no timing of its shapes or does
-    not occur once per layer.
+  - It fails (exit 1) in three cases:
+    - a router op has no timing of its one-token shape;
+    - a router op has no timing of its ubatch shape (output and sources
+      the one-token ones, with every dimension of 1 grown to the
+      `llama-bench` ubatch);
+    - a router op, or one of Kolibri's five stages (`-router`), does not
+      occur once per layer.
   - Other ops that occur with the same shapes in different strides, which
     the listing does not show, get the mean of their timings.
 
@@ -1234,7 +1239,9 @@ their shapes.
   - the ARGSORT lines removed from `perf.txt` ("FAIL routing overhead:
     ffn_moe_argsort-0 (ARGSORT [384 1 1 1]): 0 matching timings, want 1");
   - layer 49 removed from the node listing ("FAIL routing overhead:
-    ffn_moe_logits: 49 nodes, want one per layer (50)").
+    ffn_moe_logits: 49 nodes, want one per layer (50)");
+  - every argsort node removed from it ("FAIL routing overhead: router
+    stage ffn_moe_argsort: no nodes, want one per layer (50)").
 - **Build:** `libllama` and `libggml` are from fork commit `6d51eaf70`
   (patch 0009). The executables report `e1a553f5f`, the build string of
   their older `libllama-common`.

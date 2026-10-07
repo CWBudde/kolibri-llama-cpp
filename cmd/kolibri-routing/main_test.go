@@ -14,6 +14,7 @@ Backend 1/3: MTL0
   Device description: Apple M5 Pro
   MUL_MAT(name=ffn_moe_logits-0,type=f32,ne=[8,1,1,1],op_params=[0:10],sources=f32[4,8,1,1],f32[4,1,1,1]):        1000 runs -     6.00 us/run -        1 kB/run - ` + "\x1b[1;34m" + `   1.00 GB/s` + "\x1b[0m" + `
   MUL_MAT(name=ffn_moe_logits-0,type=f32,ne=[8,4,1,1],op_params=[0:10],sources=f32[4,8,1,1],f32[4,4,1,1]):        1000 runs -    40.00 us/run -        1 kB/run -    1.00 GB/s
+  MUL_MAT(name=ffn_moe_logits-0,type=f32,ne=[8,2,1,1],op_params=[0:10],sources=f32[4,8,1,1],f32[4,2,1,1]):        1000 runs -    20.00 us/run -        1 kB/run -    1.00 GB/s
   ARGSORT(name=ffn_moe_argsort-0,type=i32,ne=[8,1,1,1],op_params=[0:1],sources=f32[8,1,1,1]):        1000 runs -     4.00 us/run -        1 kB/run -    1.00 GB/s
   ARGSORT(name=ffn_moe_argsort-0,type=i32,ne=[8,4,1,1],op_params=[0:1],sources=f32[8,4,1,1]):        1000 runs -    60.00 us/run -        1 kB/run -    1.00 GB/s
   MUL_MAT_ID(name=ffn_moe_gate-0,type=f32,ne=[2,2,1,1],op_params=[],sources=iq3_xxs[4,2,8,1],f32[4,1,1,1],i32[2,1,1,1]nb[4,8,8,8]):        1000 runs -    30.00 us/run -        1 kB/run -    1.00 GB/s
@@ -48,7 +49,10 @@ const tinyBench = `[
 
 func near(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 
-func tinyReport(t *testing.T, perf, nodes string, layers int) (Report, error) {
+// tinyRouter are the tiny graph's router stages.
+var tinyRouter = []string{"ffn_moe_logits", "ffn_moe_argsort"}
+
+func tinyReport(t *testing.T, perf, nodes string, layers int, required []string) (Report, error) {
 	t.Helper()
 	p, err := parsePerf(strings.NewReader(perf))
 	if err != nil {
@@ -62,7 +66,7 @@ func tinyReport(t *testing.T, perf, nodes string, layers int) (Report, error) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return analyze(p, n, b, layers)
+	return analyze(p, n, b, layers, required)
 }
 
 func TestParsePerf(t *testing.T) {
@@ -70,15 +74,15 @@ func TestParsePerf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p) != 9 {
-		t.Fatalf("%d timings, want 9", len(p))
+	if len(p) != 10 {
+		t.Fatalf("%d timings, want 10", len(p))
 	}
-	g := p[4]
+	g := p[5]
 	if g.Op != "MUL_MAT_ID" || g.Name != "ffn_moe_gate-0" || g.NE != [4]int{2, 2, 1, 1} || g.US != 30 {
-		t.Fatalf("p[4] = %+v", g)
+		t.Fatalf("p[5] = %+v", g)
 	}
 	if len(g.Src) != 3 || g.Src[0] != [4]int{4, 2, 8, 1} || g.Src[2] != [4]int{2, 1, 1, 1} {
-		t.Fatalf("p[4].Src = %v", g.Src)
+		t.Fatalf("p[5].Src = %v", g.Src)
 	}
 }
 
@@ -98,14 +102,17 @@ func TestParseNodes(t *testing.T) {
 }
 
 func TestAnalyze(t *testing.T) {
-	r, err := tinyReport(t, tinyPerf, tinyNodes, 2)
+	r, err := tinyReport(t, tinyPerf, tinyNodes, 2, tinyRouter)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(r.Router) != 2 || r.Router[0].Name != "ffn_moe_logits" || r.Router[1].Name != "ffn_moe_argsort" {
 		t.Fatalf("Router = %+v", r.Router)
 	}
-	// per token: 2 layers x (6 + 4) us; per 4-token ubatch: 2 x (40 + 60) us
+	// per token: 2 layers x (6 + 4) us; per 4-token ubatch: 2 x (40 + 60) us, not the 2-token logits
+	if r.Router[0].PPNE != [4]int{8, 4, 1, 1} {
+		t.Fatalf("logits ubatch shape %v, want [8 4 1 1]", r.Router[0].PPNE)
+	}
 	if !near(r.RouterTG, 20) || !near(r.RouterPP, 200) {
 		t.Fatalf("RouterTG, RouterPP = %v, %v", r.RouterTG, r.RouterPP)
 	}
@@ -126,6 +133,15 @@ func TestAnalyze(t *testing.T) {
 func TestAnalyzeRejects(t *testing.T) {
 	noArgsort := strings.ReplaceAll(tinyPerf, "ARGSORT(", "XARGSORT(")
 	layer0 := tinyNodes[:strings.Index(tinyNodes, "common_debug_cb_eval:         ffn_moe_logits-1")]
+	var noArgsortNodes []string
+	for line := range strings.Lines(tinyNodes) {
+		if !strings.Contains(line, "ffn_moe_argsort-0 =") && !strings.Contains(line, "ffn_moe_argsort-1 =") {
+			noArgsortNodes = append(noArgsortNodes, line)
+		}
+	}
+	// the argsort's prompt timing is for 2 tokens, not the 4-token ubatch
+	wrongUbatch := strings.Replace(tinyPerf, "ARGSORT(name=ffn_moe_argsort-0,type=i32,ne=[8,4,1,1],op_params=[0:1],sources=f32[8,4,1,1])",
+		"ARGSORT(name=ffn_moe_argsort-0,type=i32,ne=[8,2,1,1],op_params=[0:1],sources=f32[8,2,1,1])", 1)
 	for name, c := range map[string]struct {
 		perf, nodes string
 		layers      int
@@ -134,8 +150,10 @@ func TestAnalyzeRejects(t *testing.T) {
 		"layers missing":           {tinyPerf, layer0, 2},
 		"layer count":              {tinyPerf, tinyNodes, 3},
 		"no router":                {tinyPerf, strings.ReplaceAll(tinyNodes, "ffn_moe_", "ffn_x_"), 2},
+		"router stage missing":     {tinyPerf, strings.Join(noArgsortNodes, ""), 2},
+		"no ubatch-shaped timing":  {wrongUbatch, tinyNodes, 2},
 	} {
-		if _, err := tinyReport(t, c.perf, c.nodes, c.layers); err == nil {
+		if _, err := tinyReport(t, c.perf, c.nodes, c.layers, tinyRouter); err == nil {
 			t.Errorf("%s: no error", name)
 		}
 	}
