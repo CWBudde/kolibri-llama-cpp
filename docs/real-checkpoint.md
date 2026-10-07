@@ -880,7 +880,7 @@ and in `~/models/eval/locality/stats-<model>.json` (with the 384 counts).
   averaged over the layers, is 11–18: half of the repeat selections come
   back after that many other experts or fewer. An
   LRU cache of a few dozen experts per layer could therefore catch a large
-  share. The next Phase 8 item simulates that.
+  share. "Expert cache simulation" below tests that.
 - **Layers 0 and 1 use about a quarter of the experts** (69–79% never
   selected, in every workload), layer 2 about 60%. In layers 3 to 49 the
   median layer leaves 5.5% (coding) to 11.5% (hr) unused; the most
@@ -911,6 +911,100 @@ and in `~/models/eval/locality/stats-<model>.json` (with the 384 counts).
     twice: [367, 104, 104, 219, 318, 161]");
   - one changed token ID in hr's token file ("FAIL hr: the token IDs
     differ from testdata/locality/manifest.json (run workloads.py)").
+
+### Expert cache simulation
+
+How much of a decode would a cache of recently used experts serve, and how
+many expert bytes would the misses load? This replays the recorded
+selections through simulated LRU caches. It runs no model and does no I/O,
+so cache-policy questions get answered before any streaming exists (the
+streaming benchmark is a separate Phase 8 item).
+
+**Simulation.** `cmd/kolibri-cache`, using `internal/locality` (`lru.go`):
+- **Access order:** decode order. Token by token; within a token, layer by
+  layer; within a layer, the 6 experts in the router's order.
+- **Two policies,** each at 8 to 384 experts per layer:
+  - *per-layer:* every layer has its own LRU cache of C experts;
+  - *shared:* one LRU cache of C × 50 experts, from any layers.
+- **Method:** one pass computes every access's LRU stack distance (the
+  distinct other experts since its previous access, via a Fenwick tree
+  over access times). A cache of capacity C hits exactly the accesses
+  with a distance below C, so one pass answers every size. The tests check
+  this against a plain list-based LRU on 200 random traces at every
+  capacity.
+- **Bytes:** a miss loads the expert's gate, up and down rows.
+  `tools/locality/expert_bytes.py` records their exact size per layer from
+  the GGUF tensors (`n_bytes` ÷ 384) in `testdata/locality/expert-bytes.json`:
+  - IQ3_XXS/IQ4_XS: 1,699,840 bytes per expert in every layer, 32.64 GB in
+    all;
+  - Q8_0: 4,177,920 bytes per expert, 80.22 GB.
+
+  Its default run fails (exit 1) when a GGUF differs from the record.
+- **Consistency check:** a per-layer cache holding all 384 experts must
+  miss exactly the experts the layer selects at all and hit every reuse,
+  both as `cmd/kolibri-locality` counted them in `stats-<model>.json`. A
+  mismatch is fatal. All 8 model × workload runs pass ("PASS
+  IQ3_XXS-IQ4_XS-down-imx medtech: 50 layers, cold misses and full-cache
+  hits as in stats-IQ3_XXS-IQ4_XS-down-imx.json").
+
+```sh
+tools/locality/expert_bytes.py --gguf ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf [--record]
+tools/locality/expert_bytes.py --gguf ~/models/Kolibri-1-Q8_0.gguf [--record]
+go run ./cmd/kolibri-cache -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx,Kolibri-1-Q8_0 -md docs/expert-cache.md
+```
+
+The run takes 3 s. Every size, policy, workload and layer is in
+[docs/expert-cache.md](expert-cache.md) (generated) and in
+`~/models/eval/locality/cache-<model>.json`.
+
+**Results** (IQ3_XXS/IQ4_XS, shared policy; without a cache a token loads
+all 300 of its experts, 510 MB):
+
+| Experts per layer | Cache GB | coding | research | hr | medtech | MB/token loaded (coding–medtech) |
+|--:|--:|--:|--:|--:|--:|--:|
+| 32 | 2.72 | 60.8% | 67.6% | 67.1% | 70.5% | 150–200 |
+| 64 | 5.44 | 76.3% | 80.9% | 83.0% | 83.8% | 83–121 |
+| 96 | 8.16 | 84.9% | 88.0% | 90.1% | 90.8% | 47–77 |
+| 128 | 10.88 | 90.1% | 92.6% | 94.4% | 94.8% | 27–50 |
+| 192 | 16.32 | 95.8% | 97.1% | 98.2% | 98.4% | 8–21 |
+| 256 | 21.76 | 98.5% | 98.9% | 99.2% | 99.5% | 2–8 |
+
+- **90% hits need a quarter to a third of the experts.** That is 96 per
+  layer (8.2 GB) for hr and medtech, and 128 (10.9 GB) for coding and
+  research. At 8 GB the misses still load 47–77 MB per token, and at
+  16 GB 8–21 MB, against 510 MB without a cache.
+- **Coding is the hardest workload** at every size, matching its wider
+  spread in "Expert locality per layer".
+- **Hit rates rise slowly with size.** Doubling from 64 to 128 experts per
+  layer gains 11–14 points. Going from 128 to 256 still gains 4.7–8.4
+  points.
+- **The shared cache barely beats the per-layer one,** by -0.5 (coding at
+  16) to +1.2 points (medtech at 96). Layers 0 and 1, which use a quarter
+  of their experts, already hit 94–99% with 32 slots per layer. The other
+  layers gain little from their spare room. At 64 per layer the layers
+  range from 52% (coding) to 97% (medtech, its best layer).
+- **Q8_0 gives the same hit rates** to within 0.09 points, since its
+  selections concentrate the same way. Its experts are 2.46 times larger:
+  medtech at 96 per layer takes 20.05 GB and loads 115 MB per token
+  (shared).
+- **Limits:**
+  - the traces are teacher-forced and replayed token by token, as in
+    decoding. A prefill batch loads the union of its tokens' experts per
+    layer, which this does not model;
+  - LRU only, with no prefetching and no other policy;
+  - the bytes are the experts' tensor sizes, not measured transfers.
+- **Negative controls** (exit 1, then restored):
+  - one changed byte count in `expert-bytes.json` ("FAIL
+    Kolibri-1-IQ3_XXS-IQ4_XS-down-imx: differs from
+    testdata/locality/expert-bytes.json: {'layers': [17]}");
+  - one reuse added to layer 23 of hr in a copy of the stats ("FAIL
+    IQ3_XXS-IQ4_XS-down-imx hr: the simulation disagrees with
+    stats-IQ3_XXS-IQ4_XS-down-imx.json: layer 23: the stats count 355
+    experts selected and 65400 reuses, the simulation 355 cold misses and
+    65399 hits with every expert cached");
+  - a simulator that keeps a key's previous mark (`go test
+    ./internal/locality`: "trial 0, 17 keys, capacity 2: 26 hits, the LRU
+    simulation 27").
 
 ## Raw German completions repeat, BF16 included
 
@@ -1413,6 +1507,9 @@ All files live outside the repo, in `~/models`.
 12. For the expert locality per layer, run `tools/locality/experts.py` for
     both models, then `cmd/kolibri-locality`, as in "Expert locality per
     layer": 2 min on Metal, 86 min for Q8_0 on the CPU.
+13. For the expert cache simulation, run `tools/locality/expert_bytes.py`
+    for both models, then `cmd/kolibri-cache`, as in "Expert cache
+    simulation" (3 s, after step 12).
 
 Disk peaks at about 312 GB during the conversion. After that it is the BF16
 GGUF plus the quantized files.
