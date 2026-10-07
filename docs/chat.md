@@ -6,6 +6,7 @@ This document covers what llama.cpp does with Kolibri's chat conventions:
 - the reasoning modes none / low / medium / high;
 - the tool-call format;
 - the official reasoning and tool parsers compared with llama.cpp's;
+- continuing a final assistant message (`continue_final_message`);
 - the stop tokens and EOS.
 
 None of it needs the checkpoint. On the real weights, a Q3_K/Q8_0
@@ -167,7 +168,78 @@ The default server is compared with `preserve_thinking=true` on the reference
 side, and `--no-reasoning-preserve` without it. The `history_reasoning` set
 renders differently between the two, so both settings are checked.
 
-### 3. Stop tokens
+### 3. Continuing an assistant message
+
+A request whose last message comes from the assistant continues that message.
+This works through llama-server's default `--prefill-assistant`, and through
+`continue_final_message` with `add_generation_prompt: false`. vLLM takes
+`true` there. llama.cpp also takes `"content"` and `"reasoning_content"`.
+
+**How llama.cpp builds the prompt:** it renders every message but the last
+through the template. It then appends the generation prompt, cut at
+`<think>`, and builds the rest itself (`common/chat-auto-parser-generator.cpp`):
+- **Content continuation:** `<think>\n`, the reasoning, `\n</think>\n\n` and
+  the content.
+- **Reasoning continuation:** only `<think>\n` and the reasoning. The block
+  stays open.
+
+`true` and the default resolve to a reasoning continuation when the message
+has reasoning but no content (`common/chat.cpp`).
+
+**The reference:**
+- transformers renders the whole conversation and cuts it after the final
+  message's content (`continue_final_message=True`, with the vLLM arguments as
+  in section 2);
+- the template renders that message with its think block closed, whatever the
+  thinking mode (aleph-alpha-inference `reasoning.py`: it "always gets the
+  closed block").
+
+**Message sets (4):** user `hi`, then an assistant message with
+- content only;
+- reasoning plus content;
+- reasoning only;
+- content after the reference's tool loop.
+
+A final message with tool calls is not continuable; llama-server rejects it.
+
+**Requests:**
+- the reasoning-mode requests of section 2 on all four servers;
+- each crossed with four ways to continue: the default, `true`, `"content"` and
+  `"reasoning_content"`.
+
+That makes 124 requests per message set on the first two servers and 4 on the
+others.
+
+**The comparison:**
+- **A content continuation** must equal the reference byte for byte.
+- **A reasoning continuation** has no reference: vLLM's flag is a bool, and its
+  template always closes the block. So the check asserts two things exactly:
+  - llama.cpp's prompt is the reference render of the earlier messages, then
+    `<|im_start|>assistant\n<think>\n` and the reasoning;
+  - the reference closes the block (`\n</think>\n\n` and the content).
+
+**Result:**
+- Every content continuation is identical to the reference, with thinking on
+  and off.
+- llama.cpp differs only where it continues the reasoning: with
+  `"reasoning_content"`, and, for the reasoning-only message, with `true` and
+  the default.
+
+```
+PASS chat continue [default] content: 93/124 prompts equal the reference, reasoning continued in an open think block 31/124 (the reference closes it)
+PASS chat continue [default] reasoning_only: 31/124 prompts equal the reference, reasoning continued in an open think block 93/124 (the reference closes it)
+```
+
+**How the output is parsed:** see "Parser tests" below.
+- **llama.cpp** parses the continuation after the prompt it built: content
+  after a closed block, reasoning in an open one.
+- **vLLM's parser** takes its starting state from the thinking switch alone.
+  With thinking on, it starts in the reasoning although the prompt has already
+  closed the block. On the non-streaming path, where it never sees the prompt,
+  it then files the continued answer as reasoning. That is the gap
+  `reasoning.py` documents. llama.cpp does not have it.
+
+### 4. Stop tokens
 
 Both GGUFs are loaded vocab-only in libllama and checked for:
 - the EOG set over all 128000 ids;
@@ -176,7 +248,8 @@ Both GGUFs are loaded vocab-only in libllama and checked for:
 
 ### Result
 
-Full check: `check_chat.py` rc 0, **37 PASS**. The template line:
+Full check: `check_chat.py` rc 0, **53 PASS**: the template line, 28 render
+lines, 16 continue lines (section 3) and 8 stop-token lines. The template line:
 
 ```
 PASS chat template: tokenizer_config.json 9ba35d4bd6ba, vocab GGUF 9ba35d4bd6ba, converted GGUF 9ba35d4bd6ba, models/templates/Aleph-Alpha-Kolibri-1.jinja 9ba35d4bd6ba, llama-server /props 9ba35d4bd6ba (released 9ba35d4bd6ba, 6236 chars)
@@ -216,7 +289,16 @@ The cases:
 - thinking off: the output is content; also after a tool loop;
 - a tool call after the reasoning; a tool call with thinking off; content plus
   two parallel calls; a partial call while streaming;
-- a `<tool_call>` inside the reasoning stays reasoning.
+- a `<tool_call>` inside the reasoning stays reasoning;
+- continuing the final assistant message, with thinking on and off:
+  - a content continuation of `Hello, ` (reasoning `I'm thinking`) gives
+    content `Hello, world!\nWhat's up?`, and the reasoning stays; also when the
+    continuation ends in a tool call;
+  - a reasoning continuation of `I'm` goes on until `</think>`: reasoning
+    `I'm thinking`, then the content.
+
+`test-chat --template Kolibri` runs only this block: "[chat] All template tests
+passed!".
 
 **`test_kolibri_reasoning_effort`:**
 - **The reference's 10 kwarg sets,** for the single-turn and tool-loop message
@@ -279,7 +361,7 @@ contradicting request, the template now sees what the server already assumed.
 | `<tool_call>` before `</think>` | `Qwen3Parser` ends the reasoning at `<tool_call>` (`vllm/parser/qwen3.py:139`, "Tool call directly from reasoning (implicit end)") | stays reasoning until `</think>` | peg block (fake call in the reasoning) |
 | Tool calls | `Hermes2ProToolParser`: one or more `<tool_call>` JSON blocks, content before the first call | the same format, parallel calls, content before them, streaming partial arguments | peg block |
 | Structured output | the grammar applies once the reasoning has ended (`is_reasoning_end`, current turn only) | lazy grammar, triggered on `<tool_call>` | `test_peg_parser` builds the grammar and checks its triggers |
-| `continue_final_message` | known gap, documented in `reasoning.py` | not tested | — |
+| `continue_final_message` | the template closes the think block of the continued message; the parser starts in REASONING with thinking on and files the continued answer as reasoning (known gap, documented in `reasoning.py`) | content continuation: the same prompt, parsed as content; reasoning continuation (`"reasoning_content"`, or a message with reasoning only): the block stays open and the output is reasoning until `</think>` | `check_chat.py` continue, peg block |
 
 Two differences remain, both in how output is split, not in the prompt:
 
@@ -340,6 +422,10 @@ Each was run, then reverted.
 | M13: vocab GGUF with eos moved to `<think>` (`gguf_new_metadata.py --special-token eos '<think>'`) | FAIL: EOG set `[127901, 127906, 127907]`, eos 127907, and `<think>` flagged as EOG. The unchanged converted GGUF stays PASS. |
 | M14: the fork's template file without the thinking-off prefill | FAIL: `test-chat` in `test_kolibri_reasoning_effort` ("Expected: 1 Actual: 0", rc 134), and `check_chat.py`'s template sha. The peg block alone still passes, because without a prefill, content still parses as content. The prefill belongs to the effort test. |
 
+| M20: llama.cpp's content continuation without the closing `</think>` (`chat-auto-parser-generator.cpp`, `data.generation_prompt += autoparser.reasoning.end` commented out) | FAIL: `test-chat --template Kolibri` ("Expected: Hello, world!", "Actual: ", rc 134), and `check_chat.py` on every continue line ("0/124 prompts equal the reference", rc 1). |
+| M21: `check_chat.py` compares with the reference rendered without `continue_final_message` | FAIL on all 16 continue lines, rc 1: the reference ends in `<\|im_end\|>`, the continuation does not. |
+| M22: `check_chat.py` expects the open think block without the newline after `<think>` | FAIL on all 16 continue lines, rc 1: every reasoning continuation differs at that character. |
+
 The `reasoning_effort: "none"` fix was also checked in reverse: without the
 line, its new server cases fail (see above).
 
@@ -361,8 +447,12 @@ line, its new server cases fail (see above).
   results render byte-identically. llama.cpp parses the Hermes JSON calls
   (single, parallel, after reasoning, partial).
 - **Official parsers:** the table above. Behaviour is the same except the two
-  documented output-splitting differences. `continue_final_message` with
-  thinking is a known gap in the reference parser itself and is not tested.
+  documented output-splitting differences.
+- **Continuing an assistant message:** a content continuation renders exactly
+  as the reference does, in every reasoning mode. llama.cpp parses it as
+  content, where vLLM's parser files it as reasoning with thinking on (the gap
+  `reasoning.py` documents). A reasoning continuation, which vLLM does not
+  have, leaves the think block open.
 - **Stop tokens and EOS:** libllama stops on exactly the two eos ids of
   `generation_config.json`, and the tag tokens reach the parser as text.
 - **Reference compatibility cases:** `test_kolibri_reasoning_effort` carries the
