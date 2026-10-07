@@ -96,3 +96,41 @@ func TestParseSwapUsed(t *testing.T) {
 		t.Errorf("parseSwapUsed = %v, %v; want 14714.5", got, err)
 	}
 }
+
+func TestParsePageins(t *testing.T) {
+	out := "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               1238098.\nPageins:                                  3410795619.\nPageouts:                                   52063.\n"
+	got, err := parsePageins(out)
+	if err != nil || got != 3410795619 {
+		t.Errorf("parsePageins = %v, %v; want 3410795619", got, err)
+	}
+	if _, err := parsePageins("Pages free: 1."); err == nil {
+		t.Error("want an error without a Pageins line")
+	}
+}
+
+func TestIDsSHA256(t *testing.T) {
+	// tools/locality/workloads.py: sha256 of the decimal IDs joined by commas
+	if got := idsSHA256([]int32{1, 22, 333}); got != "8915516745284e69425d3f566025a855f5a5718d6d44f09451fb19d0f61fc185" {
+		t.Errorf("idsSHA256 = %s", got)
+	}
+}
+
+func TestCheckTokens(t *testing.T) {
+	manifest := `{"answers": {}, "workloads": {"hr": {"n_tokens": 3, "text_sha256": "x",
+		"tokens_sha256": "8915516745284e69425d3f566025a855f5a5718d6d44f09451fb19d0f61fc185"}}}`
+	if err := checkTokens("hr", []int32{1, 22, 333}, strings.NewReader(manifest)); err != nil {
+		t.Errorf("recorded IDs: %v", err)
+	}
+	for name, c := range map[string]struct {
+		workload string
+		ids      []int32
+	}{
+		"changed ID":   {"hr", []int32{1, 22, 334}},
+		"truncated":    {"hr", []int32{1, 22}},
+		"not recorded": {"coding", []int32{1, 22, 333}},
+	} {
+		if err := checkTokens(c.workload, c.ids, strings.NewReader(manifest)); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+}

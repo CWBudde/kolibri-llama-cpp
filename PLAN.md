@@ -422,8 +422,27 @@ For each candidate:
     -n 128 -r 3` on Metal: Q3 mix "tg128 | 60.67 ± 0.08", IQ3_S 61.78,
     IQ3_XXS 63.03, IQ3_XXS/IQ4_XS "tg128 | 64.00 ± 0.07". `llama-server` chat
     on the Q3 mix: 58.7 tokens/s.
--   [ ] Measure expert-routing overhead. Needs a definition first (which ops
-    count, which backend) before it can be measured.
+-   [x] Measure expert-routing overhead. (2026-10-07) — definition: the
+    nodes `build_moe_ffn` computes before the expert matmuls, for Kolibri
+    five per layer (router logits, sigmoid, selection bias, Top-6 argsort,
+    gathered weights), on Metal, per decoded token and per 512-token ubatch.
+    `cmd/kolibri-routing` sums them from `test-backend-ops perf` timings of
+    the model's real graph ops (`test-export-graph-ops`), counted in a
+    `llama-eval-callback` node listing, against `llama-bench` on
+    IQ3_XXS/IQ4_XS: "router per token: 1.105 ms of 15.685 ms measured (tg
+    63.76 tokens/s): 7.0%", "router per 512-token ubatch: 14.481 ms of
+    379.673 ms measured (pp 1348.53 tokens/s): 3.8%". The argsort and the
+    F32 router matmul take 16.5 of the 22.1 µs per layer. The isolated
+    timings of all other nodes sum to 87% of the measured token, with the
+    flash-attention nodes left untimed. 7.0% is an upper estimate (no
+    overlap or fusion). These fail with exit 1:
+    - a router op without timing ("ffn_moe_argsort-0 (ARGSORT [384 1 1 1]):
+      0 matching timings, want 1");
+    - a missing layer ("ffn_moe_logits: 49 nodes, want one per layer
+      (50)").
+
+    ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Routing
+    overhead".)
 -   [x] Test 8k, 16k, and 32k contexts first. (2026-10-06) — both IQ3_XXS files
     load at `-c 8192/16384/32768` on Metal, answer "Berlin" and keep at least
     3.4 GiB free (above). `llama-bench -ngl 99 -p 512 -n 128 -d
@@ -453,9 +472,16 @@ For each candidate:
     - the pressure level was 2 (warn) in all 122 samples, under real system
       pressure.
 
-    Remaining: the simulated warn (`memory_pressure -S -l warn`) needs root
-    ("Operation not permitted"). Also missing is a rerun of the speed on a
-    machine without other load (control: tg128 28.19 against 61.0 at depth 0)
+    (2026-10-07) — rerun on a quiet machine (tg128 control 63.05 ± 0.99):
+    "32000 tokens ( 21.02 ms per token, 47.56 tokens per second)". The speed
+    falls from 60.4 to 39.4 tokens/s per 2,048-token window, following
+    the depth curve. RSS 34,401–34,517 MiB, `phys_footprint` 909–918 MiB,
+    swap 3.70–3.95 GB. The pressure level was 2 in all 68 samples, against 1
+    before the load. So the earlier 24.14 came from the other load.
+
+    partial: remaining is only the simulated pressure
+    (`memory_pressure -S -l warn`, better `-l critical` since the model
+    alone holds the level at warn), which needs a root shell
     ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Sustained
     generation").
 -   [ ] Compare quality and Top-6 routing agreement with BF16.
@@ -557,13 +583,41 @@ For each candidate:
 
     ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Expert cache
     simulation".)
--   [ ] Benchmark resident Metal inference against streamed/offloaded expert
+-   [x] Benchmark resident Metal inference against streamed/offloaded expert
     execution using the same quantization, prompt corpus and context lengths.
     Record prompt-processing and generation tokens/s, peak unified memory,
     host/Metal buffer use, bytes transferred per generated token and, where
     measurable, expert-cache hit rate. This should distinguish the cost of
     keeping the quantized experts resident from exploiting Kolibri's sparse
     Top-6-of-384 expert activation.
+
+    (2026-10-07) — IQ3_XXS/IQ4_XS, three placements:
+    - resident;
+    - `--n-cpu-moe 25`;
+    - `--n-cpu-moe 50`: the routed experts on the CPU, read on demand from
+      the mmap.
+
+    Each runs `llama-bench` and the four locality workloads (first 8,000
+    tokens at 8k, medtech's 28,450 at 32k) through `llama-server` and
+    `cmd/kolibri-stream -tokens`, which checks each token file against the
+    manifest. Results:
+    - **Speed:** `llama-bench` "pp512 1342.90 / tg128 62.85" resident,
+      517.19 / 40.89 and 318.38 / 18.06 with experts on the CPU. After 8k
+      tokens it generates 54.6–54.7 tokens/s resident, against 16.1–17.1.
+    - **Memory:** streaming frees Metal's working set (34,966 MiB free
+      instead of 3,947), but the 31 GB of experts move to the page cache.
+      RSS stays at 33–35 GB, with pressure 1 instead of 2.
+    - **Bytes from disk:** generating reads 0.01–1.7 MiB per token from
+      disk, against the 243 or 486 MiB of expert rows the CPU reads.
+    - **Expert-cache hit rate:** the page cache serves 99.65–100% of those
+      reads. The 33 GB file fits in RAM; llama.cpp has no expert cache.
+    - **Handoffs:** two graph splits per CPU layer and decode step (102 at
+      `--n-cpu-moe 50`), about 1 MiB of activations per token.
+
+    A changed token ID fails the prompt check ("FAIL hr: 10959 token IDs
+    with sha256 9ba08817…, the manifest records 10959 with 05dcdd3f…", exit
+    1). ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Resident
+    against streamed experts".)
 
 
 **Target:** Prefer a configuration that leaves several GB of unified

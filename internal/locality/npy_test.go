@@ -47,6 +47,31 @@ func TestReadNPYInt32(t *testing.T) {
 	}
 }
 
+func TestReadTokens(t *testing.T) {
+	ids, err := ReadTokens(bytes.NewReader(npy("{'descr': '<i4', 'fortran_order': False, 'shape': (3,), }", []int32{1, 100278, 7})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 3 || ids[0] != 1 || ids[1] != 100278 || ids[2] != 7 {
+		t.Fatalf("ReadTokens = %v", ids)
+	}
+}
+
+func TestReadTokensRejects(t *testing.T) {
+	for name, file := range map[string][]byte{
+		"3-D":                npy("{'descr': '<i4', 'fortran_order': False, 'shape': (1, 1, 2), }", []int32{1, 2}),
+		"float data":         npy("{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }", []float32{1}),
+		"short data":         npy("{'descr': '<i4', 'fortran_order': False, 'shape': (3,), }", []int32{1, 2}),
+		"negative dimension": npy("{'descr': '<i4', 'fortran_order': False, 'shape': (-2,), }", []int32{1, 2}),
+		"oversized":          npy("{'descr': '<i4', 'fortran_order': False, 'shape': (4294967296,), }", []int32{1}),
+		"not npy":            []byte("PK\x03\x04 a zip file"),
+	} {
+		if _, err := ReadTokens(bytes.NewReader(file)); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+}
+
 func TestReadNPYRejects(t *testing.T) {
 	for name, file := range map[string][]byte{
 		"fortran order":      npy("{'descr': '<i2', 'fortran_order': True, 'shape': (1, 1, 2), }", []int16{1, 2}),

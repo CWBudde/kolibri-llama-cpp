@@ -45,42 +45,60 @@ var (
 // (format versions 1 to 3).
 func ReadNPY(r io.Reader) (Selections, error) {
 	var s Selections
+	dims, ids, err := readInts(r, 3)
+	if err != nil {
+		return s, err
+	}
+	s.Layers, s.Tokens, s.K = dims[0], dims[1], dims[2]
+	s.IDs = ids
+	return s, nil
+}
+
+// ReadTokens reads a 1-D little-endian int16 or int32 array, such as a workload's token IDs
+// (<workload>.tokens.npy of tools/locality/workloads.py), from a .npy file.
+func ReadTokens(r io.Reader) ([]int32, error) {
+	_, ids, err := readInts(r, 1)
+	return ids, err
+}
+
+// readInts reads a .npy file's integer array of rank dimensions, in C order.
+func readInts(r io.Reader, rank int) ([]int, []int32, error) {
 	br := bufio.NewReader(r)
 	magic := make([]byte, 8)
 	if _, err := io.ReadFull(br, magic); err != nil {
-		return s, fmt.Errorf("npy: %w", err)
+		return nil, nil, fmt.Errorf("npy: %w", err)
 	}
 	if string(magic[:6]) != "\x93NUMPY" {
-		return s, errors.New("npy: not a .npy file")
+		return nil, nil, errors.New("npy: not a .npy file")
 	}
 	var n int
 	switch magic[6] {
 	case 1:
 		var n16 uint16
 		if err := binary.Read(br, binary.LittleEndian, &n16); err != nil {
-			return s, fmt.Errorf("npy: %w", err)
+			return nil, nil, fmt.Errorf("npy: %w", err)
 		}
 		n = int(n16)
 	case 2, 3:
 		var n32 uint32
 		if err := binary.Read(br, binary.LittleEndian, &n32); err != nil {
-			return s, fmt.Errorf("npy: %w", err)
+			return nil, nil, fmt.Errorf("npy: %w", err)
 		}
 		n = int(n32)
 	default:
-		return s, fmt.Errorf("npy: format version %d", magic[6])
+		return nil, nil, fmt.Errorf("npy: format version %d", magic[6])
 	}
 	hdr := make([]byte, n)
 	if _, err := io.ReadFull(br, hdr); err != nil {
-		return s, fmt.Errorf("npy header: %w", err)
+		return nil, nil, fmt.Errorf("npy header: %w", err)
 	}
 	h := string(hdr)
 	descr, fortran, shape := descrRe.FindStringSubmatch(h), fortranRe.FindStringSubmatch(h), shapeRe.FindStringSubmatch(h)
 	if descr == nil || fortran == nil || shape == nil {
-		return s, fmt.Errorf("npy: header %q", h)
+		return nil, nil, fmt.Errorf("npy: header %q", h)
 	}
 	if fortran[1] != "False" {
-		return s, errors.New("npy: Fortran order")
+		return nil, nil, errors.New("npy: Fortran order")
 	}
 	var dims []int
 	for f := range strings.SplitSeq(shape[1], ",") {
@@ -89,40 +107,39 @@ func ReadNPY(r io.Reader) (Selections, error) {
 		}
 		d, err := strconv.Atoi(f)
 		if err != nil {
-			return s, fmt.Errorf("npy: shape %q", shape[1])
+			return nil, nil, fmt.Errorf("npy: shape %q", shape[1])
 		}
 		dims = append(dims, d)
 	}
-	if len(dims) != 3 {
-		return s, fmt.Errorf("npy: shape (%s), want 3 dimensions", shape[1])
+	if len(dims) != rank {
+		return nil, nil, fmt.Errorf("npy: shape (%s), want %d dimensions", shape[1], rank)
 	}
 	// the shape comes from the file: check it before it sizes an allocation
 	size := 1
 	for _, d := range dims {
 		if d <= 0 || size > maxIDs/d {
-			return s, fmt.Errorf("npy: shape (%s), want positive dimensions of at most %d IDs", shape[1], maxIDs)
+			return nil, nil, fmt.Errorf("npy: shape (%s), want positive dimensions of at most %d IDs", shape[1], maxIDs)
 		}
 		size *= d
 	}
-	s.Layers, s.Tokens, s.K = dims[0], dims[1], dims[2]
-	s.IDs = make([]int32, size)
+	ids := make([]int32, size)
 	switch descr[1] {
 	case "<i2":
-		ids := make([]int16, len(s.IDs))
-		if err := binary.Read(br, binary.LittleEndian, ids); err != nil {
-			return s, fmt.Errorf("npy data: %w", err)
+		ids16 := make([]int16, len(ids))
+		if err := binary.Read(br, binary.LittleEndian, ids16); err != nil {
+			return nil, nil, fmt.Errorf("npy data: %w", err)
 		}
-		for i, id := range ids {
-			s.IDs[i] = int32(id)
+		for i, id := range ids16 {
+			ids[i] = int32(id)
 		}
 	case "<i4":
-		if err := binary.Read(br, binary.LittleEndian, s.IDs); err != nil {
-			return s, fmt.Errorf("npy data: %w", err)
+		if err := binary.Read(br, binary.LittleEndian, ids); err != nil {
+			return nil, nil, fmt.Errorf("npy data: %w", err)
 		}
 	default:
-		return s, fmt.Errorf("npy: dtype %s, want <i2 or <i4", descr[1])
+		return nil, nil, fmt.Errorf("npy: dtype %s, want <i2 or <i4", descr[1])
 	}
-	return s, nil
+	return dims, ids, nil
 }
 
 // ReadNPYFile reads a .npy file with ReadNPY.
