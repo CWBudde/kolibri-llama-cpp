@@ -12,7 +12,8 @@ fails (exit 1) when:
 - the token IDs differ from testdata/locality/manifest.json;
 - a token's selection in some layer is not n_expert_used distinct experts in
   [0, n_expert);
-- the sha256 of the selections (their int16 little-endian bytes) differs from
+- the sha256 of the selections (their int16 little-endian bytes), or that of
+  the token IDs they were captured from, differs from
   testdata/locality/experts.json, which --record writes.
 
 A capture replaces the stored selections only once it passes (or, with
@@ -152,7 +153,10 @@ def main() -> None:
             print(f"{name}: {len(tokens)} tokens in {seconds:.0f} s ({len(tokens) / seconds:.1f} tokens/s) on "
                   f"{dev_name}", flush=True)
         n_tokens = tokens_manifest[name]["n_tokens"]
-        entry = {"n_tokens": int(sel.shape[1]), "experts_sha256": selections_sha256(sel)}
+        # the token IDs the selections belong to: a capture checked them against the workloads
+        # manifest, so a changed trace of the same length fails here, --verify included
+        entry = {"n_tokens": int(sel.shape[1]), "tokens_sha256": tokens_manifest[name]["tokens_sha256"],
+                 "experts_sha256": selections_sha256(sel)}
         if sel.shape != (n_layer, n_tokens, n_used):
             fail(f"{name}: selections of shape {sel.shape}, not {(n_layer, n_tokens, n_used)}")
         elif why := invalid(sel, n_expert):

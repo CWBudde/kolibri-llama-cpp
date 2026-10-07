@@ -826,7 +826,9 @@ in `testdata/locality/experts.json`. Two models:
   - the token IDs differ from the workloads manifest;
   - a token's selection in some layer is not 6 distinct experts in
     [0, 384);
-  - the selections' sha256 differs from the recorded one.
+  - the selections' sha256 differs from the recorded one, or the token
+    IDs' sha256 they were captured from does. That catches a changed trace
+    of the same length, `--verify` included.
 
   `--verify` re-hashes the stored files without running the model.
 - **A rejected capture changes nothing:** it does not replace the stored

@@ -3,6 +3,7 @@
   "workloads": {
    "coding": {
     "n_tokens": 11146,
+    "tokens_sha256": "4e0a77cca373d7a1e0f665b79404b8ca2ac1ee33b74cd14d1f2a50e7cae13360",
     "experts_sha256": "b192238cfea1fd281384e68a3de9d3ef4bf7c5b028df2ce0c252ae629cdebc78",
     "gguf": "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
     "gguf_bytes": 35556257600,
@@ -15,6 +16,7 @@
    },
    "research": {
     "n_tokens": 10645,
+    "tokens_sha256": "b35d11c77c5e658bfe796370db53102e0dd219263b7d959c4dd4c76d2a35655a",
     "experts_sha256": "d962beb1bec3c893f7dbcc50bbccf1bc2a3e650668a41241a460a9172cf7a2aa",
     "gguf": "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
     "gguf_bytes": 35556257600,
@@ -27,6 +29,7 @@
    },
    "hr": {
     "n_tokens": 10959,
+    "tokens_sha256": "05dcdd3f3da552dbb4085cc6cb6dbf62d67034233324a9ddbd7f026fb36fbfe2",
     "experts_sha256": "faf613ddd8e4f913efebfb5d5bf1e0ce7b8b1ea01eef41343d11cdc223fca3ea",
     "gguf": "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
     "gguf_bytes": 35556257600,
@@ -39,6 +42,7 @@
    },
    "medtech": {
     "n_tokens": 28450,
+    "tokens_sha256": "00b2baebe5fd343ebff4462cfaf392e15934137270efc686b8d1370fe244f98b",
     "experts_sha256": "411dba4e92af4e8494fd35768d42b0927b93d3f4d92860da4860d9f71ce51550",
     "gguf": "Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
     "gguf_bytes": 35556257600,
@@ -55,6 +59,7 @@
   "workloads": {
    "coding": {
     "n_tokens": 11146,
+    "tokens_sha256": "4e0a77cca373d7a1e0f665b79404b8ca2ac1ee33b74cd14d1f2a50e7cae13360",
     "experts_sha256": "a2c61ec9a884b3ebe3d8b0be4ed75b7631548b922c71bc8a237ac291516e7dd4",
     "gguf": "Kolibri-1-Q8_0.gguf",
     "gguf_bytes": 83135393312,
@@ -67,6 +72,7 @@
    },
    "research": {
     "n_tokens": 10645,
+    "tokens_sha256": "b35d11c77c5e658bfe796370db53102e0dd219263b7d959c4dd4c76d2a35655a",
     "experts_sha256": "09b9d9fb1818b9d445bdedecdec5c1db4c466c6df6c15a1932621e0ecd640ed1",
     "gguf": "Kolibri-1-Q8_0.gguf",
     "gguf_bytes": 83135393312,
@@ -79,6 +85,7 @@
    },
    "hr": {
     "n_tokens": 10959,
+    "tokens_sha256": "05dcdd3f3da552dbb4085cc6cb6dbf62d67034233324a9ddbd7f026fb36fbfe2",
     "experts_sha256": "b77e449b1b2eaec28473c765651fc4192378470722d6a02e058db371a8577ee3",
     "gguf": "Kolibri-1-Q8_0.gguf",
     "gguf_bytes": 83135393312,
@@ -91,6 +98,7 @@
    },
    "medtech": {
     "n_tokens": 28450,
+    "tokens_sha256": "00b2baebe5fd343ebff4462cfaf392e15934137270efc686b8d1370fe244f98b",
     "experts_sha256": "e3b46fde5454ae9648a3f455c71dea0be4f242deec54b10e850e56bcb9182707",
     "gguf": "Kolibri-1-Q8_0.gguf",
     "gguf_bytes": 83135393312,
