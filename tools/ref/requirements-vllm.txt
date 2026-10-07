@@ -1,0 +1,9 @@
+# vLLM and Aleph Alpha's plugin for vllm_capture.py, in an environment of their
+# own (not .venv: vLLM pins its own torch). The plugin requires vllm>=0.29.0,<0.30.0.
+#
+# CUDA host:      pip install -r tools/ref/requirements-vllm.txt
+# Apple Silicon:  the CPU wheel of the v0.29.0 release instead of vllm==0.29.0,
+#                 vllm-0.29.0+cpu-cp312-cp312-macosx_11_0_arm64.whl (Python 3.12),
+#                 then aleph-alpha-inference==1.0.0 (docs/vllm-reference.md)
+vllm==0.29.0
+aleph-alpha-inference==1.0.0

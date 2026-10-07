@@ -135,9 +135,41 @@ below except the last bullet is checked on tiny synthetic checkpoints
     suitable hardware.
 -   [ ] Save a small deterministic reference corpus: token IDs, selected
     logits, generated tokens, and sampling settings.
--   [ ] Extend the deterministic corpus with tokenizer edge cases (special
+-   [x] Capture the reference run's outputs from vLLM itself, in a form the
+    llama.cpp comparisons can read. (2026-10-07) — `tools/ref/vllm_capture.py`
+    runs vLLM 0.29.0 with `aleph-alpha-inference` 1.0.0 in its own
+    environment (`tools/ref/requirements-vllm.txt`). Forward hooks record, per
+    case of the e2e corpus or random tokens, under libllama's node names:
+    - the logits for every position;
+    - the router logits and the experts selected;
+    - embeddings, Q/K after the QK norm, `attn_out`, `attn_post_norm`, the
+      shared and routed expert output, and `l_out`;
+    - vLLM's greedy tokens and their top-20 logprobs.
+
+    `tools/ref/compare_vllm.py` compares the torch port and libllama with the
+    capture. On the tiny checkpoint, captured with vLLM's macOS CPU backend in
+    float32, top-2: "PASS tiny, torch port vs vLLM: logits NMSE 1.52e-12, …
+    worst layer node NMSE 2.84e-12 where they agree", "PASS tiny, libllama vs
+    vLLM: logits NMSE 1.70e-12, …" and "PASS vLLM capture, 2 of 8 experts:
+    torch port and libllama within the tiny bounds", rc 0. With all 8 experts
+    it is likewise PASS, rc 0. Decode logprobs match the hooked prefill
+    logits to 3.20e-06. Control M27 (×1.01 on one layer's captured router
+    logits) gives FAIL, rc 1. Pipeline parallelism is unverified, because
+    vLLM's CPU backend fails it even without hooks. The real BF16 run (by the file
+    size, one GPU with more than 156 GB) is item 134
+    ([docs/vllm-reference.md](docs/vllm-reference.md)).
+-   [x] Extend the deterministic corpus with tokenizer edge cases (special
     tokens, Unicode, whitespace, code, German/English text) and keep exact
-    token-ID/round-trip agreement as a regression gate.
+    token-ID/round-trip agreement as a regression gate. (2026-10-07) —
+    `testdata/tokenizer/golden.jsonl` holds 85 cases from the pinned reference
+    tokenizer, in groups `special` (13), `unicode` (19), `whitespace` (19),
+    `code` (10), `german` (9), `umlauts` (6), `english` (7) and `chat` (2)
+    ([docs/tokenizer.md](docs/tokenizer.md), "Golden tests").
+    `tools/ref/regress.py` gates them with the fixed corpus. Its tokenizer
+    part, `compare.py --only golden --only corpus`, rerun on the fork build:
+    "golden: 85/85 ok", "corpus/wiki.test.raw: 4212/4212 ok",
+    "corpus/kolibri-calibration.txt: 6461/6461 ok", rc 0. A case passes only
+    if the IDs and the detokenized bytes both match.
 -   [ ] Use deterministic/greedy decoding for numerical validation
     before testing recommended sampling (`temperature=1.0`,
     `top_p=0.97`, `top_k=128`).
