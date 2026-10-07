@@ -528,7 +528,35 @@ For each candidate:
 
     ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Expert locality per
     layer".)
--   [ ] Replay the recorded expert-selection traces through simulated LRU caches of several sizes and report hit rate, miss rate and estimated expert bytes loaded per token. Keep this simulation separate from the later real streaming benchmark so cache-policy questions can be answered before implementing I/O.
+-   [x] Replay the recorded expert-selection traces through simulated LRU caches of several sizes and report hit rate, miss rate and estimated expert bytes loaded per token. Keep this simulation separate from the later real streaming benchmark so cache-policy questions can be answered before implementing I/O.
+
+    (2026-10-07) — `cmd/kolibri-cache` replays the recorded selections in
+    decode order through LRU caches of 8 to 384 experts per layer, per layer
+    and shared across layers. One pass of LRU stack distances
+    (`internal/locality/lru.go`, checked against a plain LRU simulator on
+    random traces) answers every size. Expert bytes come from the GGUF
+    tensors (`tools/locality/expert_bytes.py`, pinned in
+    `testdata/locality/expert-bytes.json`). Results in
+    [docs/expert-cache.md](docs/expert-cache.md); every run checks itself
+    against the 467 stats ("PASS IQ3_XXS-IQ4_XS-down-imx medtech: 50 layers,
+    cold misses and full-cache hits as in stats-…json"). For IQ3, shared:
+    - 90% hits need 96 experts per layer (8.2 GB) for hr and medtech, 128
+      (10.9 GB) for coding and research;
+    - misses load 47–77 MB per token at 8.2 GB and 8–21 MB at 16.3 GB,
+      against 510 MB without a cache;
+    - the shared cache beats the per-layer one by at most 1.2 points;
+    - Q8_0 hit rates are within 0.09 points, with 2.46× the bytes.
+
+    These fail with exit 1:
+    - a changed byte count in the record ("FAIL …: differs from
+      testdata/locality/expert-bytes.json: {'layers': [17]}");
+    - a doctored reuse count in the stats ("layer 23: the stats count 355
+      experts selected and 65400 reuses, the simulation 355 cold misses and
+      65399 hits");
+    - a simulator mutation ("26 hits, the LRU simulation 27").
+
+    ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Expert cache
+    simulation".)
 -   [ ] Benchmark resident Metal inference against streamed/offloaded expert
     execution using the same quantization, prompt corpus and context lengths.
     Record prompt-processing and generation tokens/s, peak unified memory,
