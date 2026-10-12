@@ -116,7 +116,7 @@ go run ./cmd/kolibri-tiny -out /tmp/kt/kolibri-tiny -tokenizer-dir <tokenizer di
 vllm-venv/bin/python tools/ref/vllm_capture.py --model /tmp/kt/kolibri-tiny --random 100 --seed 1 \
     --greedy 4 --dtype float32 --gpu-memory-utilization 0.1 --out /tmp/kt/cap-top2
 .venv/bin/python tools/ref/compare_vllm.py --llama-cpp third_party/llama.cpp --capture /tmp/kt/cap-top2 \
-    --model /tmp/kt/kolibri-tiny --tiny --libllama
+    --model /tmp/kt/kolibri-tiny --gate --libllama
 ```
 
 **`--gpu-memory-utilization`:** on the CPU backend it is the share of RAM vLLM
@@ -157,7 +157,7 @@ port and libllama compute, node by node, at float32 rounding level.
 the 50-layer, 384-expert shape.
 
 **The corpus path:** the e2e corpus, captured from the tiny checkpoint in
-bfloat16 with `--attn-layers 0,4` (no `--tiny`, INFO only), runs through all
+bfloat16 with `--attn-layers 0,4` (no `--gate`, INFO only), runs through all
 six cases. Example line: "INFO de-chat, libllama vs vLLM: logits NMSE 5.62e-04,
 KLD 0.000029, same top token 95.6%; same experts for 99.8% of (token, layer)
 pairs". These numbers measure bf16 rounding on random weights, not the model.
@@ -169,6 +169,75 @@ pairs". These numbers measure bf16 rounding on random weights, not the model.
 FAIL tiny, torch port vs vLLM, router probe: worst layer router-logit NMSE 9.80e-05 where every earlier layer picks the same experts, Top-1 same 99.8%, Top-2 set same 100.0%
 FAIL vLLM capture, 2 of 8 experts: 1 check(s) failed
 ```
+
+## Slices of the real weights
+
+The full model needs a GPU host, but a slice of it does not. `tools/ref/slice.py`
+writes chosen layers of the real checkpoint as a smaller HF checkpoint, taken
+from the BF16 GGUF:
+- the inventory's name mapping, which `check_real.py` verified bit-exact;
+- the experts unstacked, the F32 norms and router written back as the BF16
+  they hold;
+- the real config, with `num_hidden_layers` and `layer_types` cut to the
+  chosen layers.
+
+A slice is a smaller, well-defined Kolibri model with the real attention shape
+(48/4 heads, window 513), the real 384-expert top-6 routing and the real
+weights. vLLM, the port and libllama have to agree on it. It does not compute
+what the full model computes at those depths. Two layers take 7.5 GB in BF16
+and fit vLLM's CPU backend in float32.
+
+```sh
+.venv/bin/python tools/ref/slice.py --gguf ~/models/Kolibri-1-BF16.gguf \
+    --model-dir ~/models/Kolibri-1-BF16 --layers 0,4 --out /tmp/slice-0-4      # 22 s
+vllm-venv/bin/python tools/ref/vllm_capture.py --model /tmp/slice-0-4 \
+    --corpus testdata/e2e/corpus.json --dtype float32 --gpu-memory-utilization 0.45 --out /tmp/cap-0-4
+.venv/bin/python tools/ref/compare_vllm.py --llama-cpp third_party/llama.cpp --capture /tmp/cap-0-4 \
+    --model /tmp/slice-0-4 --gate --max-nmse 1e-8 --libllama  # converts the slice to an F32 GGUF (15 GB)
+```
+
+**Slices run:**
+- layers 0 and 4, the first sliding and the first full layer;
+- layers 48 and 49, the last ones, before the final norm and the head.
+
+Each slice took under half a minute to capture and as long to compare, on all
+six cases of the e2e corpus. `de-long` runs 1024 tokens, past the window.
+
+**Result:** every node, the router and the logits of the port (float64) and of
+libllama agree with vLLM at 1e-12 to 2e-10 NMSE. Every case picks the same
+experts in every (token, layer) pair. Each slice gives 105 PASS lines and exit
+0, for example:
+
+```text
+PASS de-raw, libllama vs vLLM: logits NMSE 1.20e-12, KLD 0.000000, same top token 100.0%; same experts for 100.0% of (token, layer) pairs, worst layer node NMSE 1.06e-11 where they agree
+PASS de-long, libllama vs vLLM, layer 0 (sliding attention), 1024 of 1024 tokens on the same experts before it: NMSE Q after QK norm 6.92e-13, K after QK norm 6.83e-13, attention output attn_out 1.67e-12, attn_post_norm 1.59e-12
+PASS vLLM capture, 6 of 384 experts: torch port and libllama within NMSE 1e-08
+PASS de-long, libllama vs vLLM: PPL 212415.5290 vs 212415.3448, logits NMSE 1.92e-10, KLD 0.000000, same top token 100.0%; same experts for 100.0% of (token, layer) pairs, worst layer node NMSE 1.50e-10 where they agree
+PASS vLLM capture, 6 of 384 experts: torch port and libllama within NMSE 1e-08
+```
+
+The first three lines are slice [0,4], the last two slice [48,49]. A slice's
+PPL is meaningless as a language model number; only the agreement counts.
+
+**Why `--max-nmse 1e-8`:** the default bound, 1e-6 from `compare_real.py
+--tiny`, is too loose for the real weights. Control M28 sets
+`sliding_window` 512 in vLLM's copy of the config only, a window one key
+short:
+- that moves `de-long`'s layer-0 attention output from 1.5e-12 to 1.7e-07, and
+  its logits to 7.6e-07, still inside 1e-6;
+- at 1e-8 it fails, on `de-long` only, the one case past the window, with exit
+  1: "FAIL de-long, torch port vs vLLM, layer 0 (sliding attention), … attention
+  output attn_out 1.67e-07 …", "FAIL vLLM capture, 6 of 384 experts: 6
+  check(s) failed".
+
+Without the mutation, the slices stay at least 50 times below 1e-8.
+
+With top-k routing the logits are gated over the tokens whose experts agree in
+every layer, as the nodes are. An expert flip changes them legitimately. Control
+M29 scales `de-raw`'s captured logits by 1.01 and leaves every node alone, a
+fault confined to the head. It fails, with exit 1: "FAIL de-raw, torch port vs
+vLLM: logits NMSE 9.80e-05, … worst layer node NMSE 4.66e-12 and logits NMSE
+9.80e-05 (21 of 21 tokens) where they agree".
 
 ## On the real checkpoint
 

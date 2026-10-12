@@ -306,7 +306,23 @@ when both are.
         greedy, float32: 'Die Hauptstadt von Deutschland ist Deutschland
         Deutschland …'", and so does bfloat16. An F32 KV cache or flash
         attention changes nothing.
-    -   [ ] vLLM, the only one that can still contradict it.
+    -   [ ] vLLM, the only one that can still contradict it. (2026-10-07) —
+        partial: vLLM itself on two-layer slices of the real weights (layers
+        0/4 and 48/49, float32, CPU) agrees with the port and libllama on
+        `de-raw` and `de-long` too: "PASS de-raw, libllama vs vLLM, router
+        probe: worst layer router-logit NMSE 5.79e-13 …, Top-6 set same
+        100.0%". `tools/ref/lang_stats.py` shows that the reference itself
+        repeats with confidence:
+        - " Deutschland" gets p 0.88 after the prompt, then 0.99;
+        - `de-raw`'s KLD comes from 2 of 17 positions (0.182, 0.690);
+        - German router margins are no tighter than English (below 0.01:
+          27.1% vs 23.5%);
+        - per byte, German loses 1.088 bits against English's 1.029.
+
+        With more context, raw German gets the facts right, then copies the
+        prompt; through the chat template it is coherent
+        ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Where the German
+        numbers come from"). Remaining: the full-model vLLM run.
 -   [ ] Establish tolerances separately for BF16 and any FP8 reference
     run.
     -   [x] Measure how far BF16 rounding alone moves the torch port.
@@ -324,6 +340,20 @@ Use independent community work only as a source of test ideas, not implementatio
 -   [x] Reproduce a larger fixed tokenizer case set independently and record exact token-ID agreement. (2026-10-05) — `compare.py --only corpus` cuts every line, every paragraph and the whole file from wikitext-2 `wiki.test.raw` and the imatrix calibration text (English, German, code): "corpus/wiki.test.raw: 4212/4212 ok", "corpus/kolibri-calibration.txt: 6461/6461 ok", 1,271,044 reference tokens, IDs and detokenized bytes identical. `testdata/tokenizer/corpus.json` pins each text's sha256 and the sha256 of the reference IDs, so a changed reference fails too. With `tokenizer.ggml.pre = default`, only 129/4212 pass.
 -   [x] Add a compact router probe that records logits, Top-1, Top-6 set overlap and near-tie margins per token/layer. (2026-10-05) — `tools/ref/router_probe.py`, run by `compare_real.py`. `--tiny`: "PASS tiny, top-2 routing, router probe: worst layer router-logit NMSE 4.74e-13 …"; a 1.01 scale on the reference router logits fails it (M17). `--probe-out` saves each probe as `router-<name>.npz`, with both sides' logits and per (token, layer) Top-1, set, overlap and margin arrays.
 -   [x] Keep a small end-to-end corpus whose BF16 reference artifacts can be rerun after upstream llama.cpp changes. (2026-10-06) — `tools/ref/e2e.py`: six cases in `testdata/e2e/corpus.json` (German, English and code prompts with 16 greedy tokens, a German chat turn, wikitext-2 chunk 1, and 1024 German tokens past the 513-token window), with token IDs from the pinned tokenizer. `--write` stores the torch port's float32 and bfloat16 logits and the float32 router logits and experts in `~/models/eval/e2e` (1.85 GB, 2 h 23 min); `testdata/e2e/manifest.json` pins each array's sha256 and the recorded libllama run. The check reruns libllama only (13 min): "INFO de-long: unchanged, logits bit-identical to the recorded libllama run (Kolibri-1-BF16.gguf)", likewise for all six cases; "INFO de-long, libllama vs reference float32: PPL 26.3648 vs 26.5145, logits NMSE 1.65e-03, KLD 0.046278, same top token 95.1%; router Top-1 same 97.32%, Top-6 set same 85.55%". A changed array, a flipped byte or a changed token ID fails with exit 1; the IQ3 chat GGUF reports "CHANGED …: vs_float32 kld 0.090176 (recorded 0.033408)" on wiki-c1. Metrics are INFO until tolerances exist. The artifacts come from the torch port; vLLM BF16 artifacts can replace them later.
+-   [x] Run vLLM itself on slices of the real weights, so a misreading the
+    torch port and libllama share shows before a GPU run. (2026-10-07) —
+    `tools/ref/slice.py` writes chosen layers of the BF16 GGUF as an HF
+    checkpoint (inventory mapping, bit-exact). `vllm_capture.py` runs it
+    with vLLM's CPU backend in float32; `compare_vllm.py --gate --max-nmse
+    1e-8 --libllama` checks all six e2e cases. Layers 0/4 and 48/49 each give
+    105 PASS lines and exit 0: "PASS vLLM capture, 6 of 384 experts: torch port
+    and libllama within NMSE 1e-08". Node, router and logit NMSE range from
+    1e-12 to 2e-10, with the same experts in every (token, layer) pair.
+    `de-long` reaches past the 513-token window. Control M28 (vLLM's window
+    512) fails on `de-long` only, with exit 1; it showed that the tiny bound
+    1e-6 would have missed it (attention output 1.7e-07)
+    ([docs/vllm-reference.md](docs/vllm-reference.md), "Slices of the real
+    weights").
 -   [ ] For every retained quantization, emit the same summary row: perplexity, KLD, same-top-token rate, Top-1 router agreement and Top-6 overlap.
 
 **Hard gate:** Do not diagnose quantization quality until the
