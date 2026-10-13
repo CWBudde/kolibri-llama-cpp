@@ -1,0 +1,9 @@
+{
+ "rule": "chronological, per workload: train on the first floor(n/2) of its n answers, up to the last one's decoded tokens; test from the next request's prefill on. Tuning sees training prefixes only, leave-one-workload-out the other workloads' training prefixes.",
+ "workloads": {
+  "coding": {"answers": 6, "train_answers": 3, "first_test_token": 6257},
+  "research": {"answers": 5, "train_answers": 2, "first_test_token": 5669},
+  "hr": {"answers": 5, "train_answers": 2, "first_test_token": 5295},
+  "medtech": {"answers": 6, "train_answers": 3, "first_test_token": 21886}
+ }
+}

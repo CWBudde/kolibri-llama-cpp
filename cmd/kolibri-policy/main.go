@@ -20,12 +20,22 @@
 // with a step's compute time taken from the resident model's measured speed (-decode-tps,
 // -prefill-tps). These are assumptions, not measurements.
 //
+// Every workload is split chronologically after one of its answers (-splits): the training prefix
+// is everything up to that answer's decoded tokens, the test suffix the rest. Each replay runs
+// straight through and is counted for both apart (locality.ReplaySegments), so the test suffix
+// starts warm from the prefix. LFU's half-life is replayed at every value of a grid and chosen
+// per size on training prefixes only: the workload's own, the other workloads' (leave one
+// workload out) and the other model's; the choice in hindsight on the test suffix is reported as
+// the leaky bound of tuning.
+//
 // For each model and workload it reads <dir>/<workload>.<model>.experts.npy and the token IDs
 // <dir>/<workload>.tokens.npy, and the answers' prompt lengths and generated tokens from
 // testdata/locality/<workload>.json. A conversation that ends with an answer ends the online
 // replay after that answer's decoded tokens: no request sends the rest. These checks are fatal:
 //
 //   - the token IDs hold every answer's generated tokens after its prompt;
+//   - the declared split trains on the first ⌊n/2⌋ of n answers and its test suffix starts at the
+//     declared token;
 //   - the layer and the shared LRU, replayed token by token in trace order, hit exactly as often as
 //     in <dir>/cache-<model>.json of cmd/kolibri-cache at every size;
 //   - at every size, the shared oracle loads no more expert bytes than any policy and the per-layer
@@ -44,6 +54,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,11 +99,17 @@ type CacheSize struct {
 	Hits            int `json:"hits"`
 }
 
+// Replayed is an online replay, whole and cut into its training prefix and test suffix.
+type Replayed struct {
+	Online locality.Result `json:"online"`
+	Split  Split           `json:"split"`
+}
+
 // Run is a policy's online replay at one size.
 type Run struct {
-	ExpertsPerLayer int             `json:"experts_per_layer"`
-	BudgetBytes     int64           `json:"budget_bytes"`
-	Online          locality.Result `json:"online"`
+	ExpertsPerLayer int   `json:"experts_per_layer"`
+	BudgetBytes     int64 `json:"budget_bytes"`
+	Replayed
 }
 
 // Runs are a policy's replays at every size. An oracle knows the future: an unattainable bound.
@@ -111,12 +128,15 @@ type TraceOrder struct {
 
 // Workload is one workload's replays.
 type Workload struct {
-	Tokens     int             `json:"tokens"`
-	Answers    int             `json:"answers"`
-	Ubatches   int             `json:"ubatches"`
-	NoCache    locality.Result `json:"no_cache"`
-	Policies   []Runs          `json:"policies"`
-	TraceOrder TraceOrder      `json:"trace_order"`
+	Tokens     int           `json:"tokens"`
+	Answers    int           `json:"answers"`
+	Ubatches   int           `json:"ubatches"`
+	Split      SplitWorkload `json:"split"`
+	NoCache    Replayed      `json:"no_cache"`
+	Policies   []Runs        `json:"policies"`
+	TraceOrder TraceOrder    `json:"trace_order"`
+	LFUGrid    Grid          `json:"lfu_grid"`
+	LFUTuning  []Tuning      `json:"lfu_tuning"`
 }
 
 // Assumptions are the declared, unmeasured inputs of the replays.
@@ -126,6 +146,8 @@ type Assumptions struct {
 	DecodeTokensPerSecond  float64            `json:"decode_tokens_per_second"`
 	PrefillTokensPerSecond float64            `json:"prefill_tokens_per_second"`
 	LFUHalfLife            int                `json:"lfu_half_life_tokens"`
+	LFUHalfLives           []int              `json:"lfu_tuning_half_lives"`
+	SplitRule              string             `json:"split_rule"`
 }
 
 // Output is <dir>/policy-<model>.json.
@@ -172,13 +194,31 @@ func baselines(sel locality.Selections, spans []locality.Span, m Model, halfLife
 	}
 }
 
-// replay runs no cache once and every baseline at every size online, in parallel.
-func replay(sel locality.Selections, spans []locality.Span, m Model, sizes []int, bases []baseline,
-	timing locality.Timing) (locality.Result, []Runs, error) {
-	noCache, err := locality.ReplayTimed(sel, spans, m.NExpert, m.bytes(), &locality.NoCache{}, timing)
+// replay runs no cache once and every baseline at every size online, cut before span cut into the
+// training prefix and the test suffix.
+func replay(sel locality.Selections, spans []locality.Span, cut int, m Model, sizes []int, bases []baseline,
+	timing locality.Timing) (Replayed, []Runs, error) {
+	noCache, err := replayed(sel, spans, cut, m, &locality.NoCache{}, timing)
 	if err != nil {
 		return noCache, nil, err
 	}
+	runs, err := replayAll(sel, spans, cut, m, sizes, bases, timing)
+	return noCache, runs, err
+}
+
+// replayed replays p online, whole and split before span cut.
+func replayed(sel locality.Selections, spans []locality.Span, cut int, m Model, p locality.Policy,
+	timing locality.Timing) (Replayed, error) {
+	segs, err := locality.ReplaySegments(sel, spans, []int{cut}, m.NExpert, m.bytes(), p, timing)
+	if err != nil {
+		return Replayed{}, err
+	}
+	return Replayed{locality.Merge(segs...), Split{segs[0], segs[1]}}, nil
+}
+
+// replayAll replays every baseline at every size, in parallel.
+func replayAll(sel locality.Selections, spans []locality.Span, cut int, m Model, sizes []int, bases []baseline,
+	timing locality.Timing) ([]Runs, error) {
 	out := make([]Runs, len(bases))
 	errs := make([]error, len(bases)*len(sizes))
 	for i, b := range bases {
@@ -198,7 +238,7 @@ func replay(sel locality.Selections, spans []locality.Span, m Model, sizes []int
 					errs[j] = err
 					continue
 				}
-				res, err := locality.ReplayTimed(sel, spans, m.NExpert, m.bytes(), p, timing)
+				res, err := replayed(sel, spans, cut, m, p, timing)
 				if o, ok := p.(*locality.Oracle); ok && err == nil {
 					err = o.Err()
 				}
@@ -214,11 +254,11 @@ func replay(sel locality.Selections, spans []locality.Span, m Model, sizes []int
 	wg.Wait()
 	for j, err := range errs {
 		if err != nil {
-			return noCache, nil, fmt.Errorf("%s at %d experts per layer: %w", bases[j/len(sizes)].name,
+			return nil, fmt.Errorf("%s at %d experts per layer: %w", bases[j/len(sizes)].name,
 				sizes[j%len(sizes)], err)
 		}
 	}
-	return noCache, out, nil
+	return out, nil
 }
 
 // traceOrder replays the layer and the shared LRU token by token at every size.
@@ -327,11 +367,11 @@ func at(sizes []int, c int) int {
 
 func summary(r result, sizes []int, detail int) string {
 	i := max(at(sizes, detail), 0)
-	parts := []string{"no cache " + perToken(r.w.NoCache.Decode)}
+	parts := []string{"no cache " + perToken(r.w.NoCache.Online.Decode)}
 	for _, p := range r.w.Policies {
 		parts = append(parts, label(p)+" "+perToken(p.Runs[i].Online.Decode))
 	}
-	p := r.w.NoCache
+	p := r.w.NoCache.Online
 	return fmt.Sprintf("%s %s: %d prefill and %d decode tokens; decode MB/token at %d experts per layer: %s", r.model,
 		r.workload, p.Prefill.Tokens, p.Decode.Tokens, sizes[i], strings.Join(parts, ", "))
 }
@@ -379,9 +419,26 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 		"prefill, %.1f ms per decoded token. Until its experts arrive, it stalls. None of the baselines "+
 		"prefetches, so all their loads stall.\n", strings.Join(bw, ", "), a.DecodeTokensPerSecond,
 		a.PrefillTokensPerSecond, 1e3/a.DecodeTokensPerSecond)
+	fmt.Fprintf(w, "\n**Held-out splits.** Each workload is split chronologically after one of its answers "+
+		"(`testdata/locality/splits.json`): %s A test suffix is replayed "+
+		"warm, after its prefix, with whatever state the prefix's causal replay left behind, and only its own steps "+
+		"are counted. A policy at test time knows only the steps before it; the answers fix only the order of the "+
+		"spans. The oracle † is still built from the whole trace.\n\n", a.SplitRule)
+	fmt.Fprintf(w, "| Workload | Answers | Training answers | First test token | Training decode tokens | "+
+		"Test decode tokens | Test prefill tokens |\n|---|--:|--:|--:|--:|--:|--:|\n")
+	listed := map[string]bool{}
+	for _, r := range results {
+		if listed[r.workload] {
+			continue
+		}
+		listed[r.workload] = true
+		sp := r.w.NoCache.Split
+		fmt.Fprintf(w, "| %s | %d | %d | %d | %d | %d | %d |\n", r.workload, r.w.Split.Answers, r.w.Split.TrainAnswers,
+			r.w.Split.FirstTestToken, sp.Train.Decode.Tokens, sp.Test.Decode.Tokens, sp.Test.Prefill.Tokens)
+	}
 	d := max(at(sizes, detail), 0)
 	for _, r := range results {
-		p := r.w.NoCache
+		p := r.w.NoCache.Online
 		fmt.Fprintf(w, "\n## %s, %s\n\n%d tokens, %d answers: %d prefill tokens in %d ubatches, %d decoded "+
 			"tokens, %d after the last answer not processed. No cache: %s MB per decoded token, %s per "+
 			"prefill token.\n\n", r.model, r.workload, r.w.Tokens, r.w.Answers, p.Prefill.Tokens, r.w.Ubatches,
@@ -406,27 +463,15 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 			}
 			fmt.Fprintln(w)
 		}
-		fmt.Fprintf(w, "At %d experts per layer (%s GB):\n\n| Policy | Phase | Hit rate | Set recall | MB/token | "+
-			"Evictions | Peak GB |", sizes[d], gb(r.w.Policies[0].Runs[d].BudgetBytes))
-		for _, l := range links {
-			fmt.Fprintf(w, " %s ms/token |", l.Name)
-		}
-		fmt.Fprintf(w, "\n|---|---|--:|--:|--:|--:|--:|%s\n", strings.Repeat("--:|", len(links)))
-		rows := []Runs{{Policy: "no cache", Runs: []Run{{Online: r.w.NoCache}}}}
+		fmt.Fprintf(w, "At %d experts per layer (%s GB):\n\n", sizes[d], gb(r.w.Policies[0].Runs[d].BudgetBytes))
+		rows := []Runs{{Policy: "no cache", Runs: []Run{{Replayed: r.w.NoCache}}}}
 		for _, pr := range r.w.Policies {
 			rows = append(rows, Runs{pr.Policy, pr.Oracle, []Run{pr.Runs[d]}})
 		}
-		for _, ph := range []locality.Phase{locality.Decode, locality.Prefill} {
-			for _, pr := range rows {
-				x := phase(pr.Runs[0].Online, ph)
-				fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %d | %s |", label(pr), ph, pct(rate(x)), pct(recall(x)),
-					perToken(x), x.Evictions, gb(pr.Runs[0].Online.PeakBytes))
-				for i := range links {
-					fmt.Fprintf(w, " %s |", msPerToken(x, i))
-				}
-				fmt.Fprintln(w)
-			}
-		}
+		detailTable(w, rows, links, func(x Replayed) locality.Result { return x.Online })
+		fmt.Fprintf(w, "\nHeld-out test suffix at %d experts per layer: answers %d to %d, from token %d on, warm from "+
+			"the training prefix:\n\n", sizes[d], r.w.Split.TrainAnswers+1, r.w.Split.Answers, r.w.Split.FirstTestToken)
+		detailTable(w, rows, links, func(x Replayed) locality.Result { return x.Split.Test })
 		fmt.Fprintf(w, "\nDecode recall of single layers at %d experts per layer (hits per access):\n\n| Layer |",
 			sizes[d])
 		for _, pr := range r.w.Policies {
@@ -440,6 +485,116 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 				fmt.Fprintf(w, " %s |", pct(float64(x.Hits)/float64(max(x.Accesses, 1))))
 			}
 			fmt.Fprintln(w)
+		}
+	}
+	writeTuning(w, a, sizes, d, results)
+}
+
+// detailTable is one row per policy and phase of the result pick selects, at one size.
+func detailTable(w io.Writer, rows []Runs, links []locality.Link, pick func(Replayed) locality.Result) {
+	fmt.Fprintf(w, "| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB |")
+	for _, l := range links {
+		fmt.Fprintf(w, " %s ms/token |", l.Name)
+	}
+	fmt.Fprintf(w, "\n|---|---|--:|--:|--:|--:|--:|%s\n", strings.Repeat("--:|", len(links)))
+	for _, ph := range []locality.Phase{locality.Decode, locality.Prefill} {
+		for _, pr := range rows {
+			res := pick(pr.Runs[0].Replayed)
+			x := phase(res, ph)
+			fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %d | %s |", label(pr), ph, pct(rate(x)), pct(recall(x)),
+				perToken(x), x.Evictions, gb(res.PeakBytes))
+			for i := range links {
+				fmt.Fprintf(w, " %s |", msPerToken(x, i))
+			}
+			fmt.Fprintln(w)
+		}
+	}
+}
+
+// mbPer is bytes per token in MB.
+func mbPer(b int64, tokens int) string {
+	return fmt.Sprintf("%.0f", float64(b)/1e6/float64(max(tokens, 1)))
+}
+
+// choiceCell is a tuned half-life and the test suffix's decode MB/token with it.
+func choiceCell(c *Choice, tokens int) string {
+	if c == nil {
+		return "–"
+	}
+	return fmt.Sprintf("%d: %s", c.HalfLife, mbPer(c.TestBytes, tokens))
+}
+
+// writeTuning reports LFU's half-life tuned on training prefixes, scored on the test suffixes.
+func writeTuning(w io.Writer, a Assumptions, sizes []int, d int, results []result) {
+	var hs []string
+	for _, h := range a.LFUHalfLives {
+		hs = append(hs, strconv.Itoa(h))
+	}
+	fmt.Fprintf(w, "\n## LFU half-life, tuned on training prefixes\n\n")
+	fmt.Fprintf(w, "LFU's half-life is its only parameter. At every budget it is chosen from %s tokens as the one "+
+		"whose decode misses load the fewest bytes in a training prefix, the first of equal ones, and scored on the "+
+		"test suffix. It is chosen four ways:\n\n", strings.Join(hs, ", "))
+	fmt.Fprintf(w, "- **own prefix:** the workload's own training prefix, chronologically before its test suffix;\n")
+	fmt.Fprintf(w, "- **leave one workload out:** the other workloads' training prefixes, of the same model;\n")
+	fmt.Fprintf(w, "- **other model:** the same workload's training prefix in the other model's trace. The two "+
+		"quantizations route the same tokens differently ([expert-locality.md](expert-locality.md) gives the "+
+		"share of the same expert sets), and their traces are never pooled;\n")
+	fmt.Fprintf(w, "- **hindsight †:** the test suffix itself. **It is tuned on the test data, the bound of tuning "+
+		"and not a result.**\n\n")
+	fmt.Fprintf(w, "Cells are the half-life and the test suffix's decode MB/token with it; untuned is the declared "+
+		"%d.\n\n", a.LFUHalfLife)
+	header := "| Untuned | Own prefix | Leave one workload out | Other model | Hindsight † |"
+	fmt.Fprintf(w, "At %d experts per layer:\n\n| Model | Workload | %s\n|---|---|--:|--:|--:|--:|--:|\n", sizes[d],
+		strings.TrimPrefix(header, "| "))
+	for _, r := range results {
+		t, n := r.w.LFUTuning[d], r.w.NoCache.Split.Test.Decode.Tokens
+		fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %s | %s |\n", r.model, r.workload, choiceCell(&t.Default, n),
+			choiceCell(&t.Own, n), choiceCell(t.LOWO, n), choiceCell(t.OtherModel, n), choiceCell(&t.Hindsight, n))
+	}
+	var models []string
+	for _, r := range results {
+		if !slices.Contains(models, r.model) {
+			models = append(models, r.model)
+		}
+	}
+	for _, m := range models {
+		fmt.Fprintf(w, "\n%s, all workloads' test suffixes together, decode MB/token:\n\n| Experts per layer %s\n"+
+			"|--:|--:|--:|--:|--:|--:|\n", m, header)
+		for s, c := range sizes {
+			var tokens int
+			var sum [5]int64
+			lowo, other := true, true
+			for _, r := range results {
+				if r.model != m {
+					continue
+				}
+				t := r.w.LFUTuning[s]
+				tokens += r.w.NoCache.Split.Test.Decode.Tokens
+				sum[0] += t.Default.TestBytes
+				sum[1] += t.Own.TestBytes
+				if t.LOWO != nil {
+					sum[2] += t.LOWO.TestBytes
+				} else {
+					lowo = false
+				}
+				if t.OtherModel != nil {
+					sum[3] += t.OtherModel.TestBytes
+				} else {
+					other = false
+				}
+				sum[4] += t.Hindsight.TestBytes
+			}
+			cells := make([]string, 5)
+			for i, b := range sum {
+				cells[i] = mbPer(b, tokens)
+			}
+			if !lowo {
+				cells[2] = "–"
+			}
+			if !other {
+				cells[3] = "–"
+			}
+			fmt.Fprintf(w, "| %d | %s |\n", c, strings.Join(cells, " | "))
 		}
 	}
 }
@@ -503,6 +658,7 @@ func main() {
 	decodeTPS := flag.Float64("decode-tps", 63.7, "measured resident decode speed, tokens/s (tg128 on Metal)")
 	prefillTPS := flag.Float64("prefill-tps", 1347, "measured resident prefill speed, tokens/s (pp512 on Metal)")
 	halfLife := flag.Int("lfu-halflife", 512, "LFU: halve all counts every this many tokens")
+	splitsPath := flag.String("splits", "testdata/locality/splits.json", "the workloads' train/test splits")
 	detail := flag.Int("detail", 128, "the size the detail tables show")
 	layersFlag := flag.String("layers", "0,1,2,10,25,49", "the layers whose recall the report shows")
 	md := flag.String("md", "", "write the Markdown report here")
@@ -521,15 +677,20 @@ func main() {
 		log.Fatal("-decode-tps and -prefill-tps must be finite and positive, -lfu-halflife positive, -detail one " +
 			"of -sizes")
 	}
+	var splits SplitManifest
+	readJSON(*splitsPath, &splits)
+	hs := halfLives(*halfLife)
 	a := Assumptions{Ubatch: *ubatch, LinkGBPerSecond: map[string]float64{}, DecodeTokensPerSecond: *decodeTPS,
-		PrefillTokensPerSecond: *prefillTPS, LFUHalfLife: *halfLife}
+		PrefillTokensPerSecond: *prefillTPS, LFUHalfLife: *halfLife, LFUHalfLives: hs, SplitRule: splits.Rule}
 	for _, l := range links {
 		a.LinkGBPerSecond[l.Name] = l.BytesPerSecond / 1e9
 	}
 	var known map[string]Model
 	readJSON(*bytesPath, &known)
 	var results []result
-	for name := range strings.SplitSeq(*models, ",") {
+	grids := map[string]map[string]Grid{}
+	names := strings.Split(*models, ",")
+	for _, name := range names {
 		m, ok := known[name]
 		if !ok {
 			log.Fatalf("%s: no expert sizes in %s (run tools/locality/expert_bytes.py --record)", name, *bytesPath)
@@ -541,7 +702,7 @@ func main() {
 		}
 		var cache map[string]CacheSizes
 		readJSON(filepath.Join(*dir, "cache-"+name+".json"), &cache)
-		out := Output{Assumptions: a, Workloads: map[string]Workload{}}
+		grids[short(name)] = map[string]Grid{}
 		for wl := range strings.SplitSeq(*workloads, ",") {
 			sel, err := locality.ReadNPYFile(filepath.Join(*dir, fmt.Sprintf("%s.%s.experts.npy", wl, name)))
 			if err != nil {
@@ -580,6 +741,16 @@ func main() {
 			if err != nil {
 				log.Fatalf("%s: %v", wl, err)
 			}
+			d, ok := splits.Workloads[wl]
+			if !ok {
+				log.Fatalf("%s: no split in %s", wl, *splitsPath)
+			}
+			cut, err := split(d, spans, answers)
+			if err != nil {
+				log.Fatalf("FAIL %s: the split disagrees with %s: %v", wl, *splitsPath, err)
+			}
+			fmt.Printf("PASS %s: split after %d of %d answers at token %d, as in %s\n", wl, d.TrainAnswers, d.Answers,
+				d.FirstTestToken, filepath.Base(*splitsPath))
 			tr, err := traceOrder(sel, m, sizes)
 			if err != nil {
 				log.Fatalf("%s %s: %v", name, wl, err)
@@ -598,25 +769,44 @@ func main() {
 				wl, short(name), len(sizes))
 			timing := locality.Timing{Links: links, DecodeStep: 1 / (*decodeTPS * float64(sel.Layers)),
 				PrefillToken: 1 / (*prefillTPS * float64(sel.Layers))}
-			noCache, runs, err := replay(sel, spans, m, sizes, baselines(sel, spans, m, *halfLife), timing)
+			noCache, runs, err := replay(sel, spans, cut, m, sizes, baselines(sel, spans, m, *halfLife), timing)
 			if err != nil {
 				log.Fatalf("%s %s: %v", name, wl, err)
 			}
-			if err := checkOracles(noCache, runs); err != nil {
+			grid, err := lfuGrid(sel, spans, cut, m, sizes, hs)
+			if err != nil {
+				log.Fatalf("%s %s: %v", name, wl, err)
+			}
+			grids[short(name)][wl] = grid
+			if err := checkOracles(noCache.Online, runs); err != nil {
 				log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
 			}
 			fmt.Printf("PASS %s %s: the shared oracle loads no more than any policy, the per-layer one no more "+
 				"than the layer LRU, at %d sizes\n", short(name), wl, len(sizes))
-			w := Workload{Tokens: sel.Tokens, Answers: len(answers), NoCache: noCache, Policies: runs, TraceOrder: tr}
+			w := Workload{Tokens: sel.Tokens, Answers: len(answers), Split: d, NoCache: noCache, Policies: runs,
+				TraceOrder: tr, LFUGrid: grid}
 			for _, s := range spans {
 				if s.Phase == locality.Prefill {
 					w.Ubatches++
 				}
 			}
-			out.Workloads[wl] = w
 			r := result{short(name), wl, w}
 			results = append(results, r)
 			fmt.Println(summary(r, sizes, *detail))
+		}
+	}
+	for i := range results {
+		r := &results[i]
+		for s, c := range sizes {
+			r.w.LFUTuning = append(r.w.LFUTuning, tune(grids, r.model, r.workload, s, c, *halfLife))
+		}
+	}
+	for _, name := range names {
+		out := Output{Assumptions: a, Workloads: map[string]Workload{}}
+		for _, r := range results {
+			if r.model == short(name) {
+				out.Workloads[r.workload] = r.w
+			}
 		}
 		b, err := json.MarshalIndent(out, "", " ")
 		if err != nil {
