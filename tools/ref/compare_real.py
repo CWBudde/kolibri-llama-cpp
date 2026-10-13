@@ -157,7 +157,7 @@ def node_lines(got: dict, ref: dict, W: Weights) -> list[tuple[float, str]]:
         lines.append((v, f"token embeddings (embd): NMSE {v:.2e}"))
     first = {"sliding": next(il for il in range(W.n_layer) if W.is_swa[il]),
              "full": next(il for il in range(W.n_layer) if not W.is_swa[il])}
-    n = len(got[EMBD])
+    n = len(got["ffn_moe_topk-0"])
     before = np.ones(n, dtype=bool)  # the same experts in every earlier layer
     top = {"ffn_moe_out": (float("nan"), -1), "ffn_shexp": (float("nan"), -1)}
     every = all(f"{node}-{il}" in ref for node in top for il in range(W.n_layer))

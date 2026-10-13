@@ -27,12 +27,18 @@ checkpoint in bfloat16 the lines are INFO: its tolerances (PLAN Phase 6) are
 still to be set from this comparison.
 
 The torch port runs in float64 against a float32 capture and in its bfloat16
-emulation against a bfloat16 one. libllama runs with an F32 KV cache and
+emulation against a bfloat16 one. On the full checkpoint that forward takes
+hours; --port-artifacts takes its float32 side from e2e.py's stored artifacts
+instead, for the nodes they hold (the logits and the router in every case,
+e2e.py's compact node set in wiki-c1 and de-long), as for the float32 capture
+of the full model from vllm_chain.py. libllama runs with an F32 KV cache and
 without flash attention under --gate, as compare_real.py --tiny, and with its
 defaults otherwise, as e2e.py.
 
     compare_vllm.py --llama-cpp third_party/llama.cpp --capture DIR --model DIR --gate --libllama
     compare_vllm.py --llama-cpp third_party/llama.cpp --capture DIR --gguf ~/models/Kolibri-1-BF16.gguf --libllama
+    compare_vllm.py --llama-cpp third_party/llama.cpp --capture CHAIN --gguf ~/models/Kolibri-1-BF16.gguf \\
+        --port-artifacts ~/models/eval/e2e --libllama
 """
 
 import argparse
@@ -66,6 +72,21 @@ def load(path: Path) -> dict:
     return {"nodes": d, "tokens": a["tokens"].tolist(), "logits": a["logits"], "is_swa": a["is_swa"]}
 
 
+def artifacts(path: Path, tokens: list[int]) -> tuple[dict, object]:
+    """e2e.py's float32 reference arrays of a case as a torch port dump, and its logits."""
+    import numpy as np
+
+    with np.load(path) as z:
+        a = {key: z[key] for key in z.files}
+    if a["tokens"].tolist() != tokens:
+        raise SystemExit(f"FAIL {path}: other tokens than the capture")
+    d = {key.removeprefix("node."): v for key, v in a.items() if key.startswith("node.")}
+    for il in range(len(a["router_logits"])):
+        d[f"ffn_moe_logits-{il}"] = a["router_logits"][il]
+        d[f"ffn_moe_topk-{il}"] = a["router_topk"][il]
+    return d, a["ref_float32"]
+
+
 def layer_table(got: dict, ref: dict, n_layer: int, mask_rows: bool) -> list[tuple]:
     """compare_real.layer_table for a ref that may lack nodes (--attn-layers): NaN where it does."""
     import numpy as np
@@ -75,7 +96,7 @@ def layer_table(got: dict, ref: dict, n_layer: int, mask_rows: bool) -> list[tup
         same = same_experts(got[f"ffn_moe_topk-{il}"], ref[f"ffn_moe_topk-{il}"])
         ok = same if ok is None else ok & same
         keep = ok if mask_rows else np.ones_like(ok)
-        vals = [nmse(ref[key][keep], got[key][keep]) if key in ref and keep.any() else float("nan")
+        vals = [nmse(ref[key][keep], got[key][keep]) if key in ref and key in got and keep.any() else float("nan")
                 for key in (f"{node}-{il}" for node in NODES)]
         rows.append((il, *vals, float(same.mean())))
     return rows
@@ -90,7 +111,7 @@ def compare(label: str, got: dict, got_logits, cap: dict, entry: dict, W: Weight
     print(f"INFO {label}: layer, NMSE " + ", ".join(NODES) + ", same experts")
     for il, *vals, same in rows:
         print(f"INFO   {il:2d}  " + "  ".join(f"{v:.2e}" for v in vals) + f"  {same:6.1%}")
-    worst = max(v for row in rows for v in row[1:-1] if not np.isnan(v))
+    worst = max((v for row in rows for v in row[1:-1] if not np.isnan(v)), default=float("nan"))
     same = float(np.mean([row[-1] for row in rows]))
     if entry["kind"] == "chunk":
         s = chunk_stats(cap["logits"], got_logits, tokens, len(tokens) // 2)
@@ -110,13 +131,13 @@ def compare(label: str, got: dict, got_logits, cap: dict, entry: dict, W: Weight
         report(same >= MIN_SAME_EXPERTS_TINY and worst <= bound and v <= bound,
                f"{label}: {text}; same experts for {same:.1%} of (token, layer) pairs, worst layer node NMSE "
                f"{worst:.2e} and logits NMSE {v:.2e} ({int(ok.sum())} of {len(ok)} tokens) where they agree")
-    # node_lines reads the attention nodes of the first sliding and the first full layer
+    # node_lines reads the attention nodes of the first sliding and the first full layer, from both sides
     first = {list(W.is_swa).index(True), list(W.is_swa).index(False)}
-    missing = sorted(il for il in first if f"Qcur_normed-{il}" not in ref)
+    missing = sorted(il for il in first if f"Qcur_normed-{il}" not in ref or f"Qcur_normed-{il}" not in got)
     if missing:
-        print(f"INFO {label}: node lines skipped, the capture lacks the attention nodes of layer(s) {missing}")
+        print(f"INFO {label}: node lines skipped, the attention nodes of layer(s) {missing} are not on both sides")
     else:
-        for v, line in node_lines(got, ref, W):
+        for v, line in node_lines(got, {key: v for key, v in ref.items() if key in got}, W):
             report(v <= bound, f"{label}, {line}")
     p = router(got, ref, W)
     v = masked_router_nmse(p)
@@ -146,6 +167,8 @@ def main() -> None:
                     help="gate a float32 capture with compare_real.py --tiny's bounds")
     ap.add_argument("--max-nmse", type=float, default=MAX_NMSE_TINY,
                     help=f"--gate: the NMSE bound (default {MAX_NMSE_TINY:g}, compare_real.py --tiny's)")
+    ap.add_argument("--port-artifacts", type=Path, help="e2e.py's artifact directory: the torch port's float32 "
+                                                       "arrays instead of its forward")
     ap.add_argument("--threads", type=int, default=10)
     args = ap.parse_args()
 
@@ -162,8 +185,10 @@ def main() -> None:
     all_experts = k == n_expert
     dtype = {"float32": "float64", "bfloat16": "bfloat16"}[meta["dtype"]]
     v = meta["versions"]
+    port_from = f"float32 artifacts in {args.port_artifacts}" if args.port_artifacts else dtype
+    chain = f", stitched from {len(meta['chain'])} slices" if meta.get("chain") else ""
     print(f"INFO capture: vllm {v['vllm']}, aleph-alpha-inference {v['aleph-alpha-inference']}, torch {v['torch']}, "
-          f"{meta['dtype']}, {k} of {n_expert} experts per token; torch port in {dtype}; {gguf.name}")
+          f"{meta['dtype']}, {k} of {n_expert} experts per token{chain}; torch port in {port_from}; {gguf.name}")
 
     errs = []
 
@@ -181,12 +206,16 @@ def main() -> None:
         tokens = cap["tokens"]
         if list(map(bool, cap["is_swa"])) != list(W.is_swa):
             raise SystemExit(f"FAIL {name}: the capture's sliding-window pattern differs from {gguf.name}")
+        diff = entry["logprobs_max_abs_diff"]
         print(f"INFO {name}: {len(tokens)} tokens, vLLM decode logprobs vs its prefill logits max abs diff "
-              f"{entry['logprobs_max_abs_diff']:.2e}")
-        port = {}
-        port_logits = forward(W, tokens, dtype, port).numpy()
-        compare(f"{name}, torch port vs vLLM", port, port_logits, cap, entry, W, all_experts, report,
-                args.max_nmse)
+              + (f"{diff:.2e}" if diff is not None else "n/a (no decode run)"))
+        if args.port_artifacts:
+            port, port_logits = artifacts(args.port_artifacts / f"{name}.npz", tokens)
+        else:
+            port = {}
+            port_logits = forward(W, tokens, dtype, port).numpy()
+        compare(f"{name}, torch port{' float32' if args.port_artifacts else ''} vs vLLM", port, port_logits, cap,
+                entry, W, all_experts, report, args.max_nmse)
         if runner:
             lib = runner.lib
             ctx = dict(flash_attn_type=lib.LLAMA_FLASH_ATTN_TYPE_DISABLED, type_k=lib.GGML_TYPE_F32,

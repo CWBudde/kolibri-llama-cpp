@@ -239,6 +239,108 @@ fault confined to the head. It fails, with exit 1: "FAIL de-raw, torch port vs
 vLLM: logits NMSE 9.80e-05, … worst layer node NMSE 4.66e-12 and logits NMSE
 9.80e-05 (21 of 21 tokens) where they agree".
 
+## Full model as chained slices
+
+A slice fed the previous slice's output computes what the full model computes
+in its layers. vLLM's decoder layer hands on the hidden state and the residual
+separately, but the next layer uses only their sum, in its fused add and
+RMSNorm. The capture records that sum as `l_out`. `vllm_capture.py --embeds`
+passes it to the next slice as vLLM's `prompt_embeds`. There it becomes the
+first layer's residual and the input of its norm, just as in the full model.
+In float32 nothing is rounded at the handover. `tools/ref/vllm_chain.py run`
+does this for the whole model:
+1. Slice layers 0–1, 2–3, … 48–49 from the BF16 GGUF.
+2. Capture each slice in vLLM's environment, fed the previous one's `l_out`,
+   then delete the slice.
+3. Stitch the 25 captures into one capture of all 50 layers, renumbered to the
+   global layers.
+
+`compare_vllm.py` reads the result as a capture of the full checkpoint.
+
+```sh
+.venv/bin/python tools/ref/vllm_chain.py run --gguf ~/models/Kolibri-1-BF16.gguf \
+    --model-dir ~/models/Kolibri-1-BF16 --vllm-python vllm-venv/bin/python \
+    --work /tmp/chain --out /tmp/chain/capture      # 13 min, 3.5 GB
+.venv/bin/python tools/ref/compare_vllm.py --llama-cpp third_party/llama.cpp --capture /tmp/chain/capture \
+    --gguf ~/models/Kolibri-1-BF16.gguf --port-artifacts ~/models/eval/e2e --libllama   # 13 min
+```
+
+**Inputs:**
+- **The same tokens in every slice:** `vllm_capture.py --sequence` runs `e2e.py`'s
+  sequences. That is each prompt plus the torch port's float32 greedy
+  continuation, or the chunk, with no greedy run of its own.
+- **vLLM's greedy continuation:** `vllm_chain.py` reads it off vLLM's argmax
+  along that sequence. Where the argmax is the next token at every position,
+  vLLM's greedy decoding takes exactly those tokens, and the stitched capture
+  records them as vLLM's greedy tokens. This assumes decode steps give the same
+  argmax as the prefill; on the tiny checkpoint, decode logprobs and prefill
+  logits differ by 3.2e-06.
+- **Attention nodes:** kept for layers 0 and 4, as in `e2e.py`'s compact set.
+- **KV cache size:** `--kv-cache-gib` (1 GiB) fixes it. Otherwise the CPU
+  backend subtracts the process's resident memory from its share of RAM, and
+  that fails once a float32 slice is loaded.
+
+**The torch port's side:** `--port-artifacts` takes it from `e2e.py`'s stored
+float32 artifacts. These are the logits and the router of every case, plus the
+compact node set of wiki-c1 and de-long. This replaces a float64 forward over
+the full checkpoint.
+
+**Chaining check:** one slice of layers 0–2 against the chain (0–1, then 2),
+on all six cases. It is bit-identical:
+
+```text
+PASS de-long: 20 arrays in both, 20 bit-identical, worst NMSE 0.00e+00
+PASS diff …/full3 vs …/chain3: every common array within NMSE 0
+```
+
+**Controls:**
+- **M30:** the handed-over `l_out-1` scaled by 1+1e-6. Stitched with its own
+  part 0–1, the diff fails on every case with exit 1: "FAIL de-raw: 20 arrays in
+  both, 14 bit-identical, worst NMSE 1.79e-12 (node.ffn_moe_out-2); 6 over the
+  bound: logits NMSE 3.81e-13; …". Stitched with the real part 0–1, the stitch
+  fails on the sha256: "FAIL stitch de-raw: m30-part-2-2 was fed {'node':
+  'l_out-1', 'sha256': 'c4e07da1…'}, not the l_out-1 of part-0-1", exit 1.
+- **M31:** layer 2 fed `l_out-0` instead of `l_out-1`. The stitch fails: "…
+  was fed {'node': 'l_out-0', …}, not the l_out-1 of part-0-1", exit 1.
+
+**Result, full model:**
+- **vLLM's greedy continuation:** every prompt case's argmax follows the
+  sequence at 16 of 16 positions, so vLLM's greedy continuation is the torch
+  port's. Raw German repeats:
+
+  ```text
+  INFO de-raw: vLLM's argmax along the sequence is its next token at 16 of 16 positions, so vLLM's greedy continuation is the sequence's: ' Deutschland Deutschland Deutschland Deutschland Deutschland …'
+  INFO en-raw: … ' Berlin.\n\nWe need to answer the question: "What is the capital of Germany'
+  INFO de-chat: … 'Ein Mixture-of-Experts-Modell ist ein neuronales Netz, das aus mehreren spezialisierten'
+  ```
+- **Torch port (float32) against vLLM:** the four prompt cases agree, with
+  logits NMSE 6e-13 to 7e-12 and the same experts in every (token, layer) pair.
+  Over the long cases, a few experts flip at near-ties: 99.85% of Top-6 sets
+  agree on wiki-c1 and 98.24% on de-long. Both sides are float32 with a
+  different summation order.
+
+  ```text
+  INFO wiki-c1, torch port float32 vs vLLM: PPL 15.1244 vs 15.1267, logits NMSE 6.13e-06, KLD 0.000055, same top token 100.0%; same experts for 99.9% of (token, layer) pairs, …
+  INFO de-long, torch port float32 vs vLLM: PPL 26.5145 vs 26.2731, logits NMSE 4.60e-04, KLD 0.006585, same top token 97.7%; same experts for 98.2% of (token, layer) pairs, …
+  INFO de-long, torch port float32 vs vLLM, layer 0 (sliding attention), 1024 of 1024 tokens on the same experts before it: NMSE Q after QK norm 0.00e+00, K after QK norm 0.00e+00, attention output attn_out 6.38e-14, attn_post_norm 5.89e-14
+  ```
+- **libllama against vLLM:** almost the numbers libllama shows against the
+  torch port (PLAN Phase 6). The difference between the two references is far
+  below libllama's distance to either:
+
+  ```text
+  INFO wiki-c1, libllama vs vLLM: PPL 15.1787 vs 15.1267, logits NMSE 2.02e-03, KLD 0.033433, same top token 96.5%; same experts for 84.1% of (token, layer) pairs, …
+  INFO router wiki-c1, libllama vs vLLM: Top-1 same 97.09%, Top-6 set same 84.07%, mean overlap 5.817/6 over 25600 (token, layer) pairs; …
+  INFO de-raw, libllama vs vLLM: logits NMSE 9.56e-03, KLD 0.112537, same top token 100.0%; same experts for 56.5% of (token, layer) pairs, …
+  INFO de-raw, libllama vs vLLM: argmax follows vLLM's greedy tokens at 16 of 16 positions
+  ```
+
+All of these lines are INFO, as on the full checkpoint below: the tolerances
+are still open. The chain runs in float32, not in vLLM's BF16. A BF16 chain
+would also add a BF16 rounding at every handover, because the next layer
+normalizes the unrounded float32 sum. So it cannot stand in for the BF16 run
+the tolerances need.
+
 ## On the real checkpoint
 
 ```sh
@@ -271,11 +373,13 @@ path. Tensor parallelism would split heads and experts across workers and is
 not offered.
 
 **What is open in PLAN:**
-- **Done:** only the capture tooling, verified on the tiny checkpoint.
+- **Done:**
+  - the capture tooling, verified on the tiny checkpoint;
+  - the full model in float32 as chained slices (above), which closes the
+    Phase 6 "vLLM" leaves it covers.
 - **Still open, waiting for the real run:**
   - the vLLM version of the reference run (128/132);
   - the run itself (134) and its corpus (136);
-  - the Phase 6 "vLLM" leaves;
-  - the tolerances (285).
+  - the BF16 tolerances.
 - **Once the run exists:** its output and the comparison above are the
   evidence those items need.
