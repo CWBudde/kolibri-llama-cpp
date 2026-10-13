@@ -181,6 +181,9 @@ def main() -> None:
         raise SystemExit("--metal needs --libllama")
 
     meta = json.loads((args.capture / "capture.json").read_text())
+    unknown = sorted(set(args.case or []) - set(meta["cases"]))
+    if unknown:
+        raise SystemExit(f"unknown cases: {', '.join(unknown)} (the capture holds {', '.join(meta['cases'])})")
     gguf = args.gguf
     if args.model:
         from tiny import convert
