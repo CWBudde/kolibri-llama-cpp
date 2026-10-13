@@ -6,15 +6,31 @@
 //
 //	kolibri-policy -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx,Kolibri-1-Q8_0 -md docs/expert-policy.md
 //
-// The only policy so far is the evaluator's reference, a per-layer LRU cache of C experts in every
-// layer (cmd/kolibri-cache's per-layer policy), at every size C.
+// The baselines (policies.go), each at every size C, a budget of C experts of every layer:
+//
+//   - no cache, once;
+//   - layer LRU: an LRU cache of C experts in every layer, cmd/kolibri-cache's per-layer policy;
+//   - shared LRU: one LRU cache of the whole budget for all layers, cmd/kolibri-cache's shared one;
+//   - LFU: shared, the least used experts evicted, counts halved every -lfu-halflife tokens;
+//   - ARC: shared, the Adaptive Replacement Cache;
+//   - oracle, per layer and shared: Belady's MIN, which knows the future. It is no baseline but
+//     the unattainable bound, marked † wherever it is reported.
+//
+// Every replay also estimates its time when all loads go over one declared link (-bw, transfer.go),
+// with a step's compute time taken from the resident model's measured speed (-decode-tps,
+// -prefill-tps). These are assumptions, not measurements.
 //
 // For each model and workload it reads <dir>/<workload>.<model>.experts.npy and the token IDs
 // <dir>/<workload>.tokens.npy, and the answers' prompt lengths and generated tokens from
 // testdata/locality/<workload>.json. A conversation that ends with an answer ends the online
-// replay after that answer's decoded tokens: no request sends the rest. Two checks are fatal: the token IDs must hold every answer's
-// generated tokens after its prompt, and the per-layer LRU, replayed token by token in trace order,
-// must hit exactly as often as in <dir>/cache-<model>.json of cmd/kolibri-cache at every size.
+// replay after that answer's decoded tokens: no request sends the rest. These checks are fatal:
+//
+//   - the token IDs hold every answer's generated tokens after its prompt;
+//   - the layer and the shared LRU, replayed token by token in trace order, hit exactly as often as
+//     in <dir>/cache-<model>.json of cmd/kolibri-cache at every size;
+//   - at every size, the shared oracle loads no more expert bytes than any policy and the per-layer
+//     oracle none more than the layer LRU.
+//
 // It writes <dir>/policy-<model>.json and, given -md, a Markdown report.
 package main
 
@@ -24,10 +40,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"kolibri-llm/internal/locality"
 )
@@ -48,68 +67,220 @@ func (m Model) bytes() []int64 {
 	return out
 }
 
-// CacheSizes are the fields of a workload in cmd/kolibri-cache's output the check needs.
-type CacheSizes struct {
-	PerLayer []struct {
-		ExpertsPerLayer int `json:"experts_per_layer"`
-		Hits            int `json:"hits"`
-	} `json:"per_layer"`
-}
-
-// Size is the per-layer LRU at one size.
-type Size struct {
-	ExpertsPerLayer int             `json:"experts_per_layer"`
-	CacheBytes      int64           `json:"cache_bytes"`
-	Online          locality.Result `json:"online"`
-	TraceOrderHits  int             `json:"trace_order_hits"`
-	Accesses        int             `json:"trace_order_accesses"`
-}
-
-// Workload is one workload's replay.
-type Workload struct {
-	Tokens   int    `json:"tokens"`
-	Answers  int    `json:"answers"`
-	Ubatch   int    `json:"ubatch"`
-	Ubatches int    `json:"ubatches"`
-	LRU      []Size `json:"layer_lru"`
-}
-
-// replay runs the per-layer LRU at every size, online and in trace order.
-func replay(sel locality.Selections, spans []locality.Span, m Model, sizes []int) ([]Size, error) {
+// budget is the bytes of c experts of every layer.
+func (m Model) budget(c int) int64 {
 	var all int64
 	for _, b := range m.bytes() {
 		all += b
 	}
-	out := make([]Size, len(sizes))
-	for i, c := range sizes {
-		online, err := locality.Replay(sel, spans, m.NExpert, m.bytes(), locality.NewLayerLRU(sel.Layers, m.NExpert, c))
-		if err != nil {
-			return nil, err
-		}
-		trace, err := locality.Replay(sel, locality.TraceOrder(sel.Tokens), m.NExpert, m.bytes(),
-			locality.NewLayerLRU(sel.Layers, m.NExpert, c))
-		if err != nil {
-			return nil, err
-		}
-		out[i] = Size{c, int64(c) * all, online, trace.Decode.Hits, trace.Decode.Accesses}
-	}
-	return out, nil
+	return int64(c) * all
 }
 
-// check compares the trace-order hits with cmd/kolibri-cache's per-layer hits at the same sizes.
-func check(lru []Size, cache CacheSizes) error {
-	recorded := map[int]int{}
-	for _, s := range cache.PerLayer {
-		recorded[s.ExpertsPerLayer] = s.Hits
+// CacheSizes are the fields of a workload in cmd/kolibri-cache's output the check needs.
+type CacheSizes struct {
+	PerLayer []CacheSize `json:"per_layer"`
+	Shared   []CacheSize `json:"shared"`
+}
+
+// CacheSize is one size of a cmd/kolibri-cache policy.
+type CacheSize struct {
+	ExpertsPerLayer int `json:"experts_per_layer"`
+	Hits            int `json:"hits"`
+}
+
+// Run is a policy's online replay at one size.
+type Run struct {
+	ExpertsPerLayer int             `json:"experts_per_layer"`
+	BudgetBytes     int64           `json:"budget_bytes"`
+	Online          locality.Result `json:"online"`
+}
+
+// Runs are a policy's replays at every size. An oracle knows the future: an unattainable bound.
+type Runs struct {
+	Policy string `json:"policy"`
+	Oracle bool   `json:"oracle,omitempty"`
+	Runs   []Run  `json:"runs"`
+}
+
+// TraceOrder are the LRU caches' hits replayed token by token, as cmd/kolibri-cache does.
+type TraceOrder struct {
+	Accesses  int   `json:"accesses"`
+	LayerLRU  []int `json:"layer_lru_hits"`
+	SharedLRU []int `json:"shared_lru_hits"`
+}
+
+// Workload is one workload's replays.
+type Workload struct {
+	Tokens     int             `json:"tokens"`
+	Answers    int             `json:"answers"`
+	Ubatches   int             `json:"ubatches"`
+	NoCache    locality.Result `json:"no_cache"`
+	Policies   []Runs          `json:"policies"`
+	TraceOrder TraceOrder      `json:"trace_order"`
+}
+
+// Assumptions are the declared, unmeasured inputs of the replays.
+type Assumptions struct {
+	Ubatch                 int                `json:"ubatch"`
+	LinkGBPerSecond        map[string]float64 `json:"link_gb_per_second"`
+	DecodeTokensPerSecond  float64            `json:"decode_tokens_per_second"`
+	PrefillTokensPerSecond float64            `json:"prefill_tokens_per_second"`
+	LFUHalfLife            int                `json:"lfu_half_life_tokens"`
+}
+
+// Output is <dir>/policy-<model>.json.
+type Output struct {
+	Assumptions Assumptions         `json:"assumptions"`
+	Workloads   map[string]Workload `json:"workloads"`
+}
+
+// baseline is a policy to replay at every size c.
+type baseline struct {
+	name   string
+	oracle bool
+	build  func(c int) (locality.Policy, error)
+}
+
+const (
+	layerLRU = iota
+	sharedLRU
+	lfu
+	arc
+	layerOracle
+	sharedOracle
+)
+
+func baselines(sel locality.Selections, spans []locality.Span, m Model, halfLife int) []baseline {
+	b := m.bytes()
+	return []baseline{
+		layerLRU: {"layer LRU", false, func(c int) (locality.Policy, error) {
+			return locality.NewLayerLRU(sel.Layers, m.NExpert, c), nil
+		}},
+		sharedLRU: {"shared LRU", false, func(c int) (locality.Policy, error) {
+			return locality.NewSharedLRU(m.NExpert, b, m.budget(c)), nil
+		}},
+		lfu: {"LFU", false, func(c int) (locality.Policy, error) {
+			return locality.NewLFU(m.NExpert, b, m.budget(c), halfLife), nil
+		}},
+		arc: {"ARC", false, func(c int) (locality.Policy, error) { return locality.NewARC(m.NExpert, b, m.budget(c)) }},
+		layerOracle: {"oracle, per layer", true, func(c int) (locality.Policy, error) {
+			return locality.NewLayerOracle(sel, spans, m.NExpert, b, c), nil
+		}},
+		sharedOracle: {"oracle, shared", true, func(c int) (locality.Policy, error) {
+			return locality.NewOracle(sel, spans, m.NExpert, b, m.budget(c)), nil
+		}},
 	}
-	for _, s := range lru {
-		h, ok := recorded[s.ExpertsPerLayer]
-		if !ok {
-			return fmt.Errorf("no size %d (run kolibri-cache with it in -sizes)", s.ExpertsPerLayer)
+}
+
+// replay runs no cache once and every baseline at every size online, in parallel.
+func replay(sel locality.Selections, spans []locality.Span, m Model, sizes []int, bases []baseline,
+	timing locality.Timing) (locality.Result, []Runs, error) {
+	noCache, err := locality.ReplayTimed(sel, spans, m.NExpert, m.bytes(), &locality.NoCache{}, timing)
+	if err != nil {
+		return noCache, nil, err
+	}
+	out := make([]Runs, len(bases))
+	errs := make([]error, len(bases)*len(sizes))
+	for i, b := range bases {
+		out[i] = Runs{Policy: b.name, Oracle: b.oracle, Runs: make([]Run, len(sizes))}
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				i, s := j/len(sizes), j%len(sizes)
+				c := sizes[s]
+				p, err := bases[i].build(c)
+				if err != nil {
+					errs[j] = err
+					continue
+				}
+				res, err := locality.ReplayTimed(sel, spans, m.NExpert, m.bytes(), p, timing)
+				if o, ok := p.(*locality.Oracle); ok && err == nil {
+					err = o.Err()
+				}
+				errs[j] = err
+				out[i].Runs[s] = Run{c, m.budget(c), res}
+			}
+		}()
+	}
+	for j := range errs {
+		jobs <- j
+	}
+	close(jobs)
+	wg.Wait()
+	for j, err := range errs {
+		if err != nil {
+			return noCache, nil, fmt.Errorf("%s at %d experts per layer: %w", bases[j/len(sizes)].name,
+				sizes[j%len(sizes)], err)
 		}
-		if h != s.TraceOrderHits {
-			return fmt.Errorf("%d experts per layer: %d hits in trace order, kolibri-cache %d", s.ExpertsPerLayer,
-				s.TraceOrderHits, h)
+	}
+	return noCache, out, nil
+}
+
+// traceOrder replays the layer and the shared LRU token by token at every size.
+func traceOrder(sel locality.Selections, m Model, sizes []int) (TraceOrder, error) {
+	tr := TraceOrder{Accesses: sel.Layers * sel.Tokens * sel.K}
+	for _, c := range sizes {
+		for _, p := range []locality.Policy{locality.NewLayerLRU(sel.Layers, m.NExpert, c),
+			locality.NewSharedLRU(m.NExpert, m.bytes(), m.budget(c))} {
+			res, err := locality.Replay(sel, locality.TraceOrder(sel.Tokens), m.NExpert, m.bytes(), p)
+			if err != nil {
+				return tr, err
+			}
+			if _, ok := p.(*locality.LayerLRU); ok {
+				tr.LayerLRU = append(tr.LayerLRU, res.Decode.Hits)
+			} else {
+				tr.SharedLRU = append(tr.SharedLRU, res.Decode.Hits)
+			}
+		}
+	}
+	return tr, nil
+}
+
+// check compares trace-order hits with one of cmd/kolibri-cache's policies at the same sizes.
+func check(hits []int, sizes []int, recorded []CacheSize) error {
+	byC := map[int]int{}
+	for _, s := range recorded {
+		byC[s.ExpertsPerLayer] = s.Hits
+	}
+	for i, c := range sizes {
+		h, ok := byC[c]
+		if !ok {
+			return fmt.Errorf("no size %d (run kolibri-cache with it in -sizes)", c)
+		}
+		if h != hits[i] {
+			return fmt.Errorf("%d experts per layer: %d hits in trace order, kolibri-cache %d", c, hits[i], h)
+		}
+	}
+	return nil
+}
+
+// loaded is the expert bytes a replay loads, missed or prefetched.
+func loaded(r locality.Result) int64 {
+	return r.Prefill.MissBytes + r.Decode.MissBytes + r.Prefill.PrefetchBytes + r.Decode.PrefetchBytes
+}
+
+// checkOracles fails unless at every size the shared oracle loads no more than any policy, and the
+// per-layer oracle no more than the layer LRU.
+func checkOracles(noCache locality.Result, runs []Runs) error {
+	for s := range runs[0].Runs {
+		o := loaded(runs[sharedOracle].Runs[s].Online)
+		if o > loaded(noCache) {
+			return fmt.Errorf("the shared oracle loads %d bytes, no cache %d", o, loaded(noCache))
+		}
+		for _, p := range runs {
+			if l := loaded(p.Runs[s].Online); o > l {
+				return fmt.Errorf("%d experts per layer: the shared oracle loads %d bytes, %s %d",
+					p.Runs[s].ExpertsPerLayer, o, p.Policy, l)
+			}
+		}
+		if lo, l := loaded(runs[layerOracle].Runs[s].Online), loaded(runs[layerLRU].Runs[s].Online); lo > l {
+			return fmt.Errorf("%d experts per layer: the per-layer oracle loads %d bytes, the layer LRU %d",
+				runs[0].Runs[s].ExpertsPerLayer, lo, l)
 		}
 	}
 	return nil
@@ -119,11 +290,24 @@ func gb(b int64) string         { return fmt.Sprintf("%.2f", float64(b)/1e9) }
 func pct(v float64) string      { return fmt.Sprintf("%.1f%%", 100*v) }
 func short(model string) string { return strings.TrimPrefix(model, "Kolibri-1-") }
 
-func rate(c locality.Counts) float64 { return float64(c.Hits) / float64(max(c.Accesses, 1)) }
+func rate(c locality.Counts) float64   { return float64(c.Hits) / float64(max(c.Accesses, 1)) }
+func recall(c locality.Counts) float64 { return float64(c.FullSteps) / float64(max(c.Steps, 1)) }
 
 // perToken is a phase's miss bytes per token in MB.
 func perToken(c locality.Counts) string {
 	return fmt.Sprintf("%.0f", float64(c.MissBytes)/1e6/float64(max(c.Tokens, 1)))
+}
+
+// msPerToken is a phase's estimated time per token on link i.
+func msPerToken(c locality.Counts, i int) string {
+	return fmt.Sprintf("%.1f", 1e3*c.Links[i].Seconds/float64(max(c.Tokens, 1)))
+}
+
+func label(r Runs) string {
+	if r.Oracle {
+		return r.Policy + " †"
+	}
+	return r.Policy
 }
 
 type result struct {
@@ -131,48 +315,140 @@ type result struct {
 	w               Workload
 }
 
-func summary(r result) string {
-	var parts []string
-	for _, s := range r.w.LRU {
-		parts = append(parts, fmt.Sprintf("%d %s/%s", s.ExpertsPerLayer, pct(rate(s.Online.Prefill)),
-			pct(rate(s.Online.Decode))))
+// at is the index of size c, or -1.
+func at(sizes []int, c int) int {
+	for i, s := range sizes {
+		if s == c {
+			return i
+		}
 	}
-	p := r.w.LRU[0].Online
-	return fmt.Sprintf("%s %s: %d prefill and %d decode tokens; per-layer LRU hit rate prefill/decode %s", r.model,
-		r.workload, p.Prefill.Tokens, p.Decode.Tokens, strings.Join(parts, ", "))
+	return -1
 }
 
-func writeMarkdown(w io.Writer, command string, results []result) {
+func summary(r result, sizes []int, detail int) string {
+	i := max(at(sizes, detail), 0)
+	parts := []string{"no cache " + perToken(r.w.NoCache.Decode)}
+	for _, p := range r.w.Policies {
+		parts = append(parts, label(p)+" "+perToken(p.Runs[i].Online.Decode))
+	}
+	p := r.w.NoCache
+	return fmt.Sprintf("%s %s: %d prefill and %d decode tokens; decode MB/token at %d experts per layer: %s", r.model,
+		r.workload, p.Prefill.Tokens, p.Decode.Tokens, sizes[i], strings.Join(parts, ", "))
+}
+
+func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.Link, sizes []int, detail int,
+	layers []int, results []result) {
 	fmt.Fprintf(w, "# Expert cache policies, replayed online\n\n")
 	fmt.Fprintf(w, "Generated by `%s` from the selection files of `tools/locality/experts.py`, the answers in "+
 		"`testdata/locality/<workload>.json` and the expert sizes in `testdata/locality/expert-bytes.json`; do not "+
 		"edit by hand.\n\n", command)
 	fmt.Fprintf(w, "The workloads are replayed in the order an online server with a prompt cache meets them: each "+
-		"prompt's new tokens prefilled in ubatches, each answer decoded token by token. A decoded token needs its "+
-		"six experts per layer; a prefill ubatch the union of its tokens' experts, once. The policy learns a "+
+		"prompt's new tokens prefilled in ubatches of %d, each answer decoded token by token. A decoded token needs "+
+		"its six experts per layer; a prefill ubatch the union of its tokens' experts, once. The policy learns a "+
 		"step's experts only when the step runs (PLAN Phase 10, Stage A). An answer that stopped at the token "+
 		"limit decodes all but its last token, which the next prompt's prefill processes. Every workload ends with "+
-		"an answer: no request follows it, so the tokens after its decoded ones are never processed online.\n\n")
+		"an answer: no request follows it, so the tokens after its decoded ones are never processed online.\n\n",
+		a.Ubatch)
 	fmt.Fprintf(w, "Prefill and decode are counted apart: a prefill hit serves a ubatch of up to hundreds of "+
 		"teacher-forced tokens at once and is no decode speedup. MB/token are the expert bytes a phase's misses "+
-		"load per token of that phase. The trace-order hit rate replays every token as one decode step, the "+
-		"order of [expert-cache.md](expert-cache.md), whose hits it reproduces exactly.\n\n")
-	fmt.Fprintf(w, "Policy: an LRU cache of the given number of experts in every layer, the only policy so far. "+
-		"Cache GB counts the expert bytes it holds when full.\n")
+		"load per token of that phase. Set recall is the share of steps that found every expert they need "+
+		"resident: a decoded token's exact Top-6 set in a layer, a ubatch's whole union.\n\n")
+	fmt.Fprintf(w, "Every policy holds at most the same budget: the bytes of the given number of experts of every "+
+		"layer.\n\n")
+	fmt.Fprintf(w, "- **layer LRU:** an LRU cache of that many experts in every layer, [expert-cache.md](expert-cache.md)'s "+
+		"per-layer policy;\n")
+	fmt.Fprintf(w, "- **shared LRU:** one LRU cache of the whole budget for all layers, its shared policy;\n")
+	fmt.Fprintf(w, "- **LFU:** shared, the experts used least often evicted (one use per step, counts kept for "+
+		"evicted experts too), the least recent of equal counts; all counts are halved every %d tokens. The "+
+		"half-life is a declared default, not tuned: a value tuned on these traces would be tuned on the test "+
+		"data;\n", a.LFUHalfLife)
+	fmt.Fprintf(w, "- **ARC:** shared, the Adaptive Replacement Cache (Megiddo and Modha 2003), which has no "+
+		"parameters;\n")
+	fmt.Fprintf(w, "- **oracle †:** Belady's MIN, per layer and shared: it knows every future step and drops the "+
+		"expert needed furthest ahead, the incoming one included. **It uses future knowledge and is an "+
+		"unattainable upper bound, not a policy a server can run.** With equal expert sizes no cache of the "+
+		"budget, prefetching or not, loads fewer bytes.\n\n")
+	var bw []string
+	for _, l := range links {
+		bw = append(bw, fmt.Sprintf("%s %.0f GB/s", l.Name, l.BytesPerSecond/1e9))
+	}
+	fmt.Fprintf(w, "**Estimated time (an assumption, not a measurement).** Each load, missed or prefetched, goes "+
+		"over one link at a constant bandwidth, one after another: %s, each estimated on its own. A step "+
+		"computes once all its experts have arrived, for the time the fully resident model takes on this Mac "+
+		"(`llama-bench` on Metal, [real-checkpoint.md](real-checkpoint.md)): %.1f tokens/s decode, %.0f/s "+
+		"prefill, %.1f ms per decoded token. Until its experts arrive, it stalls. None of the baselines "+
+		"prefetches, so all their loads stall.\n", strings.Join(bw, ", "), a.DecodeTokensPerSecond,
+		a.PrefillTokensPerSecond, 1e3/a.DecodeTokensPerSecond)
+	d := max(at(sizes, detail), 0)
 	for _, r := range results {
-		p := r.w.LRU[0].Online
-		fmt.Fprintf(w, "\n## %s, %s\n\n%d tokens, %d answers: %d prefill tokens in %d ubatches of up to %d, "+
-			"%d decoded tokens, %d after the last answer not processed.\n\n", r.model, r.workload, r.w.Tokens,
-			r.w.Answers, p.Prefill.Tokens, r.w.Ubatches, r.w.Ubatch, p.Decode.Tokens,
-			r.w.Tokens-p.Prefill.Tokens-p.Decode.Tokens)
-		fmt.Fprintf(w, "| Experts per layer | Cache GB | Prefill hit rate | Prefill MB/token | Decode hit rate "+
-			"| Decode MB/token | Trace-order hit rate |\n|--:|--:|--:|--:|--:|--:|--:|\n")
-		for _, s := range r.w.LRU {
-			fmt.Fprintf(w, "| %d | %s | %s | %s | %s | %s | %s |\n", s.ExpertsPerLayer, gb(s.CacheBytes),
-				pct(rate(s.Online.Prefill)), perToken(s.Online.Prefill), pct(rate(s.Online.Decode)),
-				perToken(s.Online.Decode), pct(float64(s.TraceOrderHits)/float64(s.Accesses)))
+		p := r.w.NoCache
+		fmt.Fprintf(w, "\n## %s, %s\n\n%d tokens, %d answers: %d prefill tokens in %d ubatches, %d decoded "+
+			"tokens, %d after the last answer not processed. No cache: %s MB per decoded token, %s per "+
+			"prefill token.\n\n", r.model, r.workload, r.w.Tokens, r.w.Answers, p.Prefill.Tokens, r.w.Ubatches,
+			p.Decode.Tokens, r.w.Tokens-p.Prefill.Tokens-p.Decode.Tokens, perToken(p.Decode), perToken(p.Prefill))
+		for _, ph := range []locality.Phase{locality.Decode, locality.Prefill} {
+			name := "Decode"
+			if ph == locality.Prefill {
+				name = "Prefill (ubatches, no decode speedup)"
+			}
+			fmt.Fprintf(w, "%s, MB/token (hit rate):\n\n| Experts per layer | Budget GB |", name)
+			for _, pr := range r.w.Policies {
+				fmt.Fprintf(w, " %s |", label(pr))
+			}
+			fmt.Fprintf(w, "\n|--:|--:|%s\n", strings.Repeat("--:|", len(r.w.Policies)))
+			for s, c := range sizes {
+				fmt.Fprintf(w, "| %d | %s |", c, gb(r.w.Policies[0].Runs[s].BudgetBytes))
+				for _, pr := range r.w.Policies {
+					x := phase(pr.Runs[s].Online, ph)
+					fmt.Fprintf(w, " %s (%s) |", perToken(x), pct(rate(x)))
+				}
+				fmt.Fprintln(w)
+			}
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintf(w, "At %d experts per layer (%s GB):\n\n| Policy | Phase | Hit rate | Set recall | MB/token | "+
+			"Evictions | Peak GB |", sizes[d], gb(r.w.Policies[0].Runs[d].BudgetBytes))
+		for _, l := range links {
+			fmt.Fprintf(w, " %s ms/token |", l.Name)
+		}
+		fmt.Fprintf(w, "\n|---|---|--:|--:|--:|--:|--:|%s\n", strings.Repeat("--:|", len(links)))
+		rows := []Runs{{Policy: "no cache", Runs: []Run{{Online: r.w.NoCache}}}}
+		for _, pr := range r.w.Policies {
+			rows = append(rows, Runs{pr.Policy, pr.Oracle, []Run{pr.Runs[d]}})
+		}
+		for _, ph := range []locality.Phase{locality.Decode, locality.Prefill} {
+			for _, pr := range rows {
+				x := phase(pr.Runs[0].Online, ph)
+				fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %d | %s |", label(pr), ph, pct(rate(x)), pct(recall(x)),
+					perToken(x), x.Evictions, gb(pr.Runs[0].Online.PeakBytes))
+				for i := range links {
+					fmt.Fprintf(w, " %s |", msPerToken(x, i))
+				}
+				fmt.Fprintln(w)
+			}
+		}
+		fmt.Fprintf(w, "\nDecode recall of single layers at %d experts per layer (hits per access):\n\n| Layer |",
+			sizes[d])
+		for _, pr := range r.w.Policies {
+			fmt.Fprintf(w, " %s |", label(pr))
+		}
+		fmt.Fprintf(w, "\n|--:|%s\n", strings.Repeat("--:|", len(r.w.Policies)))
+		for _, l := range layers {
+			fmt.Fprintf(w, "| %d |", l)
+			for _, pr := range r.w.Policies {
+				x := pr.Runs[d].Online.Decode.Layers[l]
+				fmt.Fprintf(w, " %s |", pct(float64(x.Hits)/float64(max(x.Accesses, 1))))
+			}
+			fmt.Fprintln(w)
 		}
 	}
+}
+
+func phase(r locality.Result, p locality.Phase) locality.Counts {
+	if p == locality.Decode {
+		return r.Decode
+	}
+	return r.Prefill
 }
 
 func readJSON(path string, v any) {
@@ -185,6 +461,35 @@ func readJSON(path string, v any) {
 	}
 }
 
+// positive reports whether v is finite and positive: NaN and infinities are no rates.
+func positive(v float64) bool { return v > 0 && !math.IsInf(v, 1) }
+
+// parseLinks reads name=GB/s pairs.
+func parseLinks(s string) ([]locality.Link, error) {
+	var out []locality.Link
+	for f := range strings.SplitSeq(s, ",") {
+		name, v, ok := strings.Cut(f, "=")
+		g, err := strconv.ParseFloat(v, 64)
+		if !ok || err != nil || !positive(g) {
+			return nil, fmt.Errorf("%q is not name=GB/s", f)
+		}
+		out = append(out, locality.Link{Name: name, BytesPerSecond: g * 1e9})
+	}
+	return out, nil
+}
+
+func ints(flagName, s string) []int {
+	var out []int
+	for f := range strings.SplitSeq(s, ",") {
+		c, err := strconv.Atoi(f)
+		if err != nil || c < 0 {
+			log.Fatalf("-%s: %q is not a count", flagName, f)
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 func main() {
 	home, _ := os.UserHomeDir()
 	dir := flag.String("dir", filepath.Join(home, "models", "eval", "locality"), "selection files, token IDs and output")
@@ -194,19 +499,32 @@ func main() {
 	sizesFlag := flag.String("sizes", "8,16,32,48,64,96,128,192,256,384", "cache sizes in experts per layer")
 	ubatch := flag.Int("ubatch", 512, "prefill ubatch size (llama-server's default)")
 	bytesPath := flag.String("bytes", "testdata/locality/expert-bytes.json", "expert sizes per model")
+	bwFlag := flag.String("bw", "ssd=5,pcie=25,ram=100", "declared links, name=GB/s, each estimated on its own")
+	decodeTPS := flag.Float64("decode-tps", 63.7, "measured resident decode speed, tokens/s (tg128 on Metal)")
+	prefillTPS := flag.Float64("prefill-tps", 1347, "measured resident prefill speed, tokens/s (pp512 on Metal)")
+	halfLife := flag.Int("lfu-halflife", 512, "LFU: halve all counts every this many tokens")
+	detail := flag.Int("detail", 128, "the size the detail tables show")
+	layersFlag := flag.String("layers", "0,1,2,10,25,49", "the layers whose recall the report shows")
 	md := flag.String("md", "", "write the Markdown report here")
 	flag.Parse()
 	if *models == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
-	var sizes []int
-	for s := range strings.SplitSeq(*sizesFlag, ",") {
-		c, err := strconv.Atoi(s)
-		if err != nil || c < 0 {
-			log.Fatalf("-sizes: %q is not a count", s)
-		}
-		sizes = append(sizes, c)
+	sizes := ints("sizes", *sizesFlag)
+	layers := ints("layers", *layersFlag)
+	links, err := parseLinks(*bwFlag)
+	if err != nil {
+		log.Fatalf("-bw: %v", err)
+	}
+	if !positive(*decodeTPS) || !positive(*prefillTPS) || *halfLife <= 0 || at(sizes, *detail) < 0 {
+		log.Fatal("-decode-tps and -prefill-tps must be finite and positive, -lfu-halflife positive, -detail one " +
+			"of -sizes")
+	}
+	a := Assumptions{Ubatch: *ubatch, LinkGBPerSecond: map[string]float64{}, DecodeTokensPerSecond: *decodeTPS,
+		PrefillTokensPerSecond: *prefillTPS, LFUHalfLife: *halfLife}
+	for _, l := range links {
+		a.LinkGBPerSecond[l.Name] = l.BytesPerSecond / 1e9
 	}
 	var known map[string]Model
 	readJSON(*bytesPath, &known)
@@ -216,9 +534,14 @@ func main() {
 		if !ok {
 			log.Fatalf("%s: no expert sizes in %s (run tools/locality/expert_bytes.py --record)", name, *bytesPath)
 		}
+		for _, l := range layers {
+			if l >= len(m.Layers) {
+				log.Fatalf("-layers: %s has %d layers", name, len(m.Layers))
+			}
+		}
 		var cache map[string]CacheSizes
 		readJSON(filepath.Join(*dir, "cache-"+name+".json"), &cache)
-		out := map[string]Workload{}
+		out := Output{Assumptions: a, Workloads: map[string]Workload{}}
 		for wl := range strings.SplitSeq(*workloads, ",") {
 			sel, err := locality.ReadNPYFile(filepath.Join(*dir, fmt.Sprintf("%s.%s.experts.npy", wl, name)))
 			if err != nil {
@@ -257,26 +580,43 @@ func main() {
 			if err != nil {
 				log.Fatalf("%s: %v", wl, err)
 			}
-			lru, err := replay(sel, spans, m, sizes)
+			tr, err := traceOrder(sel, m, sizes)
 			if err != nil {
 				log.Fatalf("%s %s: %v", name, wl, err)
 			}
-			if err := check(lru, cache[wl]); err != nil {
-				log.Fatalf("FAIL %s %s: the trace-order replay disagrees with cache-%s.json: %v", short(name), wl,
-					short(name), err)
+			if err := check(tr.LayerLRU, sizes, cache[wl].PerLayer); err != nil {
+				log.Fatalf("FAIL %s %s: the layer LRU in trace order disagrees with cache-%s.json: %v", short(name),
+					wl, short(name), err)
 			}
 			fmt.Printf("PASS %s %s: per-layer LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
 				wl, short(name), len(sizes))
-			w := Workload{Tokens: sel.Tokens, Answers: len(answers), Ubatch: *ubatch, LRU: lru}
+			if err := check(tr.SharedLRU, sizes, cache[wl].Shared); err != nil {
+				log.Fatalf("FAIL %s %s: the shared LRU in trace order disagrees with cache-%s.json: %v",
+					short(name), wl, short(name), err)
+			}
+			fmt.Printf("PASS %s %s: shared LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
+				wl, short(name), len(sizes))
+			timing := locality.Timing{Links: links, DecodeStep: 1 / (*decodeTPS * float64(sel.Layers)),
+				PrefillToken: 1 / (*prefillTPS * float64(sel.Layers))}
+			noCache, runs, err := replay(sel, spans, m, sizes, baselines(sel, spans, m, *halfLife), timing)
+			if err != nil {
+				log.Fatalf("%s %s: %v", name, wl, err)
+			}
+			if err := checkOracles(noCache, runs); err != nil {
+				log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
+			}
+			fmt.Printf("PASS %s %s: the shared oracle loads no more than any policy, the per-layer one no more "+
+				"than the layer LRU, at %d sizes\n", short(name), wl, len(sizes))
+			w := Workload{Tokens: sel.Tokens, Answers: len(answers), NoCache: noCache, Policies: runs, TraceOrder: tr}
 			for _, s := range spans {
 				if s.Phase == locality.Prefill {
 					w.Ubatches++
 				}
 			}
-			out[wl] = w
+			out.Workloads[wl] = w
 			r := result{short(name), wl, w}
 			results = append(results, r)
-			fmt.Println(summary(r))
+			fmt.Println(summary(r, sizes, *detail))
 		}
 		b, err := json.MarshalIndent(out, "", " ")
 		if err != nil {
@@ -293,7 +633,8 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		writeMarkdown(f, "go run ./cmd/kolibri-policy -models "+*models+" -md "+*md, results)
+		writeMarkdown(f, "go run ./cmd/kolibri-policy -models "+*models+" -md "+*md, a, links, sizes, *detail, layers,
+			results)
 		if err := f.Close(); err != nil {
 			log.Fatal(err)
 		}
