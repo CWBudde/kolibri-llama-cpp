@@ -13,7 +13,10 @@ package locality
 // Each link of a Timing is replayed on its own, as the only link: SSD, PCIe and RAM are
 // alternatives for where experts come from, not stages of one path.
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // Link is a declared path for expert bytes at a constant bandwidth, e.g. an SSD or PCIe.
 type Link struct {
@@ -32,15 +35,19 @@ type Timing struct {
 
 func (t Timing) check() error {
 	for _, l := range t.Links {
-		if l.BytesPerSecond <= 0 {
-			return fmt.Errorf("replay: link %s has no bandwidth", l.Name)
+		if !(l.BytesPerSecond > 0) || math.IsInf(l.BytesPerSecond, 1) {
+			return fmt.Errorf("replay: link %s has no finite positive bandwidth: %g", l.Name, l.BytesPerSecond)
 		}
 	}
-	if t.DecodeStep < 0 || t.PrefillToken < 0 {
-		return fmt.Errorf("replay: negative compute times %g and %g", t.DecodeStep, t.PrefillToken)
+	if !finite(t.DecodeStep) || !finite(t.PrefillToken) {
+		return fmt.Errorf("replay: compute times %g and %g are not finite and non-negative", t.DecodeStep,
+			t.PrefillToken)
 	}
 	return nil
 }
+
+// finite reports whether v is a finite, non-negative time.
+func finite(v float64) bool { return v >= 0 && !math.IsInf(v, 1) }
 
 // compute is the time one layer of span s takes once its experts are there.
 func (t Timing) compute(s Span) float64 {

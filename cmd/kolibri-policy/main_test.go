@@ -98,7 +98,7 @@ func TestParseLinks(t *testing.T) {
 	if err != nil || len(links) != 2 || links[1] != (locality.Link{Name: "pcie", BytesPerSecond: 25e9}) {
 		t.Fatalf("%v, %v", links, err)
 	}
-	for _, bad := range []string{"ssd", "ssd=0", "ssd=x"} {
+	for _, bad := range []string{"ssd", "ssd=0", "ssd=x", "ssd=NaN", "ssd=Inf", "ssd=-1"} {
 		if _, err := parseLinks(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}

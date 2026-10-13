@@ -1,6 +1,7 @@
 package locality
 
 import (
+	"math"
 	"math/rand/v2"
 	"reflect"
 	"slices"
@@ -324,7 +325,14 @@ func TestReplayTransfer(t *testing.T) {
 	if res, _ := Replay(sel, TraceOrder(3), 4, []int64{10}, &NoCache{}); res.Decode.Links != nil {
 		t.Errorf("an untimed replay has links %v", res.Decode.Links)
 	}
-	if _, err := ReplayTimed(sel, TraceOrder(3), 4, []int64{10}, &NoCache{}, Timing{Links: []Link{{"x", 0}}}); err == nil {
-		t.Error("a link without bandwidth accepted")
+	nan, inf := math.NaN(), math.Inf(1)
+	for _, bad := range []Timing{
+		{Links: []Link{{"x", 0}}}, {Links: []Link{{"x", nan}}}, {Links: []Link{{"x", inf}}},
+		{Links: []Link{{"x", 1}}, DecodeStep: nan}, {Links: []Link{{"x", 1}}, PrefillToken: inf},
+		{Links: []Link{{"x", 1}}, DecodeStep: -1},
+	} {
+		if _, err := ReplayTimed(sel, TraceOrder(3), 4, []int64{10}, &NoCache{}, bad); err == nil {
+			t.Errorf("timing %+v accepted", bad)
+		}
 	}
 }

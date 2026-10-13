@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -460,13 +461,16 @@ func readJSON(path string, v any) {
 	}
 }
 
+// positive reports whether v is finite and positive: NaN and infinities are no rates.
+func positive(v float64) bool { return v > 0 && !math.IsInf(v, 1) }
+
 // parseLinks reads name=GB/s pairs.
 func parseLinks(s string) ([]locality.Link, error) {
 	var out []locality.Link
 	for f := range strings.SplitSeq(s, ",") {
 		name, v, ok := strings.Cut(f, "=")
 		g, err := strconv.ParseFloat(v, 64)
-		if !ok || err != nil || g <= 0 {
+		if !ok || err != nil || !positive(g) {
 			return nil, fmt.Errorf("%q is not name=GB/s", f)
 		}
 		out = append(out, locality.Link{Name: name, BytesPerSecond: g * 1e9})
@@ -513,8 +517,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("-bw: %v", err)
 	}
-	if *decodeTPS <= 0 || *prefillTPS <= 0 || *halfLife <= 0 || at(sizes, *detail) < 0 {
-		log.Fatal("-decode-tps, -prefill-tps and -lfu-halflife must be positive, -detail one of -sizes")
+	if !positive(*decodeTPS) || !positive(*prefillTPS) || *halfLife <= 0 || at(sizes, *detail) < 0 {
+		log.Fatal("-decode-tps and -prefill-tps must be finite and positive, -lfu-halflife positive, -detail one " +
+			"of -sizes")
 	}
 	a := Assumptions{Ubatch: *ubatch, LinkGBPerSecond: map[string]float64{}, DecodeTokensPerSecond: *decodeTPS,
 		PrefillTokensPerSecond: *prefillTPS, LFUHalfLife: *halfLife}
