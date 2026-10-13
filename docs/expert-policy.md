@@ -16,6 +16,15 @@ Every policy holds at most the same budget: the bytes of the given number of exp
 
 **Estimated time (an assumption, not a measurement).** Each load, missed or prefetched, goes over one link at a constant bandwidth, one after another: ssd 5 GB/s, pcie 25 GB/s, ram 100 GB/s, each estimated on its own. A step computes once all its experts have arrived, for the time the fully resident model takes on this Mac (`llama-bench` on Metal, [real-checkpoint.md](real-checkpoint.md)): 63.7 tokens/s decode, 1347/s prefill, 15.7 ms per decoded token. Until its experts arrive, it stalls. None of the baselines prefetches, so all their loads stall.
 
+**Held-out splits.** Each workload is split chronologically after one of its answers (`testdata/locality/splits.json`): chronological, per workload: train on the first floor(n/2) of its n answers, up to the last one's decoded tokens; test from the next request's prefill on. Tuning sees training prefixes only, leave-one-workload-out the other workloads' training prefixes. A test suffix is replayed warm, after its prefix, with whatever state the prefix's causal replay left behind, and only its own steps are counted. A policy at test time knows only the steps before it; the answers fix only the order of the spans. The oracle † is still built from the whole trace.
+
+| Workload | Answers | Training answers | First test token | Training decode tokens | Test decode tokens | Test prefill tokens |
+|---|--:|--:|--:|--:|--:|--:|
+| coding | 6 | 3 | 6257 | 1149 | 1149 | 3737 |
+| research | 5 | 2 | 5669 | 717 | 1085 | 3888 |
+| hr | 5 | 2 | 5295 | 560 | 1019 | 4643 |
+| medtech | 6 | 3 | 21886 | 1149 | 1149 | 5412 |
+
 ## IQ3_XXS-IQ4_XS-down-imx, coding
 
 11146 tokens, 6 answers: 8845 prefill tokens in 21 ubatches, 2298 decoded tokens, 3 after the last answer not processed. No cache: 510 MB per decoded token, 42 per prefill token.
@@ -68,6 +77,25 @@ At 128 experts per layer (10.88 GB):
 | ARC | prefill | 10.3% | 0.0% | 38 | 189445 | 10.88 | 8.3 | 2.2 | 1.1 |
 | oracle, per layer † | prefill | 55.2% | 1.4% | 19 | 52896 | 10.79 | 4.5 | 1.5 | 0.9 |
 | oracle, shared † | prefill | 56.8% | 0.0% | 18 | 43002 | 10.88 | 4.4 | 1.5 | 0.9 |
+
+Held-out test suffix at 128 experts per layer: answers 4 to 6, from token 6257 on, warm from the training prefix:
+
+| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB | ssd ms/token | pcie ms/token | ram ms/token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no cache | decode | 0.0% | 0.0% | 510 | 0 | 0.00 | 117.7 | 36.1 | 20.8 |
+| layer LRU | decode | 89.3% | 56.8% | 55 | 37027 | 10.79 | 26.7 | 17.9 | 16.2 |
+| shared LRU | decode | 90.3% | 59.7% | 50 | 33546 | 10.88 | 25.6 | 17.7 | 16.2 |
+| LFU | decode | 89.4% | 54.4% | 54 | 36707 | 10.88 | 26.6 | 17.9 | 16.2 |
+| ARC | decode | 90.2% | 59.0% | 50 | 33898 | 10.88 | 25.7 | 17.7 | 16.2 |
+| oracle, per layer † | decode | 95.5% | 78.1% | 23 | 11765 | 10.79 | 20.3 | 16.6 | 15.9 |
+| oracle, shared † | decode | 95.9% | 79.3% | 21 | 10964 | 10.88 | 19.9 | 16.5 | 15.9 |
+| no cache | prefill | 0.0% | 0.0% | 42 | 0 | 0.00 | 9.1 | 2.4 | 1.2 |
+| layer LRU | prefill | 16.9% | 2.4% | 35 | 76256 | 10.79 | 7.7 | 2.1 | 1.1 |
+| shared LRU | prefill | 6.7% | 0.0% | 39 | 85552 | 10.88 | 8.5 | 2.3 | 1.1 |
+| LFU | prefill | 36.6% | 0.0% | 26 | 58190 | 10.88 | 6.0 | 1.8 | 1.0 |
+| ARC | prefill | 14.3% | 0.0% | 36 | 78644 | 10.88 | 7.9 | 2.2 | 1.1 |
+| oracle, per layer † | prefill | 59.3% | 2.4% | 17 | 21277 | 10.79 | 4.1 | 1.4 | 0.9 |
+| oracle, shared † | prefill | 61.1% | 0.0% | 16 | 20032 | 10.88 | 4.0 | 1.4 | 0.9 |
 
 Decode recall of single layers at 128 experts per layer (hits per access):
 
@@ -133,6 +161,25 @@ At 128 experts per layer (10.88 GB):
 | oracle, per layer † | prefill | 58.8% | 1.7% | 16 | 44796 | 10.80 | 3.9 | 1.4 | 0.9 |
 | oracle, shared † | prefill | 60.7% | 0.0% | 15 | 38158 | 10.88 | 3.7 | 1.3 | 0.9 |
 
+Held-out test suffix at 128 experts per layer: answers 3 to 5, from token 5669 on, warm from the training prefix:
+
+| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB | ssd ms/token | pcie ms/token | ram ms/token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no cache | decode | 0.0% | 0.0% | 510 | 0 | 0.00 | 117.7 | 36.1 | 20.8 |
+| layer LRU | decode | 92.0% | 65.2% | 41 | 26177 | 10.80 | 23.9 | 17.3 | 16.1 |
+| shared LRU | decode | 93.1% | 68.3% | 35 | 22527 | 10.88 | 22.8 | 17.1 | 16.1 |
+| LFU | decode | 93.4% | 68.2% | 34 | 21561 | 10.88 | 22.5 | 17.0 | 16.0 |
+| ARC | decode | 93.0% | 67.7% | 36 | 22886 | 10.88 | 22.9 | 17.1 | 16.1 |
+| oracle, per layer † | decode | 96.7% | 83.2% | 17 | 8306 | 10.80 | 19.1 | 16.4 | 15.9 |
+| oracle, shared † | decode | 97.1% | 85.0% | 15 | 7388 | 10.88 | 18.6 | 16.3 | 15.8 |
+| no cache | prefill | 0.0% | 0.0% | 40 | 0 | 0.00 | 8.7 | 2.3 | 1.1 |
+| layer LRU | prefill | 20.3% | 1.8% | 32 | 72730 | 10.80 | 7.1 | 2.0 | 1.1 |
+| shared LRU | prefill | 9.3% | 0.0% | 36 | 82850 | 10.88 | 8.0 | 2.2 | 1.1 |
+| LFU | prefill | 40.7% | 0.0% | 24 | 54139 | 10.88 | 5.5 | 1.7 | 1.0 |
+| ARC | prefill | 15.3% | 0.0% | 34 | 77340 | 10.88 | 7.5 | 2.1 | 1.1 |
+| oracle, per layer † | prefill | 62.9% | 2.0% | 15 | 19836 | 10.80 | 3.7 | 1.3 | 0.9 |
+| oracle, shared † | prefill | 65.1% | 0.0% | 14 | 18221 | 10.88 | 3.5 | 1.3 | 0.9 |
+
 Decode recall of single layers at 128 experts per layer (hits per access):
 
 | Layer | layer LRU | shared LRU | LFU | ARC | oracle, per layer † | oracle, shared † |
@@ -196,6 +243,25 @@ At 128 experts per layer (10.88 GB):
 | ARC | prefill | 8.5% | 0.0% | 30 | 159481 | 10.88 | 6.8 | 1.9 | 1.0 |
 | oracle, per layer † | prefill | 64.7% | 2.5% | 12 | 34084 | 10.75 | 3.1 | 1.2 | 0.9 |
 | oracle, shared † | prefill | 66.5% | 0.5% | 11 | 27264 | 10.88 | 2.9 | 1.2 | 0.9 |
+
+Held-out test suffix at 128 experts per layer: answers 3 to 5, from token 5295 on, warm from the training prefix:
+
+| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB | ssd ms/token | pcie ms/token | ram ms/token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no cache | decode | 0.0% | 0.0% | 510 | 0 | 0.00 | 117.7 | 36.1 | 20.8 |
+| layer LRU | decode | 93.1% | 70.0% | 35 | 21196 | 10.75 | 22.8 | 17.1 | 16.1 |
+| shared LRU | decode | 93.9% | 72.7% | 31 | 18700 | 10.88 | 21.9 | 16.9 | 16.0 |
+| LFU | decode | 93.6% | 70.3% | 32 | 19469 | 10.88 | 22.2 | 17.0 | 16.0 |
+| ARC | decode | 93.8% | 72.3% | 32 | 19032 | 10.88 | 22.0 | 17.0 | 16.0 |
+| oracle, per layer † | decode | 97.2% | 86.2% | 14 | 6276 | 10.75 | 18.5 | 16.3 | 15.8 |
+| oracle, shared † | decode | 97.7% | 88.2% | 12 | 5396 | 10.88 | 18.0 | 16.2 | 15.8 |
+| no cache | prefill | 0.0% | 0.0% | 32 | 0 | 0.00 | 7.1 | 2.0 | 1.1 |
+| layer LRU | prefill | 23.0% | 2.7% | 24 | 66326 | 10.75 | 5.6 | 1.7 | 1.0 |
+| shared LRU | prefill | 9.0% | 0.0% | 29 | 78437 | 10.88 | 6.5 | 1.9 | 1.0 |
+| LFU | prefill | 40.5% | 0.0% | 19 | 51237 | 10.88 | 4.5 | 1.5 | 0.9 |
+| ARC | prefill | 10.0% | 0.0% | 28 | 77519 | 10.88 | 6.4 | 1.9 | 1.0 |
+| oracle, per layer † | prefill | 69.6% | 2.7% | 10 | 15134 | 10.75 | 2.7 | 1.1 | 0.8 |
+| oracle, shared † | prefill | 71.8% | 0.5% | 9 | 13434 | 10.88 | 2.5 | 1.1 | 0.8 |
 
 Decode recall of single layers at 128 experts per layer (hits per access):
 
@@ -261,6 +327,25 @@ At 128 experts per layer (10.88 GB):
 | oracle, per layer † | prefill | 65.1% | 2.3% | 11 | 95978 | 10.82 | 3.0 | 1.2 | 0.9 |
 | oracle, shared † | prefill | 68.5% | 0.0% | 10 | 77410 | 10.88 | 2.8 | 1.1 | 0.8 |
 
+Held-out test suffix at 128 experts per layer: answers 4 to 6, from token 21886 on, warm from the training prefix:
+
+| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB | ssd ms/token | pcie ms/token | ram ms/token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no cache | decode | 0.0% | 0.0% | 510 | 0 | 0.00 | 117.7 | 36.1 | 20.8 |
+| layer LRU | decode | 91.5% | 64.5% | 43 | 29208 | 10.82 | 24.3 | 17.4 | 16.1 |
+| shared LRU | decode | 93.1% | 68.7% | 35 | 23857 | 10.88 | 22.8 | 17.1 | 16.1 |
+| LFU | decode | 93.9% | 70.9% | 31 | 21042 | 10.88 | 21.9 | 16.9 | 16.0 |
+| ARC | decode | 93.2% | 69.1% | 35 | 23448 | 10.88 | 22.6 | 17.1 | 16.0 |
+| oracle, per layer † | decode | 97.0% | 84.9% | 15 | 7126 | 10.82 | 18.7 | 16.3 | 15.8 |
+| oracle, shared † | decode | 97.6% | 87.1% | 12 | 5783 | 10.88 | 18.1 | 16.2 | 15.8 |
+| no cache | prefill | 0.0% | 0.0% | 34 | 0 | 0.00 | 7.5 | 2.1 | 1.1 |
+| layer LRU | prefill | 22.5% | 2.3% | 26 | 83067 | 10.82 | 6.0 | 1.8 | 1.0 |
+| shared LRU | prefill | 6.4% | 0.0% | 32 | 100347 | 10.88 | 7.0 | 2.0 | 1.1 |
+| LFU | prefill | 38.8% | 0.0% | 21 | 65595 | 10.88 | 4.9 | 1.6 | 0.9 |
+| ARC | prefill | 7.7% | 0.0% | 31 | 99031 | 10.88 | 7.0 | 2.0 | 1.1 |
+| oracle, per layer † | prefill | 65.1% | 2.3% | 12 | 21260 | 10.82 | 3.1 | 1.2 | 0.9 |
+| oracle, shared † | prefill | 68.0% | 0.0% | 11 | 19440 | 10.88 | 2.9 | 1.2 | 0.9 |
+
 Decode recall of single layers at 128 experts per layer (hits per access):
 
 | Layer | layer LRU | shared LRU | LFU | ARC | oracle, per layer † | oracle, shared † |
@@ -324,6 +409,25 @@ At 128 experts per layer (26.74 GB):
 | ARC | prefill | 12.3% | 0.0% | 90 | 184668 | 26.74 | 18.8 | 4.4 | 1.6 |
 | oracle, per layer † | prefill | 55.2% | 1.3% | 46 | 52808 | 26.52 | 10.0 | 2.6 | 1.2 |
 | oracle, shared † | prefill | 56.8% | 0.0% | 44 | 42852 | 26.74 | 9.6 | 2.5 | 1.2 |
+
+Held-out test suffix at 128 experts per layer: answers 4 to 6, from token 6257 on, warm from the training prefix:
+
+| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB | ssd ms/token | pcie ms/token | ram ms/token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no cache | decode | 0.0% | 0.0% | 1253 | 0 | 0.00 | 266.4 | 65.8 | 28.2 |
+| layer LRU | decode | 89.2% | 56.7% | 135 | 37204 | 26.52 | 42.8 | 21.1 | 17.1 |
+| shared LRU | decode | 90.2% | 59.5% | 123 | 33707 | 26.74 | 40.2 | 20.6 | 16.9 |
+| LFU | decode | 89.3% | 54.3% | 134 | 36779 | 26.74 | 42.4 | 21.0 | 17.0 |
+| ARC | decode | 90.1% | 59.0% | 124 | 34014 | 26.74 | 40.4 | 20.6 | 16.9 |
+| oracle, per layer † | decode | 95.5% | 77.9% | 57 | 11800 | 26.52 | 27.0 | 18.0 | 16.3 |
+| oracle, shared † | decode | 95.9% | 79.3% | 52 | 11005 | 26.74 | 26.0 | 17.8 | 16.2 |
+| no cache | prefill | 0.0% | 0.0% | 102 | 0 | 0.00 | 21.2 | 4.8 | 1.8 |
+| layer LRU | prefill | 16.9% | 2.4% | 85 | 75992 | 26.52 | 17.7 | 4.1 | 1.6 |
+| shared LRU | prefill | 6.7% | 0.0% | 95 | 85339 | 26.74 | 19.8 | 4.6 | 1.7 |
+| LFU | prefill | 36.7% | 0.0% | 65 | 57927 | 26.74 | 13.7 | 3.3 | 1.4 |
+| ARC | prefill | 15.1% | 0.0% | 87 | 77721 | 26.74 | 18.1 | 4.2 | 1.6 |
+| oracle, per layer † | prefill | 59.4% | 2.4% | 42 | 21214 | 26.52 | 9.1 | 2.4 | 1.2 |
+| oracle, shared † | prefill | 61.2% | 0.0% | 40 | 19895 | 26.74 | 8.7 | 2.3 | 1.1 |
 
 Decode recall of single layers at 128 experts per layer (hits per access):
 
@@ -389,6 +493,25 @@ At 128 experts per layer (26.74 GB):
 | oracle, per layer † | prefill | 58.7% | 1.6% | 38 | 44843 | 26.54 | 8.4 | 2.3 | 1.1 |
 | oracle, shared † | prefill | 60.7% | 0.0% | 37 | 38029 | 26.74 | 8.1 | 2.2 | 1.1 |
 
+Held-out test suffix at 128 experts per layer: answers 3 to 5, from token 5669 on, warm from the training prefix:
+
+| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB | ssd ms/token | pcie ms/token | ram ms/token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no cache | decode | 0.0% | 0.0% | 1253 | 0 | 0.00 | 266.4 | 65.8 | 28.2 |
+| layer LRU | decode | 91.9% | 65.1% | 101 | 26275 | 26.54 | 35.9 | 19.7 | 16.7 |
+| shared LRU | decode | 93.1% | 68.3% | 87 | 22612 | 26.74 | 33.1 | 19.2 | 16.6 |
+| LFU | decode | 93.4% | 68.3% | 83 | 21554 | 26.74 | 32.3 | 19.0 | 16.5 |
+| ARC | decode | 93.0% | 67.7% | 88 | 22886 | 26.74 | 33.3 | 19.2 | 16.6 |
+| oracle, per layer † | decode | 96.7% | 83.2% | 42 | 8294 | 26.54 | 24.0 | 17.4 | 16.1 |
+| oracle, shared † | decode | 97.1% | 85.0% | 36 | 7382 | 26.74 | 22.9 | 17.1 | 16.1 |
+| no cache | prefill | 0.0% | 0.0% | 98 | 0 | 0.00 | 20.4 | 4.7 | 1.7 |
+| layer LRU | prefill | 20.4% | 1.8% | 78 | 72654 | 26.54 | 16.4 | 3.9 | 1.5 |
+| shared LRU | prefill | 9.3% | 0.0% | 89 | 82797 | 26.74 | 18.5 | 4.3 | 1.6 |
+| LFU | prefill | 40.8% | 0.0% | 58 | 54098 | 26.74 | 12.4 | 3.1 | 1.3 |
+| ARC | prefill | 15.1% | 0.0% | 83 | 77565 | 26.74 | 17.4 | 4.1 | 1.6 |
+| oracle, per layer † | prefill | 62.9% | 1.8% | 36 | 19723 | 26.54 | 8.0 | 2.2 | 1.1 |
+| oracle, shared † | prefill | 65.1% | 0.0% | 34 | 18196 | 26.74 | 7.6 | 2.1 | 1.1 |
+
 Decode recall of single layers at 128 experts per layer (hits per access):
 
 | Layer | layer LRU | shared LRU | LFU | ARC | oracle, per layer † | oracle, shared † |
@@ -452,6 +575,25 @@ At 128 experts per layer (26.74 GB):
 | ARC | prefill | 8.5% | 0.0% | 74 | 159466 | 26.74 | 15.5 | 3.7 | 1.5 |
 | oracle, per layer † | prefill | 64.7% | 2.6% | 28 | 34094 | 26.43 | 6.4 | 1.9 | 1.0 |
 | oracle, shared † | prefill | 66.6% | 0.6% | 27 | 27326 | 26.74 | 6.1 | 1.8 | 1.0 |
+
+Held-out test suffix at 128 experts per layer: answers 3 to 5, from token 5295 on, warm from the training prefix:
+
+| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB | ssd ms/token | pcie ms/token | ram ms/token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no cache | decode | 0.0% | 0.0% | 1253 | 0 | 0.00 | 266.4 | 65.8 | 28.2 |
+| layer LRU | decode | 93.1% | 70.0% | 87 | 21142 | 26.43 | 33.0 | 19.2 | 16.6 |
+| shared LRU | decode | 93.9% | 72.6% | 77 | 18679 | 26.74 | 31.0 | 18.8 | 16.5 |
+| LFU | decode | 93.7% | 70.4% | 79 | 19277 | 26.74 | 31.5 | 18.9 | 16.5 |
+| ARC | decode | 93.8% | 72.2% | 78 | 19052 | 26.74 | 31.3 | 18.8 | 16.5 |
+| oracle, per layer † | decode | 97.2% | 86.2% | 35 | 6281 | 26.43 | 22.6 | 17.1 | 16.0 |
+| oracle, shared † | decode | 97.7% | 88.2% | 29 | 5431 | 26.74 | 21.5 | 16.8 | 16.0 |
+| no cache | prefill | 0.0% | 0.0% | 78 | 0 | 0.00 | 16.3 | 3.8 | 1.5 |
+| layer LRU | prefill | 23.0% | 2.9% | 60 | 66393 | 26.43 | 12.7 | 3.1 | 1.3 |
+| shared LRU | prefill | 9.0% | 0.0% | 71 | 78459 | 26.74 | 14.9 | 3.6 | 1.4 |
+| LFU | prefill | 40.4% | 0.0% | 46 | 51371 | 26.74 | 10.0 | 2.6 | 1.2 |
+| ARC | prefill | 10.0% | 0.0% | 70 | 77582 | 26.74 | 14.7 | 3.5 | 1.4 |
+| oracle, per layer † | prefill | 69.6% | 2.9% | 24 | 15092 | 26.43 | 5.5 | 1.7 | 1.0 |
+| oracle, shared † | prefill | 71.8% | 0.5% | 22 | 13407 | 26.74 | 5.1 | 1.6 | 1.0 |
 
 Decode recall of single layers at 128 experts per layer (hits per access):
 
@@ -517,6 +659,25 @@ At 128 experts per layer (26.74 GB):
 | oracle, per layer † | prefill | 65.1% | 2.4% | 27 | 96126 | 26.58 | 6.2 | 1.8 | 1.0 |
 | oracle, shared † | prefill | 68.4% | 0.0% | 25 | 77890 | 26.74 | 5.7 | 1.7 | 1.0 |
 
+Held-out test suffix at 128 experts per layer: answers 4 to 6, from token 21886 on, warm from the training prefix:
+
+| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB | ssd ms/token | pcie ms/token | ram ms/token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no cache | decode | 0.0% | 0.0% | 1253 | 0 | 0.00 | 266.4 | 65.8 | 28.2 |
+| layer LRU | decode | 91.5% | 64.4% | 106 | 29243 | 26.58 | 37.0 | 20.0 | 16.8 |
+| shared LRU | decode | 93.1% | 68.7% | 87 | 23863 | 26.74 | 33.1 | 19.2 | 16.6 |
+| LFU | decode | 93.9% | 70.8% | 77 | 21047 | 26.74 | 31.0 | 18.8 | 16.5 |
+| ARC | decode | 93.2% | 69.1% | 85 | 23441 | 26.74 | 32.7 | 19.1 | 16.6 |
+| oracle, per layer † | decode | 97.0% | 84.8% | 37 | 7139 | 26.58 | 23.2 | 17.2 | 16.1 |
+| oracle, shared † | decode | 97.6% | 87.1% | 30 | 5766 | 26.74 | 21.7 | 16.9 | 16.0 |
+| no cache | prefill | 0.0% | 0.0% | 83 | 0 | 0.00 | 17.3 | 4.1 | 1.6 |
+| layer LRU | prefill | 22.5% | 2.5% | 64 | 83112 | 26.58 | 13.6 | 3.3 | 1.4 |
+| shared LRU | prefill | 6.4% | 0.0% | 78 | 100401 | 26.74 | 16.2 | 3.8 | 1.5 |
+| LFU | prefill | 38.7% | 0.0% | 51 | 65790 | 26.74 | 10.9 | 2.8 | 1.3 |
+| ARC | prefill | 7.7% | 0.0% | 76 | 99062 | 26.74 | 16.0 | 3.8 | 1.5 |
+| oracle, per layer † | prefill | 65.0% | 2.5% | 29 | 21334 | 26.58 | 6.5 | 1.9 | 1.0 |
+| oracle, shared † | prefill | 67.9% | 0.0% | 27 | 19542 | 26.74 | 6.1 | 1.8 | 1.0 |
+
 Decode recall of single layers at 128 experts per layer (hits per access):
 
 | Layer | layer LRU | shared LRU | LFU | ARC | oracle, per layer † | oracle, shared † |
@@ -527,3 +688,57 @@ Decode recall of single layers at 128 experts per layer (hits per access):
 | 10 | 92.5% | 92.3% | 93.5% | 92.5% | 97.3% | 97.7% |
 | 25 | 93.6% | 93.9% | 93.9% | 93.9% | 97.8% | 97.7% |
 | 49 | 98.6% | 96.4% | 95.9% | 96.4% | 99.4% | 98.0% |
+
+## LFU half-life, tuned on training prefixes
+
+LFU's half-life is its only parameter. At every budget it is chosen from 64, 128, 256, 512, 1024, 2048, 4096, 8192 tokens as the one whose decode misses load the fewest bytes in a training prefix, the first of equal ones, and scored on the test suffix. It is chosen four ways:
+
+- **own prefix:** the workload's own training prefix, chronologically before its test suffix;
+- **leave one workload out:** the other workloads' training prefixes, of the same model;
+- **other model:** the same workload's training prefix in the other model's trace. The two quantizations route the same tokens differently ([expert-locality.md](expert-locality.md) gives the share of the same expert sets), and their traces are never pooled;
+- **hindsight †:** the test suffix itself. **It is tuned on the test data, the bound of tuning and not a result.**
+
+Cells are the half-life and the test suffix's decode MB/token with it; untuned is the declared 512.
+
+At 128 experts per layer:
+
+| Model | Workload | Untuned | Own prefix | Leave one workload out | Other model | Hindsight † |
+|---|---|--:|--:|--:|--:|--:|
+| IQ3_XXS-IQ4_XS-down-imx | coding | 512: 54 | 512: 54 | 1024: 61 | 512: 54 | 128: 49 |
+| IQ3_XXS-IQ4_XS-down-imx | research | 512: 34 | 1024: 38 | 512: 34 | 1024: 38 | 512: 34 |
+| IQ3_XXS-IQ4_XS-down-imx | hr | 512: 32 | 256: 33 | 512: 32 | 256: 33 | 64: 31 |
+| IQ3_XXS-IQ4_XS-down-imx | medtech | 512: 31 | 1024: 31 | 512: 31 | 1024: 31 | 1024: 31 |
+| Q8_0 | coding | 512: 134 | 512: 134 | 1024: 150 | 512: 134 | 128: 121 |
+| Q8_0 | research | 512: 83 | 1024: 94 | 512: 83 | 1024: 94 | 512: 83 |
+| Q8_0 | hr | 512: 79 | 256: 81 | 512: 79 | 256: 81 | 64: 77 |
+| Q8_0 | medtech | 512: 77 | 1024: 76 | 512: 77 | 1024: 76 | 1024: 76 |
+
+IQ3_XXS-IQ4_XS-down-imx, all workloads' test suffixes together, decode MB/token:
+
+| Experts per layer | Untuned | Own prefix | Leave one workload out | Other model | Hindsight † |
+|--:|--:|--:|--:|--:|--:|
+| 8 | 333 | 317 | 317 | 317 | 317 |
+| 16 | 263 | 242 | 242 | 242 | 242 |
+| 32 | 185 | 164 | 164 | 164 | 164 |
+| 48 | 139 | 120 | 120 | 120 | 120 |
+| 64 | 106 | 93 | 91 | 93 | 91 |
+| 96 | 64 | 59 | 59 | 59 | 57 |
+| 128 | 38 | 39 | 40 | 39 | 37 |
+| 192 | 13 | 15 | 13 | 15 | 13 |
+| 256 | 4 | 4 | 4 | 4 | 3 |
+| 384 | 0 | 0 | 0 | 0 | 0 |
+
+Q8_0, all workloads' test suffixes together, decode MB/token:
+
+| Experts per layer | Untuned | Own prefix | Leave one workload out | Other model | Hindsight † |
+|--:|--:|--:|--:|--:|--:|
+| 8 | 818 | 779 | 779 | 779 | 779 |
+| 16 | 646 | 595 | 595 | 595 | 595 |
+| 32 | 456 | 402 | 402 | 402 | 402 |
+| 48 | 341 | 295 | 295 | 295 | 295 |
+| 64 | 261 | 229 | 225 | 229 | 225 |
+| 96 | 157 | 145 | 144 | 145 | 141 |
+| 128 | 94 | 97 | 98 | 97 | 90 |
+| 192 | 33 | 36 | 33 | 36 | 31 |
+| 256 | 9 | 9 | 10 | 9 | 8 |
+| 384 | 0 | 0 | 0 | 0 | 0 |
