@@ -279,7 +279,14 @@ when both are.
         87.17%" (CPU: 84.05%). Against libllama on the CPU, layer 0's router
         logits differ by NMSE 1.36e-07 and 1.4% of its Top-6 sets change,
         against 2.1% for the torch port's own BF16 rounding.
-    -   [ ] vLLM.
+    -   [x] vLLM. (2026-10-13) — `compare_vllm.py --libllama --metal` against
+        the chained full-model capture (float32), BF16 GGUF on Metal with the
+        experts on the CPU: "router wiki-c1, libllama MTL0 vs vLLM: Top-1 same
+        97.68%, Top-6 set same 87.17%" (CPU: 84.07%), de-long "Top-6 set same
+        86.63%" (CPU: 85.50%). Metal against libllama on the CPU: 83.88% and
+        86.39%. Metal is no further from vLLM than the CPU is
+        ([docs/vllm-reference.md](docs/vllm-reference.md), "Full model as
+        chained slices").
     -   [ ] The Phase 8 decision on an F32 router path on Metal.
 -   [ ] Compare routed expert output.
     -   [x] Torch port. (2026-10-05) — on tokens with the same experts so far:

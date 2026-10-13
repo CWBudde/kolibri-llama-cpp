@@ -335,6 +335,28 @@ PASS diff …/full3 vs …/chain3: every common array within NMSE 0
   INFO de-raw, libllama vs vLLM: argmax follows vLLM's greedy tokens at 16 of 16 positions
   ```
 
+**Metal:** `--metal --case wiki-c1 --case de-long` adds libllama on the GPU,
+with the routed experts on the CPU, as `compare_real.py --metal`. It adds
+2–3 min per case. Against vLLM, Metal picks the same experts slightly more
+often than libllama's CPU path:
+
+| case | CPU vs vLLM, Top-6 set same | Metal vs vLLM | Metal vs CPU |
+|---|---|---|---|
+| wiki-c1 | 84.07% | 87.17% | 83.88% |
+| de-long | 85.50% | 86.63% | 86.39% |
+
+```text
+INFO router wiki-c1, libllama MTL0 vs vLLM: Top-1 same 97.68%, Top-6 set same 87.17%, mean overlap 5.861/6 over 25600 (token, layer) pairs; …
+INFO wiki-c1, libllama MTL0 vs vLLM: PPL 14.9382 vs 15.1267, logits NMSE 1.36e-03, KLD 0.017919, same top token 96.9%; same experts for 87.2% of (token, layer) pairs, …
+INFO de-long, libllama MTL0 vs vLLM: PPL 26.8693 vs 26.2731, logits NMSE 1.60e-03, KLD 0.041976, same top token 93.2%; same experts for 86.6% of (token, layer) pairs, …
+```
+
+The half-precision tiles of Metal's F32 matmul do not cost agreement with
+vLLM. Metal and the CPU differ from each other about as much as each differs
+from vLLM. Both flip at the same near-ties: a third of the sets with a margin
+below 0.001 change in every pairing. That is the input PLAN Phase 8 needs for
+its decision on an F32 router path on Metal.
+
 All of these lines are INFO, as on the full checkpoint below: the tolerances
 are still open. The chain runs in float32, not in vLLM's BF16. A BF16 chain
 would also add a BF16 rounding at every handover, because the next layer

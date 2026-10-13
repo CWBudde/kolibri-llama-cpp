@@ -3,7 +3,9 @@
 
 vLLM is the reference: every line compares the torch port (kolibri_ref.py)
 and, with --libllama, libllama on the CPU against the captured vLLM arrays,
-on the captured tokens, with the experts per token the capture ran with:
+on the captured tokens, with the experts per token the capture ran with
+(--metal adds libllama on the GPU with the routed experts on the CPU, as
+compare_real.py --metal, and its router against libllama's on the CPU):
 
 - per layer, the NMSE of every captured node and the share of tokens with the
   same experts (where not all experts are active, a node counts only the tokens
@@ -38,12 +40,13 @@ defaults otherwise, as e2e.py.
     compare_vllm.py --llama-cpp third_party/llama.cpp --capture DIR --model DIR --gate --libllama
     compare_vllm.py --llama-cpp third_party/llama.cpp --capture DIR --gguf ~/models/Kolibri-1-BF16.gguf --libllama
     compare_vllm.py --llama-cpp third_party/llama.cpp --capture CHAIN --gguf ~/models/Kolibri-1-BF16.gguf \\
-        --port-artifacts ~/models/eval/e2e --libllama
+        --port-artifacts ~/models/eval/e2e --libllama [--metal --case wiki-c1 --case de-long]
 """
 
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -163,6 +166,9 @@ def main() -> None:
     src.add_argument("--gguf", type=Path, help="the GGUF of the captured checkpoint")
     src.add_argument("--model", type=Path, help="the captured checkpoint, converted here to an F32 GGUF")
     ap.add_argument("--libllama", action="store_true", help="also compare libllama on the CPU")
+    ap.add_argument("--metal", action="store_true",
+                    help="--libllama: also on the GPU, routed experts on the CPU (as compare_real.py --metal)")
+    ap.add_argument("--case", action="append", help="only these cases")
     ap.add_argument("--gate", "--tiny", dest="gate", action="store_true",
                     help="gate a float32 capture with compare_real.py --tiny's bounds")
     ap.add_argument("--max-nmse", type=float, default=MAX_NMSE_TINY,
@@ -171,8 +177,13 @@ def main() -> None:
                                                        "arrays instead of its forward")
     ap.add_argument("--threads", type=int, default=10)
     args = ap.parse_args()
+    if args.metal and not args.libllama:
+        raise SystemExit("--metal needs --libllama")
 
     meta = json.loads((args.capture / "capture.json").read_text())
+    unknown = sorted(set(args.case or []) - set(meta["cases"]))
+    if unknown:
+        raise SystemExit(f"unknown cases: {', '.join(unknown)} (the capture holds {', '.join(meta['cases'])})")
     gguf = args.gguf
     if args.model:
         from tiny import convert
@@ -201,7 +212,12 @@ def main() -> None:
             print("INFO " + what)
 
     runner = Runner(args.llama_cpp) if args.libllama else None
+    devs = runner.devices() if runner else []
+    if args.metal and len(devs) < 2:
+        raise SystemExit("--metal: no GPU device")
     for name, entry in meta["cases"].items():
+        if args.case and name not in args.case:
+            continue
         cap = load(args.capture / f"{name}.npz")
         tokens = cap["tokens"]
         if list(map(bool, cap["is_swa"])) != list(W.is_swa):
@@ -220,16 +236,30 @@ def main() -> None:
             lib = runner.lib
             ctx = dict(flash_attn_type=lib.LLAMA_FLASH_ATTN_TYPE_DISABLED, type_k=lib.GGML_TYPE_F32,
                        type_v=lib.GGML_TYPE_F32) if args.gate else {}
-            capture = capture_names(W.n_layer)
             overrides = {f"{ARCH}.expert_used_count": k} if k != converted else None
-            _, cpu = runner.devices()[0]
-            got_logits = runner.logits(gguf, cpu, tokens, len(tokens), overrides, capture=capture,
+
+            def run(dev, **kw):
+                capture = capture_names(W.n_layer)
+                t0 = time.time()
+                logits = runner.logits(gguf, dev, tokens, len(tokens), overrides, capture=capture,
                                        n_ctx=max(N_CTX, len(tokens)), n_threads=args.threads,
-                                       n_threads_batch=args.threads, **ctx)
-            got = flat(capture, len(tokens))
+                                       n_threads_batch=args.threads, **ctx, **kw)
+                return logits, flat(capture, len(tokens)), time.time() - t0
+
+            got_logits, got, _ = run(devs[0][1])
             assert EMBD in got
             compare(f"{name}, libllama vs vLLM", got, got_logits, cap, entry, W, all_experts, report,
                     args.max_nmse)
+            if args.metal:
+                gpu_name, gpu = devs[1]
+                mtl_logits, mtl, seconds = run(gpu, cpu_moe=True)
+                print(f"INFO {name} on {gpu_name}, routed experts on the CPU: libllama {seconds:.0f} s")
+                compare(f"{name}, libllama {gpu_name} vs vLLM", mtl, mtl_logits, cap, entry, W, all_experts,
+                        report, args.max_nmse)
+                # the GPU's router against the CPU's, both libllama: what the backend alone changes
+                for line in summary(router(mtl, got, W), f"{name}, libllama {gpu_name} vs libllama CPU"):
+                    print("INFO " + line)
+                del mtl
 
     if args.gate:
         print(("FAIL" if errs else "PASS") + f" vLLM capture, {k} of {n_expert} experts: "
