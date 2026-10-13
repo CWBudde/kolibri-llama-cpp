@@ -241,10 +241,16 @@ when both are.
         same experts before it"): "attention output attn_out 2.04e-06,
         attn_post_norm 3.87e-06" (torch port BF16 rounding: 2.55e-05, 5.68e-05).
     -   [ ] vLLM.
--   [ ] Compare router logits/probabilities and selected expert IDs.
+-   [x] Compare router logits/probabilities and selected expert IDs.
     -   [x] Torch port. (2026-10-05) — router-logit NMSE from 2.05e-09 (layer 0)
         to at most 3.90e-03, "Top-1 same 97.09%, Top-6 set same 84.05%".
-    -   [ ] vLLM.
+    -   [x] vLLM. (2026-10-13) — the full model in float32, as chained slices
+        (`vllm_chain.py`, below), not the Phase 0 BF16 run. `compare_vllm.py
+        --gguf … --port-artifacts ~/models/eval/e2e --libllama` on wiki-c1:
+        "router wiki-c1, libllama vs vLLM: Top-1 same 97.09%, Top-6 set same
+        84.07%", "worst layer router-logit NMSE 1.06e-04 where every earlier
+        layer picks the same experts"; the torch port against vLLM: "Top-1
+        same 99.98%, Top-6 set same 99.85%", router-logit NMSE median 6.65e-13.
 -   [ ] Report router agreement explicitly: Top-1 agreement, Top-6 set
     agreement/overlap, and the rate of selection changes at near-ties.
     -   [x] Torch port. (2026-10-05) — `compare_real.py --gguf` reports all
@@ -253,13 +259,17 @@ when both are.
         >= 0.1: 3.06% of 4282". The torch port's BF16 rounding against itself:
         "Top-1 same 95.14%, Top-6 set same 75.88%".
     -   [ ] vLLM.
--   [ ] Report KL divergence for comparable output distributions alongside
+-   [x] Report KL divergence for comparable output distributions alongside
     NMSE/top-token agreement, so small numerical drift can be separated from
     behavior-changing drift.
     -   [x] Torch port. (2026-10-05) — every final-logit comparison in
         `compare_real.py --gguf` prints NMSE, KLD and same top token together:
         "logits NMSE 2.02e-03, KLD 0.033408, same top token 96.5%".
-    -   [ ] vLLM.
+    -   [x] vLLM. (2026-10-13) — `compare_vllm.py` on the chained full-model
+        capture prints the three together for all six cases, e.g. "wiki-c1,
+        libllama vs vLLM: … logits NMSE 2.02e-03, KLD 0.033433, same top token
+        96.5%", "de-raw, libllama vs vLLM: logits NMSE 9.56e-03, KLD 0.112537,
+        same top token 100.0%".
 -   [ ] Repeat the expert-ID comparison on Metal: its F32 matmul uses
     half-precision tiles (router logits off by a relative RMS of about
     4e-4), so Top-6 near-ties may pick different experts than vLLM. Decide
@@ -289,15 +299,24 @@ when both are.
         experts at near-ties (same experts for 99.8% of tokens in layer 0,
         64.3% in layer 49).
     -   [ ] vLLM.
--   [ ] Compare final logits.
+-   [x] Compare final logits.
     -   [x] Torch port. (2026-10-05) — "PPL 15.1787 vs 15.1244, logits NMSE
         2.02e-03, KLD 0.033408, same top token 96.5%".
-    -   [ ] vLLM.
--   [ ] Compare greedy next-token sequences.
+    -   [x] vLLM. (2026-10-13) — chained full model, float32: "wiki-c1,
+        libllama vs vLLM: PPL 15.1787 vs 15.1267, logits NMSE 2.02e-03, KLD
+        0.033433, same top token 96.5%". The torch port against vLLM: "PPL
+        15.1244 vs 15.1267, logits NMSE 6.13e-06, KLD 0.000055", and 6e-13 to
+        7e-12 on the four prompts.
+-   [x] Compare greedy next-token sequences.
     -   [x] Torch port. (2026-10-05) — "libllama greedy token along the
         reference continuation: equal at 16/16" for the German prompt.
-    -   [ ] vLLM.
--   [ ] Include raw German continuations in that comparison. In this
+    -   [x] vLLM. (2026-10-13) — in the chained full model, vLLM's argmax along
+        the torch port's greedy continuation is the next token at 16 of 16
+        positions in all four prompt cases, so vLLM's greedy continuation is
+        the port's. libllama: "de-raw, libllama vs vLLM: argmax follows vLLM's
+        greedy tokens at 16 of 16 positions", likewise code and de-chat;
+        en-raw 15 of 16.
+-   [x] Include raw German continuations in that comparison. In this
     port's BF16 (CPU), "Die Hauptstadt von Deutschland ist" continues
     greedily with " Deutschland Deutschland Deutschland …", while English
     raw prompts and German through the chat template stay coherent.
@@ -306,8 +325,8 @@ when both are.
         greedy, float32: 'Die Hauptstadt von Deutschland ist Deutschland
         Deutschland …'", and so does bfloat16. An F32 KV cache or flash
         attention changes nothing.
-    -   [ ] vLLM, the only one that can still contradict it. (2026-10-07) —
-        partial: vLLM itself on two-layer slices of the real weights (layers
+    -   [x] vLLM, the only one that can still contradict it. (2026-10-07) —
+        vLLM itself on two-layer slices of the real weights (layers
         0/4 and 48/49, float32, CPU) agrees with the port and libllama on
         `de-raw` and `de-long` too: "PASS de-raw, libllama vs vLLM, router
         probe: worst layer router-logit NMSE 5.79e-13 …, Top-6 set same
@@ -322,7 +341,13 @@ when both are.
         With more context, raw German gets the facts right, then copies the
         prompt; through the chat template it is coherent
         ([docs/real-checkpoint.md](docs/real-checkpoint.md), "Where the German
-        numbers come from"). Remaining: the full-model vLLM run.
+        numbers come from"). (2026-10-13) — the full model through vLLM, as
+        chained float32 slices, continues the same way: "de-raw: vLLM's argmax
+        along the sequence is its next token at 16 of 16 positions, so vLLM's
+        greedy continuation is the sequence's: ' Deutschland Deutschland
+        Deutschland …'"; the torch port agrees with it to logits NMSE 4.95e-12
+        ([docs/real-checkpoint.md](docs/real-checkpoint.md), "vLLM itself on
+        the full model").
 -   [ ] Establish tolerances separately for BF16 and any FP8 reference
     run.
     -   [x] Measure how far BF16 rounding alone moves the torch port.
@@ -354,6 +379,29 @@ Use independent community work only as a source of test ideas, not implementatio
     1e-6 would have missed it (attention output 1.7e-07)
     ([docs/vllm-reference.md](docs/vllm-reference.md), "Slices of the real
     weights").
+-   [x] Run the full model through vLLM itself without a GPU, as chained
+    slices of the real weights. (2026-10-13) — `tools/ref/vllm_chain.py run`
+    slices layers 0–1 … 48–49 and captures each with `vllm_capture.py
+    --embeds`, which feeds the previous slice's `l_out` as vLLM's
+    `prompt_embeds` (the first layer's residual and norm input, as in the full
+    model), on `--sequence`, the e2e sequences. It stitches the 25 captures into
+    one 50-layer capture: 13 min, 3.5 GB, float32 on the CPU.
+    - **Chaining check:** one slice of layers 0–2 against the chain 0–1, 2,
+      `vllm_chain.py diff`: "PASS de-long: 20 arrays in both, 20
+      bit-identical", likewise for all six cases, rc 0.
+    - **Controls:**
+      - M30 (the handover scaled by 1+1e-6) fails the diff, "FAIL de-raw: …
+        worst NMSE 1.79e-12 (node.ffn_moe_out-2)", and the stitch's sha256
+        check, exit 1 each;
+      - M31 (layer 2 fed `l_out-0`) fails the stitch, "was fed {'node':
+        'l_out-0', …}, not the l_out-1 of part-0-1", exit 1.
+    - **Comparison:** `compare_vllm.py --port-artifacts` takes the torch port
+      from the e2e float32 artifacts. The tiny and slice [0,4] gates still
+      pass: 105 PASS lines, rc 0.
+
+    Results are in the vLLM leaves above
+    ([docs/vllm-reference.md](docs/vllm-reference.md), "Full model as chained
+    slices"). The BF16 tolerances still need the BF16 run.
 -   [ ] For every retained quantization, emit the same summary row: perplexity, KLD, same-top-token rate, Top-1 router agreement and Top-6 overlap.
 
 **Hard gate:** Do not diagnose quantization quality until the
