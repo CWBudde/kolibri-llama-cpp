@@ -336,3 +336,107 @@ func TestReplayTransfer(t *testing.T) {
 		}
 	}
 }
+
+func TestReplaySegments(t *testing.T) {
+	r := rand.New(rand.NewPCG(11, 12))
+	sel := randomSelections(r, 3, 200, 4, 16)
+	answers := []Answer{{Prompt: 40, Tokens: make([]int32, 30)}, {Prompt: 120, Tokens: make([]int32, 40)}}
+	spans, err := OnlineSpans(200, answers, false, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timing := Timing{Links: []Link{{"slow", 50}, {"fast", 500}}, DecodeStep: 0.1, PrefillToken: 0.01}
+	policy := func() Policy {
+		// an LRU that also prefetches the step's previous-token experts, so that prefetches cross cuts
+		lru := NewLayerLRU(3, 16, 6)
+		return &prefetching{Policy: lru, prefetch: func(s StepInfo) []int {
+			if s.First == 0 {
+				return nil
+			}
+			var keys []int
+			for _, e := range sel.IDs[(s.Layer*sel.Tokens+s.First-1)*sel.K : (s.Layer*sel.Tokens+s.First)*sel.K] {
+				keys = append(keys, s.Layer*16+int(e))
+			}
+			return keys
+		}}
+	}
+	whole, err := ReplayTimed(sel, spans, 16, sizes(3, 5), policy(), timing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cuts := range [][]int{nil, {1}, {len(spans) - 1}, {3, 7, 20}, {5, 6}} {
+		segs, err := ReplaySegments(sel, spans, cuts, 16, sizes(3, 5), policy(), timing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segs) != len(cuts)+1 {
+			t.Fatalf("cuts %v: %d segments", cuts, len(segs))
+		}
+		for i, s := range segs {
+			if s.PeakBytes > whole.PeakBytes {
+				t.Fatalf("cuts %v: segment %d peaks at %d, the whole replay at %d", cuts, i, s.PeakBytes, whole.PeakBytes)
+			}
+		}
+		got := Merge(segs...)
+		if !sameResult(got, whole) {
+			t.Fatalf("cuts %v: merged %+v\nwhole        %+v", cuts, got, whole)
+		}
+	}
+	// the cache runs on across a cut: token 1 finds the expert token 0 loaded, and the prefetch
+	// made before token 0 counts in the first segment, its use in the second
+	sel = Selections{Layers: 1, Tokens: 3, K: 1, IDs: []int32{0, 1, 0}}
+	p := &recorder{seen: map[int]bool{}, prefetch: func(s StepInfo) []int {
+		if s.First == 0 {
+			return []int{1}
+		}
+		return nil
+	}}
+	segs, err := ReplaySegments(sel, TraceOrder(3), []int{1}, 2, []int64{7}, p, Timing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := segs[0].Decode, segs[1].Decode; a.Prefetches != 1 || a.UsefulPrefetches != 1 || a.Misses != 1 ||
+		b.Hits != 2 || b.Misses != 0 || b.Tokens != 2 || segs[1].PeakBytes != 14 {
+		t.Fatalf("segments %+v", segs)
+	}
+	for _, bad := range [][]int{{0}, {3}, {2, 1}, {1, 1}} {
+		if _, err := ReplaySegments(sel, TraceOrder(3), bad, 2, []int64{7}, &NoCache{}, Timing{}); err == nil {
+			t.Errorf("cuts %v accepted", bad)
+		}
+	}
+}
+
+// prefetching is a Policy whose Prefetch is replaced.
+type prefetching struct {
+	Policy
+	prefetch func(StepInfo) []int
+}
+
+func (p *prefetching) Prefetch(s StepInfo) []int { return p.prefetch(s) }
+
+// sameResult compares a and b exactly, their link times up to rounding.
+func sameResult(a, b Result) bool {
+	near := func(x, y float64) bool { return math.Abs(x-y) <= 1e-9*max(1, math.Abs(x), math.Abs(y)) }
+	for _, p := range []Phase{Prefill, Decode} {
+		x, y := a.phase(p), b.phase(p)
+		if len(x.Links) != len(y.Links) {
+			return false
+		}
+		for i := range x.Links {
+			lx, ly := x.Links[i], y.Links[i]
+			if !near(lx.Seconds, ly.Seconds) || !near(lx.StallSeconds, ly.StallSeconds) {
+				return false
+			}
+		}
+	}
+	strip := func(r Result) Result {
+		for _, c := range []*Counts{&r.Prefill, &r.Decode} {
+			c.Links = slices.Clone(c.Links)
+			for i := range c.Links {
+				c.Links[i].Seconds, c.Links[i].StallSeconds = 0, 0
+			}
+		}
+		return r
+	}
+	return reflect.DeepEqual(strip(a), strip(b))
+}
