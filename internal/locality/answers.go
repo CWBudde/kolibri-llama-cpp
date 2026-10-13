@@ -30,8 +30,9 @@ func (a Answer) Decoded() int {
 	return len(a.Tokens) - 1
 }
 
-// ReadAnswers reads a trace's generated answers in conversation order.
-func ReadAnswers(r io.Reader) ([]Answer, error) {
+// ReadAnswers reads a trace's generated answers in conversation order, and whether the
+// conversation ends with its last answer: then no later request sends the tokens after it.
+func ReadAnswers(r io.Reader) (answers []Answer, ended bool, err error) {
 	var trace struct {
 		Messages []struct {
 			Answer *struct {
@@ -42,16 +43,15 @@ func ReadAnswers(r io.Reader) ([]Answer, error) {
 		} `json:"messages"`
 	}
 	if err := json.NewDecoder(r).Decode(&trace); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	var out []Answer
 	for i, m := range trace.Messages {
 		a := m.Answer
 		if a == nil {
 			continue
 		}
 		if a.NPrompt == nil || (a.Stop != "eos" && a.Stop != "limit") {
-			return nil, fmt.Errorf("message %d: answer without n_prompt or with stop %q, want eos or limit", i, a.Stop)
+			return nil, false, fmt.Errorf("message %d: answer without n_prompt or with stop %q, want eos or limit", i, a.Stop)
 		}
 		var gen []int32
 		for _, t := range a.Tokens {
@@ -59,9 +59,10 @@ func ReadAnswers(r io.Reader) ([]Answer, error) {
 				gen = append(gen, t)
 			}
 		}
-		out = append(out, Answer{Prompt: *a.NPrompt, Tokens: gen, EOS: a.Stop == "eos"})
+		answers = append(answers, Answer{Prompt: *a.NPrompt, Tokens: gen, EOS: a.Stop == "eos"})
 	}
-	return out, nil
+	n := len(trace.Messages)
+	return answers, n > 0 && trace.Messages[n-1].Answer != nil, nil
 }
 
 // CheckAnswers checks that the token IDs of the whole conversation hold every answer's generated
@@ -79,9 +80,10 @@ func CheckAnswers(ids []int32, answers []Answer) error {
 
 // OnlineSpans is the order in which a server with a prompt cache meets a conversation of tokens
 // tokens: for each answer it prefills the prompt's tokens it has not processed yet in ubatches of
-// ubatch tokens, then decodes the answer token by token (Decoded of them); the tokens after the
-// last answer are a final prefill.
-func OnlineSpans(tokens int, answers []Answer, ubatch int) ([]Span, error) {
+// ubatch tokens, then decodes the answer token by token (Decoded of them). The tokens after the
+// last answer are a final prefill, unless the conversation ended with that answer: then no
+// request sends them, and the spans end after its decoded tokens.
+func OnlineSpans(tokens int, answers []Answer, ended bool, ubatch int) ([]Span, error) {
 	if ubatch < 1 {
 		return nil, fmt.Errorf("ubatch %d, want at least 1", ubatch)
 	}
@@ -104,6 +106,8 @@ func OnlineSpans(tokens int, answers []Answer, ubatch int) ([]Span, error) {
 		done = a.Prompt + a.Decoded()
 		end = a.Prompt + len(a.Tokens)
 	}
-	prefill(done, tokens)
+	if !ended || len(answers) == 0 {
+		prefill(done, tokens)
+	}
 	return out, nil
 }

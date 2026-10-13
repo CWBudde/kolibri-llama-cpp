@@ -108,8 +108,8 @@ func TraceOrder(tokens int) []Span {
 	return out
 }
 
-// Replay runs sel through p, span by span. The spans must cover the tokens [0, sel.Tokens) in
-// order, each exactly once. bytes[l] is the size of one expert of layer l; expert IDs are in
+// Replay runs sel through p, span by span. The spans must cover tokens [0, n) in order, each
+// exactly once, for some n up to sel.Tokens: an online replay may end before the trace does. bytes[l] is the size of one expert of layer l; expert IDs are in
 // [0, nExpert). It fails on a span out of order and on a policy that prefetches an unknown key or
 // evicts a key that is not resident.
 func Replay(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy) (Result, error) {
@@ -124,9 +124,6 @@ func Replay(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy) 
 				next, sel.Tokens)
 		}
 		next = s.End
-	}
-	if next != sel.Tokens {
-		return r, fmt.Errorf("replay: the spans end at token %d of %d", next, sel.Tokens)
 	}
 	nKey := sel.Layers * nExpert
 	resident := make([]bool, nKey)

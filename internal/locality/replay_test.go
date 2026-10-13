@@ -119,7 +119,7 @@ func TestReplayCausal(t *testing.T) {
 	r := rand.New(rand.NewPCG(5, 6))
 	sel := randomSelections(r, 3, 40, 4, 16)
 	answers := []Answer{{Prompt: 9, Tokens: make([]int32, 6)}, {Prompt: 30, Tokens: make([]int32, 3), EOS: true}}
-	spans, err := OnlineSpans(40, answers, 4)
+	spans, err := OnlineSpans(40, answers, true, 4) // ends at token 33
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestReplayDeterministic(t *testing.T) {
 	r := rand.New(rand.NewPCG(7, 8))
 	sel := randomSelections(r, 4, 300, 6, 32)
 	answers := []Answer{{Prompt: 100, Tokens: make([]int32, 50)}, {Prompt: 200, Tokens: make([]int32, 60)}}
-	spans, err := OnlineSpans(300, answers, 32)
+	spans, err := OnlineSpans(300, answers, false, 32)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,12 +221,16 @@ func TestReplayRejects(t *testing.T) {
 	for _, spans := range [][]Span{
 		{{Decode, 0, 1}, {Decode, 2, 3}},  // a gap
 		{{Prefill, 0, 2}, {Decode, 1, 3}}, // overlapping
-		{{Prefill, 0, 2}},                 // short
 		{{Prefill, 0, 4}},                 // beyond the trace
 	} {
 		if _, err := Replay(sel, spans, 2, []int64{1}, NewLayerLRU(1, 2, 1)); err == nil {
 			t.Errorf("spans %v accepted", spans)
 		}
+	}
+	// an online replay may stop before the trace ends
+	if res, err := Replay(sel, []Span{{Prefill, 0, 2}}, 2, []int64{1}, NewLayerLRU(1, 2, 1)); err != nil ||
+		res.Prefill.Tokens != 2 || res.Prefill.Accesses != 2 {
+		t.Errorf("a prefix of the trace: %+v, %v", res, err)
 	}
 	bad := []Policy{
 		&recorder{seen: map[int]bool{}, prefetch: func(StepInfo) []int { return []int{2} }}, // no such key

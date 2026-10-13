@@ -11,7 +11,8 @@
 //
 // For each model and workload it reads <dir>/<workload>.<model>.experts.npy and the token IDs
 // <dir>/<workload>.tokens.npy, and the answers' prompt lengths and generated tokens from
-// testdata/locality/<workload>.json. Two checks are fatal: the token IDs must hold every answer's
+// testdata/locality/<workload>.json. A conversation that ends with an answer ends the online
+// replay after that answer's decoded tokens: no request sends the rest. Two checks are fatal: the token IDs must hold every answer's
 // generated tokens after its prompt, and the per-layer LRU, replayed token by token in trace order,
 // must hit exactly as often as in <dir>/cache-<model>.json of cmd/kolibri-cache at every size.
 // It writes <dir>/policy-<model>.json and, given -md, a Markdown report.
@@ -150,7 +151,8 @@ func writeMarkdown(w io.Writer, command string, results []result) {
 		"prompt's new tokens prefilled in ubatches, each answer decoded token by token. A decoded token needs its "+
 		"six experts per layer; a prefill ubatch the union of its tokens' experts, once. The policy learns a "+
 		"step's experts only when the step runs (PLAN Phase 10, Stage A). An answer that stopped at the token "+
-		"limit decodes all but its last token, which the next prompt's prefill processes.\n\n")
+		"limit decodes all but its last token, which the next prompt's prefill processes. Every workload ends with "+
+		"an answer: no request follows it, so the tokens after its decoded ones are never processed online.\n\n")
 	fmt.Fprintf(w, "Prefill and decode are counted apart: a prefill hit serves a ubatch of up to hundreds of "+
 		"teacher-forced tokens at once and is no decode speedup. MB/token are the expert bytes a phase's misses "+
 		"load per token of that phase. The trace-order hit rate replays every token as one decode step, the "+
@@ -160,8 +162,9 @@ func writeMarkdown(w io.Writer, command string, results []result) {
 	for _, r := range results {
 		p := r.w.LRU[0].Online
 		fmt.Fprintf(w, "\n## %s, %s\n\n%d tokens, %d answers: %d prefill tokens in %d ubatches of up to %d, "+
-			"%d decoded tokens.\n\n", r.model, r.workload, r.w.Tokens, r.w.Answers, p.Prefill.Tokens, r.w.Ubatches,
-			r.w.Ubatch, p.Decode.Tokens)
+			"%d decoded tokens, %d after the last answer not processed.\n\n", r.model, r.workload, r.w.Tokens,
+			r.w.Answers, p.Prefill.Tokens, r.w.Ubatches, r.w.Ubatch, p.Decode.Tokens,
+			r.w.Tokens-p.Prefill.Tokens-p.Decode.Tokens)
 		fmt.Fprintf(w, "| Experts per layer | Cache GB | Prefill hit rate | Prefill MB/token | Decode hit rate "+
 			"| Decode MB/token | Trace-order hit rate |\n|--:|--:|--:|--:|--:|--:|--:|\n")
 		for _, s := range r.w.LRU {
@@ -237,7 +240,7 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			answers, err := locality.ReadAnswers(f)
+			answers, ended, err := locality.ReadAnswers(f)
 			f.Close()
 			if err != nil {
 				log.Fatalf("%s trace: %v", wl, err)
@@ -250,7 +253,7 @@ func main() {
 			}
 			fmt.Printf("PASS %s: the token IDs hold the %d answers' generated tokens after their prompts\n", wl,
 				len(answers))
-			spans, err := locality.OnlineSpans(sel.Tokens, answers, *ubatch)
+			spans, err := locality.OnlineSpans(sel.Tokens, answers, ended, *ubatch)
 			if err != nil {
 				log.Fatalf("%s: %v", wl, err)
 			}
