@@ -689,6 +689,60 @@ memory headroom rather than merely loading successfully.
 quantization is likely to provide substantially safer headroom on a 48
 GB Mac.
 
+
+## Phase 10 --- Predictive expert caching and prefetch (proposed)
+
+**Status:** Planning only. No predictive cache or prefetch implementation is claimed. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
+
+### Objective and constraints
+
+Reduce *critical-path* expert transfer latency and bytes transferred per generated token on memory-constrained hardware, while preserving the original Kolibri Top-6 router's decisions and numerical output. A predictor may only advise placement/prefetch, never substitute its own expert IDs for the true router selection. If a prediction is wrong, fall back to loading the exact requested experts. Distinguish page-cache hits, RAM-to-device copies, and physical SSD reads: Phase 8's CPU-moe path is not evidence of GPU expert streaming.
+
+### Existing evidence and baseline
+
+- Reuse the frozen, SHA-pinned coding/research/hr/medtech traces and expert sizes in `testdata/locality/`, `tools/locality/experts.py`, `internal/locality`, `cmd/kolibri-cache` and `docs/expert-{locality,cache}.md`. Keep the original quantization, token order, layer IDs and six selected experts per token.
+- IQ3 coding, shared LRU: 128 experts/layer uses 10.88 GB, yields 90.1% hits and approximately 50 MB/token misses; 192 experts/layer uses 16.32 GB, yields 95.8% hits and approximately 21 MB/token misses. These are *trace simulations*, not measured transfers.
+- Layer 0/1 are unusually concentrated, whereas other layers have much broader use. A fixed equal-sized cache is therefore a baseline, not the presumed optimum.
+- The resident Metal benchmark (~64 tokens/s) and `--n-cpu-moe` comparisons are separate execution paths; record hardware, quantization, context length and memory pressure with every new result.
+
+### Stage A --- Reproducible offline policy comparison (no model training)
+
+- [ ] Add a deterministic trace-replay evaluator with strictly causal observations: at prediction time only previous tokens' selected experts, known workload metadata and already completed layers may be used. Never use the target token's future routing decisions or future tokens. Replay prefill and decode separately; do not report teacher-forced prefill as an online decode speedup.
+- [ ] Baselines: no cache; fixed-size per-layer LRU; globally shared byte-budgeted LRU; frequency/LFU with aging; recency-frequency hybrid; and an *oracle* with future knowledge explicitly labelled as an unattainable upper bound.
+- [ ] Under identical total byte budgets, optimize cache allocation across layers (e.g. greedy marginal miss-byte reduction from held-out history). Compare against uniform allocation and a global shared cache. Account for heterogeneous expert sizes and compulsory/cold misses.
+- [ ] Measure exact Top-6 set recall, per-layer recall, hit/miss rate, *miss bytes/token*, bytes prefetched but unused, peak cache bytes, evictions and estimated transfer time under declared RAM/PCIe/SSD bandwidth assumptions. Distinguish predictions that arrive early enough to overlap transfers from merely accurate predictions.
+- [ ] Split traces chronologically and by workload: fit/tune on training prefixes, validate on later suffixes, and report leave-one-workload-out generalization. Preserve separate quantized and Q8 traces to expose routing disagreement. No leakage from the frozen answers or full-trace frequencies into test-time state.
+- [ ] Gate: retain only policies that improve held-out miss bytes or latency proxy at equal memory budgets; include a trivial last-token/last-N reuse predictor as the first prediction baseline.
+
+### Stage B --- Small causal router predictor
+
+- [ ] Start with a CPU-cheap frequency/Markov predictor per layer: features are recent expert IDs, recency, exponentially decayed counts, layer index and (optionally) previous-layer choices already known for the *same* token. Predict a ranked candidate set for the *next* token; evaluate Top-6 recall versus candidate count and prefetch-byte budget.
+- [ ] If heuristics plateau, train a small multi-label model (linear classifier or tiny MLP/GRU) against the recorded expert-ID sets. Use chronological/workload-held-out splits, calibrated scores and ablations; do not train on the target token's own router logits or hidden state unless those are actually available before the intended prefetch deadline.
+- [ ] Evaluate two prediction horizons separately: next-token same-layer (can prefetch during other work) and same-token later-layer (only after preceding-layer activations exist). Explicitly calculate available overlap time from the layer execution schedule. No speculative claim that the next token is known before sampling.
+- [ ] Bound inference overhead: report predictor wall time, CPU use, memory footprint and net estimated latency saved. Compare against the ~15.7 ms/token resident baseline; a predictor that costs more than its hidden transfer latency is a failure.
+- [ ] Gate: require an improvement over Stage A on held-out workloads, with prediction cost included; otherwise keep the simpler policy.
+
+### Stage C --- Optional go-laya workload controller (not token-level routing)
+
+- [ ] Evaluate `MeKo-Christian/go-laya` only once per request or at explicit phase boundaries, to choose among *pre-measured* cache profiles (e.g. coding, research, hr, medtech, unknown). Its `choice`/`score` API is a semantic decision engine, not a pretrained Kolibri expert predictor.
+- [ ] Benchmark against keyword/metadata routing and a single generic profile. Include Laya's model loading/residency and measured CPU inference cost (README: ~160 ms for the multilingual 128-token case, workload dependent) in end-to-end economics; avoid per-token Laya calls.
+- [ ] Calibrate on held-out requests, measure wrong-profile penalty and retain a safe default when classification confidence is low. Only keep Laya if it improves net cost enough to justify its resident memory and setup complexity.
+
+### Stage D --- Real streaming prototype, after offline gates
+
+- [ ] Implement a bounded, byte-accounted expert cache with asynchronous staging, pinning while kernels execute, eviction safety, cancellation and fallback on every miss. Instrument *actual* host-to-device bytes, wait time, overlapped copy time, peak host/device memory, page faults and disk I/O. Do not assume Metal unified memory behaves like a discrete GPU over PCIe.
+- [ ] Benchmark resident Metal, current `--cpu-moe`, demand-loaded cache, and predictive prefetch on the same checkpoint and workload, both warm and cold, under controlled memory pressure. Report prompt processing and decode separately, including tokens/s, p50/p95 token latency and output equivalence.
+- [ ] Correctness gate: the original router chooses every expert; outputs remain within existing quantization/reference tolerances, with deterministic regression checks. Performance gate: net tokens/s or tail-latency improvement at the *same* memory ceiling; no win may be claimed from simulated hit rates alone.
+
+### Suggested deliverables
+
+1. Reproducible policy-evaluation command and results document, with train/test split manifests.
+2. Layer-budget allocation and causal heuristic predictor with ablation tables.
+3. Optional small trained predictor and a go-laya request-level profile experiment, only if earlier stages justify them.
+4. Separately reviewed runtime streaming prototype and real-hardware benchmarks.
+
+**Stop condition:** If held-out trace predictions cannot reduce critical-path transfer costs enough to offset predictor/runtime overhead, document the negative result and do not complicate llama.cpp.
+
 ## Phase 9 --- User-facing inference behavior
 
 Template, reasoning modes, tool calls, parsers and stop tokens are done
