@@ -82,6 +82,18 @@ type Counts struct {
 	UsefulPrefetches    int   `json:"useful_prefetches"`
 	UnusedPrefetchBytes int64 `json:"unused_prefetch_bytes"`
 	Evictions           int   `json:"evictions"`
+	// FullSteps are the steps that found every expert they need resident: for a decoded token
+	// its exact Top-K set, for a ubatch its whole union.
+	FullSteps int           `json:"full_steps"`
+	Layers    []LayerCounts `json:"layers"`
+	// Links is the transfer model's estimate per declared link (transfer.go), when timed.
+	Links []LinkTime `json:"links,omitempty"`
+}
+
+// LayerCounts are one layer's accesses and hits in a phase: its share of hits is the layer's recall.
+type LayerCounts struct {
+	Accesses int `json:"accesses"`
+	Hits     int `json:"hits"`
 }
 
 // Result is a replay's counts per phase and the most expert bytes resident at once.
@@ -109,13 +121,23 @@ func TraceOrder(tokens int) []Span {
 }
 
 // Replay runs sel through p, span by span. The spans must cover tokens [0, n) in order, each
-// exactly once, for some n up to sel.Tokens: an online replay may end before the trace does. bytes[l] is the size of one expert of layer l; expert IDs are in
-// [0, nExpert). It fails on a span out of order and on a policy that prefetches an unknown key or
-// evicts a key that is not resident.
+// exactly once, for some n up to sel.Tokens: an online replay may end before the trace does.
+// bytes[l] is the size of one expert of layer l; expert IDs are in [0, nExpert). It fails on a
+// span out of order and on a policy that prefetches an unknown key or evicts a key that is not
+// resident.
 func Replay(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy) (Result, error) {
+	return ReplayTimed(sel, spans, nExpert, bytes, p, Timing{})
+}
+
+// ReplayTimed is Replay that also estimates, for every link of t, the time the replay takes when
+// each load goes over that link (transfer.go).
+func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy, t Timing) (Result, error) {
 	var r Result
 	if len(bytes) != sel.Layers {
 		return r, fmt.Errorf("replay: %d layers of expert sizes, %d of selections", len(bytes), sel.Layers)
+	}
+	if err := t.check(); err != nil {
+		return r, err
 	}
 	next := 0
 	for i, s := range spans {
@@ -126,6 +148,16 @@ func Replay(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy) 
 		next = s.End
 	}
 	nKey := sel.Layers * nExpert
+	for _, c := range []*Counts{&r.Prefill, &r.Decode} {
+		c.Layers = make([]LayerCounts, sel.Layers)
+		for _, l := range t.Links {
+			c.Links = append(c.Links, LinkTime{Link: l.Name})
+		}
+	}
+	qs := make([]queue, len(t.Links))
+	for i, l := range t.Links {
+		qs[i] = queue{bw: l.BytesPerSecond, arrival: make([]float64, nKey)}
+	}
 	resident := make([]bool, nKey)
 	prefetched := make([]Phase, nKey) // the phase a resident key was prefetched in, while unused
 	pending := make([]bool, nKey)     // resident, prefetched and not used yet
@@ -133,6 +165,9 @@ func Replay(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy) 
 	size := func(k int) int64 { return bytes[k/nExpert] }
 	var cur int64
 	load := func(k int, c *Counts) error {
+		for i := range qs {
+			qs[i].load(k, size(k))
+		}
 		resident[k] = true
 		cur += size(k)
 		for _, e := range p.Load(k) {
@@ -156,6 +191,7 @@ func Replay(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy) 
 	for _, s := range spans {
 		c := r.phase(s.Phase)
 		c.Tokens += s.End - s.First
+		compute := t.compute(s)
 		for l := range sel.Layers {
 			info := StepInfo{step, s, l}
 			step++
@@ -174,29 +210,57 @@ func Replay(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy) 
 					return r, err
 				}
 			}
-			for t := s.First; t < s.End; t++ {
-				for _, e := range sel.IDs[(l*sel.Tokens+t)*sel.K : (l*sel.Tokens+t+1)*sel.K] {
+			for i := range qs {
+				qs[i].ready = qs[i].now
+			}
+			full := true
+			for tok := s.First; tok < s.End; tok++ {
+				for _, e := range sel.IDs[(l*sel.Tokens+tok)*sel.K : (l*sel.Tokens+tok+1)*sel.K] {
 					k := l*nExpert + int(e)
 					if needed[k] == step { // already used by this step: a ubatch's union
 						continue
 					}
 					needed[k] = step
 					c.Accesses++
+					c.Layers[l].Accesses++
 					if resident[k] {
 						c.Hits++
+						c.Layers[l].Hits++
 						if pending[k] {
 							pending[k] = false
-							r.phase(prefetched[k]).UsefulPrefetches++
+							pc := r.phase(prefetched[k])
+							pc.UsefulPrefetches++
+							for i := range qs {
+								if qs[i].arrival[k] <= qs[i].now {
+									pc.Links[i].Timely++
+								} else {
+									pc.Links[i].Late++
+								}
+							}
 						}
 					} else {
+						full = false
 						c.Misses++
 						c.MissBytes += size(k)
 						if err := load(k, c); err != nil {
 							return r, err
 						}
 					}
+					for i := range qs {
+						qs[i].ready = max(qs[i].ready, qs[i].arrival[k])
+					}
 					p.Use(info, k)
 				}
+			}
+			if full {
+				c.FullSteps++
+			}
+			for i := range qs {
+				q := &qs[i]
+				stall := q.ready - q.now
+				c.Links[i].StallSeconds += stall
+				c.Links[i].Seconds += stall + compute
+				q.now = q.ready + compute
 			}
 		}
 	}

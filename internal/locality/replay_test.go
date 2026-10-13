@@ -52,7 +52,7 @@ func TestReplayLayerLRUMatchesHits(t *testing.T) {
 			}
 			d := res.Decode
 			if d.Hits != hits || d.MissBytes != missBytes || d.Hits+d.Misses != d.Accesses ||
-				d.Accesses != layers*sel.Tokens*k || res.Prefill != (Counts{}) {
+				d.Accesses != layers*sel.Tokens*k || res.Prefill.Steps != 0 || res.Prefill.Accesses != 0 {
 				t.Fatalf("trial %d, capacity %d: %+v, want %d hits and %d miss bytes of %d accesses", trial, c, res,
 					hits, missBytes, layers*sel.Tokens*k)
 			}
@@ -75,11 +75,13 @@ func TestReplayPhases(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Result{
-		Prefill:   Counts{Tokens: 4, Steps: 2, Accesses: 5, Hits: 1, Misses: 4, MissBytes: 40, Evictions: 1},
-		Decode:    Counts{Tokens: 2, Steps: 2, Accesses: 4, Hits: 1, Misses: 3, MissBytes: 30, Evictions: 3},
+		Prefill: Counts{Tokens: 4, Steps: 2, Accesses: 5, Hits: 1, Misses: 4, MissBytes: 40, Evictions: 1,
+			Layers: []LayerCounts{{5, 1}}},
+		Decode: Counts{Tokens: 2, Steps: 2, Accesses: 4, Hits: 1, Misses: 3, MissBytes: 30, Evictions: 3,
+			Layers: []LayerCounts{{4, 1}}},
 		PeakBytes: 30,
 	}
-	if res != want {
+	if !reflect.DeepEqual(res, want) {
 		t.Fatalf("Replay = %+v\nwant     %+v", res, want)
 	}
 }
@@ -168,9 +170,10 @@ func TestReplayPrefetch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Result{Decode: Counts{Tokens: 2, Steps: 2, Accesses: 4, Hits: 2, Misses: 2, MissBytes: 14,
-		Prefetches: 2, PrefetchBytes: 14, UsefulPrefetches: 1, UnusedPrefetchBytes: 7}, PeakBytes: 28}
-	if res != want {
+	want := Result{Prefill: Counts{Layers: []LayerCounts{{}}}, Decode: Counts{Tokens: 2, Steps: 2, Accesses: 4,
+		Hits: 2, Misses: 2, MissBytes: 14, Prefetches: 2, PrefetchBytes: 14, UsefulPrefetches: 1,
+		UnusedPrefetchBytes: 7, FullSteps: 1, Layers: []LayerCounts{{4, 2}}}, PeakBytes: 28}
+	if !reflect.DeepEqual(res, want) {
 		t.Fatalf("Replay = %+v\nwant     %+v", res, want)
 	}
 	// A key prefetched in prefill and evicted before use is unused bytes of the prefill.
@@ -243,5 +246,85 @@ func TestReplayRejects(t *testing.T) {
 	}
 	if _, err := Replay(sel, TraceOrder(3), 2, []int64{1, 1}, NewLayerLRU(1, 2, 1)); err == nil {
 		t.Error("two layers of sizes for one accepted")
+	}
+}
+
+func TestReplayRecall(t *testing.T) {
+	// LRU of 2 per layer. Layer 0 {0,1} {0,1}: token 1 finds its whole set. Layer 1 {2,3} {2,0}:
+	// token 1 finds 2 but not 0.
+	sel := Selections{Layers: 2, Tokens: 2, K: 2, IDs: []int32{0, 1, 0, 1, 2, 3, 2, 0}}
+	res, err := Replay(sel, TraceOrder(2), 4, []int64{1, 1}, NewLayerLRU(2, 4, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := res.Decode; d.FullSteps != 1 || !reflect.DeepEqual(d.Layers, []LayerCounts{{4, 2}, {4, 1}}) {
+		t.Fatalf("recall: %d full steps, layers %v", d.FullSteps, d.Layers)
+	}
+	// on random traces the layers add up and a step is full exactly when it misses nothing
+	r := rand.New(rand.NewPCG(9, 10))
+	sel = randomSelections(r, 3, 120, 4, 12)
+	spans, err := OnlineSpans(120, []Answer{{Prompt: 50, Tokens: make([]int32, 30)}}, false, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []int{0, 4, 12} {
+		res, err := Replay(sel, spans, 12, sizes(3, 1), NewLayerLRU(3, 12, c))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []Counts{res.Prefill, res.Decode} {
+			var acc, hits int
+			for _, l := range p.Layers {
+				acc, hits = acc+l.Accesses, hits+l.Hits
+			}
+			if acc != p.Accesses || hits != p.Hits || p.FullSteps > p.Steps || (c == 0 && p.FullSteps != 0) {
+				t.Fatalf("capacity %d: %+v", c, p)
+			}
+		}
+	}
+}
+
+func TestReplayTransfer(t *testing.T) {
+	// One layer of 10-byte experts over a link of 10 B/s (1 s per expert) and one of 20 B/s, 2 s
+	// per decoded token. Tokens {0} {1} {2}; before token 0 the policy prefetches 1, before token 2
+	// it prefetches 2.
+	//
+	// 10 B/s: 1 arrives at 1, 0 (a miss queued behind it) at 2; token 0 stalls 2 and ends at 4.
+	// Token 1 finds 1, there since 1: timely, ends at 6. Prefetched at 6, 2 arrives at 7: late,
+	// token 2 stalls 1 and ends at 9.
+	// 20 B/s: 1 at 0.5, 0 at 1, token 0 ends at 3; token 1, timely again, at 5; 2 arrives at 5.5,
+	// late, and token 2 ends at 7.5.
+	sel := Selections{Layers: 1, Tokens: 3, K: 1, IDs: []int32{0, 1, 2}}
+	p := &recorder{seen: map[int]bool{}, prefetch: func(s StepInfo) []int {
+		switch s.First {
+		case 0:
+			return []int{1}
+		case 2:
+			return []int{2}
+		}
+		return nil
+	}}
+	timing := Timing{Links: []Link{{"slow", 10}, {"fast", 20}}, DecodeStep: 2}
+	res, err := ReplayTimed(sel, TraceOrder(3), 4, []int64{10}, p, timing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []LinkTime{{"slow", 9, 3, 1, 1}, {"fast", 7.5, 1.5, 1, 1}}
+	if !reflect.DeepEqual(res.Decode.Links, want) || res.Decode.UsefulPrefetches != 2 {
+		t.Fatalf("decode links %+v\nwant         %+v", res.Decode.Links, want)
+	}
+	// a prefill ubatch of two tokens at 0.5 s per token: misses 0 and 1 arrive at 1 and 2, then
+	// 1 s of compute
+	res, err = ReplayTimed(Selections{Layers: 1, Tokens: 2, K: 1, IDs: []int32{0, 1}}, []Span{{Prefill, 0, 2}}, 4,
+		[]int64{10}, NewLayerLRU(1, 4, 4), Timing{Links: []Link{{"ssd", 10}}, PrefillToken: 0.5})
+	if err != nil || !reflect.DeepEqual(res.Prefill.Links, []LinkTime{{"ssd", 3, 2, 0, 0}}) ||
+		!reflect.DeepEqual(res.Decode.Links, []LinkTime{{Link: "ssd"}}) {
+		t.Fatalf("prefill: %+v, %v", res, err)
+	}
+	if res, _ := Replay(sel, TraceOrder(3), 4, []int64{10}, &NoCache{}); res.Decode.Links != nil {
+		t.Errorf("an untimed replay has links %v", res.Decode.Links)
+	}
+	if _, err := ReplayTimed(sel, TraceOrder(3), 4, []int64{10}, &NoCache{}, Timing{Links: []Link{{"x", 0}}}); err == nil {
+		t.Error("a link without bandwidth accepted")
 	}
 }
