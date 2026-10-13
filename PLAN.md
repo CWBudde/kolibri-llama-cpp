@@ -724,8 +724,9 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
 
 ### Stage C --- Optional go-laya workload controller (not token-level routing)
 
-- [ ] Evaluate `MeKo-Christian/go-laya` only once per request or at explicit phase boundaries, to choose among *pre-measured* cache profiles (e.g. coding, research, hr, medtech, unknown). Its `choice`/`score` API is a semantic decision engine, not a pretrained Kolibri expert predictor.
-- [ ] Benchmark against keyword/metadata routing and a single generic profile. Include Laya's model loading/residency and measured CPU inference cost (README: ~160 ms for the multilingual 128-token case, workload dependent) in end-to-end economics; avoid per-token Laya calls.
+- [ ] Gate: pin `MeKo-Christian/go-laya` at a recorded revision (at the time of writing `3237efe68c8a`, 2026-10-12, where its PLAN reports milestones M0–M8 and the 1.0 definition of done complete) and confirm its `choice`/`score` API runs on this Mac (the ONNX backend builds on darwin/arm64). Stage C starts only then; otherwise benchmark another usable request-level classifier instead.
+- [ ] Evaluate go-laya only once per request or at explicit phase boundaries, to choose among *pre-measured* cache profiles (e.g. coding, research, hr, medtech, unknown). Its `choice`/`score` API is a semantic decision engine, not a pretrained Kolibri expert predictor.
+- [ ] Benchmark against keyword/metadata routing and a single generic profile. Include Laya's model loading/residency and its CPU inference cost *measured on this Mac* through the API in end-to-end economics. Its BENCHMARKS.md reports ~160 ms for the multilingual 128-token case on an i7-1255U (ONNX), which is only an order of magnitude. Avoid per-token Laya calls.
 - [ ] Calibrate on held-out requests, measure wrong-profile penalty and retain a safe default when classification confidence is low. Only keep Laya if it improves net cost enough to justify its resident memory and setup complexity.
 
 ### Stage D --- Real streaming prototype, after offline gates
