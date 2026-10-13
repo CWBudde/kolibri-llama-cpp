@@ -700,7 +700,7 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
 
 ### Existing evidence and baseline
 
-- Reuse the frozen, SHA-pinned coding/research/hr/medtech traces and expert sizes in `testdata/locality/`, `tools/locality/experts.py`, `internal/locality`, `cmd/kolibri-cache` and `docs/expert-{locality,cache}.md`. Keep the original quantization, token order, layer IDs and six selected experts per token.
+- Reuse the frozen coding/research/hr/medtech traces. The selected experts are `~/models/eval/locality/<workload>.<gguf stem>.experts.npy` (int16 `[n_layer, n_tokens, 6]`, written by `tools/locality/experts.py`), the token IDs `<workload>.tokens.npy` beside them. `testdata/locality/` holds only their manifests, sha256 and expert sizes; `experts.py --gguf <gguf> --verify` re-hashes the stored selections against `testdata/locality/experts.json` ("PASS coding: 50 layers x 11146 tokens x 6 distinct experts, as recorded"). Replay through `internal/locality` and `cmd/kolibri-cache`, see `docs/expert-{locality,cache}.md`. Keep the original quantization, token order, layer IDs and six selected experts per token.
 - IQ3 coding, shared LRU: 128 experts/layer uses 10.88 GB, yields 90.1% hits and approximately 50 MB/token misses; 192 experts/layer uses 16.32 GB, yields 95.8% hits and approximately 21 MB/token misses. These are *trace simulations*, not measured transfers.
 - Layer 0/1 are unusually concentrated, whereas other layers have much broader use. A fixed equal-sized cache is therefore a baseline, not the presumed optimum.
 - The resident Metal benchmark (~64 tokens/s) and `--n-cpu-moe` comparisons are separate execution paths; record hardware, quantization, context length and memory pressure with every new result.
@@ -709,14 +709,18 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
 
 - [ ] Add a deterministic trace-replay evaluator with strictly causal observations: at prediction time only previous tokens' selected experts, known workload metadata and already completed layers may be used. Never use the target token's future routing decisions or future tokens. Replay prefill and decode separately; do not report teacher-forced prefill as an online decode speedup.
 - [ ] Baselines: no cache; fixed-size per-layer LRU; globally shared byte-budgeted LRU; frequency/LFU with aging; recency-frequency hybrid; and an *oracle* with future knowledge explicitly labelled as an unattainable upper bound.
-- [ ] Under identical total byte budgets, optimize cache allocation across layers (e.g. greedy marginal miss-byte reduction from held-out history). Compare against uniform allocation and a global shared cache. Account for heterogeneous expert sizes and compulsory/cold misses.
+- [ ] Under identical total byte budgets, optimize cache allocation across layers (e.g. greedy marginal miss-byte reduction), fitted on the training prefix or a separate tuning split only and frozen before the held-out suffix is replayed. Compare against uniform allocation and a global shared cache. Account for heterogeneous expert sizes and compulsory/cold misses.
 - [ ] Measure exact Top-6 set recall, per-layer recall, hit/miss rate, *miss bytes/token*, bytes prefetched but unused, peak cache bytes, evictions and estimated transfer time under declared RAM/PCIe/SSD bandwidth assumptions. Distinguish predictions that arrive early enough to overlap transfers from merely accurate predictions.
 - [ ] Split traces chronologically and by workload: fit/tune on training prefixes, validate on later suffixes, and report leave-one-workload-out generalization. Preserve separate quantized and Q8 traces to expose routing disagreement. No leakage from the frozen answers or full-trace frequencies into test-time state.
 - [ ] Gate: retain only policies that improve held-out miss bytes or latency proxy at equal memory budgets; include a trivial last-token/last-N reuse predictor as the first prediction baseline.
 
 ### Stage B --- Small causal router predictor
 
-- [ ] Start with a CPU-cheap frequency/Markov predictor per layer: features are recent expert IDs, recency, exponentially decayed counts, layer index and (optionally) previous-layer choices already known for the *same* token. Predict a ranked candidate set for the *next* token; evaluate Top-6 recall versus candidate count and prefetch-byte budget.
+- [ ] Start with a CPU-cheap frequency/Markov predictor per layer, with one feature set per prediction horizon:
+    - next token, any layer (predicted before that token is sampled): only prior tokens' state, i.e. recent expert IDs, recency, exponentially decayed counts and the layer index;
+    - same token, a later layer (predicted while the token runs): additionally the choices of that token's already completed earlier layers.
+
+  Never feed a horizon features that only exist after its deadline. Predict a ranked candidate set; evaluate Top-6 recall versus candidate count and prefetch-byte budget, per horizon.
 - [ ] If heuristics plateau, train a small multi-label model (linear classifier or tiny MLP/GRU) against the recorded expert-ID sets. Use chronological/workload-held-out splits, calibrated scores and ablations; do not train on the target token's own router logits or hidden state unless those are actually available before the intended prefetch deadline.
 - [ ] Evaluate two prediction horizons separately: next-token same-layer (can prefetch during other work) and same-token later-layer (only after preceding-layer activations exist). Explicitly calculate available overlap time from the layer execution schedule. No speculative claim that the next token is known before sampling.
 - [ ] Bound inference overhead: report predictor wall time, CPU use, memory footprint and net estimated latency saved. Compare against the ~15.7 ms/token resident baseline; a predictor that costs more than its hidden transfer latency is a failure.
