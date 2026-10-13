@@ -20,7 +20,8 @@
 //     the share of activations that are an expert's first;
 //   - NeverSelected: the share of experts the layer never selects.
 //
-// StackDistances and Hits (lru.go) replay the same selections through simulated LRU caches.
+// StackDistances and Hits (lru.go) replay the same selections through simulated LRU caches;
+// Replay (replay.go) replays them through cache policies in an online server's order.
 package locality
 
 import (
