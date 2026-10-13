@@ -1362,11 +1362,29 @@ PASS de-long, libllama vs vLLM, layer 0 (sliding attention), 1024 of 1024 tokens
 A window one key short in vLLM's config (control M28) moves `de-long`'s
 attention output to 1.7e-07 and fails.
 
+### vLLM itself on the full model
+
+Chained slices run all 50 layers through vLLM, each slice fed the previous
+one's output ([vllm-reference.md](vllm-reference.md), "Full model as chained
+slices"). vLLM's own greedy continuation of the raw German prompt is the
+port's. libllama's argmax follows it:
+
+```text
+INFO de-raw: vLLM's argmax along the sequence is its next token at 16 of 16 positions, so vLLM's greedy continuation is the sequence's: ' Deutschland Deutschland Deutschland Deutschland Deutschland …'
+INFO de-raw, libllama vs vLLM: logits NMSE 9.56e-03, KLD 0.112537, same top token 100.0%; same experts for 56.5% of (token, layer) pairs, …
+INFO de-raw, libllama vs vLLM: argmax follows vLLM's greedy tokens at 16 of 16 positions
+```
+
+These are the numbers libllama shows against the port ("KLD 0.1125"). The
+float32 torch port and vLLM agree on `de-raw` to logits NMSE 4.95e-12, with
+the same experts in every (token, layer) pair.
+
 **Assessment:**
-- **Raw greedy German degenerates in the model itself.** vLLM computes the same
-  layers on the real weights, and the port computes the whole model the same
-  way. Only the full-model vLLM run can still contradict that (PLAN Phase 6),
-  and nothing left points at llama.cpp.
+- **Raw greedy German degenerates in the model itself.** vLLM, run on the whole
+  model in float32, continues the same way as the port and libllama. Nothing
+  left points at llama.cpp. Only vLLM's BF16 run is still to come (PLAN
+  Phase 0); it is not expected to change the continuation, because the port's
+  BF16 emulation repeats too.
 - **For German, use the chat template.** There the output is coherent
   (`de-chat`, and the 528-token German answer this section refers to).
 - **Recommended sampling is not a fix yet.** It stays unvalidated until greedy
