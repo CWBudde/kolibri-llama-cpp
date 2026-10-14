@@ -5,7 +5,11 @@ Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts ins
 ## How it works
 
 - **The file keeps the experts.** The stacked expert tensors `ffn_{gate,up,down}_exps` of every layer become lazy tensors: mapped on the CPU, excluded from the loader's `WILLNEED` advice, and never read through the mapping. Nothing places them on the GPU.
-- **Slots.** Each layer gets slot tensors of the same type and row size, with `n_slots` experts instead of 384. They live in one buffer of the layers' device (on Apple Silicon a shared Metal buffer). The buffer counts as weights, so the scheduler runs the expert matmuls where the slots are.
+- **Slots.** Each layer gets slot tensors of the same type and row size, with `n_slots` experts instead of 384, on the device of the layer's other weights.
+  - The slot memory is always host memory, since the reads write into it. For a CPU layer it is the CPU's plain buffer type, never a repacking one. For a GPU layer it is an anonymous mapping that the device uses in place (`buffer_from_host_ptr`; Metal does, as for mapped weights).
+  - A device that cannot (CUDA, for example) is rejected at load time.
+  - Slots never written cost no memory.
+  - The buffers count as weights, so the scheduler runs each layer's expert matmuls where its slots are.
 - **The remap op.** In `build_moe_ffn`, after the router's selection and its weights, a CPU custom op maps the router's ids to slots, `ffn_moe_slots-<layer>`. The three `mul_mat_id` read the slot tensors with these slot ids. The expert weights keep the router's own ids, and the router chooses every expert; a prediction only decides what is read ahead.
 - **Loads.** A missing expert is read with `pread` into its slot: three ranges per expert (gate, up, down), from a second descriptor of the GGUF with `F_NOCACHE` (macOS), so the bytes do not stay in the page cache. On unified memory there is no host-to-device copy: the read from the SSD into the slot *is* the transfer. Reads of pages that are already in the page cache are served from it, `F_NOCACHE` notwithstanding.
 - **Bookkeeping** (`src/llama-expert-slots.*`, independent of ggml):
@@ -52,7 +56,8 @@ In the C API it is `llama_model_params.expert_cache`, a `llama_expert_cache_para
   - `wait_seconds`, the time the remaps blocked on loads, which is the cost on the critical path;
   - `io_seconds`, the loads' own time, summed over the I/O threads;
   - `io_prefetch_seconds`, the part of it that prefetches took. It overlaps compute, unless a remap waited for the prefetch (`hits_loading`). Demand loads overlap nothing, except each other on the I/O threads.
-- `process`, measured since the cache was set up: `disk_bytes_read` and `pageins` from `proc_pid_rusage`, `major_faults` from `getrusage`, and the lifetime peak `max_phys_footprint`.
+- `process`, measured since the cache was set up: `disk_bytes_read` and `pageins` from `proc_pid_rusage`, `major_faults` from `getrusage`, and the lifetime peak `max_phys_footprint`. A counter the platform does not measure is `null`: on Linux all but `major_faults`.
+- The file name is a JSON string, escaped.
 
 ## Checks
 
@@ -77,8 +82,10 @@ The fixture comes from `internal/locality`'s `TestMarkovFixture`: a random conve
   - slots per layer (12, 64, 18, 384, 30, 100), bit-identical as well;
   - fewer than 6 slots fail to load;
   - a second context on the same model fails, and after the first is freed a new one gets the cache;
-  - `llama-completion` with `--expert-cache-layers`, `--expert-prefetch 8,4,0.25`, `--expert-cache-threads 2` and `--expert-cache-stats` runs as asked (the stats record it) and generates the same greedy text as without the cache.
-- **Result:** "PASS: 0 failures", 97 checks. The logits of all 100 positions are bit-identical in every configuration, and the counters are consistent.
+  - `llama-completion` with `--expert-cache-layers`, `--expert-prefetch 8,4,0.25`, `--expert-cache-threads 2` and `--expert-cache-stats` runs as asked (the stats record it) and generates the same greedy text as without the cache;
+  - placement: with 3 of 6 layers on Metal, each layer's slots are on its own device; with the CPU's repacking enabled, the slots still hold the file's bytes. Both are bit-identical to the resident run without repacking;
+  - a model file named with a quote, a backslash and a tab still gives valid stats JSON.
+- **Result:** "PASS: 0 failures", 102 checks. The logits of all 100 positions are bit-identical in every configuration, and the counters are consistent.
 
 **IQ3, real weights** (`check_expert_cache.py --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`):
 - **Setup:** the first 160 tokens of the coding workload, 128 prefilled and 32 decoded, on Metal.
@@ -108,7 +115,8 @@ All three generate the same 679 characters.
 
 ## Limits
 
-- One context per model; a second context with the cache fails to be created.
+- One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
+- The expert layers must be on the CPU or on a device that can use host memory in place (Metal); CUDA and the like are rejected.
 - Kolibri only, no LoRA on the routed experts. The experts must be in one file.
 - A ubatch of one token counts as decode, also in a prompt. In a prefill ubatch the last layer sees only the output rows, so the predictor's counts of that layer cover fewer tokens than the trace replays of Stage B.
 - LRU only. Layer budgets can be set with `--expert-cache-layers`, but nothing writes the Stage A allocation to such a file yet.
@@ -116,5 +124,5 @@ All three generate the same 679 characters.
 - libllama's INFO lines, including the cache's setup line, appear only with `-v`; the counters go to `--expert-cache-stats`.
 - Platforms:
   - macOS opens the file again through `F_GETPATH` and reads it with `F_NOCACHE`;
-  - Linux reopens `/proc/self/fd/N`, without bypassing the page cache;
-  - other systems are unsupported.
+  - Linux reopens `/proc/self/fd/N`, without bypassing the page cache, and measures only the major faults;
+  - other systems compile the cache but reject it at load time.
