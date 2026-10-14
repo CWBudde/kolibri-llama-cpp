@@ -747,7 +747,7 @@ GB Mac.
 
 ## Phase 10 --- Predictive expert caching and prefetch (proposed)
 
-**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only predictor so far, last-N, did not pass the gate; Stage B has not started. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
+**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist; it did not pass the gate either, so item 2's condition, a heuristic plateau, is met, and whether to train a model is open. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
 
 ### Objective and constraints
 
@@ -841,15 +841,58 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
 
 ### Stage B --- Small causal router predictor
 
-- [ ] Start with a CPU-cheap frequency/Markov predictor per layer, with one feature set per prediction horizon:
+- [x] Start with a CPU-cheap frequency/Markov predictor per layer, with one feature set per prediction horizon:
     - next token, any layer (predicted before that token is sampled): only prior tokens' state, i.e. recent expert IDs, recency, exponentially decayed counts and the layer index;
     - same token, a later layer (predicted while the token runs): additionally the choices of that token's already completed earlier layers.
 
-  Never feed a horizon features that only exist after its deadline. Predict a ranked candidate set; evaluate Top-6 recall versus candidate count and prefetch-byte budget, per horizon.
-- [ ] If heuristics plateau, train a small multi-label model (linear classifier or tiny MLP/GRU) against the recorded expert-ID sets. Use chronological/workload-held-out splits, calibrated scores and ablations; do not train on the target token's own router logits or hidden state unless those are actually available before the intended prefetch deadline.
-- [ ] Evaluate two prediction horizons separately: next-token same-layer (can prefetch during other work) and same-token later-layer (only after preceding-layer activations exist). Explicitly calculate available overlap time from the layer execution schedule. No speculative claim that the next token is known before sampling.
-- [ ] Bound inference overhead: report predictor wall time, CPU use, memory footprint and net estimated latency saved. Compare against the ~15.7 ms/token resident baseline; a predictor that costs more than its hidden transfer latency is a failure.
-- [ ] Gate: require an improvement over Stage A on held-out workloads, with prediction cost included; otherwise keep the simpler policy.
+  Never feed a horizon features that only exist after its deadline. Predict a ranked candidate set; evaluate Top-6 recall versus candidate count and prefetch-byte budget, per horizon. (2026-10-14) — `locality.Markov` (`internal/locality/predict.go`) is the user's choice of 2026-10-14, decayed counts plus a first-order Markov term.
+    - Per layer it keeps every expert's use count, halved every half-life tokens, and two transition tables: a decoded set in a layer to the next token's set in that layer, and within a token a layer's set to the layer after next.
+    - A score is mix × the transitions' share plus (1 − mix) × the counts' share; the top k are the candidates.
+    - It learns a step only after the step has run, from `Use`, the user's choice of online learning. Only decoded steps are predicted, only from decoded sets.
+    - Horizons, in the replay's schedule:
+      - **next token:** before layer l of token t, layer l−1 of token t+1, from token t's set in l−1, 49 steps ahead;
+      - **same token:** before layer l, the token's layer l+1 from its set in l−1, one step ahead.
+    - `Rank` precomputes the candidates a replay meets and `Ranked` prefetches them; `Prefetcher` is the same predictor as an online policy.
+    - Parameters are chosen per horizon on the own training prefix (half-lives 64–4096 tokens, mixes 0–1), as the most needed experts covered over k = 6–48; leaving one workload out is reported beside it.
+    - Checks:
+      - `TestMarkovScores` is hand-computed.
+      - `TestMarkovCausal`: redrawing every expert from a step on leaves every earlier prediction unchanged. Learning the running step before ranking fails it.
+      - `TestPrefetcher`: the online policy prefetches exactly the ranking's top k, at the right targets. Targeting the running layer, or predicting the next token from the running token, fails it.
+      - `TestPredictRecall` checks recall by brute force.
+      - On the real traces, 16 new PASS lines show the online predictor replaying exactly as its ranking, e.g. "PASS IQ3_XXS-IQ4_XS-down-imx coding: the same token predictor, learning online from Use alone, replays as its ranking at k 48 and 128 experts per layer" (64 PASS lines in all).
+    - Test-suffix recall, IQ3 (Q8_0 within 0.1 points), experts covered (whole Top-6 sets):
+      - **next token:** the own prefix chooses counts alone with the shortest half-life, 64, for every workload. 31.6% (0.1%) at k 6, 60.8% (10.2%) at 24, 75.5% (26.5%) at 48; Markov only 18.1–54.0%.
+      - **same token:** a mix of 0.75 (hr: transitions alone). 32.3% (0.1%) at k 6, 76.0% (29.9%) at 48; leaving one workload out 32.6% / 76.3%.
+      - For comparison, last-N with n 1 covers 34.4% with 6.3 candidates.
+    - The prefetch budget is k × 1.7 MB per predicted step: 509 MB per IQ3 token at k 6 ([docs/expert-policy.md](docs/expert-policy.md)).
+- [ ] If heuristics plateau, train a small multi-label model (linear classifier or tiny MLP/GRU) against the recorded expert-ID sets. Use chronological/workload-held-out splits, calibrated scores and ablations; do not train on the target token's own router logits or hidden state unless those are actually available before the intended prefetch deadline. (2026-10-14) — condition met: the decayed-count Markov predictor did not pass the Stage B gate (below). Whether to train a model is the user's call; nothing has been trained.
+- [x] Evaluate two prediction horizons separately: next-token same-layer (can prefetch during other work) and same-token later-layer (only after preceding-layer activations exist). Explicitly calculate available overlap time from the layer execution schedule. No speculative claim that the next token is known before sampling. (2026-10-14) — Each horizon is ranked, tuned, replayed and gated on its own. The next-token horizon uses only earlier tokens' experts, so nothing is known before sampling.
+    - `Horizon.Lead` and `LeadSeconds` give the lead from the replay's schedule (`transfer.go`, a decoded layer computing 0.314 ms once its experts are there).
+      - **next token:** 49 steps, 15.38 ms, time for 45 / 226 / 905 IQ3 experts on SSD / PCIe / RAM (Q8_0 18 / 92 / 368).
+      - **same token:** one step, 0.31 ms, 0 / 4 / 18 (Q8_0 0 / 1 / 7).
+    - `TestOverlap`: a same-token prefetch that fits its window arrives in time, and one slower than a step's compute arrives late, apart from the first token's.
+    - The timed replays split used prefetches into timely and late. At 128 experts per layer:
+      - same token: 94.2% timely on SSD (224 late) and 100% on PCIe and RAM (IQ3), 93.9% / 98.6% / 100% for Q8_0;
+      - next token: its top 6, the most used experts, are resident already, so it prefetches next to nothing (IQ3: no used prefetch) ([docs/expert-policy.md](docs/expert-policy.md)).
+- [x] Bound inference overhead: report predictor wall time, CPU use, memory footprint and net estimated latency saved. Compare against the ~15.7 ms/token resident baseline; a predictor that costs more than its hidden transfer latency is a failure. (2026-10-14) — `BenchmarkMarkovStep` (`go test ./internal/locality/ -run '^$' -bench Markov -benchmem -count 3`, Apple M5 Pro) measures one rank and learn at 50 layers × 384 experts and 48 candidates.
+    - It takes 3.8–4.4 µs per decoded layer step with no allocation. The slowest run, 4.4 µs, is the declared `-predict-us` default.
+    - That is 0.22 ms of one CPU core per decoded token, 1.4% of the 15.7 ms resident decode. The tables (`MarkovBytes`) take 59 MB.
+    - The timed replays add the cost to every decoded step's compute, on the critical path, and are also run without it.
+    - The net saving against the best Stage A policy is negative everywhere: on its own link, every size and both horizons, the predictor with its cost is at least 0.9% slower for IQ3 and 0.8% for Q8_0. IQ3 at 128 experts per layer, SSD: 23.3 ms/token for the best Stage A policy, 23.5 for next token and 23.7 for same token with the cost (23.3 and 23.5 without).
+    - At 8 experts per layer, wrong prefetches crowd out the cache: 182 against 79 ms/token on SSD.
+    - `TestMarkovNoLeak` checks that the cost lengthens the replay; dropping it fails the test ([docs/expert-policy.md](docs/expert-policy.md)).
+- [x] Gate: require an improvement over Stage A on held-out workloads, with prediction cost included; otherwise keep the simpler policy. (2026-10-14) — The user's rule of 2026-10-14: retained only at a budget where it beats the best Stage A policy there.
+    - The reference is the fewest bytes, and the least time on each link, of the shared LRU and all seven policies Stage A judged, last-N included.
+    - Each horizon is judged once per link, with k chosen per budget for that link on the own training prefix, by its decode time with the cost.
+    - **Not retained:** none of the 12 variants (2 horizons × 3 links × 2 models) beats the best Stage A policy anywhere, so the simpler Stage A policies stay. Without its cost, same token would be faster only at 384 experts per layer, by at most 0.007%, through carried experts (below).
+    - **Carried prefetches.** The first run showed same token "retained" at 384 experts per layer on 0.8–7.7% fewer bytes. Those bytes came entirely from wrong predictions in the training prefix that loaded experts the test suffix first needed: for hr, 671 MB were prefetched in vain before the cut, and the test suffix had no prefetch of its own.
+      - `ReplaySegments` now counts such hits as `CarriedPrefetches` / `CarriedPrefetchBytes` in the later segment, and the gate's `loadedBytes` charges them there.
+      - No Stage A policy carries any, so every Stage A table is byte-identical.
+    - Checks:
+      - `TestStageBGate`: beating the shared LRU but not the best is no win, ties and 10⁻⁹ noise are no win, and a link-tuned variant is judged on its link only. Gating against the shared LRU, letting ties pass, or ignoring the link restriction fails it.
+      - `TestReplaySegments` and `TestLoadedBytes` fail without the carried accounting.
+      - `TestChooseMarkov`, `TestChooseK` and `TestMarkovNoLeak` fail when parameters or k are tuned on the test suffix, or when leaving one workload out includes the held-out workload ([docs/expert-policy.md](docs/expert-policy.md)).
+- [ ] Extend the next-token half-life grid below 64 tokens: the own prefix chose 64, the grid's shortest, for every workload of both models, and last-N with n 1 (pure recency) covers more at the same candidate count (34.4% against 31.6%). It is not expected to change the gate, since those candidates are resident already.
 
 ### Stage C --- Optional go-laya workload controller (not token-level routing)
 
