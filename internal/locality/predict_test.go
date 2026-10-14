@@ -90,38 +90,46 @@ func TestMarkovCausal(t *testing.T) {
 	sel, spans, _ := onlineSplit(r)
 	for _, h := range []Horizon{NextToken, SameToken} {
 		p := MarkovParams{HalfLife: 16, Mix: 0.5}
-		base := Rank(sel, spans, 12, h, p, 6)
-		changed := false
-		for range 20 {
-			// redraw every expert from step (i, l) on: the predictions before it and before every
-			// earlier step stay as they were
-			i, l := r.IntN(len(spans)), r.IntN(sel.Layers)
-			re := Selections{Layers: sel.Layers, Tokens: sel.Tokens, K: sel.K, IDs: slices.Clone(sel.IDs)}
-			other := randomSelections(r, sel.Layers, sel.Tokens, sel.K, 12)
-			for ll := range sel.Layers {
-				from := spans[i].First
-				if ll < l {
-					from = spans[i].End
-				}
-				copy(re.IDs[(ll*sel.Tokens+from)*sel.K:(ll+1)*sel.Tokens*sel.K],
-					other.IDs[(ll*sel.Tokens+from)*sel.K:(ll+1)*sel.Tokens*sel.K])
+		checkCausal(t, r, sel, spans, h, func(sel Selections) *Ranking { return Rank(sel, spans, 12, h, p, 6) })
+	}
+}
+
+// checkCausal fails unless rank, a horizon's predictions over spans, predicts before every step
+// what it predicted before it on the trace redrawn from that step on, and some later prediction
+// changes.
+func checkCausal(t *testing.T, r *rand.Rand, sel Selections, spans []Span, h Horizon, rank func(Selections) *Ranking) {
+	t.Helper()
+	base := rank(sel)
+	changed := false
+	for range 20 {
+		// redraw every expert from step (i, l) on: the predictions before it and before every
+		// earlier step stay as they were
+		i, l := r.IntN(len(spans)), r.IntN(sel.Layers)
+		re := Selections{Layers: sel.Layers, Tokens: sel.Tokens, K: sel.K, IDs: slices.Clone(sel.IDs)}
+		other := randomSelections(r, sel.Layers, sel.Tokens, sel.K, 12)
+		for ll := range sel.Layers {
+			from := spans[i].First
+			if ll < l {
+				from = spans[i].End
 			}
-			got := Rank(re, spans, 12, h, p, 6)
-			cut := i*sel.Layers + l
-			for s := range base.Steps() {
-				la, a := base.Top(s, 6)
-				lb, b := got.Top(s, 6)
-				if s <= cut && (la != lb || !slices.Equal(a, b)) {
-					t.Fatalf("%v: before step %d the prediction changed with steps from %d on: %v, %v", h, s, cut, a, b)
-				}
-				if s > cut && !slices.Equal(a, b) {
-					changed = true
-				}
+			copy(re.IDs[(ll*sel.Tokens+from)*sel.K:(ll+1)*sel.Tokens*sel.K],
+				other.IDs[(ll*sel.Tokens+from)*sel.K:(ll+1)*sel.Tokens*sel.K])
+		}
+		got := rank(re)
+		cut := i*sel.Layers + l
+		for s := range base.Steps() {
+			la, a := base.Top(s, 6)
+			lb, b := got.Top(s, 6)
+			if s <= cut && (la != lb || !slices.Equal(a, b)) {
+				t.Fatalf("%v: before step %d the prediction changed with steps from %d on: %v, %v", h, s, cut, a, b)
+			}
+			if s > cut && !slices.Equal(a, b) {
+				changed = true
 			}
 		}
-		if !changed {
-			t.Fatalf("%v: redrawing the experts never changed a later prediction", h)
-		}
+	}
+	if !changed {
+		t.Fatalf("%v: redrawing the experts never changed a later prediction", h)
 	}
 }
 

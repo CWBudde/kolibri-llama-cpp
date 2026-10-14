@@ -202,22 +202,27 @@ func (m *Markov) Predict(h Horizon, s StepInfo, k int, out []int) (int, []int) {
 			m.score[b] += (1 - w) * f / sum
 		}
 	}
-	k = min(k, n)
+	return target, topK(m.score, min(k, n), out)
+}
+
+// topK is the indexes of the k best scores, best first, the lower index first of equal ones, in
+// out's storage.
+func topK[T float32 | float64](score []T, k int, out []int) []int {
 	out = out[:0]
-	for b, v := range m.score {
+	for b, v := range score {
 		if len(out) < k {
 			out = append(out, b)
-		} else if !(v > m.score[out[k-1]]) {
+		} else if !(v > score[out[k-1]]) {
 			continue
 		}
 		i := len(out) - 1
-		for i > 0 && m.score[out[i-1]] < v {
+		for i > 0 && score[out[i-1]] < v {
 			out[i] = out[i-1]
 			i--
 		}
 		out[i] = b
 	}
-	return target, out
+	return out
 }
 
 // stepExperts is the experts of layer l that span s uses, in the order Replay meets them, once
