@@ -747,7 +747,7 @@ GB Mac.
 
 ## Phase 10 --- Predictive expert caching and prefetch (proposed)
 
-**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist, and a trained linear predictor (item 2). Neither passes the gate: no predictor beats the best Stage A policy, even without its CPU cost, also with the half-life grid extended down to 1 token. Stage B is done. By the stop condition below, the negative result is documented and llama.cpp is not complicated. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
+**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist, and a trained linear predictor (item 2). Neither passes the gate: no predictor beats the best Stage A policy, even without its CPU cost, also with the half-life grid extended down to 1 token. Stage B is done. By the stop condition below, the negative result is documented. Stage D was nevertheless started by the user's decision (2026-10-14), as a separately reviewed prototype behind an experimental option: item 1, the runtime expert cache (patch 0011), exists; its benchmark and gates are open. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
 
 ### Objective and constraints
 
@@ -938,7 +938,39 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
 
 ### Stage D --- Real streaming prototype, after offline gates
 
-- [ ] Implement a bounded, byte-accounted expert cache with asynchronous staging, pinning while kernels execute, eviction safety, cancellation and fallback on every miss. Instrument *actual* host-to-device bytes, wait time, overlapped copy time, peak host/device memory, page faults and disk I/O. Do not assume Metal unified memory behaves like a discrete GPU over PCIe.
+No predictor passed the offline gates (Stages A and B). The user decided on 2026-10-14 to build the prototype anyway. It stays behind an experimental option, `--expert-cache`, and the gates below decide whether it is kept.
+
+- [x] Implement a bounded, byte-accounted expert cache with asynchronous staging, pinning while kernels execute, eviction safety, cancellation and fallback on every miss. Instrument *actual* host-to-device bytes, wait time, overlapped copy time, peak host/device memory, page faults and disk I/O. Do not assume Metal unified memory behaves like a discrete GPU over PCIe. (2026-10-15) — patch 0011 (fork `feat/kolibri-expert-cache`), [docs/expert-streaming.md](docs/expert-streaming.md).
+    - **Design:**
+      - the stacked experts stay in the GGUF as lazy tensors;
+      - each layer keeps N experts in slot tensors on its device;
+      - a CPU op between the router and the expert matmuls maps the router's ids to slots, after `pread` with `F_NOCACHE` has read every missing expert;
+      - the expert weights keep the router's ids.
+    - **Bookkeeping:** LRU per layer and I/O threads with a demand queue ahead of the prefetch queue.
+      - Pins: the ubatch's experts, and the layer in flight until the next remap.
+      - A loading slot is never a victim.
+      - Queued prefetches the layer does not need are cancelled.
+      - A failed prefetch falls back to a demand load.
+      - Optional prefetch with the C++ port of the same-token Markov predictor.
+      - `n_ubatch` is capped so that a ubatch's experts fit.
+    - **Counters** (`--expert-cache-stats`), per phase:
+      - hits, misses, evictions, demand and prefetch bytes, prefetch use, waste and cancellation;
+      - the wait on loads and the I/O time, with its prefetch share;
+      - for the process: disk bytes read, pageins, major faults and peak footprint.
+      - On unified memory the transfer is the read from the SSD into the slot; there is no host-to-device copy.
+    - **Tests:** `test-expert-cache` covers LRU, pins, capacity, awaited and cancelled prefetches, the layer in flight, failures and a threaded stress run. Its C++ predictor matches `internal/locality`'s Go one on `testdata/locality/markov-fixture.json`: "978 steps, 2528 predictions over 4 parameter sets, as the Go predictor"; `TestMarkovFixture` pins the fixture.
+    - **Correctness:**
+      - `tools/gguf/check_expert_cache.py`: the tiny 384-expert checkpoint (F32 and Q8_0, CPU and Metal, 6 to 384 slots and per-layer slots, with and without prefetch) gives logits bit-identical to resident experts at the same ubatch. "PASS: 0 failures", 97 checks, including a refused second context and the command-line options.
+      - `--real` IQ3, 160 coding tokens on Metal at 128 and 64 slots: bit-identical as well, "PASS: 0 failures".
+    - **Q8_0 smoke** (83 GB, does not fit in RAM), `llama-completion --expert-cache 128` on Metal: the same 679 characters as CPU-only Q8_0.
+      - **Speed:** 11.25 tokens/s, against 0.31 CPU-only while the machine was loaded (INFO, not a benchmark).
+      - **Cache:** 94.2% decode hits, 72.6 MB read per token. 19.12 GB were read from disk against 18.92 GB of demand loads.
+      - **Memory:** peak footprint 19.2 GB for a 26.7 GB slot buffer.
+      - **Prefetch 12:** slower (7.67 tokens/s); 111 of 576 prefetches used.
+    - **Controls:**
+      - M32, an off-by-one slot id: all 32 tiny logit checks fail.
+      - M33, victims chosen without pins: `test-expert-cache` fails.
+      - M34, a changed fixture prediction: the C++ check fails with the first differing step.
 - [ ] Benchmark resident Metal, current `--cpu-moe`, demand-loaded cache, and predictive prefetch on the same checkpoint and workload, both warm and cold, under controlled memory pressure. Report prompt processing and decode separately, including tokens/s, p50/p95 token latency and output equivalence.
 - [ ] Correctness gate: the original router chooses every expert; outputs remain within existing quantization/reference tolerances, with deterministic regression checks. Performance gate: net tokens/s or tail-latency improvement at the *same* memory ceiling; no win may be claimed from simulated hit rates alone.
 
