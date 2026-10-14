@@ -462,6 +462,26 @@ func timed(train, test []float64) Run {
 	return r
 }
 
+func TestMarkovParams(t *testing.T) {
+	// every half-life with every mix below 1, the transitions alone once, and half-lives down to
+	// pure recency: the own prefixes chose 64 when it was the shortest
+	want := len(markovHalfLives)*(len(markovMixes)-1) + 1
+	got := markovParams()
+	if len(got) != want {
+		t.Fatalf("%d parameters, want %d", len(got), want)
+	}
+	seen := map[locality.MarkovParams]bool{}
+	for _, p := range got {
+		if seen[p] || p.Mix == 1 && p.HalfLife != 0 || p.Mix < 1 && !slices.Contains(markovHalfLives, p.HalfLife) {
+			t.Fatalf("parameter %+v", p)
+		}
+		seen[p] = true
+	}
+	if slices.Min(markovHalfLives) != 1 {
+		t.Fatalf("shortest half-life %d, want 1", slices.Min(markovHalfLives))
+	}
+}
+
 func TestChooseK(t *testing.T) {
 	// two links, one size, k 6 and 12: on the first link 12 trains faster, on the second they tie;
 	// the test suffix would have chosen otherwise on both
