@@ -796,7 +796,7 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
     - the other model's prefix of the same workload, so the IQ3 and Q8_0 traces are never pooled;
     - hindsight on the test suffix, marked † as the leaky bound.
   - Checks:
-    - `TestReplaySegments`: the segments merge to the unsplit replay, and state carries across the cut. Resetting the cache at the cut fails it.
+    - `TestReplaySegments`: the first segment equals a replay of the prefix alone, so held-out routing cannot change training counts. Prefetches still unused at a cut count as unused there, and a later use of them is a plain hit. Without prefetches, the segments merge to the unsplit replay, and state carries across the cut. Resetting the cache at the cut fails it, and so does carrying pending prefetches across it.
     - `TestTuneNoLeak`: redrawing every expert of a test suffix leaves the training counts and the tuned half-life unchanged.
     - `TestTune` and `TestFolds` fail when tuning reads the test suffix or leave-one-workload-out includes the held-out workload.
     - The regenerated `docs/expert-policy.md` only adds lines: every full-trace table is byte-identical.

@@ -347,43 +347,53 @@ func TestReplaySegments(t *testing.T) {
 	}
 	timing := Timing{Links: []Link{{"slow", 50}, {"fast", 500}}, DecodeStep: 0.1, PrefillToken: 0.01}
 	policy := func() Policy {
-		// an LRU that also prefetches the step's previous-token experts, so that prefetches cross cuts
-		lru := NewLayerLRU(3, 16, 6)
+		// an LRU that also prefetches two experts of the step's layer that it guesses blindly, so
+		// that some prefetches are used, some not, and some cross a cut (it holds 12 of 16, so
+		// they stay long enough)
+		lru := NewLayerLRU(3, 16, 12)
 		return &prefetching{Policy: lru, prefetch: func(s StepInfo) []int {
-			if s.First == 0 {
-				return nil
-			}
-			var keys []int
-			for _, e := range sel.IDs[(s.Layer*sel.Tokens+s.First-1)*sel.K : (s.Layer*sel.Tokens+s.First)*sel.K] {
-				keys = append(keys, s.Layer*16+int(e))
-			}
-			return keys
+			return []int{s.Layer*16 + s.Index*7%16, s.Layer*16 + s.Index*11%16}
 		}}
 	}
-	whole, err := ReplayTimed(sel, spans, 16, sizes(3, 5), policy(), timing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, cuts := range [][]int{nil, {1}, {len(spans) - 1}, {3, 7, 20}, {5, 6}} {
-		segs, err := ReplaySegments(sel, spans, cuts, 16, sizes(3, 5), policy(), timing)
+	lru := func() Policy { return NewLayerLRU(3, 16, 6) }
+	for pi, p := range []func() Policy{lru, policy} {
+		whole, err := ReplayTimed(sel, spans, 16, sizes(3, 5), p(), timing)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(segs) != len(cuts)+1 {
-			t.Fatalf("cuts %v: %d segments", cuts, len(segs))
-		}
-		for i, s := range segs {
-			if s.PeakBytes > whole.PeakBytes {
-				t.Fatalf("cuts %v: segment %d peaks at %d, the whole replay at %d", cuts, i, s.PeakBytes, whole.PeakBytes)
+		for _, cuts := range [][]int{nil, {1}, {len(spans) - 1}, {3, 7, 20}, {5, 6}} {
+			segs, err := ReplaySegments(sel, spans, cuts, 16, sizes(3, 5), p(), timing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(segs) != len(cuts)+1 {
+				t.Fatalf("cuts %v: %d segments", cuts, len(segs))
+			}
+			for i, s := range segs {
+				if s.PeakBytes > whole.PeakBytes {
+					t.Fatalf("cuts %v: segment %d peaks at %d, the whole replay at %d", cuts, i, s.PeakBytes,
+						whole.PeakBytes)
+				}
+			}
+			// without prefetches the segments add up to the whole replay
+			if got := Merge(segs...); pi == 0 && !sameResult(got, whole) {
+				t.Fatalf("cuts %v: merged %+v\nwhole        %+v", cuts, got, whole)
+			}
+			if len(cuts) == 0 {
+				continue
+			}
+			// the first segment is the replay of its spans alone, whatever follows
+			prefix, err := ReplayTimed(sel, spans[:cuts[0]], 16, sizes(3, 5), p(), timing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameResult(segs[0], prefix) {
+				t.Fatalf("cuts %v: first segment %+v\nprefix alone  %+v", cuts, segs[0], prefix)
 			}
 		}
-		got := Merge(segs...)
-		if !sameResult(got, whole) {
-			t.Fatalf("cuts %v: merged %+v\nwhole        %+v", cuts, got, whole)
-		}
 	}
-	// the cache runs on across a cut: token 1 finds the expert token 0 loaded, and the prefetch
-	// made before token 0 counts in the first segment, its use in the second
+	// the cache runs on across a cut: tokens 1 and 2 find the experts the first segment loaded. The
+	// prefetch made before token 0 is unused when the first segment ends, its use a plain hit.
 	sel = Selections{Layers: 1, Tokens: 3, K: 1, IDs: []int32{0, 1, 0}}
 	p := &recorder{seen: map[int]bool{}, prefetch: func(s StepInfo) []int {
 		if s.First == 0 {
@@ -395,8 +405,9 @@ func TestReplaySegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, b := segs[0].Decode, segs[1].Decode; a.Prefetches != 1 || a.UsefulPrefetches != 1 || a.Misses != 1 ||
-		b.Hits != 2 || b.Misses != 0 || b.Tokens != 2 || segs[1].PeakBytes != 14 {
+	if a, b := segs[0].Decode, segs[1].Decode; a.Prefetches != 1 || a.UsefulPrefetches != 0 ||
+		a.UnusedPrefetchBytes != 7 || a.Misses != 1 || b.Hits != 2 || b.Misses != 0 || b.UsefulPrefetches != 0 ||
+		b.UnusedPrefetchBytes != 0 || b.Tokens != 2 || segs[1].PeakBytes != 14 {
 		t.Fatalf("segments %+v", segs)
 	}
 	for _, bad := range [][]int{{0}, {3}, {2, 1}, {1, 1}} {

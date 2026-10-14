@@ -146,8 +146,11 @@ func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Pol
 // holds the spans from cut i-1 (0 for the first) to cut i (len(spans) for the last). The policy,
 // the cache and the links run on across a cut, so a later segment starts warm from the earlier
 // ones, as a server's would. A segment counts what its steps cause and its peak is the most bytes
-// resident during its steps; prefetches, and their use and unused bytes, count in the segment of
-// the step they were prefetched for. Merge adds the segments up to the unsegmented replay.
+// resident during its steps; prefetches count in the segment of the step they were prefetched
+// for. A segment's counts never depend on later steps: at a cut, its prefetches not used yet
+// count as unused, as at the end of a replay, and a later use of them is a plain hit. The first
+// segment is therefore the replay of its spans alone. Merge adds the segments up to the
+// unsegmented replay, except for prefetches used across a cut.
 func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes []int64, p Policy,
 	t Timing) ([]Result, error) {
 	if len(bytes) != sel.Layers {
@@ -216,6 +219,12 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 	step, seg := 0, 0
 	for i, s := range spans {
 		if seg < len(cuts) && i == cuts[seg] {
+			for k, ok := range pending {
+				if ok {
+					pending[k] = false
+					prefetched[k].UnusedPrefetchBytes += size(k)
+				}
+			}
 			seg++
 			r = &rs[seg]
 			r.PeakBytes = cur
@@ -303,7 +312,8 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 	return rs, nil
 }
 
-// Merge adds the segments of a replay up: their counts and link times, and the largest peak.
+// Merge adds the segments of a replay up: their counts and link times, and the largest peak. It
+// is the unsegmented replay unless a prefetch made before a cut is used after it.
 func Merge(rs ...Result) Result {
 	var m Result
 	for i, r := range rs {
