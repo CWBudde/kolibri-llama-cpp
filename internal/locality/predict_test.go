@@ -70,6 +70,11 @@ func TestMarkovScores(t *testing.T) {
 	if layer, got := m.Predict(NextToken, StepInfo{7, Span{Decode, 2, 3}, 1}, 3, nil); layer != 0 || len(got) != 3 {
 		t.Fatalf("next token: layer %d, %v", layer, got)
 	}
+	// nothing before the first step of a trace decoded from token 0: no set has run yet
+	if _, got := NewMarkov(3, 3, MarkovParams{HalfLife: 64}).Predict(NextToken, StepInfo{0, Span{Decode, 0, 1}, 0}, 3,
+		nil); got != nil {
+		t.Fatalf("before any step: %v", got)
+	}
 	// nothing before a prefill step, and nothing from a ubatch
 	if _, got := m.Predict(NextToken, StepInfo{7, Span{Prefill, 2, 3}, 1}, 3, nil); got != nil {
 		t.Fatalf("before a prefill step: %v", got)

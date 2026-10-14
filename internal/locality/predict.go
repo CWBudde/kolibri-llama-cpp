@@ -124,7 +124,7 @@ func (m *Markov) Observe(s StepInfo, ids []int) {
 		m.lastTok[l] = -1
 		return
 	}
-	if m.lastTok[l] == s.First-1 {
+	if s.First > 0 && m.lastTok[l] == s.First-1 {
 		m.add(m.temporal, m.tRow, l, m.last[l], ids)
 	}
 	if l >= 2 && m.lastTok[l-2] == s.First {
@@ -161,7 +161,7 @@ func (m *Markov) Predict(h Horizon, s StepInfo, k int, out []int) (int, []int) {
 		if s.Layer == 0 {
 			from, tok = m.layers-1, s.First-1
 		}
-		if m.lastTok[from] != tok {
+		if tok < 0 || m.lastTok[from] != tok {
 			return 0, nil
 		}
 		target, table, row = from, m.temporal, m.tRow
