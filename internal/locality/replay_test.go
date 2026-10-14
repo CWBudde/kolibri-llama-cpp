@@ -336,3 +336,118 @@ func TestReplayTransfer(t *testing.T) {
 		}
 	}
 }
+
+func TestReplaySegments(t *testing.T) {
+	r := rand.New(rand.NewPCG(11, 12))
+	sel := randomSelections(r, 3, 200, 4, 16)
+	answers := []Answer{{Prompt: 40, Tokens: make([]int32, 30)}, {Prompt: 120, Tokens: make([]int32, 40)}}
+	spans, err := OnlineSpans(200, answers, false, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timing := Timing{Links: []Link{{"slow", 50}, {"fast", 500}}, DecodeStep: 0.1, PrefillToken: 0.01}
+	policy := func() Policy {
+		// an LRU that also prefetches two experts of the step's layer that it guesses blindly, so
+		// that some prefetches are used, some not, and some cross a cut (it holds 12 of 16, so
+		// they stay long enough)
+		lru := NewLayerLRU(3, 16, 12)
+		return &prefetching{Policy: lru, prefetch: func(s StepInfo) []int {
+			return []int{s.Layer*16 + s.Index*7%16, s.Layer*16 + s.Index*11%16}
+		}}
+	}
+	lru := func() Policy { return NewLayerLRU(3, 16, 6) }
+	for pi, p := range []func() Policy{lru, policy} {
+		whole, err := ReplayTimed(sel, spans, 16, sizes(3, 5), p(), timing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cuts := range [][]int{nil, {1}, {len(spans) - 1}, {3, 7, 20}, {5, 6}} {
+			segs, err := ReplaySegments(sel, spans, cuts, 16, sizes(3, 5), p(), timing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(segs) != len(cuts)+1 {
+				t.Fatalf("cuts %v: %d segments", cuts, len(segs))
+			}
+			for i, s := range segs {
+				if s.PeakBytes > whole.PeakBytes {
+					t.Fatalf("cuts %v: segment %d peaks at %d, the whole replay at %d", cuts, i, s.PeakBytes,
+						whole.PeakBytes)
+				}
+			}
+			// without prefetches the segments add up to the whole replay
+			if got := Merge(segs...); pi == 0 && !sameResult(got, whole) {
+				t.Fatalf("cuts %v: merged %+v\nwhole        %+v", cuts, got, whole)
+			}
+			if len(cuts) == 0 {
+				continue
+			}
+			// the first segment is the replay of its spans alone, whatever follows
+			prefix, err := ReplayTimed(sel, spans[:cuts[0]], 16, sizes(3, 5), p(), timing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameResult(segs[0], prefix) {
+				t.Fatalf("cuts %v: first segment %+v\nprefix alone  %+v", cuts, segs[0], prefix)
+			}
+		}
+	}
+	// the cache runs on across a cut: tokens 1 and 2 find the experts the first segment loaded. The
+	// prefetch made before token 0 is unused when the first segment ends, its use a plain hit.
+	sel = Selections{Layers: 1, Tokens: 3, K: 1, IDs: []int32{0, 1, 0}}
+	p := &recorder{seen: map[int]bool{}, prefetch: func(s StepInfo) []int {
+		if s.First == 0 {
+			return []int{1}
+		}
+		return nil
+	}}
+	segs, err := ReplaySegments(sel, TraceOrder(3), []int{1}, 2, []int64{7}, p, Timing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := segs[0].Decode, segs[1].Decode; a.Prefetches != 1 || a.UsefulPrefetches != 0 ||
+		a.UnusedPrefetchBytes != 7 || a.Misses != 1 || b.Hits != 2 || b.Misses != 0 || b.UsefulPrefetches != 0 ||
+		b.UnusedPrefetchBytes != 0 || b.Tokens != 2 || segs[1].PeakBytes != 14 {
+		t.Fatalf("segments %+v", segs)
+	}
+	for _, bad := range [][]int{{0}, {3}, {2, 1}, {1, 1}} {
+		if _, err := ReplaySegments(sel, TraceOrder(3), bad, 2, []int64{7}, &NoCache{}, Timing{}); err == nil {
+			t.Errorf("cuts %v accepted", bad)
+		}
+	}
+}
+
+// prefetching is a Policy whose Prefetch is replaced.
+type prefetching struct {
+	Policy
+	prefetch func(StepInfo) []int
+}
+
+func (p *prefetching) Prefetch(s StepInfo) []int { return p.prefetch(s) }
+
+// sameResult compares a and b exactly, their link times up to rounding.
+func sameResult(a, b Result) bool {
+	near := func(x, y float64) bool { return math.Abs(x-y) <= 1e-9*max(1, math.Abs(x), math.Abs(y)) }
+	for _, p := range []Phase{Prefill, Decode} {
+		x, y := a.phase(p), b.phase(p)
+		if len(x.Links) != len(y.Links) {
+			return false
+		}
+		for i := range x.Links {
+			lx, ly := x.Links[i], y.Links[i]
+			if !near(lx.Seconds, ly.Seconds) || !near(lx.StallSeconds, ly.StallSeconds) {
+				return false
+			}
+		}
+	}
+	strip := func(r Result) Result {
+		for _, c := range []*Counts{&r.Prefill, &r.Decode} {
+			c.Links = slices.Clone(c.Links)
+			for i := range c.Links {
+				c.Links[i].Seconds, c.Links[i].StallSeconds = 0, 0
+			}
+		}
+		return r
+	}
+	return reflect.DeepEqual(strip(a), strip(b))
+}

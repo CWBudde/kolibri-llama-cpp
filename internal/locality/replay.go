@@ -20,7 +20,10 @@ package locality
 // tokens at once; its hits and bytes say nothing about the latency of a decoded token and are not
 // to be reported as a decode speedup.
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // Phase is how a server processes a span: a prompt's ubatch at once, or one generated token.
 type Phase int
@@ -132,36 +135,62 @@ func Replay(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy) 
 // ReplayTimed is Replay that also estimates, for every link of t, the time the replay takes when
 // each load goes over that link (transfer.go).
 func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Policy, t Timing) (Result, error) {
-	var r Result
+	rs, err := ReplaySegments(sel, spans, nil, nExpert, bytes, p, t)
+	if err != nil {
+		return Result{}, err
+	}
+	return rs[0], nil
+}
+
+// ReplaySegments is ReplayTimed cut into segments: cuts are ascending span indexes, and segment i
+// holds the spans from cut i-1 (0 for the first) to cut i (len(spans) for the last). The policy,
+// the cache and the links run on across a cut, so a later segment starts warm from the earlier
+// ones, as a server's would. A segment counts what its steps cause and its peak is the most bytes
+// resident during its steps; prefetches count in the segment of the step they were prefetched
+// for. A segment's counts never depend on later steps: at a cut, its prefetches not used yet
+// count as unused, as at the end of a replay, and a later use of them is a plain hit. The first
+// segment is therefore the replay of its spans alone. Merge adds the segments up to the
+// unsegmented replay, except for prefetches used across a cut.
+func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes []int64, p Policy,
+	t Timing) ([]Result, error) {
 	if len(bytes) != sel.Layers {
-		return r, fmt.Errorf("replay: %d layers of expert sizes, %d of selections", len(bytes), sel.Layers)
+		return nil, fmt.Errorf("replay: %d layers of expert sizes, %d of selections", len(bytes), sel.Layers)
 	}
 	if err := t.check(); err != nil {
-		return r, err
+		return nil, err
 	}
 	next := 0
 	for i, s := range spans {
 		if s.First != next || s.End <= s.First || s.End > sel.Tokens {
-			return r, fmt.Errorf("replay: span %d is [%d, %d), want one from %d within %d tokens", i, s.First, s.End,
+			return nil, fmt.Errorf("replay: span %d is [%d, %d), want one from %d within %d tokens", i, s.First, s.End,
 				next, sel.Tokens)
 		}
 		next = s.End
 	}
-	nKey := sel.Layers * nExpert
-	for _, c := range []*Counts{&r.Prefill, &r.Decode} {
-		c.Layers = make([]LayerCounts, sel.Layers)
-		for _, l := range t.Links {
-			c.Links = append(c.Links, LinkTime{Link: l.Name})
+	for i, c := range cuts {
+		if c <= 0 || c >= len(spans) || (i > 0 && c <= cuts[i-1]) {
+			return nil, fmt.Errorf("replay: cuts %v, want ascending span indexes within (0, %d)", cuts, len(spans))
 		}
 	}
+	rs := make([]Result, len(cuts)+1)
+	nKey := sel.Layers * nExpert
+	for j := range rs {
+		for _, c := range []*Counts{&rs[j].Prefill, &rs[j].Decode} {
+			c.Layers = make([]LayerCounts, sel.Layers)
+			for _, l := range t.Links {
+				c.Links = append(c.Links, LinkTime{Link: l.Name})
+			}
+		}
+	}
+	r := &rs[0] // the running span's segment
 	qs := make([]queue, len(t.Links))
 	for i, l := range t.Links {
 		qs[i] = queue{bw: l.BytesPerSecond, arrival: make([]float64, nKey)}
 	}
 	resident := make([]bool, nKey)
-	prefetched := make([]Phase, nKey) // the phase a resident key was prefetched in, while unused
-	pending := make([]bool, nKey)     // resident, prefetched and not used yet
-	needed := make([]int, nKey)       // the last step that needed the key, plus one
+	prefetched := make([]*Counts, nKey) // the counts a resident key was prefetched in, while unused
+	pending := make([]bool, nKey)       // resident, prefetched and not used yet
+	needed := make([]int, nKey)         // the last step that needed the key, plus one
 	size := func(k int) int64 { return bytes[k/nExpert] }
 	var cur int64
 	load := func(k int, c *Counts) error {
@@ -178,7 +207,7 @@ func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Pol
 			cur -= size(e)
 			if pending[e] {
 				pending[e] = false
-				r.phase(prefetched[e]).UnusedPrefetchBytes += size(e)
+				prefetched[e].UnusedPrefetchBytes += size(e)
 			}
 			if e != k {
 				c.Evictions++
@@ -187,8 +216,19 @@ func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Pol
 		r.PeakBytes = max(r.PeakBytes, cur)
 		return nil
 	}
-	step := 0
-	for _, s := range spans {
+	step, seg := 0, 0
+	for i, s := range spans {
+		if seg < len(cuts) && i == cuts[seg] {
+			for k, ok := range pending {
+				if ok {
+					pending[k] = false
+					prefetched[k].UnusedPrefetchBytes += size(k)
+				}
+			}
+			seg++
+			r = &rs[seg]
+			r.PeakBytes = cur
+		}
 		c := r.phase(s.Phase)
 		c.Tokens += s.End - s.First
 		compute := t.compute(s)
@@ -198,16 +238,16 @@ func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Pol
 			c.Steps++
 			for _, k := range p.Prefetch(info) {
 				if k < 0 || k >= nKey {
-					return r, fmt.Errorf("replay: step %d prefetches key %d of %d", info.Index, k, nKey)
+					return nil, fmt.Errorf("replay: step %d prefetches key %d of %d", info.Index, k, nKey)
 				}
 				if resident[k] {
 					continue
 				}
 				c.Prefetches++
 				c.PrefetchBytes += size(k)
-				prefetched[k], pending[k] = s.Phase, true
+				prefetched[k], pending[k] = c, true
 				if err := load(k, c); err != nil {
-					return r, err
+					return nil, err
 				}
 			}
 			for i := range qs {
@@ -228,7 +268,7 @@ func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Pol
 						c.Layers[l].Hits++
 						if pending[k] {
 							pending[k] = false
-							pc := r.phase(prefetched[k])
+							pc := prefetched[k]
 							pc.UsefulPrefetches++
 							for i := range qs {
 								if qs[i].arrival[k] <= qs[i].now {
@@ -243,7 +283,7 @@ func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Pol
 						c.Misses++
 						c.MissBytes += size(k)
 						if err := load(k, c); err != nil {
-							return r, err
+							return nil, err
 						}
 					}
 					for i := range qs {
@@ -266,10 +306,57 @@ func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Pol
 	}
 	for k, ok := range pending {
 		if ok {
-			r.phase(prefetched[k]).UnusedPrefetchBytes += size(k)
+			prefetched[k].UnusedPrefetchBytes += size(k)
 		}
 	}
-	return r, nil
+	return rs, nil
+}
+
+// Merge adds the segments of a replay up: their counts and link times, and the largest peak. It
+// is the unsegmented replay unless a prefetch made before a cut is used after it.
+func Merge(rs ...Result) Result {
+	var m Result
+	for i, r := range rs {
+		if i == 0 {
+			m = Result{Prefill: r.Prefill.clone(), Decode: r.Decode.clone(), PeakBytes: r.PeakBytes}
+			continue
+		}
+		m.Prefill.add(r.Prefill)
+		m.Decode.add(r.Decode)
+		m.PeakBytes = max(m.PeakBytes, r.PeakBytes)
+	}
+	return m
+}
+
+func (c Counts) clone() Counts {
+	c.Layers, c.Links = slices.Clone(c.Layers), slices.Clone(c.Links)
+	return c
+}
+
+// add adds o's counts to c's; both have the same layers and links.
+func (c *Counts) add(o Counts) {
+	c.Tokens += o.Tokens
+	c.Steps += o.Steps
+	c.Accesses += o.Accesses
+	c.Hits += o.Hits
+	c.Misses += o.Misses
+	c.MissBytes += o.MissBytes
+	c.Prefetches += o.Prefetches
+	c.PrefetchBytes += o.PrefetchBytes
+	c.UsefulPrefetches += o.UsefulPrefetches
+	c.UnusedPrefetchBytes += o.UnusedPrefetchBytes
+	c.Evictions += o.Evictions
+	c.FullSteps += o.FullSteps
+	for l, x := range o.Layers {
+		c.Layers[l].Accesses += x.Accesses
+		c.Layers[l].Hits += x.Hits
+	}
+	for i, x := range o.Links {
+		c.Links[i].Seconds += x.Seconds
+		c.Links[i].StallSeconds += x.StallSeconds
+		c.Links[i].Timely += x.Timely
+		c.Links[i].Late += x.Late
+	}
 }
 
 // LayerLRU is an LRU cache of the same number of experts in every layer, cmd/kolibri-cache's

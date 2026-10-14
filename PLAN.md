@@ -747,7 +747,7 @@ GB Mac.
 
 ## Phase 10 --- Predictive expert caching and prefetch (proposed)
 
-**Status:** Stage A in progress (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, and the metric set with a declared-bandwidth transfer model exist. No predictive cache or prefetch policy is implemented or claimed yet. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
+**Status:** Stage A in progress (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, and chronological and leave-one-workload-out train/test splits with held-out replays exist. No predictive cache or prefetch policy is implemented or claimed yet. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
 
 ### Objective and constraints
 
@@ -786,7 +786,26 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
   - At 128 experts/layer (IQ3 coding, decode), the shared LRU has 57.9% set recall and the shared oracle 78.7%.
   - Estimated time per decoded token: no cache 117.7 / 36.1 / 20.8 ms on SSD / PCIe / RAM, shared LRU 26.1 / 17.8 / 16.2 ms, against 15.7 ms compute alone.
   - None of the baselines prefetches, so on the real traces the timely/late split stays zero until the first predictor (gate item below).
-- [ ] Split traces chronologically and by workload: fit/tune on training prefixes, validate on later suffixes, and report leave-one-workload-out generalization. Preserve separate quantized and Q8 traces to expose routing disagreement. No leakage from the frozen answers or full-trace frequencies into test-time state.
+- [x] Split traces chronologically and by workload: fit/tune on training prefixes, validate on later suffixes, and report leave-one-workload-out generalization. Preserve separate quantized and Q8 traces to expose routing disagreement. No leakage from the frozen answers or full-trace frequencies into test-time state. (2026-10-14) — `testdata/locality/splits.json` declares the split, the user's choice of 2026-10-14: train on the first ⌊n/2⌋ of a workload's n answers, test from the next request's prefill on.
+  - That gives coding 3/3, research 2/3, hr 2/3 and medtech 3/3 answers, and test suffixes of 1,019–1,149 decoded tokens.
+  - `locality.ReplaySegments` (`replay.go`) runs one replay straight through and counts each segment apart, so a test suffix starts warm from its causally replayed prefix. `SplitAfter` (`split.go`) finds the boundary.
+  - `cmd/kolibri-policy` checks every split against the rule and the declared token ("PASS coding: split after 3 of 6 answers at token 6257, as in splits.json", for all four workloads and both models: 40 PASS lines in all). It reports every baseline on the test suffixes.
+  - The only tunable parameter so far, LFU's half-life, is chosen per budget from 64–8192 tokens on training prefixes only:
+    - the workload's own prefix;
+    - leave one workload out: the other three workloads' prefixes, the user's choice of 2026-10-14;
+    - the other model's prefix of the same workload, so the IQ3 and Q8_0 traces are never pooled;
+    - hindsight on the test suffix, marked † as the leaky bound.
+  - Checks:
+    - `TestReplaySegments`: the first segment equals a replay of the prefix alone, so held-out routing cannot change training counts. Prefetches still unused at a cut count as unused there, and a later use of them is a plain hit. Without prefetches, the segments merge to the unsplit replay, and state carries across the cut. Resetting the cache at the cut fails it, and so does carrying pending prefetches across it.
+    - `TestTuneNoLeak`: redrawing every expert of a test suffix leaves the training counts and the tuned half-life unchanged.
+    - `TestTune` and `TestFolds` fail when tuning reads the test suffix or leave-one-workload-out includes the held-out workload.
+    - The regenerated `docs/expert-policy.md` only adds lines: every full-trace table is byte-identical.
+  - Results, held out:
+    - At 128 experts per layer (IQ3 coding, decode), the shared LRU and ARC load 50 MB/token, LFU 54, the shared oracle 21.
+    - Over all four test suffixes, tuning on the own prefix lowers IQ3 LFU's decode bytes at small budgets: 333 → 317 MB/token at 8 experts per layer, 106 → 93 at 64. At 128 and 192 it is no better than the untuned 512 (38 → 39, 13 → 15).
+    - Hindsight is at most 2 MB/token below the own-prefix choice for IQ3, and at most 7 for Q8_0 (97 against 90 at 128).
+    - Q8_0 behaves alike: 818 → 779 MB/token at 8 experts per layer, and 94 → 97 at 128.
+    - For every workload and budget, the other model's prefix picks the same half-life as the own prefix, so the IQ3/Q8_0 routing disagreement does not move this choice ([docs/expert-policy.md](docs/expert-policy.md)).
 - [ ] Gate: retain only policies that improve held-out miss bytes or latency proxy at equal memory budgets; include a trivial last-token/last-N reuse predictor as the first prediction baseline.
 
 ### Stage B --- Small causal router predictor
