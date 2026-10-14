@@ -359,21 +359,32 @@ func (c *Counts) add(o Counts) {
 	}
 }
 
-// LayerLRU is an LRU cache of the same number of experts in every layer, cmd/kolibri-cache's
-// per-layer policy; it prefetches nothing. It is the evaluator's reference: replayed in
-// TraceOrder, its hits are those Hits counts on each layer's stack distances. A capacity of 0
-// keeps nothing.
+// LayerLRU is an LRU cache per layer, of the same number of experts in every layer
+// (cmd/kolibri-cache's per-layer policy) or of capacities allocated per layer (allocate.go); it
+// prefetches nothing. It is the evaluator's reference: replayed in TraceOrder, its hits are those
+// Hits counts on each layer's stack distances. A capacity of 0 keeps nothing of its layer.
 type LayerLRU struct {
-	nExpert, capacity int
-	prev, next        []int // a list per layer, most recent first; key nKey+l is layer l's head
-	size              []int
-	evict             []int
+	nExpert    int
+	capacities []int
+	prev, next []int // a list per layer, most recent first; key nKey+l is layer l's head
+	size       []int
+	evict      []int
 }
 
-// NewLayerLRU returns an empty LayerLRU for layers of nExpert experts.
+// NewLayerLRU returns an empty LayerLRU of capacity experts in each of layers of nExpert experts.
 func NewLayerLRU(layers, nExpert, capacity int) *LayerLRU {
+	caps := make([]int, layers)
+	for l := range caps {
+		caps[l] = capacity
+	}
+	return NewLayerLRUSizes(nExpert, caps)
+}
+
+// NewLayerLRUSizes returns an empty LayerLRU of capacities[l] experts in layer l.
+func NewLayerLRUSizes(nExpert int, capacities []int) *LayerLRU {
+	layers := len(capacities)
 	n := layers*nExpert + layers
-	c := &LayerLRU{nExpert: nExpert, capacity: capacity, prev: make([]int, n), next: make([]int, n),
+	c := &LayerLRU{nExpert: nExpert, capacities: capacities, prev: make([]int, n), next: make([]int, n),
 		size: make([]int, layers)}
 	for l := range layers {
 		h := layers*nExpert + l
@@ -399,11 +410,11 @@ func (c *LayerLRU) Prefetch(StepInfo) []int { return nil }
 
 func (c *LayerLRU) Load(k int) []int {
 	c.evict = c.evict[:0]
-	if c.capacity == 0 {
+	l := k / c.nExpert
+	if c.capacities[l] == 0 {
 		return append(c.evict, k)
 	}
-	l := k / c.nExpert
-	if c.size[l] == c.capacity {
+	if c.size[l] == c.capacities[l] {
 		v := c.prev[c.head(k)]
 		c.unlink(v)
 		c.size[l]--
@@ -415,7 +426,7 @@ func (c *LayerLRU) Load(k int) []int {
 }
 
 func (c *LayerLRU) Use(_ StepInfo, k int) {
-	if c.capacity == 0 {
+	if c.capacities[k/c.nExpert] == 0 {
 		return
 	}
 	c.unlink(k)
