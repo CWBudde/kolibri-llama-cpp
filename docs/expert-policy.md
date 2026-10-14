@@ -742,3 +742,131 @@ Q8_0, all workloads' test suffixes together, decode MB/token:
 | 192 | 33 | 36 | 33 | 36 | 31 |
 | 256 | 9 | 9 | 10 | 9 | 8 |
 | 384 | 0 | 0 | 0 | 0 | 0 |
+
+## Layer budgets, allocated on training prefixes
+
+A layer LRU need not give every layer the same number of experts. At every budget, the experts per layer are allocated from each layer's miss curve, its decode miss bytes at every capacity in a training prefix, replayed online. The allocation grows the layer whose next step saves the most bytes per byte, along each curve's lower convex hull, until no step saves anything or fits; budget left over is spread level. The capacities are then frozen and the layer LRU replayed online; the cells are its decode MB/token in the test suffixes. Fitted on:
+
+- **own prefix:** the workload's own training prefix;
+- **leave one workload out:** the other workloads' training prefixes of the same model, their curves added up;
+- **hindsight †:** the test suffix itself. **It is fitted on the test data, the bound of fitting and not a result.**
+
+**Compulsory** are the bytes of a test suffix's first uses of experts, which no cache that only loads what a step needs avoids. Uniform is the layer LRU, shared the shared LRU, at the same budget.
+
+IQ3_XXS-IQ4_XS-down-imx, all workloads' test suffixes together, decode MB/token:
+
+| Experts per layer | Uniform | Shared | Own prefix | Leave one workload out | Hindsight † | Compulsory |
+|--:|--:|--:|--:|--:|--:|--:|
+| 8 | 336 | 335 | 329 | 329 | 328 | 0.2 |
+| 16 | 247 | 250 | 246 | 246 | 244 | 0.2 |
+| 32 | 171 | 170 | 170 | 169 | 168 | 0.2 |
+| 48 | 131 | 128 | 129 | 129 | 127 | 0.2 |
+| 64 | 102 | 97 | 101 | 101 | 98 | 0.2 |
+| 96 | 66 | 61 | 63 | 63 | 61 | 0.2 |
+| 128 | 44 | 38 | 40 | 40 | 39 | 0.2 |
+| 192 | 19 | 15 | 16 | 17 | 15 | 0.2 |
+| 256 | 6 | 4 | 4 | 4 | 4 | 0.2 |
+| 384 | 0 | 0 | 0 | 0 | 0 | 0.2 |
+
+Q8_0, all workloads' test suffixes together, decode MB/token:
+
+| Experts per layer | Uniform | Shared | Own prefix | Leave one workload out | Hindsight † | Compulsory |
+|--:|--:|--:|--:|--:|--:|--:|
+| 8 | 825 | 824 | 808 | 808 | 805 | 0.5 |
+| 16 | 609 | 615 | 604 | 604 | 601 | 0.5 |
+| 32 | 421 | 418 | 418 | 418 | 415 | 0.5 |
+| 48 | 322 | 316 | 318 | 319 | 314 | 0.5 |
+| 64 | 253 | 240 | 250 | 249 | 242 | 0.5 |
+| 96 | 163 | 150 | 154 | 155 | 150 | 0.5 |
+| 128 | 108 | 94 | 98 | 99 | 95 | 0.5 |
+| 192 | 48 | 37 | 40 | 41 | 37 | 0.5 |
+| 256 | 15 | 10 | 10 | 10 | 9 | 0.5 |
+| 384 | 0 | 0 | 0 | 0 | 0 | 0.5 |
+
+Experts per layer allocated on the own prefix at a budget of 128 per layer:
+
+| Model | Workload | Layer 0 | Layer 1 | Layer 2 | Layer 10 | Layer 25 | Layer 49 | Fewest | Most |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| IQ3_XXS-IQ4_XS-down-imx | coding | 41 | 38 | 141 | 149 | 103 | 115 | 38 | 216 |
+| IQ3_XXS-IQ4_XS-down-imx | research | 59 | 48 | 173 | 119 | 97 | 92 | 48 | 320 |
+| IQ3_XXS-IQ4_XS-down-imx | hr | 54 | 44 | 155 | 116 | 96 | 115 | 44 | 301 |
+| IQ3_XXS-IQ4_XS-down-imx | medtech | 53 | 45 | 150 | 143 | 108 | 81 | 45 | 249 |
+| Q8_0 | coding | 43 | 39 | 141 | 150 | 102 | 113 | 39 | 217 |
+| Q8_0 | research | 61 | 48 | 176 | 110 | 102 | 108 | 48 | 320 |
+| Q8_0 | hr | 55 | 44 | 169 | 115 | 96 | 115 | 44 | 303 |
+| Q8_0 | medtech | 53 | 46 | 150 | 138 | 106 | 84 | 46 | 246 |
+
+## Last-N reuse, the first prediction baseline
+
+The last-N predictor expects a layer to need again the experts it needed in its last n steps. As a policy it prefetches them one layer ahead, before the layer before it runs, into a shared LRU of the budget, which keeps or evicts them like any other expert. It knows only steps that have run. n is chosen per budget from 1, 2, 4, 8 on the own training prefix, as the one whose decode misses and unused prefetches load the fewest bytes.
+
+Recall of the test suffixes' decoded experts, per layer and token:
+
+| Model | n | Candidates | Experts covered | Sets covered |
+|---|--:|--:|--:|--:|
+| IQ3_XXS-IQ4_XS-down-imx | 1 | 6.3 | 34.4% | 0.4% |
+| IQ3_XXS-IQ4_XS-down-imx | 2 | 10.8 | 43.9% | 1.8% |
+| IQ3_XXS-IQ4_XS-down-imx | 4 | 18.2 | 54.1% | 5.4% |
+| IQ3_XXS-IQ4_XS-down-imx | 8 | 30.4 | 64.5% | 12.5% |
+| Q8_0 | 1 | 6.3 | 34.4% | 0.4% |
+| Q8_0 | 2 | 10.8 | 43.8% | 1.8% |
+| Q8_0 | 4 | 18.2 | 54.1% | 5.4% |
+| Q8_0 | 8 | 30.4 | 64.5% | 12.5% |
+
+IQ3_XXS-IQ4_XS-down-imx, all workloads' test suffixes together, decode, shared LRU against last-N with the tuned n (MB/token loaded, prefetched in vain, ms/token per link):
+
+| Experts per layer | n per workload | Shared LRU MB | Last-N MB | Unused MB | Shared LRU ssd | Last-N ssd | Shared LRU pcie | Last-N pcie | Shared LRU ram | Last-N ram |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | 1, 1, 1, 1 | 335 | 723 | 267 | 82.8 | 160.2 | 29.1 | 44.6 | 19.1 | 22.9 |
+| 16 | 1, 1, 1, 1 | 250 | 281 | 29 | 65.7 | 71.8 | 25.7 | 26.9 | 18.2 | 18.5 |
+| 32 | 1, 1, 1, 1 | 170 | 200 | 29 | 49.7 | 55.7 | 22.5 | 23.7 | 17.4 | 17.7 |
+| 48 | 1, 1, 1, 1 | 128 | 159 | 28 | 41.4 | 47.4 | 20.8 | 22.0 | 17.0 | 17.3 |
+| 64 | 1, 1, 1, 1 | 97 | 128 | 27 | 35.2 | 41.2 | 19.6 | 20.8 | 16.7 | 17.0 |
+| 96 | 1, 1, 1, 1 | 61 | 88 | 22 | 27.9 | 33.2 | 18.1 | 19.2 | 16.3 | 16.6 |
+| 128 | 1, 1, 1, 1 | 38 | 64 | 18 | 23.3 | 28.5 | 17.2 | 18.2 | 16.1 | 16.3 |
+| 192 | 1, 1, 1, 1 | 15 | 27 | 4 | 18.7 | 21.1 | 16.3 | 16.8 | 15.8 | 16.0 |
+| 256 | 1, 1, 4, 1 | 4 | 4 | 0 | 16.5 | 16.5 | 15.9 | 15.9 | 15.7 | 15.7 |
+| 384 | 1, 1, 1, 1 | 0 | 0 | 0 | 15.7 | 15.7 | 15.7 | 15.7 | 15.7 | 15.7 |
+
+Q8_0, all workloads' test suffixes together, decode, shared LRU against last-N with the tuned n (MB/token loaded, prefetched in vain, ms/token per link):
+
+| Experts per layer | n per workload | Shared LRU MB | Last-N MB | Unused MB | Shared LRU ssd | Last-N ssd | Shared LRU pcie | Last-N pcie | Shared LRU ram | Last-N ram |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | 1, 1, 1, 1 | 824 | 1596 | 532 | 180.6 | 334.9 | 48.7 | 79.5 | 23.9 | 31.6 |
+| 16 | 1, 1, 1, 1 | 615 | 690 | 72 | 138.7 | 153.7 | 40.3 | 43.3 | 21.9 | 22.6 |
+| 32 | 1, 1, 1, 1 | 418 | 492 | 71 | 99.3 | 114.2 | 32.4 | 35.4 | 19.9 | 20.6 |
+| 48 | 1, 1, 1, 1 | 316 | 391 | 68 | 78.9 | 93.8 | 28.3 | 31.3 | 18.9 | 19.6 |
+| 64 | 1, 1, 1, 1 | 240 | 314 | 65 | 63.8 | 78.6 | 25.3 | 28.3 | 18.1 | 18.8 |
+| 96 | 1, 1, 1, 1 | 150 | 216 | 53 | 45.7 | 58.9 | 21.7 | 24.3 | 17.2 | 17.8 |
+| 128 | 1, 1, 1, 1 | 94 | 157 | 43 | 34.5 | 47.1 | 19.5 | 22.0 | 16.6 | 17.3 |
+| 192 | 1, 1, 1, 1 | 37 | 66 | 9 | 23.1 | 28.9 | 17.2 | 18.3 | 16.1 | 16.4 |
+| 256 | 1, 1, 1, 1 | 10 | 10 | 0 | 17.6 | 17.6 | 16.1 | 16.1 | 15.8 | 15.8 |
+| 384 | 1, 1, 1, 1 | 0 | 0 | 0 | 15.8 | 15.8 | 15.7 | 15.7 | 15.7 | 15.7 |
+
+## Stage A gate
+
+A causal policy is retained if, on the decode of all test suffixes of a model together, it beats the shared LRU at one or more budgets: it loads fewer expert bytes, missed or prefetched, or its estimated time per token is lower on a declared link. Equal is no win, and times within a part in 10⁹ are equal. Tuned and allocated policies use the parameter chosen on training prefixes; the oracle and the hindsight fits are bounds and not judged. A size alone under faster means faster on every link.
+
+IQ3_XXS-IQ4_XS-down-imx, 4402 decoded test tokens:
+
+| Policy | Verdict | Fewer bytes at | Faster at | Most bytes saved | Most time saved |
+|---|---|---|---|---|---|
+| layer LRU | **retained** | 16 | 16 | 1.1% at 16 | 0.8% on ssd at 16 |
+| LFU | **retained** | 8, 192, 256 | 8, 192, 256 | 12.2% at 192 | 2.0% on ssd at 192 |
+| LFU, half-life tuned on the own prefix | **retained** | 8, 16, 32, 48, 64, 96, 192, 256 | 8, 16, 32, 48, 64, 96, 192, 256 | 10.1% at 256 | 4.5% on ssd at 8 |
+| ARC | **retained** | 8, 16, 32, 48, 64, 96, 192, 256 | 8, 16, 32, 48, 64, 96, 192, 256 | 2.4% at 16 | 1.8% on ssd at 16 |
+| layer budgets allocated on the own prefix | **retained** | 8, 16, 32, 256 | 8, 16, 32, 256 | 2.0% at 8 | 1.6% on ssd at 8 |
+| layer budgets allocated leaving one workload out | **retained** | 8, 16, 32 | 8, 16, 32 | 1.9% at 8 | 1.6% on ssd at 8 |
+| last-N on shared LRU, n tuned on the own prefix | not retained | – | – | – | – |
+
+Q8_0, 4402 decoded test tokens:
+
+| Policy | Verdict | Fewer bytes at | Faster at | Most bytes saved | Most time saved |
+|---|---|---|---|---|---|
+| layer LRU | **retained** | 16 | 16 | 1.0% at 16 | 0.9% on ssd at 16 |
+| LFU | **retained** | 8, 128, 192, 256 | 8, 128, 192, 256 | 11.9% at 192 | 3.8% on ssd at 192 |
+| LFU, half-life tuned on the own prefix | **retained** | 8, 16, 32, 48, 64, 96, 192, 256 | 8, 16, 32, 48, 64, 96, 192, 256 | 8.8% at 256 | 5.3% on ssd at 48 |
+| ARC | **retained** | 8, 16, 32, 48, 64, 96, 192, 256 | 8, 16, 32, 48, 64, 96, 192, 256 | 2.3% at 16 | 2.1% on ssd at 16 |
+| layer budgets allocated on the own prefix | **retained** | 8, 16, 32 | 8, 16, 32 | 2.0% at 8 | 1.8% on ssd at 8 |
+| layer budgets allocated leaving one workload out | **retained** | 8, 16, 32 | 8, 16, 32 | 2.0% at 8 | 1.8% on ssd at 8 |
+| last-N on shared LRU, n tuned on the own prefix | not retained | – | – | – | – |
