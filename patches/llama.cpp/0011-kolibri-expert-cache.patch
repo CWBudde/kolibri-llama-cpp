@@ -1,0 +1,1874 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 8c9bc2cdb..42a1940f4 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -29,6 +29,7 @@
+ #include <cstdarg>
+ #include <filesystem>
+ #include <fstream>
++#include <sstream>
+ #include <list>
+ #include <numeric>
+ #include <regex>
+@@ -2763,6 +2764,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+         }
+     ).set_env("LLAMA_ARG_CPU_MOE"));
++    add_opt(common_arg(
++        {"--expert-cache"}, "N",
++        "[EXPERIMENTAL] keep at most N routed experts per layer in device memory and read the others from the model file on demand (Kolibri only; caps the ubatch at N / experts per token)",
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.expert_cache = value;
++        }
++    ).set_env("LLAMA_ARG_EXPERT_CACHE"));
++    add_opt(common_arg(
++        {"--expert-cache-layers"}, "FNAME",
++        "[EXPERIMENTAL] the expert cache's slots per layer: a file of one integer per layer, separated by commas or white space",
++        [](common_params & params, const std::string & value) {
++            std::ifstream in(value);
++            if (!in) {
++                throw std::invalid_argument("cannot read " + value);
++            }
++            params.expert_cache_layers.clear();
++            std::string tok;
++            while (in >> tok) {
++                std::stringstream ss(tok);
++                std::string part;
++                while (std::getline(ss, part, ',')) {
++                    if (!part.empty()) {
++                        params.expert_cache_layers.push_back(std::stoi(part));
++                    }
++                }
++            }
++        }
++    ));
++    add_opt(common_arg(
++        {"--expert-cache-threads"}, "N",
++        string_format("[EXPERIMENTAL] the expert cache's I/O threads (default: %d)", params.expert_cache_threads),
++        [](common_params & params, int value) {
++            if (value < 1) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.expert_cache_threads = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--expert-prefetch"}, "K[,HALF_LIFE[,MIX]]",
++        "[EXPERIMENTAL] prefetch the K experts per layer that a decayed-count Markov predictor ranks best, two layers ahead within a token (default: 0, demand only; half-life 1 token, mix 0.75)",
++        [](common_params & params, const std::string & value) {
++            const auto parts = string_split<std::string>(value, ',');
++            if (parts.empty() || parts.size() > 3) {
++                throw std::invalid_argument("want K[,HALF_LIFE[,MIX]]");
++            }
++            params.expert_prefetch_k = std::stoi(parts[0]);
++            if (parts.size() > 1) {
++                params.expert_prefetch_half_life = std::stoi(parts[1]);
++            }
++            if (parts.size() > 2) {
++                params.expert_prefetch_mix = std::stof(parts[2]);
++            }
++            if (params.expert_prefetch_k < 0 || params.expert_prefetch_half_life < 1 || params.expert_prefetch_mix < 0 || params.expert_prefetch_mix > 1) {
++                throw std::invalid_argument("invalid value");
++            }
++        }
++    ));
++    add_opt(common_arg(
++        {"--expert-cache-stats"}, "FNAME",
++        "[EXPERIMENTAL] write the expert cache's counters as JSON to FNAME when the model is freed",
++        [](common_params & params, const std::string & value) {
++            params.expert_cache_stats = value;
++        }
++    ));
+     add_opt(common_arg(
+         {"-ncmoe", "--n-cpu-moe"}, "N",
+         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
+diff --git a/common/common.cpp b/common/common.cpp
+index a2f162b6f..12b9567f4 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1671,6 +1671,21 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.progress_callback           = params.load_progress_callback;
+     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
+     mparams.no_alloc                    = params.no_alloc;
++
++    if (params.expert_cache > 0 || !params.expert_cache_layers.empty()) {
++        auto & ec = params.expert_cache_lp;
++        ec = llama_expert_cache_default_params();
++        ec.n_slots            = params.expert_cache;
++        ec.n_slots_layer      = params.expert_cache_layers.empty() ? nullptr : params.expert_cache_layers.data();
++        ec.n_layer_slots      = (int32_t) params.expert_cache_layers.size();
++        ec.n_threads          = params.expert_cache_threads;
++        ec.prefetch_k         = params.expert_prefetch_k;
++        ec.prefetch_half_life = params.expert_prefetch_half_life;
++        ec.prefetch_mix       = params.expert_prefetch_mix;
++        ec.stats_path         = params.expert_cache_stats.empty() ? nullptr : params.expert_cache_stats.c_str();
++        mparams.expert_cache  = &ec;
++    }
++
+     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+ 
+     return mparams;
+diff --git a/common/common.h b/common/common.h
+index 4308b0703..21e6f43a4 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -531,6 +531,16 @@ struct common_params {
+     std::vector<llama_model_kv_override> kv_overrides;
+     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+ 
++    // [EXPERIMENTAL] bounded expert cache (--expert-cache and the options after it)
++    int32_t              expert_cache              = 0;     // slots per layer, 0 = off
++    std::vector<int32_t> expert_cache_layers;               // slots per layer, one entry per layer
++    int32_t              expert_cache_threads      = 4;     // I/O threads
++    int32_t              expert_prefetch_k         = 0;     // experts prefetched per layer, 0 = demand only
++    int32_t              expert_prefetch_half_life = 1;     // the predictor's count half-life in tokens
++    float                expert_prefetch_mix       = 0.75f; // the weight of its transitions against its counts
++    std::string          expert_cache_stats;                // JSON counters, written when the model is freed
++    llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
++
+     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
+     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
+ 
+diff --git a/include/llama.h b/include/llama.h
+index dea4d4606..1606baa4c 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -316,6 +316,20 @@ extern "C" {
+         ggml_backend_buffer_type_t buft;
+     };
+ 
++    // [EXPERIMENTAL] bounded cache of routed experts (Kolibri only): the stacked expert tensors stay
++    // in the file, and each layer keeps at most n_slots of its experts in device memory, read on
++    // demand with pread and, optionally, prefetched by a causal predictor
++    struct llama_expert_cache_params {
++        int32_t         n_slots;       // experts per layer, 0 = cache off
++        const int32_t * n_slots_layer; // optional: experts per layer, n_layer entries (overrides n_slots)
++        int32_t         n_layer_slots; // number of entries in n_slots_layer
++        int32_t         n_threads;     // I/O threads
++        int32_t         prefetch_k;    // experts the predictor prefetches per layer, 0 = demand only
++        int32_t         prefetch_half_life; // the predictor's count half-life in tokens
++        float           prefetch_mix;  // the weight of its transitions against its counts, in [0, 1]
++        const char *    stats_path;    // optional: write the cache counters as JSON when the model is freed
++    };
++
+     struct llama_model_params {
+         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
+         ggml_backend_dev_t * devices;
+@@ -346,6 +360,9 @@ extern "C" {
+         // override key-value pairs of the model meta data
+         const struct llama_model_kv_override * kv_overrides;
+ 
++        // [EXPERIMENTAL] bounded expert cache, NULL = off
++        const struct llama_expert_cache_params * expert_cache;
++
+         // Keep the booleans together to avoid misalignment during copy-by-value.
+         bool vocab_only;      // only load the vocabulary, no weights
+         bool check_tensors;   // validate model tensor data
+@@ -478,6 +495,7 @@ extern "C" {
+     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
+     LLAMA_API struct llama_model_params          llama_model_default_params(void);
+     LLAMA_API struct llama_context_params        llama_context_default_params(void);
++    LLAMA_API struct llama_expert_cache_params   llama_expert_cache_default_params(void);
+     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
+     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
+ 
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc79..2d48b0cb8 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -16,6 +16,8 @@ set(LLAMA_CORE_SOURCES
+     llama-chat.cpp
+     llama-context.cpp
+     llama-cparams.cpp
++    llama-expert-cache.cpp
++    llama-expert-slots.cpp
+     llama-grammar.cpp
+     llama-graph.cpp
+     llama-hparams.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 96b5464e6..cc8dbd258 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-expert-cache.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -247,6 +248,19 @@ llama_context::llama_context(
+ 
+     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+ 
++    // [EXPERIMENTAL] with the expert cache, the experts of every ubatch must fit its slots
++    if (model.expert_cache) {
++        if (!model.expert_cache->attach()) {
++            throw std::runtime_error("the expert cache serves one context per model, and it has one");
++        }
++        expert_cache_attached = true;
++        const uint32_t cap = model.expert_cache->max_ubatch();
++        if (cparams.n_ubatch > cap) {
++            LLAMA_LOG_WARN("%s: n_ubatch %u capped to %u, so that a ubatch's experts fit the expert cache\n", __func__, cparams.n_ubatch, cap);
++            cparams.n_ubatch = cap;
++        }
++    }
++
+     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+@@ -484,6 +498,10 @@ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
++    if (expert_cache_attached) {
++        model.expert_cache->detach();
++    }
++
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 95b722628..c76fd8583 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -389,6 +389,9 @@ private:
+ 
+     bool has_evaluated_once = false;
+ 
++    // this context holds the model's expert cache
++    bool expert_cache_attached = false;
++
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+new file mode 100644
+index 000000000..556c38192
+--- /dev/null
++++ b/src/llama-expert-cache.cpp
+@@ -0,0 +1,313 @@
++#include "llama-expert-cache.h"
++
++#include "llama-impl.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++#include <fstream>
++#include <stdexcept>
++
++#if defined(__APPLE__)
++#include <fcntl.h>
++#include <libproc.h>
++#include <sys/param.h>
++#include <sys/resource.h>
++#include <unistd.h>
++#elif defined(__linux__)
++#include <fcntl.h>
++#include <sys/resource.h>
++#include <unistd.h>
++#endif
++
++namespace {
++
++struct process_counts {
++    uint64_t disk_read = 0;
++    uint64_t pageins   = 0;
++    uint64_t faults    = 0;
++    uint64_t max_phys_footprint = 0;
++};
++
++process_counts process_now() {
++    process_counts c;
++#if defined(__APPLE__)
++    rusage_info_v4 ri = {};
++    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *) &ri) == 0) {
++        c.disk_read          = ri.ri_diskio_bytesread;
++        c.pageins            = ri.ri_pageins;
++        c.max_phys_footprint = ri.ri_lifetime_max_phys_footprint;
++    }
++#endif
++#if defined(__APPLE__) || defined(__linux__)
++    rusage ru = {};
++    if (getrusage(RUSAGE_SELF, &ru) == 0) {
++        c.faults = ru.ru_majflt;
++    }
++#endif
++    return c;
++}
++
++void remap_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    auto * ud = (llama_expert_cache::layer_ud *) userdata;
++    ud->cache->remap(ud->il, dst->src[0], dst);
++}
++
++std::string counts_json(const llama_expert_cache_counts & c) {
++    return format(
++        "{\"steps\": %llu, \"needed\": %llu, \"hits\": %llu, \"hits_loading\": %llu, \"misses\": %llu, "
++        "\"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
++        "\"prefetch_used\": %llu, \"prefetch_wasted\": %llu, \"prefetch_cancelled\": %llu, "
++        "\"prefetch_skipped\": %llu, \"load_failures\": %llu, \"wait_seconds\": %.6f, \"io_seconds\": %.6f, "
++        "\"io_prefetch_seconds\": %.6f}",
++        (unsigned long long) c.steps, (unsigned long long) c.needed, (unsigned long long) c.hits,
++        (unsigned long long) c.hits_loading, (unsigned long long) c.misses, (unsigned long long) c.evictions,
++        (unsigned long long) c.demand_bytes, (unsigned long long) c.prefetch_bytes,
++        (unsigned long long) c.prefetch_issued, (unsigned long long) c.prefetch_used,
++        (unsigned long long) c.prefetch_wasted, (unsigned long long) c.prefetch_cancelled,
++        (unsigned long long) c.prefetch_skipped, (unsigned long long) c.load_failures, c.wait_seconds, c.io_seconds,
++        c.io_prefetch_seconds);
++}
++
++} // namespace
++
++llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int n_layer, int n_expert, int n_expert_used)
++    : n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used),
++      n_threads(std::max(p.n_threads, 1)), prefetch_k(std::max(p.prefetch_k, 0)),
++      prefetch_half_life(std::max(p.prefetch_half_life, 1)), prefetch_mix(p.prefetch_mix),
++      stats_path(p.stats_path ? p.stats_path : "") {
++    if (p.n_slots_layer && p.n_layer_slots > 0) {
++        if (p.n_layer_slots != n_layer) {
++            throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
++        }
++        n_slots.assign(p.n_slots_layer, p.n_slots_layer + n_layer);
++    } else {
++        n_slots.assign(n_layer, p.n_slots);
++    }
++    for (int & s : n_slots) {
++        if (s < n_expert_used) {
++            throw std::runtime_error(format("expert cache: %d slots per layer, at least %d needed (the experts of one token)", s, n_expert_used));
++        }
++        s = std::min(s, n_expert);
++    }
++    if (prefetch_mix < 0 || prefetch_mix > 1) {
++        throw std::runtime_error(format("expert cache: prefetch mix %g, want [0, 1]", prefetch_mix));
++    }
++}
++
++llama_expert_cache::~llama_expert_cache() {
++    // the I/O threads go first: they write into the slots and read the file
++    if (slots) {
++        slots->drain();
++    }
++    const std::string stats = slots ? stats_json() : "";
++    slots.reset();
++    if (!stats.empty()) {
++        LLAMA_LOG_INFO("%s: %s\n", __func__, stats.c_str());
++        if (!stats_path.empty()) {
++            std::ofstream out(stats_path);
++            out << stats << "\n";
++            if (!out) {
++                LLAMA_LOG_ERROR("%s: cannot write %s\n", __func__, stats_path.c_str());
++            }
++        }
++    }
++    if (fd >= 0) {
++        close(fd);
++    }
++    if (buf) {
++        ggml_backend_buffer_free(buf);
++    }
++    if (ctx) {
++        ggml_free(ctx);
++    }
++}
++
++void llama_expert_cache::init(const std::vector<tensors> & stacked_in, int fd_loader, ggml_backend_buffer_type_t buft) {
++    GGML_ASSERT((int) stacked_in.size() == n_layer);
++    stacked = stacked_in;
++
++    // the slot tensors: the stacked tensors' first two dimensions, n_slots experts
++    ggml_init_params ip = {
++        /*.mem_size   =*/ ggml_tensor_overhead()*3*n_layer,
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ctx = ggml_init(ip);
++    if (!ctx) {
++        throw std::runtime_error("expert cache: ggml_init failed");
++    }
++    static const char * names[3] = { "ffn_gate_exps_slots", "ffn_up_exps_slots", "ffn_down_exps_slots" };
++    slot_t.resize(n_layer);
++    expert_bytes.resize(n_layer);
++    for (int il = 0; il < n_layer; ++il) {
++        size_t bytes = 0;
++        for (int k = 0; k < 3; ++k) {
++            const ggml_tensor * s = stacked[il].t[k];
++            if (!s || s->ne[2] != n_expert || !ggml_is_contiguous(s)) {
++                throw std::runtime_error(format("expert cache: layer %d has no contiguous stacked tensor %s of %d experts", il, names[k], n_expert));
++            }
++            ggml_tensor * t = ggml_new_tensor_3d(ctx, s->type, s->ne[0], s->ne[1], n_slots[il]);
++            ggml_format_name(t, "blk.%d.%s", il, names[k]);
++            GGML_ASSERT(t->nb[2] == s->nb[2]);
++            slot_t[il].t[k] = t;
++            bytes += s->nb[2];
++        }
++        expert_bytes[il] = bytes;
++    }
++    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
++    if (!buf) {
++        throw std::runtime_error(format("expert cache: cannot allocate the slots in %s", ggml_backend_buft_name(buft)));
++    }
++    // the slots hold weights: the scheduler runs the expert matmuls where they are
++    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    if (ggml_backend_buffer_get_base(buf) == nullptr) {
++        throw std::runtime_error("expert cache: the slot buffer is not addressable from the host");
++    }
++
++#if defined(__APPLE__)
++    char p[MAXPATHLEN];
++    if (fcntl(fd_loader, F_GETPATH, p) == -1) {
++        throw std::runtime_error(format("expert cache: F_GETPATH: %s", strerror(errno)));
++    }
++    path = p;
++    fd = open(p, O_RDONLY);
++    if (fd < 0) {
++        throw std::runtime_error(format("expert cache: open %s: %s", p, strerror(errno)));
++    }
++    // reads go to the device, not through the page cache
++    fcntl(fd, F_NOCACHE, 1);
++#elif defined(__linux__)
++    path = format("/proc/self/fd/%d", fd_loader);
++    fd = open(path.c_str(), O_RDONLY);
++    if (fd < 0) {
++        throw std::runtime_error(format("expert cache: open %s: %s", path.c_str(), strerror(errno)));
++    }
++#else
++    GGML_UNUSED(fd_loader);
++    throw std::runtime_error("expert cache: not supported on this platform");
++#endif
++
++    ud.resize(n_layer);
++    for (int il = 0; il < n_layer; ++il) {
++        ud[il] = { this, il };
++    }
++    slots = std::make_unique<llama_expert_slots>(n_slots, n_expert, expert_bytes, n_threads,
++        [this](int il, int e, int s) { return load(il, e, s); });
++    if (prefetch_k > 0) {
++        markov = std::make_unique<llama_expert_markov>(n_layer, n_expert, prefetch_half_life, prefetch_mix);
++    }
++
++    const auto pc = process_now();
++    disk_read0 = pc.disk_read;
++    pageins0   = pc.pageins;
++    faults0    = pc.faults;
++
++    const std::string pf = markov
++        ? format("markov same-token k %d, half-life %d, mix %g (%.1f MiB)", prefetch_k, prefetch_half_life, prefetch_mix, markov->bytes()/1024.0/1024.0)
++        : std::string("off");
++    LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %.2f MiB in %s, %d I/O threads, prefetch %s, reading %s\n",
++        __func__, *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
++        n_expert, ggml_backend_buffer_get_size(buf)/1024.0/1024.0, ggml_backend_buft_name(buft), n_threads,
++        pf.c_str(), path.c_str());
++}
++
++uint32_t llama_expert_cache::max_ubatch() const {
++    return std::max(1, *std::min_element(n_slots.begin(), n_slots.end()) / n_expert_used);
++}
++
++bool llama_expert_cache::attach() {
++    if (attached) {
++        return false;
++    }
++    attached = true;
++    return true;
++}
++
++void llama_expert_cache::detach() {
++    attached = false;
++}
++
++ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor * selected_experts, int il) {
++    ggml_tensor * ids = ggml_cont(ctx0, selected_experts); // [n_expert_used, n_tokens]
++    ggml_format_name(ids, "ffn_moe_topk_cont-%d", il);
++    ggml_tensor * args[1] = { ids };
++    ggml_tensor * out = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids->ne[0], ids->ne[1], 1, 1, args, 1, remap_op, 1, &ud[il]);
++    ggml_format_name(out, "ffn_moe_slots-%d", il);
++    return out;
++}
++
++void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * dst) {
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
++    const int n_tokens = (int) ids->ne[1];
++
++    // a graph runs its layers in order; layer 0 starts the next ubatch (the last layer may see
++    // fewer tokens, only the outputs)
++    if (il == 0) {
++        tok_first = tok_next;
++        tok_next += n_tokens;
++        decode    = n_tokens == 1;
++    }
++
++    if (!slots->remap(il, (const int32_t *) ids->data, (int) ggml_nelements(ids), decode, (int32_t *) dst->data)) {
++        int l = -1;
++        int e = -1;
++        if (slots->failure(l, e)) {
++            GGML_ABORT("expert cache: reading expert %d of layer %d from %s failed", e, l, path.c_str());
++        }
++        GGML_ABORT("expert cache: layer %d needs more distinct experts in one ubatch of %d tokens than its %d slots",
++            il, n_tokens, n_slots[il]);
++    }
++
++    if (markov) {
++        const auto & needed = slots->last_needed();
++        markov->observe(il, tok_first, decode, needed.data(), (int) needed.size());
++        const int target = markov->predict(il + 1, tok_first, decode, prefetch_k, pred);
++        if (target >= 0) {
++            slots->prefetch(target, pred.data(), (int) pred.size(), decode);
++        }
++    }
++}
++
++bool llama_expert_cache::load(int il, int e, int s) {
++    for (int k = 0; k < 3; ++k) {
++        const ggml_tensor * t = slot_t[il].t[k];
++        const size_t n   = t->nb[2];
++        char *       dst = (char *) t->data + (size_t) s*n;
++        const off_t  off = (off_t) (stacked[il].offs[k] + (size_t) e*n);
++        size_t done = 0;
++        while (done < n) {
++            const ssize_t r = pread(fd, dst + done, n - done, off + (off_t) done);
++            if (r <= 0) {
++                if (r < 0 && errno == EINTR) {
++                    continue;
++                }
++                LLAMA_LOG_ERROR("%s: pread of %zu bytes at %lld in %s: %s\n", __func__, n - done,
++                    (long long) (off + (off_t) done), path.c_str(), r < 0 ? strerror(errno) : "end of file");
++                return false;
++            }
++            done += (size_t) r;
++        }
++    }
++    return true;
++}
++
++std::string llama_expert_cache::stats_json() const {
++    const auto pc = process_now();
++    const int s_min = *std::min_element(n_slots.begin(), n_slots.end());
++    const int s_max = *std::max_element(n_slots.begin(), n_slots.end());
++    return format(
++        "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
++        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"file\": \"%s\"}, "
++        "\"prefill\": %s, \"decode\": %s, "
++        "\"process\": {\"disk_bytes_read\": %llu, \"pageins\": %llu, \"major_faults\": %llu, \"max_phys_footprint\": %llu}}",
++        s_min, s_max, buf ? ggml_backend_buffer_get_size(buf) : (size_t) 0, expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
++        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, path.c_str(),
++        counts_json(slots->counts(false)).c_str(), counts_json(slots->counts(true)).c_str(),
++        (unsigned long long) (pc.disk_read - disk_read0), (unsigned long long) (pc.pageins - pageins0),
++        (unsigned long long) (pc.faults - faults0), (unsigned long long) pc.max_phys_footprint);
++}
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+new file mode 100644
+index 000000000..719a955f0
+--- /dev/null
++++ b/src/llama-expert-cache.h
+@@ -0,0 +1,96 @@
++#pragma once
++
++// [EXPERIMENTAL] A bounded cache of routed experts (Kolibri only).
++//
++// The stacked expert tensors of every layer stay in the GGUF: they are mapped, but never touched.
++// Each layer instead has slot tensors of n_slots experts in device memory. Before the expert
++// matmuls of a ubatch, a CPU op maps the router's ids to slots, reading every expert that is not in
++// a slot with pread (F_NOCACHE on macOS, so the bytes do not stay in the page cache); the matmuls
++// then read the slots. The router chooses every expert: the expert weights keep its own ids, and a
++// prediction only ever decides what to read ahead.
++
++#include "llama.h"
++#include "llama-expert-slots.h"
++
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <memory>
++#include <string>
++#include <vector>
++
++struct llama_expert_cache {
++    // the gate, up and down tensors of one layer, with their data offsets in the file
++    struct tensors {
++        ggml_tensor * t[3]    = {};
++        size_t        offs[3] = {};
++    };
++
++    // userdata of the remap op of one layer
++    struct layer_ud {
++        llama_expert_cache * cache;
++        int il;
++    };
++
++    llama_expert_cache(const llama_expert_cache_params & p, int n_layer, int n_expert, int n_expert_used);
++    ~llama_expert_cache();
++
++    // init takes the stacked expert tensors and their offsets in the file the loader opened as fd,
++    // allocates the slots in buft, opens the file for its own reads and starts the I/O threads;
++    // it throws on failure
++    void init(const std::vector<tensors> & stacked, int fd, ggml_backend_buffer_type_t buft);
++
++    // the largest ubatch whose experts always fit: the fewest slots of a layer over n_expert_used
++    uint32_t max_ubatch() const;
++
++    // one context per model
++    bool attach();
++    void detach();
++
++    // the slot ids of the router's selected experts [n_expert_used, n_tokens], from a CPU op
++    ggml_tensor * build_remap(ggml_context * ctx, ggml_tensor * selected_experts, int il);
++
++    ggml_tensor * gate(int il) const { return slot_t[il].t[0]; }
++    ggml_tensor * up  (int il) const { return slot_t[il].t[1]; }
++    ggml_tensor * down(int il) const { return slot_t[il].t[2]; }
++
++    // the remap op's work
++    void remap(int il, const ggml_tensor * ids, ggml_tensor * dst);
++
++    std::string stats_json() const;
++
++private:
++    bool load(int il, int e, int s);
++
++    const int n_layer, n_expert, n_expert_used;
++    std::vector<int> n_slots; // per layer
++    int    n_threads;
++    int    prefetch_k;
++    int    prefetch_half_life;
++    double prefetch_mix;
++    std::string stats_path;
++
++    std::vector<tensors>  stacked;
++    std::vector<tensors>  slot_t; // the slot tensors; offs unused
++    std::vector<size_t>   expert_bytes; // per layer
++    std::vector<layer_ud> ud;
++
++    ggml_context *        ctx = nullptr;
++    ggml_backend_buffer_t buf = nullptr;
++    std::string path;
++    int fd = -1;
++
++    std::unique_ptr<llama_expert_slots>  slots;
++    std::unique_ptr<llama_expert_markov> markov;
++    std::vector<int> pred;
++
++    bool    attached  = false;
++    int64_t tok_first = 0; // the first token of the ubatch being computed
++    int64_t tok_next  = 0;
++    bool    decode    = false;
++
++    // process counters at init, for the deltas in the stats
++    uint64_t disk_read0 = 0;
++    uint64_t pageins0   = 0;
++    uint64_t faults0    = 0;
++};
+diff --git a/src/llama-expert-slots.cpp b/src/llama-expert-slots.cpp
+new file mode 100644
+index 000000000..228bbbcfd
+--- /dev/null
++++ b/src/llama-expert-slots.cpp
+@@ -0,0 +1,406 @@
++#include "llama-expert-slots.h"
++
++#include <algorithm>
++#include <cassert>
++#include <chrono>
++#include <cmath>
++
++llama_expert_slots::llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load)
++    : n_expert(n_expert), expert_bytes(std::move(expert_bytes)), load(std::move(load)), keep(n_expert, 0) {
++    assert(n_slots.size() == this->expert_bytes.size());
++    layers.resize(n_slots.size());
++    for (size_t l = 0; l < n_slots.size(); ++l) {
++        layers[l].slots.resize(std::max(n_slots[l], 0));
++        layers[l].where.assign(n_expert, -1);
++    }
++    for (int i = 0; i < std::max(n_threads, 1); ++i) {
++        threads.emplace_back([this] { worker(); });
++    }
++}
++
++llama_expert_slots::~llama_expert_slots() {
++    {
++        std::lock_guard<std::mutex> lock(mtx);
++        stop = true;
++        q_demand.clear();
++        q_prefetch.clear();
++    }
++    cv_work.notify_all();
++    for (auto & t : threads) {
++        t.join();
++    }
++}
++
++int llama_expert_slots::min_slots() const {
++    int m = layers.empty() ? 0 : (int) layers[0].slots.size();
++    for (const auto & L : layers) {
++        m = std::min(m, (int) L.slots.size());
++    }
++    return m;
++}
++
++int llama_expert_slots::slot_of(int l, int e) const {
++    std::lock_guard<std::mutex> lock(mtx);
++    return layers[l].where[e];
++}
++
++llama_expert_cache_counts llama_expert_slots::counts(bool decode) const {
++    std::lock_guard<std::mutex> lock(mtx);
++    return decode ? c_decode : c_prefill;
++}
++
++bool llama_expert_slots::failure(int & l, int & e) const {
++    std::lock_guard<std::mutex> lock(mtx);
++    l = failed_layer;
++    e = failed_expert;
++    return demand_failed;
++}
++
++void llama_expert_slots::drain() {
++    std::unique_lock<std::mutex> lock(mtx);
++    cv_done.wait(lock, [this] { return q_demand.empty() && q_prefetch.empty() && running == 0; });
++}
++
++// an empty slot, else the least recently used ready slot whose expert the running remap does not
++// need; never a slot that is loading
++int llama_expert_slots::pick_victim(int l) const {
++    const auto & L = layers[l];
++    int best = -1;
++    for (int s = 0; s < (int) L.slots.size(); ++s) {
++        const slot & x = L.slots[s];
++        if (x.state == EMPTY) {
++            return s;
++        }
++        if (x.state == READY && !keep[x.expert] && (best < 0 || x.last_use < L.slots[best].last_use)) {
++            best = s;
++        }
++    }
++    return best;
++}
++
++// the caller holds the lock; slot s of layer l is empty or ready and no longer mapped
++void llama_expert_slots::assign(int l, int s, int e, bool demand, bool decode) {
++    slot & x = layers[l].slots[s];
++    x.expert       = e;
++    x.state        = LOADING;
++    x.last_use     = tick;
++    x.prefetched   = !demand;
++    x.queued       = true;
++    x.demand       = demand;
++    x.phase_decode = decode;
++    layers[l].where[e] = s;
++    (demand ? q_demand : q_prefetch).push_back({l, s});
++}
++
++bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, int32_t * out) {
++    std::unique_lock<std::mutex> lock(mtx);
++    auto & L = layers[l];
++
++    for (int i = 0; i < n; ++i) {
++        if (ids[i] < 0 || ids[i] >= n_expert) {
++            return false;
++        }
++    }
++    needed.clear();
++    for (int i = 0; i < n; ++i) {
++        const int e = ids[i];
++        if (!keep[e]) {
++            keep[e] = 1;
++            needed.push_back(e);
++        }
++    }
++    auto release = [&] {
++        for (int e : needed) {
++            keep[e] = 0;
++        }
++    };
++    if (needed.size() > L.slots.size()) {
++        release();
++        return false;
++    }
++
++    in_flight = l;
++    tick++;
++    auto & c = counts_of(decode);
++    c.steps++;
++    c.needed += needed.size();
++
++    // queued prefetches of this layer that it does not need are dropped: their slots are free again
++    for (auto it = q_prefetch.begin(); it != q_prefetch.end();) {
++        slot & x = layers[it->l].slots[it->slot];
++        if (it->l == l && !keep[x.expert]) {
++            counts_of(x.phase_decode).prefetch_cancelled++;
++            L.where[x.expert] = -1;
++            x = slot{};
++            it = q_prefetch.erase(it);
++        } else {
++            ++it;
++        }
++    }
++
++    // hits; a queued prefetch of a needed expert moves to the demand queue
++    for (int e : needed) {
++        const int s = L.where[e];
++        if (s < 0) {
++            continue;
++        }
++        slot & x = L.slots[s];
++        if (x.state == READY) {
++            c.hits++;
++        } else {
++            c.hits_loading++;
++            if (x.queued && !x.demand) {
++                for (auto it = q_prefetch.begin(); it != q_prefetch.end(); ++it) {
++                    if (it->l == l && it->slot == s) {
++                        q_prefetch.erase(it);
++                        q_demand.push_front({l, s});
++                        break;
++                    }
++                }
++            }
++        }
++        if (x.prefetched) {
++            counts_of(x.phase_decode).prefetch_used++;
++            x.prefetched = false;
++        }
++        x.last_use = tick;
++    }
++
++    // misses go to the least recently used slots the ubatch does not need; when every such slot
++    // is loading, the remap waits for one of those loads
++    auto load_missing = [&] {
++        for (int e : needed) {
++            if (L.where[e] >= 0) {
++                continue;
++            }
++            int s;
++            while ((s = pick_victim(l)) < 0) {
++                cv_done.wait(lock);
++            }
++            slot & x = L.slots[s];
++            if (x.state == READY) {
++                c.evictions++;
++                if (x.prefetched) {
++                    counts_of(x.phase_decode).prefetch_wasted++;
++                }
++                L.where[x.expert] = -1;
++            }
++            c.misses++;
++            assign(l, s, e, true, decode);
++        }
++        cv_work.notify_all();
++    };
++    load_missing();
++
++    const auto t0 = std::chrono::steady_clock::now();
++    bool ok = true;
++    for (;;) {
++        if (demand_failed) {
++            ok = false;
++            break;
++        }
++        bool pending = false;
++        bool lost    = false; // a prefetch of a needed expert failed: load it on demand
++        for (int e : needed) {
++            const int s = L.where[e];
++            if (s < 0) {
++                lost = true;
++            } else if (L.slots[s].state != READY) {
++                pending = true;
++            }
++        }
++        if (lost) {
++            load_missing();
++            continue;
++        }
++        if (!pending) {
++            break;
++        }
++        cv_done.wait(lock);
++    }
++    c.wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++
++    if (ok) {
++        for (int i = 0; i < n; ++i) {
++            out[i] = L.where[ids[i]];
++        }
++    }
++    release();
++    return ok;
++}
++
++void llama_expert_slots::prefetch(int l, const int * experts, int n, bool decode) {
++    std::lock_guard<std::mutex> lock(mtx);
++    auto & L = layers[l];
++    auto & c = counts_of(decode);
++    if (l == in_flight) {
++        c.prefetch_skipped += n;
++        return;
++    }
++    for (int i = 0; i < n; ++i) {
++        const int e = experts[i];
++        if (L.where[e] >= 0) {
++            c.prefetch_skipped++;
++            continue;
++        }
++        const int s = pick_victim(l);
++        if (s < 0) {
++            c.prefetch_skipped++;
++            continue;
++        }
++        slot & x = L.slots[s];
++        if (x.state == READY) {
++            c.evictions++;
++            if (x.prefetched) {
++                counts_of(x.phase_decode).prefetch_wasted++;
++            }
++            L.where[x.expert] = -1;
++        }
++        c.prefetch_issued++;
++        assign(l, s, e, false, decode);
++    }
++    cv_work.notify_all();
++}
++
++void llama_expert_slots::worker() {
++    std::unique_lock<std::mutex> lock(mtx);
++    for (;;) {
++        cv_work.wait(lock, [this] { return stop || !q_demand.empty() || !q_prefetch.empty(); });
++        if (stop) {
++            return;
++        }
++        auto & q = q_demand.empty() ? q_prefetch : q_demand;
++        const job j = q.front();
++        q.pop_front();
++
++        slot & x = layers[j.l].slots[j.slot];
++        x.queued = false;
++        const int  e      = x.expert;
++        const bool demand = x.demand;
++        const bool decode = x.phase_decode;
++        running++;
++
++        // the slot is loading and in no queue: no remap, prefetch or cancellation touches it now
++        lock.unlock();
++        const auto t0 = std::chrono::steady_clock::now();
++        const bool ok = load(j.l, e, j.slot);
++        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        lock.lock();
++
++        running--;
++        auto & c = counts_of(decode);
++        c.io_seconds += dt;
++        if (!demand) {
++            c.io_prefetch_seconds += dt;
++        }
++        if (ok) {
++            x.state = READY;
++            (demand ? c.demand_bytes : c.prefetch_bytes) += expert_bytes[j.l];
++        } else {
++            c.load_failures++;
++            layers[j.l].where[e] = -1;
++            x = slot{};
++            if (demand) {
++                demand_failed = true;
++                failed_layer  = j.l;
++                failed_expert = e;
++            }
++        }
++        cv_done.notify_all();
++    }
++}
++
++void llama_expert_top_k(const std::vector<double> & score, int k, std::vector<int> & out) {
++    out.clear();
++    for (int b = 0; b < (int) score.size(); ++b) {
++        const double v = score[b];
++        if ((int) out.size() < k) {
++            out.push_back(b);
++        } else if (!(v > score[out[k-1]])) {
++            continue;
++        }
++        int i = (int) out.size() - 1;
++        while (i > 0 && score[out[i-1]] < v) {
++            out[i] = out[i-1];
++            i--;
++        }
++        out[i] = b;
++    }
++}
++
++llama_expert_markov::llama_expert_markov(int n_layer, int n_expert, int half_life, double mix)
++    : n_layer(n_layer), n_expert(n_expert), half_life(std::max(half_life, 1)), mix(mix),
++      freq((size_t) n_layer*n_expert), sum(n_layer), seen(n_layer, 0),
++      cross((size_t) n_layer*n_expert*n_expert), x_row((size_t) n_layer*n_expert),
++      last(n_layer), last_tok(n_layer, -1), score(n_expert) {}
++
++size_t llama_expert_markov::bytes() const {
++    return cross.size()*sizeof(float) + x_row.size()*sizeof(float) + freq.size()*sizeof(double) + sum.size()*sizeof(double);
++}
++
++void llama_expert_markov::observe(int l, int64_t first, bool decode, const int * ids, int n) {
++    const size_t N = n_expert;
++    if (const int64_t d = first - seen[l]; d > 0) {
++        const double f = std::pow(0.5, double(d)/double(half_life));
++        for (size_t e = 0; e < N; ++e) {
++            freq[l*N + e] *= f;
++        }
++        sum[l] *= f;
++        seen[l] = first;
++    }
++    for (int i = 0; i < n; ++i) {
++        freq[l*N + ids[i]]++;
++    }
++    sum[l] += double(n);
++    if (!decode) {
++        last_tok[l] = -1;
++        return;
++    }
++    if (l >= 2 && last_tok[l-2] == first) {
++        for (int a : last[l-2]) {
++            float * r = &cross[(l*N + a)*N];
++            for (int i = 0; i < n; ++i) {
++                r[ids[i]]++;
++            }
++            x_row[l*N + a] += float(n);
++        }
++    }
++    last[l].assign(ids, ids + n);
++    last_tok[l] = first;
++}
++
++int llama_expert_markov::predict(int l, int64_t first, bool decode, int k, std::vector<int> & out) {
++    out.clear();
++    if (!decode || k <= 0) {
++        return -1;
++    }
++    const int target = l + 1;
++    const int from   = l - 1;
++    if (l < 1 || target >= n_layer || last_tok[from] != first) {
++        return -1;
++    }
++    const size_t N = n_expert;
++    std::fill(score.begin(), score.end(), 0.0);
++    double den = 0;
++    for (int a : last[from]) {
++        den += double(x_row[target*N + a]);
++    }
++    if (den > 0 && mix > 0) {
++        for (int a : last[from]) {
++            const float * r = &cross[(target*N + a)*N];
++            for (size_t b = 0; b < N; ++b) {
++                score[b] += double(r[b]);
++            }
++        }
++        for (size_t b = 0; b < N; ++b) {
++            score[b] *= mix / den;
++        }
++    }
++    if (const double s = sum[target]; s > 0 && mix < 1) {
++        for (size_t b = 0; b < N; ++b) {
++            score[b] += (1 - mix) * freq[target*N + b] / s;
++        }
++    }
++    llama_expert_top_k(score, std::min(k, n_expert), out);
++    return target;
++}
+diff --git a/src/llama-expert-slots.h b/src/llama-expert-slots.h
+new file mode 100644
+index 000000000..11e12b66a
+--- /dev/null
++++ b/src/llama-expert-slots.h
+@@ -0,0 +1,161 @@
++#pragma once
++
++// Bookkeeping of a bounded expert cache, independent of ggml: which expert of a layer sits in which
++// slot, which loads are queued or running, and what they cost. The loads themselves go through a
++// callback, so the logic can be tested without a model.
++
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++// counters of one phase (prefill or decode)
++struct llama_expert_cache_counts {
++    uint64_t steps          = 0; // remaps: one per layer and ubatch
++    uint64_t needed         = 0; // distinct experts the remaps needed
++    uint64_t hits           = 0; // needed and ready
++    uint64_t hits_loading   = 0; // needed while a prefetch of it was queued or running: awaited, not repeated
++    uint64_t misses         = 0; // needed and not in the cache: loaded on demand
++    uint64_t evictions      = 0; // a ready expert replaced
++    uint64_t demand_bytes   = 0; // read for misses
++    uint64_t prefetch_bytes = 0; // read for prefetches
++    uint64_t prefetch_issued    = 0;
++    uint64_t prefetch_used      = 0; // a prefetched expert needed before it was evicted
++    uint64_t prefetch_wasted    = 0; // a prefetched expert evicted before it was needed
++    uint64_t prefetch_cancelled = 0; // dropped from the queue before it started
++    uint64_t prefetch_skipped   = 0; // not issued: resident or loading already, or its layer in flight
++    uint64_t load_failures      = 0;
++    double   wait_seconds = 0; // remaps blocked on loads: the cost on the critical path
++    double   io_seconds   = 0; // the loads' own durations, summed over the I/O threads
++    double   io_prefetch_seconds = 0; // the part of io_seconds that prefetches took: overlapped with
++                                      // compute, unless a remap awaited the prefetch (hits_loading)
++};
++
++struct llama_expert_slots {
++    // load(layer, expert, slot) reads one expert into one slot and returns false on failure
++    using load_fn = std::function<bool(int layer, int expert, int slot)>;
++
++    llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load);
++    ~llama_expert_slots();
++
++    llama_expert_slots(const llama_expert_slots &) = delete;
++    llama_expert_slots & operator=(const llama_expert_slots &) = delete;
++
++    // remap maps the router's ids of one ubatch of layer l (n ids) to slots, loading every expert
++    // that is not ready and waiting for all of them; out gets the slot of each id. The layer is in
++    // flight from then until the next remap: no prefetch replaces its slots. It returns false, with
++    // nothing changed, when the ubatch needs more distinct experts than the layer has slots or an
++    // id is out of range, and false after a demand load failed.
++    bool remap(int l, const int32_t * ids, int n, bool decode, int32_t * out);
++
++    // prefetch queues loads of the experts of layer l that are neither ready nor loading, best
++    // first, into its least recently used slots. Nothing is queued for the layer in flight.
++    void prefetch(int l, const int * experts, int n, bool decode);
++
++    // distinct experts of the last remap, in the order the ids met them
++    const std::vector<int> & last_needed() const { return needed; }
++
++    int n_slots(int l) const { return (int) layers[l].slots.size(); }
++    int min_slots() const;
++
++    // the slot an expert of layer l sits in, ready or loading, or -1
++    int slot_of(int l, int e) const;
++
++    // waits until no load is queued or running
++    void drain();
++
++    // whether a demand load failed, and which: a remap then returns false
++    bool failure(int & l, int & e) const;
++
++    llama_expert_cache_counts counts(bool decode) const;
++
++private:
++    enum slot_state { EMPTY, LOADING, READY };
++
++    struct slot {
++        int        expert   = -1;
++        slot_state state    = EMPTY;
++        uint64_t   last_use = 0;
++        bool       prefetched   = false; // loaded by a prefetch and not needed since
++        bool       queued       = false; // its load waits in a queue
++        bool       demand       = false; // its load is a demand load
++        bool       phase_decode = false; // the phase of the step that issued its load
++    };
++
++    struct layer {
++        std::vector<slot> slots;
++        std::vector<int>  where; // per expert: its slot, or -1
++    };
++
++    struct job {
++        int l, slot;
++    };
++
++    int pick_victim(int l) const;
++    void assign(int l, int s, int e, bool demand, bool decode);
++    void worker();
++    llama_expert_cache_counts & counts_of(bool decode) { return decode ? c_decode : c_prefill; }
++
++    const int n_expert;
++    const std::vector<size_t> expert_bytes; // per layer
++    load_fn load;
++
++    std::vector<layer> layers;
++    int      in_flight = -1;
++    uint64_t tick      = 0;
++    std::vector<int>  needed;
++    std::vector<char> keep; // per expert: needed by the remap running now
++
++    llama_expert_cache_counts c_prefill;
++    llama_expert_cache_counts c_decode;
++
++    mutable std::mutex      mtx;
++    std::condition_variable cv_work; // a job was queued, or stop
++    std::condition_variable cv_done; // a load finished
++    std::deque<job> q_demand;
++    std::deque<job> q_prefetch;
++    int  running = 0;
++    bool stop    = false;
++    bool demand_failed = false;
++    int  failed_layer  = -1;
++    int  failed_expert = -1;
++    std::vector<std::thread> threads;
++};
++
++// A port of the decayed-count Markov predictor of the repository's internal/locality (predict.go),
++// same-token horizon only: before layer l of a decode step it ranks the experts of layer l+1 from
++// layer l-1's experts and layer l+1's decayed use counts.
++struct llama_expert_markov {
++    llama_expert_markov(int n_layer, int n_expert, int half_life, double mix);
++
++    // observe: the step (token first, layer l), now run, used the distinct experts ids
++    void observe(int l, int64_t first, bool decode, const int * ids, int n);
++
++    // predict ranks, before the step (token first, layer l), the experts of layer l+1; it returns
++    // that layer and its k best experts in out, best first, the lower expert first of equal
++    // scores, or -1 and nothing when it predicts nothing
++    int predict(int l, int64_t first, bool decode, int k, std::vector<int> & out);
++
++    size_t bytes() const;
++
++private:
++    const int    n_layer, n_expert;
++    const int    half_life;
++    const double mix;
++
++    std::vector<double>  freq;  // per layer and expert: its uses, decayed to the token in seen
++    std::vector<double>  sum;   // per layer
++    std::vector<int64_t> seen;  // per layer
++    std::vector<float>   cross; // per layer l, from expert of l-2, to expert of l
++    std::vector<float>   x_row;
++    std::vector<std::vector<int>> last; // per layer: its latest decoded set
++    std::vector<int64_t> last_tok;      // per layer: that set's token, -1 for none
++    std::vector<double>  score;
++};
++
++// the indexes of the k best scores, best first, the lower index first of equal ones (predict.go's topK)
++void llama_expert_top_k(const std::vector<double> & score, int k, std::vector<int> & out);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 81f75d8e9..d606447ad 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-graph.h"
++#include "llama-expert-cache.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+@@ -2179,6 +2180,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // [EXPERIMENTAL] with an expert cache, the matmuls read the layer's slots, indexed by the
++    // router's ids mapped to slots; the weights above keep the router's own ids
++    ggml_tensor * ids_mm = selected_experts;
++    if (expert_cache && il >= 0) {
++        GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s);
++        ids_mm    = expert_cache->build_remap(ctx0, selected_experts, il);
++        cb(ids_mm, "ffn_moe_slots", il);
++        up_exps   = expert_cache->up(il);
++        gate_exps = gate_exps ? expert_cache->gate(il) : nullptr;
++        down_exps = expert_cache->down(il);
++    }
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+@@ -2212,7 +2225,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(up, "ffn_moe_up", il);
+     } else {
+         // separate gate and up path
+-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
++        up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+         cb(up, "ffn_moe_up", il);
+ 
+         if (up_exps_s) {
+@@ -2225,7 +2238,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+ 
+         if (gate_exps) {
+-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
++            cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+             cb(cur, "ffn_moe_gate", il);
+         } else {
+             cur = up;
+@@ -2326,7 +2339,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
+-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
++    experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+     if (arch == LLM_ARCH_MISTRAL4) {
+         // src1 can exceed F16 range
+         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 366eccbcd..fd1d01102 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -94,6 +94,7 @@ struct llama_cross {
+ };
+ 
+ struct llm_graph_params;
++struct llama_expert_cache;
+ 
+ //
+ // llm_graph_input
+@@ -1032,6 +1033,9 @@ struct llm_graph_context {
+ 
+     const llama_prec_policy * prec_policy;
+ 
++    // [EXPERIMENTAL] the model's expert cache, set by the archs that read their experts from it
++    llama_expert_cache * expert_cache = nullptr;
++
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+     const llm_graph_cb & cb_func;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index a15984663..5f25acf71 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -6,6 +6,7 @@
+ #include "llama-impl.h"
+ #include "llama-mmap.h"
+ #include "llama-cparams.h"
++#include "llama-expert-cache.h"
+ #include "llama-model-loader.h"
+ 
+ #include "llama-kv-cache.h"
+@@ -1295,6 +1296,11 @@ llama_model::~llama_model() {
+     }
+ }
+ 
++bool llama_model::expert_cache_requested() const {
++    const auto * p = params.expert_cache;
++    return p && (p->n_slots > 0 || (p->n_slots_layer && p->n_layer_slots > 0));
++}
++
+ void llama_model_base::load_stats(llama_model_loader & ml) {
+     pimpl->n_elements = ml.n_elements;
+     pimpl->n_bytes = ml.n_bytes;
+@@ -1633,6 +1639,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+         layers.resize(n_layer_all);
+ 
++        if (expert_cache_requested()) {
++            if (arch != LLM_ARCH_KOLIBRI) {
++                throw std::runtime_error(format("the expert cache supports the kolibri architecture only, not %s", llm_arch_name(arch)));
++            }
++            // the stacked experts stay in the file: lazy tensors, mapped on the CPU and never read
++            ml.lazy.mode = LLAMA_LAZY_MODE_ON;
++        }
++
+         // call the per-model loading function
+         load_arch_tensors(ml);
+ 
+@@ -1977,6 +1991,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    if (expert_cache_requested()) {
++        const int n_layer = (int) hparams.n_layer();
++        expert_cache = std::make_unique<llama_expert_cache>(*params.expert_cache, n_layer, (int) hparams.n_expert, (int) hparams.n_expert_used_max());
++        std::vector<llama_expert_cache::tensors> stacked(n_layer);
++        int fd = -1;
++        int idx = -1;
++        for (int il = 0; il < n_layer; ++il) {
++            ggml_tensor * t[3] = { layers[il].ffn_gate_exps, layers[il].ffn_up_exps, layers[il].ffn_down_exps };
++            for (int k = 0; k < 3; ++k) {
++                if (!t[k] || !ml.lazy.has(t[k])) {
++                    throw std::runtime_error(format("expert cache: layer %d's stacked experts are not lazy tensors (is mmap available?)", il));
++                }
++                const auto & w = ml.require_weight(ggml_get_name(t[k]));
++                if (idx >= 0 && w.idx != idx) {
++                    throw std::runtime_error("expert cache: the experts span several files");
++                }
++                idx = w.idx;
++                stacked[il].t[k]    = t[k];
++                stacked[il].offs[k] = w.offs;
++            }
++        }
++        fd = ml.files.at(idx)->file_id();
++        // the slots live where the layers' other weights live
++        expert_cache->init(stacked, fd, pimpl->dev_layer.at(0).buft_list->front().second);
++    }
++
+     return true;
+ }
+ 
+@@ -2953,6 +2993,7 @@ llama_model_params llama_model_default_params() {
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
++        /*.expert_cache                =*/ nullptr,
+         /*.vocab_only                  =*/ false,
+         /*.check_tensors               =*/ false,
+         /*.use_extra_bufts             =*/ true,
+@@ -2964,6 +3005,21 @@ llama_model_params llama_model_default_params() {
+     return result;
+ }
+ 
++llama_expert_cache_params llama_expert_cache_default_params() {
++    llama_expert_cache_params result = {
++        /*.n_slots            =*/ 0,
++        /*.n_slots_layer      =*/ nullptr,
++        /*.n_layer_slots      =*/ 0,
++        /*.n_threads          =*/ 4,
++        /*.prefetch_k         =*/ 0,
++        /*.prefetch_half_life =*/ 1,
++        /*.prefetch_mix       =*/ 0.75f,
++        /*.stats_path         =*/ nullptr,
++    };
++
++    return result;
++}
++
+ const llama_vocab * llama_model_get_vocab(const llama_model * model) {
+     return &model->vocab;
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 2243377cc..9e1009100 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -633,6 +633,8 @@ struct llama_prec_policy {
+     void load(llama_model_loader & ml, const llama_model & model);
+ };
+ 
++struct llama_expert_cache;
++
+ struct llama_model {
+     llm_type type = LLM_TYPE_UNKNOWN;
+     llm_arch arch = LLM_ARCH_UNKNOWN;
+@@ -743,6 +745,10 @@ struct llama_model {
+     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
+     std::unordered_set<const ggml_tensor *> can_prefetch;
+ 
++    // [EXPERIMENTAL] bounded cache of routed experts, when llama_model_params.expert_cache asks for one
++    std::unique_ptr<llama_expert_cache> expert_cache;
++    bool expert_cache_requested() const;
++
+     // statically allocated context for assigning
+     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+ 
+diff --git a/src/models/kolibri.cpp b/src/models/kolibri.cpp
+index ac6de0cc2..7b1fb6b09 100644
+--- a/src/models/kolibri.cpp
++++ b/src/models/kolibri.cpp
+@@ -43,6 +43,9 @@ void llama_model_kolibri::load_arch_tensors(llama_model_loader &) {
+     const int64_t n_ff_exp   = hparams.n_ff_exp();
+     const int64_t n_ff_shexp = hparams.n_ff_shexp;
+ 
++    // with the expert cache, the stacked experts are read from the file into its slots, never mapped to a device
++    const int exps_flags = expert_cache_requested() ? TENSOR_READ_LAZY : 0;
++
+     for (int i = 0; i < n_layer; ++i) {
+         auto & layer = layers[i];
+ 
+@@ -60,9 +63,9 @@ void llama_model_kolibri::load_arch_tensors(llama_model_loader &) {
+         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
+         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
+ 
+-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
++        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags);
++        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags);
++        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, exps_flags);
+ 
+         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,     n_ff_shexp}, 0);
+         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,     n_ff_shexp}, 0);
+@@ -80,6 +83,9 @@ llama_model_kolibri::graph::graph(const llama_model & model, const llm_graph_par
+     const int64_t n_embd_head = hparams.n_embd_head_v();
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+ 
++    // build_moe_ffn reads the experts from the cache's slots, if there is one
++    expert_cache = model.expert_cache.get();
++
+     ggml_tensor * cur;
+     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 8989c2784..93546515f 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -161,6 +161,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     llama_build_and_test(test-grammar-integration.cpp)
+     llama_build_and_test(test-llama-grammar.cpp)
+     llama_build_and_test(test-batch-alloc.cpp)
++    llama_build_and_test(test-expert-cache.cpp)
+     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+     target_link_libraries(test-chat PRIVATE server-context)
+diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
+new file mode 100644
+index 000000000..157750c17
+--- /dev/null
++++ b/tests/test-expert-cache.cpp
+@@ -0,0 +1,370 @@
++// Tests of the expert cache's bookkeeping (src/llama-expert-slots.*) with a fake loader, and of its
++// Markov predictor against the predictions of the Go original:
++//
++//   test-expert-cache [markov-fixture.json]
++//
++// The fixture is testdata/locality/markov-fixture.json of the kolibri-llama-cpp repository; without
++// it the predictor check is skipped.
++
++#include "../src/llama-expert-slots.h"
++
++#include <nlohmann/json.hpp>
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <fstream>
++#include <memory>
++#include <mutex>
++#include <random>
++#include <set>
++#include <thread>
++#include <utility>
++#include <vector>
++
++static int n_failed = 0;
++
++#define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "%s:%d: FAIL %s\n", __FILE__, __LINE__, #cond); n_failed++; } } while (0)
++
++// fake device memory: the expert each slot holds; a load may wait for a gate and may fail
++struct fake {
++    int n_layer, n_slots;
++    std::vector<std::atomic<int>>  mem;
++    std::vector<std::atomic<bool>> busy;
++    std::atomic<bool> overlap{false}; // a load started on a slot another load was writing
++    std::atomic<int>  n_loads{0};
++    std::mutex mtx;
++    std::set<std::pair<int, int>> gated;   // (layer, expert): wait for open
++    std::set<std::pair<int, int>> failing; // (layer, expert): fail once
++    std::atomic<bool> open{false};
++    std::atomic<int>  delay_us{0};
++
++    fake(int n_layer, int n_slots) : n_layer(n_layer), n_slots(n_slots), mem(n_layer*n_slots), busy(n_layer*n_slots) {
++        for (auto & m : mem) {
++            m = -1;
++        }
++    }
++
++    bool load(int l, int e, int s) {
++        if (busy[l*n_slots + s].exchange(true)) {
++            overlap = true;
++        }
++        bool wait = false, fail = false;
++        {
++            std::lock_guard<std::mutex> lock(mtx);
++            wait = gated.count({l, e}) > 0;
++            fail = failing.erase({l, e}) > 0;
++        }
++        while (wait && !open) {
++            std::this_thread::sleep_for(std::chrono::microseconds(100));
++        }
++        if (delay_us > 0) {
++            std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
++        }
++        if (!fail) {
++            mem[l*n_slots + s] = e;
++        }
++        n_loads++;
++        busy[l*n_slots + s] = false;
++        return !fail;
++    }
++
++    int at(int l, int s) const { return mem[l*n_slots + s]; }
++
++    // waits until a load of layer l runs
++    void wait_busy(int l) const {
++        for (;;) {
++            for (int s = 0; s < n_slots; ++s) {
++                if (busy[l*n_slots + s]) {
++                    return;
++                }
++            }
++            std::this_thread::sleep_for(std::chrono::microseconds(100));
++        }
++    }
++};
++
++static std::unique_ptr<llama_expert_slots> make(fake & f, int n_expert, int n_threads, size_t bytes = 100) {
++    return std::make_unique<llama_expert_slots>(std::vector<int>(f.n_layer, f.n_slots), n_expert,
++        std::vector<size_t>(f.n_layer, bytes), n_threads, [&f](int l, int e, int s) { return f.load(l, e, s); });
++}
++
++// every id maps to a slot that holds it
++static bool mapped(const fake & f, int l, const std::vector<int32_t> & ids, const std::vector<int32_t> & out) {
++    for (size_t i = 0; i < ids.size(); ++i) {
++        if (out[i] < 0 || out[i] >= f.n_slots || f.at(l, out[i]) != ids[i]) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool remap(llama_expert_slots & c, int l, std::vector<int32_t> ids, std::vector<int32_t> & out, bool decode = true) {
++    out.assign(ids.size(), -1);
++    return c.remap(l, ids.data(), (int) ids.size(), decode, out.data());
++}
++
++// opens the fake's gate after a pause, so that a remap waits for a gated load
++struct opener {
++    std::thread t;
++    explicit opener(fake & f) : t([&f] { std::this_thread::sleep_for(std::chrono::milliseconds(20)); f.open = true; }) {}
++    ~opener() { t.join(); }
++};
++
++static void test_lru() {
++    fake f(1, 3);
++    auto c = make(f, 10, 2);
++    std::vector<int32_t> out;
++    CHECK(remap(*c, 0, {0, 1, 2}, out) && mapped(f, 0, {0, 1, 2}, out));
++    CHECK(remap(*c, 0, {0}, out) && mapped(f, 0, {0}, out));
++    // 1 and 2 were used once, before 0: the least recently used is 1, the lower slot of the two
++    CHECK(remap(*c, 0, {3}, out) && mapped(f, 0, {3}, out));
++    CHECK(c->slot_of(0, 1) < 0 && c->slot_of(0, 2) >= 0 && c->slot_of(0, 0) >= 0);
++    const auto n = c->counts(true);
++    CHECK(n.steps == 3 && n.needed == 5 && n.misses == 4 && n.hits == 1 && n.evictions == 1);
++    CHECK(n.demand_bytes == 400 && n.prefetch_bytes == 0 && n.io_prefetch_seconds == 0);
++    CHECK(c->counts(false).steps == 0);
++    // duplicate ids in a ubatch need one slot
++    CHECK(remap(*c, 0, {3, 0, 3, 0}, out) && mapped(f, 0, {3, 0, 3, 0}, out) && out[0] == out[2]);
++}
++
++static void test_pinned() {
++    // the least recently used expert is needed by the ubatch itself: the other one goes
++    fake f(1, 2);
++    auto c = make(f, 10, 1);
++    std::vector<int32_t> out;
++    CHECK(remap(*c, 0, {5}, out));
++    CHECK(remap(*c, 0, {6}, out));
++    CHECK(remap(*c, 0, {5, 7}, out) && mapped(f, 0, {5, 7}, out));
++    CHECK(c->slot_of(0, 6) < 0);
++}
++
++static void test_pinned_loading() {
++    // two slots: a needed expert, and a prefetch still loading; the miss must wait for the
++    // prefetch's slot rather than take the needed expert's, the only other one
++    fake f(2, 2);
++    f.gated.insert({1, 3});
++    auto c = make(f, 10, 2);
++    std::vector<int32_t> out;
++    CHECK(remap(*c, 1, {5}, out));
++    CHECK(remap(*c, 0, {0}, out)); // layer 1 is no longer in flight
++    const int p = 3;
++    c->prefetch(1, &p, 1, true);
++    f.wait_busy(1);
++    {
++        opener o(f);
++        CHECK(remap(*c, 1, {5, 7}, out) && mapped(f, 1, {5, 7}, out));
++    }
++    CHECK(c->slot_of(1, 3) < 0);
++    // one miss per remap and no second load of the needed expert: only the prefetch is evicted
++    const auto n = c->counts(true);
++    CHECK(n.misses == 3 && n.hits == 1 && n.evictions == 1 && n.prefetch_wasted == 1);
++}
++
++static void test_capacity() {
++    fake f(1, 2);
++    auto c = make(f, 10, 1);
++    std::vector<int32_t> out;
++    CHECK(!remap(*c, 0, {1, 2, 3}, out));
++    CHECK(c->counts(true).steps == 0 && f.n_loads == 0);
++    CHECK(remap(*c, 0, {1, 2, 1}, out) && mapped(f, 0, {1, 2, 1}, out));
++}
++
++static void test_prefetch_awaited() {
++    // a needed expert whose prefetch is still loading is awaited, not loaded twice
++    fake f(3, 4);
++    f.gated.insert({2, 7});
++    auto c = make(f, 10, 2);
++    std::vector<int32_t> out;
++    CHECK(remap(*c, 0, {1}, out));
++    const int p = 7;
++    c->prefetch(2, &p, 1, true);
++    {
++        opener o(f);
++        CHECK(remap(*c, 2, {7}, out) && mapped(f, 2, {7}, out));
++    }
++    const auto n = c->counts(true);
++    CHECK(n.hits_loading == 1 && n.misses == 1 && n.prefetch_issued == 1 && n.prefetch_used == 1);
++    CHECK(f.n_loads == 2 && n.wait_seconds > 0.005);
++    c->drain();
++    const auto m = c->counts(true);
++    CHECK(m.prefetch_bytes == 100 && m.io_prefetch_seconds > 0.005 && m.io_prefetch_seconds <= m.io_seconds);
++}
++
++static void test_cancel() {
++    // one I/O thread, held by a gated prefetch of layer 3; of the two prefetches queued behind it,
++    // the needed one moves to the demand queue and the other is dropped
++    fake f(4, 4);
++    f.gated.insert({3, 0});
++    auto c = make(f, 10, 1);
++    std::vector<int32_t> out;
++    CHECK(remap(*c, 1, {9}, out));
++    const int p[] = {0, 1, 2};
++    c->prefetch(3, p, 3, true);
++    f.wait_busy(3);
++    {
++        opener o(f);
++        CHECK(remap(*c, 3, {1}, out) && mapped(f, 3, {1}, out));
++    }
++    c->drain();
++    const auto n = c->counts(true);
++    CHECK(n.prefetch_issued == 3 && n.prefetch_cancelled == 1 && n.hits_loading == 1 && n.prefetch_used == 1);
++    CHECK(c->slot_of(3, 2) < 0 && c->slot_of(3, 0) >= 0);
++    CHECK(n.prefetch_bytes == 200); // 0 ran, 1 ran from the demand queue, 2 never ran
++}
++
++static void test_in_flight() {
++    // no prefetch into the layer in flight; a loading slot is never a victim
++    fake f(2, 2);
++    f.gated.insert({1, 4});
++    auto c = make(f, 10, 2);
++    std::vector<int32_t> out;
++    CHECK(remap(*c, 0, {1}, out));
++    const int p0 = 2;
++    c->prefetch(0, &p0, 1, true);
++    CHECK(c->slot_of(0, 2) < 0 && c->counts(true).prefetch_skipped == 1);
++
++    // layer 1: one slot loads a gated prefetch; a ubatch of two other experts must wait for it
++    const int p1 = 4;
++    c->prefetch(1, &p1, 1, true);
++    f.wait_busy(1);
++    {
++        opener o(f);
++        CHECK(remap(*c, 1, {5, 6}, out) && mapped(f, 1, {5, 6}, out));
++    }
++    CHECK(!f.overlap);
++    const auto n = c->counts(true);
++    CHECK(n.prefetch_wasted == 1 && n.evictions == 1);
++}
++
++static void test_failures() {
++    fake f(1, 3);
++    auto c = make(f, 10, 1);
++    std::vector<int32_t> out;
++    // a failed prefetch falls back to a demand load
++    f.failing.insert({0, 3});
++    const int p = 3;
++    c->prefetch(0, &p, 1, false);
++    c->drain();
++    CHECK(c->slot_of(0, 3) < 0);
++    CHECK(remap(*c, 0, {3}, out, false) && mapped(f, 0, {3}, out));
++    const auto n = c->counts(false);
++    CHECK(n.load_failures == 1 && n.misses == 1);
++    // a failed demand load fails the remap and is reported
++    f.failing.insert({0, 4});
++    CHECK(!remap(*c, 0, {4}, out, false));
++    int l = -1, e = -1;
++    CHECK(c->failure(l, e) && l == 0 && e == 4);
++}
++
++static void test_stress() {
++    // random ubatches and prefetches over 4 layers, with slow loads: every remap maps every id to
++    // a slot holding it, and the slots of the layer in flight stay intact until the next remap
++    fake f(4, 8);
++    f.delay_us = 50;
++    auto c = make(f, 32, 4);
++    std::mt19937 rng(7);
++    std::vector<int32_t> out;
++    bool ok = true;
++    int n_remaps = 0;
++    for (int step = 0; step < 400 && ok; ++step) {
++        const int l = step % 4;
++        const int n = 1 + rng() % 8;
++        std::vector<int32_t> ids;
++        for (int i = 0; i < n; ++i) {
++            ids.push_back(rng() % 12 + (rng() % 4 == 0 ? 20 : 0));
++        }
++        ok = remap(*c, l, ids, out, n == 1) && mapped(f, l, ids, out);
++        n_remaps++;
++        for (int t = 1; t <= 2; ++t) {
++            std::vector<int> pf;
++            for (int i = 0; i < 4; ++i) {
++                pf.push_back(rng() % 32);
++            }
++            c->prefetch((l + t) % 4, pf.data(), (int) pf.size(), true);
++        }
++        std::this_thread::sleep_for(std::chrono::microseconds(rng() % 200));
++        ok = ok && mapped(f, l, ids, out);
++    }
++    c->drain();
++    CHECK(ok && n_remaps == 400);
++    CHECK(!f.overlap);
++    const auto d = c->counts(true), p = c->counts(false);
++    CHECK(d.hits + d.hits_loading + d.misses == d.needed && p.hits + p.hits_loading + p.misses == p.needed);
++    CHECK(d.demand_bytes + p.demand_bytes == 100*(d.misses + p.misses));
++    CHECK(d.prefetch_issued > 0 && d.prefetch_used > 0);
++}
++
++static void test_top_k() {
++    std::vector<int> out;
++    llama_expert_top_k({0.5, 2.0, 1.0, 2.0, 0.0}, 3, out);
++    CHECK((out == std::vector<int>{1, 3, 2}));
++    llama_expert_top_k({0.0, 0.0, 0.0}, 2, out);
++    CHECK((out == std::vector<int>{0, 1}));
++}
++
++static void test_markov_fixture(const char * path) {
++    std::ifstream in(path);
++    if (!in) {
++        fprintf(stderr, "cannot read %s\n", path);
++        n_failed++;
++        return;
++    }
++    const auto j = nlohmann::json::parse(in);
++    const int n_layer = j["layers"], n_expert = j["n_expert"], k = j["k"];
++    const auto & steps = j["steps"];
++    size_t n_pred = 0;
++    for (size_t pi = 0; pi < j["params"].size(); ++pi) {
++        const auto & p = j["params"][pi];
++        llama_expert_markov m(n_layer, n_expert, p["half_life_tokens"].get<int>(), p["mix"].get<double>());
++        const auto & preds = j["predictions"][pi];
++        std::vector<int> out;
++        size_t bad = 0;
++        for (size_t i = 0; i < steps.size(); ++i) {
++            const auto & s = steps[i];
++            const int     l      = s["layer"];
++            const int64_t first  = s["first"];
++            const bool    decode = s["decode"];
++            const auto    ex     = s["experts"].get<std::vector<int>>();
++            const int target = m.predict(l, first, decode, k, out);
++            std::vector<int> got = {target};
++            got.insert(got.end(), out.begin(), out.end());
++            const auto want = preds[i].get<std::vector<int>>();
++            if (got != want && bad++ == 0) {
++                fprintf(stderr, "params %zu, step %zu (token %lld, layer %d): predicted", pi, i, (long long) first, l);
++                for (int x : got) { fprintf(stderr, " %d", x); }
++                fprintf(stderr, ", Go");
++                for (int x : want) { fprintf(stderr, " %d", x); }
++                fprintf(stderr, "\n");
++            }
++            n_pred += target >= 0;
++            m.observe(l, first, decode, ex.data(), (int) ex.size());
++        }
++        CHECK(bad == 0);
++    }
++    printf("markov fixture: %zu steps, %zu predictions over %zu parameter sets, as the Go predictor\n", steps.size(), n_pred, j["params"].size());
++}
++
++int main(int argc, char ** argv) {
++    test_lru();
++    test_pinned();
++    test_pinned_loading();
++    test_capacity();
++    test_prefetch_awaited();
++    test_cancel();
++    test_in_flight();
++    test_failures();
++    test_stress();
++    test_top_k();
++    if (argc > 1) {
++        test_markov_fixture(argv[1]);
++    } else {
++        printf("markov fixture: skipped (no path given)\n");
++    }
++    if (n_failed > 0) {
++        fprintf(stderr, "%d checks failed\n", n_failed);
++        return 1;
++    }
++    printf("all expert cache tests passed\n");
++    return 0;
++}
