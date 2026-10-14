@@ -126,23 +126,47 @@ func TestMarkdownLabelsOracle(t *testing.T) {
 		t.Fatal(err)
 	}
 	hs := halfLives(512)
-	grid, err := lfuGrid(tiny, tinySpans, 2, tinyModel, sizes, hs)
+	grid, err := lfuGrid(tiny, tinySpans, 2, tinyModel, sizes, hs, tinyTiming)
 	if err != nil {
 		t.Fatal(err)
 	}
 	grids := map[string]map[string]Grid{"tiny": {"w": grid}}
-	wl := Workload{Tokens: 3, Split: SplitWorkload{2, 1, 2}, NoCache: noCache, Policies: runs, LFUGrid: grid}
+	lastN, err := lastNGrid(tiny, tinySpans, 2, tinyModel, sizes, lastNs, tinyTiming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wl := Workload{Tokens: 3, Split: SplitWorkload{2, 1, 2}, NoCache: noCache, Policies: runs, LFUGrid: grid,
+		LastN: lastN}
 	for s, c := range sizes {
 		wl.LFUTuning = append(wl.LFUTuning, tune(grids, "tiny", "w", s, c, 512))
+	}
+	tr := trace{tiny, tinySpans, 2, tinyModel, tinyTiming}
+	var c curves
+	if c.train, err = locality.MissCurves(tiny, tinySpans, 0, 2, 4, tinyModel.bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if c.test, err = locality.MissCurves(tiny, tinySpans, 2, 3, 4, tinyModel.bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if wl.Allocation, err = replayAllocations(tr, fits(map[string]map[string]curves{"tiny": {"w": c}}, "tiny", "w"),
+		sizes); err != nil {
+		t.Fatal(err)
+	}
+	results := []result{{"tiny", "w", wl, tr}}
+	g, ok := gateOf(results, "tiny", sizes, []string{"ssd"})
+	if !ok {
+		t.Fatal("no gate")
 	}
 	var b bytes.Buffer
 	writeMarkdown(&b, "cmd", Assumptions{Ubatch: 512, DecodeTokensPerSecond: 63.7, PrefillTokensPerSecond: 1347,
 		LFUHalfLife: 512, LFUHalfLives: hs, SplitRule: "the rule."}, tinyTiming.Links, sizes, 2, []int{0, 1},
-		[]result{{"tiny", "w", wl}})
+		results, map[string]Gate{"tiny": g})
 	md := b.String()
 	for _, want := range []string{"| oracle, shared † |", "unattainable upper bound", "not a measurement",
 		"| ssd ms/token |", "| layer LRU | decode |", "| no cache | prefill |", "Held-out test suffix",
-		"| w | 2 | 1 | 2 | 1 | 1 | 0 |", "tuned on the test data", "| tiny | w | 512: ", "| 2 | "} {
+		"| w | 2 | 1 | 2 | 1 | 1 | 0 |", "tuned on the test data", "| tiny | w | 512: ", "| 2 | ",
+		"| Hindsight † | Compulsory |", "fitted on the test data", "## Last-N reuse", "| tiny | 1 | ",
+		"## Stage A gate", "| layer budgets allocated on the own prefix | ", "| last-N on shared LRU, n tuned"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("the report lacks %q", want)
 		}
@@ -250,7 +274,7 @@ func TestTuneNoLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	sizes, hs := []int{1, 2, 4}, halfLives(512)
-	before, err := lfuGrid(sel, spans, cut, m, sizes, hs)
+	before, err := lfuGrid(sel, spans, cut, m, sizes, hs, locality.Timing{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +284,7 @@ func TestTuneNoLeak(t *testing.T) {
 			draw((l*sel.Tokens + tok) * sel.K)
 		}
 	}
-	after, err := lfuGrid(sel, spans, cut, m, sizes, hs)
+	after, err := lfuGrid(sel, spans, cut, m, sizes, hs, locality.Timing{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,5 +301,97 @@ func TestTuneNoLeak(t *testing.T) {
 			t.Fatalf("size %d: the tuned half-life follows the test suffix: %d, %d", sizes[s], a.Own.HalfLife,
 				b.Own.HalfLife)
 		}
+	}
+}
+
+func TestFits(t *testing.T) {
+	c := func(v int64) [][]int64 { return [][]int64{{v, v / 2, 0}} }
+	all := map[string]map[string]curves{
+		"A": {"w1": {c(10), c(100)}, "w2": {c(20), c(200)}, "w3": {c(40), c(400)}},
+		"B": {"w1": {c(1000), c(1000)}},
+	}
+	f := fits(all, "A", "w1")
+	// the own prefix and hindsight are w1's; leaving w1 out adds w2's and w3's training curves, never
+	// w1's own, any test suffix or the other model's
+	if !reflect.DeepEqual(f[ownFit], c(10)) || !reflect.DeepEqual(f[lowoFit], c(60)) ||
+		!reflect.DeepEqual(f[hindsightFit], c(100)) {
+		t.Fatalf("fits %v", f)
+	}
+	if f := fits(all, "B", "w1"); f[lowoFit] != nil {
+		t.Fatalf("a model with one workload leaves it out onto %v", f[lowoFit])
+	}
+	if compulsory(c(100)) != 0 || compulsory([][]int64{{9, 4}, {7, 3}}) != 7 {
+		t.Fatal("compulsory bytes are not the curves at full capacity")
+	}
+}
+
+func TestCheckCurves(t *testing.T) {
+	sizes := []int{1, 2, 4}
+	_, runs, err := replay(tiny, tinySpans, 2, tinyModel, sizes, baselines(tiny, tinySpans, tinyModel, 512), tinyTiming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c curves
+	if c.train, err = locality.MissCurves(tiny, tinySpans, 0, 2, 4, tinyModel.bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if c.test, err = locality.MissCurves(tiny, tinySpans, 2, 3, 4, tinyModel.bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkCurves(c, runs[layerLRU], tinyModel); err != nil {
+		t.Fatal(err)
+	}
+	c.test[1][2] += 10
+	if checkCurves(c, runs[layerLRU], tinyModel) == nil {
+		t.Fatal("a wrong test curve passes")
+	}
+}
+
+// decode is a test suffix result whose decode loads b bytes, missed and prefetched, in s seconds.
+func decode(missed, prefetched int64, s float64) locality.Result {
+	return locality.Result{Decode: locality.Counts{MissBytes: missed, PrefetchBytes: prefetched,
+		Links: []locality.LinkTime{{Link: "ssd", Seconds: s}}}}
+}
+
+func TestGate(t *testing.T) {
+	sizes := []int{8, 16}
+	// two workloads; the reference loads 100+100 bytes in 2+2 s at 8, 50+50 in 1+1 s at 16
+	ref := heldOut{"shared LRU", [][]locality.Result{{decode(100, 0, 2), decode(50, 0, 1)},
+		{decode(100, 0, 2), decode(50, 0, 1)}}}
+	cands := []heldOut{
+		// the same in sum: no win anywhere
+		{"tie", [][]locality.Result{{decode(150, 0, 3), decode(40, 0, 1)}, {decode(50, 0, 1), decode(60, 0, 1)}}},
+		// fewer bytes at 16 only
+		{"bytes", [][]locality.Result{{decode(100, 0, 2), decode(40, 0, 1)}, {decode(100, 0, 2), decode(50, 0, 1)}}},
+		// prefetching: as many bytes, faster at 8
+		{"faster", [][]locality.Result{{decode(60, 40, 1.5), decode(50, 0, 1)}, {decode(100, 0, 2), decode(50, 0, 1)}}},
+		// fewer misses but more bytes loaded in all: no win
+		{"wasteful", [][]locality.Result{{decode(80, 40, 2), decode(50, 0, 1)}, {decode(100, 0, 2), decode(50, 0, 1)}}},
+		// faster by rounding alone: no win
+		{"noise", [][]locality.Result{{decode(100, 0, 2-1e-13), decode(50, 0, 1)}, {decode(100, 0, 2), decode(50, 0, 1)}}},
+	}
+	g := gate(ref, cands, sizes, []string{"ssd"}, 7)
+	want := map[string][][]string{"tie": {nil, nil}, "bytes": {nil, {"bytes"}}, "faster": {{"ssd"}, nil},
+		"wasteful": {nil, nil}, "noise": {nil, nil}}
+	if g.Tokens != 7 || len(g.Policies) != 5 || g.Reference.Sizes[0].LoadedBytes != 200 {
+		t.Fatalf("gate %+v", g)
+	}
+	for _, e := range g.Policies {
+		for s, x := range e.Sizes {
+			if !slices.Equal(x.Wins, want[e.Policy][s]) {
+				t.Errorf("%s at %d: wins %v, want %v", e.Policy, sizes[s], x.Wins, want[e.Policy][s])
+			}
+		}
+		if e.Retained != (e.Policy == "bytes" || e.Policy == "faster") {
+			t.Errorf("%s retained: %v", e.Policy, e.Retained)
+		}
+	}
+}
+
+func TestLoadedBytes(t *testing.T) {
+	// a useful prefetch loads as many bytes as the miss it saves: 30 missed, 20 prefetched of which
+	// 5 unused load 50
+	if b := loadedBytes(locality.Counts{MissBytes: 30, PrefetchBytes: 20, UnusedPrefetchBytes: 5}); b != 50 {
+		t.Fatalf("loaded %d bytes, want 50", b)
 	}
 }

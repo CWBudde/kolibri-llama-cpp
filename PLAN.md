@@ -747,7 +747,7 @@ GB Mac.
 
 ## Phase 10 --- Predictive expert caching and prefetch (proposed)
 
-**Status:** Stage A in progress (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, and chronological and leave-one-workload-out train/test splits with held-out replays exist. No predictive cache or prefetch policy is implemented or claimed yet. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
+**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only predictor so far, last-N, did not pass the gate; Stage B has not started. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
 
 ### Objective and constraints
 
@@ -760,7 +760,7 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
 - Layer 0/1 are unusually concentrated, whereas other layers have much broader use. A fixed equal-sized cache is therefore a baseline, not the presumed optimum.
 - The resident Metal benchmark (~64 tokens/s) and `--n-cpu-moe` comparisons are separate execution paths; record hardware, quantization, context length and memory pressure with every new result.
 
-### Stage A --- Reproducible offline policy comparison (no model training)
+### Stage A --- Reproducible offline policy comparison (no model training) — ✅ DONE (2026-10-14)
 
 - [x] Add a deterministic trace-replay evaluator with strictly causal observations: at prediction time only previous tokens' selected experts, known workload metadata and already completed layers may be used. Never use the target token's future routing decisions or future tokens. Replay prefill and decode separately; do not report teacher-forced prefill as an online decode speedup. (2026-10-13) — `locality.Replay` (`internal/locality/replay.go`) replays a trace in an online server's order. `OnlineSpans` (`answers.go`) builds that order from each answer's `n_prompt` and generated tokens in `testdata/locality/<workload>.json`: each prompt's new tokens prefilled in ubatches of 512 (a ubatch's union of experts per layer), each answer decoded token by token. An answer stopped at the limit decodes all but its last token. All four traces end with an answer, and no request follows it, so the replay stops after that answer's decoded tokens. Before a step, the policy gets only the step's position (`StepInfo`). The step's experts follow only afterwards, one `Use` at a time, and `Counts` are kept per phase. `TestReplayCausal` checks that before every step's `Prefetch` the policy knows exactly the earlier steps' experts. Moving `Prefetch` after the step's accesses fails it; dropping the ubatch union fails `TestReplayPhases`. `go run ./cmd/kolibri-policy -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx,Kolibri-1-Q8_0 -md docs/expert-policy.md` gives 16 PASS lines, including "PASS coding: the token IDs hold the 6 answers' generated tokens after their prompts". A per-layer LRU replayed in trace order reproduces `cmd/kolibri-cache`'s hits exactly at all 10 sizes, for both models and all four workloads ("PASS IQ3_XXS-IQ4_XS-down-imx coding: per-layer LRU in trace order hits as in cache-IQ3_XXS-IQ4_XS-down-imx.json at 10 sizes"). Online, IQ3 coding splits into 8845 prefill tokens in 21 ubatches and 2298 decoded tokens; the last 3 tokens are never processed. At 128 experts/layer the decode hit rate is 88.9% (57 MB/token) against 15.0% for the prefill ubatches ([docs/expert-policy.md](docs/expert-policy.md)). The only policy so far is that reference LRU; the baselines follow in the next item.
 - [x] Baselines: no cache; fixed-size per-layer LRU; globally shared byte-budgeted LRU; frequency/LFU with aging; recency-frequency hybrid; and an *oracle* with future knowledge explicitly labelled as an unattainable upper bound. (2026-10-14) — `internal/locality/policies.go` adds `NoCache`, `SharedLRU` (byte-budgeted, all layers), `LFU` (shared, counts for every expert halved every 512 tokens, a declared and untuned default) and `ARC` (the parameter-free recency-frequency hybrid, chosen for that reason). `Oracle` is Belady's MIN with bypass, shared and per layer. It is built from the whole trace, outside the causality contract, and marked "oracle †, unattainable upper bound" in the type doc, the JSON and every table. `cmd/kolibri-policy` replays all of them at 10 equal byte budgets. Checks:
@@ -775,7 +775,22 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
   - shared oracle: 22 / 13 / 13 / 12.
 
   So the best causal baseline still loads 2.4–2.5× the oracle's bytes ([docs/expert-policy.md](docs/expert-policy.md)).
-- [ ] Under identical total byte budgets, optimize cache allocation across layers (e.g. greedy marginal miss-byte reduction), fitted on the training prefix or a separate tuning split only and frozen before the held-out suffix is replayed. Compare against uniform allocation and a global shared cache. Account for heterogeneous expert sizes and compulsory/cold misses.
+- [x] Under identical total byte budgets, optimize cache allocation across layers (e.g. greedy marginal miss-byte reduction), fitted on the training prefix or a separate tuning split only and frozen before the held-out suffix is replayed. Compare against uniform allocation and a global shared cache. Account for heterogeneous expert sizes and compulsory/cold misses. (2026-10-14) — `locality.MissCurves` (`internal/locality/allocate.go`) gives every layer's decode miss bytes at every capacity in one stack-distance pass over a replayed range: the online order, a ubatch's union once, the spans before the range warming the stack.
+  - `Allocate` spends a byte budget greedily, the user's choice of 2026-10-14. It grows the layer whose next step saves the most bytes per byte, along each curve's lower convex hull, until nothing saves or fits; leftover budget is spread level.
+  - It works in bytes per layer, so heterogeneous expert sizes are handled. Both real models have equal sizes in every layer, so `TestAllocate` covers mixed sizes.
+  - `NewLayerLRUSizes` is the layer LRU with per-layer capacities. The capacities are fitted on the own training prefix and leaving one workload out (the other three workloads' curves added up), then frozen and replayed online, together with hindsight on the test suffix as the † bound.
+  - The compulsory misses, a test suffix's first uses of experts, are the curves at full capacity. They come to 0.2 MB/token for IQ3 and 0.5 for Q8_0, reported beside every row.
+  - Checks:
+    - `TestMissCurves`: the curves equal a layer LRU's per-layer misses at every capacity in both segments, the full-capacity value equals the first uses, and redrawing the test suffix leaves the training curves unchanged. Counting the prefix's prefill accesses fails it.
+    - `TestAllocate`: equals the brute-force optimum on convex curves at every budget; also covers a jump over a non-convex step, a flat layer, leftover budget and mixed sizes.
+    - `TestLayerLRUSizes`: equal capacities reproduce `NewLayerLRU` exactly.
+    - `TestFits`: fitting the own allocation on the test suffix fails it, and so does including the held-out workload in leave-one-workload-out.
+    - On the real traces 8 new PASS lines print, e.g. "PASS IQ3_XXS-IQ4_XS-down-imx coding: the layer miss curves give the layer LRU's training and test decode misses in every layer at 10 sizes" (48 PASS lines in all).
+  - Results, all four test suffixes together, decode MB/token:
+    - Allocated on the own prefix, the layer LRU beats uniform allocation at every budget below 384 experts per layer, where both load nothing (IQ3: 329 against 336 at 8 experts per layer, 40 against 44 at 128; Q8_0: 98 against 108 at 128).
+    - It beats the shared LRU only at 8–32 experts per layer, for IQ3 also at 256 (IQ3 329 against 335 at 8). From 48 up the shared LRU is better (38 against 40 at 128).
+    - Leaving one workload out is within 1 MB/token of the own prefix. Hindsight † is up to 3 MB/token lower for IQ3 and up to 8 for Q8_0 (242 against 250 at 64).
+    - At 128 experts per layer, the own-prefix allocation gives layers 0 and 1 only 38–61 experts, layer 2 141–176, and its largest layer 216–320 ([docs/expert-policy.md](docs/expert-policy.md)).
 - [x] Measure exact Top-6 set recall, per-layer recall, hit/miss rate, *miss bytes/token*, bytes prefetched but unused, peak cache bytes, evictions and estimated transfer time under declared RAM/PCIe/SSD bandwidth assumptions. Distinguish predictions that arrive early enough to overlap transfers from merely accurate predictions. (2026-10-14) — What `Counts` (`replay.go`) now holds, per phase:
   - `FullSteps`: steps that found every needed expert resident, i.e. a decoded token's exact Top-6 set in a layer, or a ubatch's whole union;
   - per-layer accesses and hits.
@@ -806,7 +821,23 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
     - Hindsight is at most 2 MB/token below the own-prefix choice for IQ3, and at most 7 for Q8_0 (97 against 90 at 128).
     - Q8_0 behaves alike: 818 → 779 MB/token at 8 experts per layer, and 94 → 97 at 128.
     - For every workload and budget, the other model's prefix picks the same half-life as the own prefix, so the IQ3/Q8_0 routing disagreement does not move this choice ([docs/expert-policy.md](docs/expert-policy.md)).
-- [ ] Gate: retain only policies that improve held-out miss bytes or latency proxy at equal memory budgets; include a trivial last-token/last-N reuse predictor as the first prediction baseline.
+- [x] Gate: retain only policies that improve held-out miss bytes or latency proxy at equal memory budgets; include a trivial last-token/last-N reuse predictor as the first prediction baseline. (2026-10-14) — `locality.LastN` (`internal/locality/lastn.go`) wraps a cache. Before layer l of a step it prefetches the experts layer l+1 used in its last n steps, so one layer ahead, the user's choice of 2026-10-14; before the last layer, layer 0's for the next step. The cache it wraps keeps or evicts the prefetched experts within its budget.
+  - On the shared LRU, n is chosen per budget from 1, 2, 4, 8 on the own training prefix, as the fewest decode bytes loaded, missed or prefetched, the gate's own measure.
+  - `LastNRecall` measures the predictor itself on the test suffixes. For IQ3, n 1 offers 6.3 candidates per layer and token and covers 34.4% of the needed experts and 0.4% of whole Top-6 sets. n 8 offers 30.4 candidates and covers 64.5% and 12.5%. Q8_0 is the same to 0.1 points.
+  - The gate, the user's rule of 2026-10-14: a causal policy is retained if, on the decode of all test suffixes of a model together, it beats the shared LRU at one or more budgets. Beating it means fewer bytes loaded (missed or prefetched), or a lower estimated time on a declared link. Equal is no win, and times within 10⁻⁹ relative count as equal.
+  - Checks:
+    - `TestLastN`: the prefetch sets equal the union of layer l+1's last n steps, computed from the trace, at every step, and the wrapped LRU keeps its budget. Prefetching for the running layer instead fails it.
+    - `TestLastNRecall` is checked by hand.
+    - `TestGate`: ties, fewer misses at more bytes loaded, and a time lower by 10⁻¹³ s are no wins. Letting ties pass fails it, and so does dropping the tolerance. Without the tolerance, last-N passed the real gate on rounding noise alone (10⁻¹³ s at 256 experts per layer, where it prefetched nothing).
+  - Verdicts, for both models ([docs/expert-policy.md](docs/expert-policy.md)):
+    - **retained:**
+      - ARC and LFU with the tuned half-life, at every budget but 128 and 384;
+      - the untuned LFU, at 8, 192 and 256 (Q8_0 also at 128), saving up to 12.2% of the bytes;
+      - the own-prefix and leave-one-workload-out allocations, at 8–32, IQ3's own-prefix one also at 256;
+      - the uniform layer LRU, at 16 only.
+    - **not retained:** last-N. Its tuned n is 1 almost everywhere. Up to 192 experts per layer it loads more and is slower than the shared LRU (IQ3 at 128: 64 against 38 MB/token, 18 of them prefetched in vain); from 256 up it equals it.
+    - At 128 experts per layer no causal policy beats the shared LRU for IQ3; for Q8_0 only the untuned LFU does.
+    - The largest time saved is 5.3% on SSD (Q8_0, tuned LFU at 48). Last-N's recall is the baseline Stage B's predictors have to beat.
 
 ### Stage B --- Small causal router predictor
 
