@@ -112,7 +112,7 @@ class Runner:
                nodes: dict[str, list[str]] | None = None, capture: dict | None = None,
                chunks: list[int] | None = None, n_ctx: int = 256, outputs: list[int] | None = None,
                rows: dict[str, tuple[int, list[int]]] | None = None, cpu_moe: bool = False, no_repack: bool = False,
-               return_logits: bool = True, expert_cache: dict | None = None, **ctx_params):
+               return_logits: bool = True, expert_cache: dict | None = None, n_gpu_layers: int = -1, **ctx_params):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
         overrides maps GGUF keys to int, float or bool values that replace the file's.
         If nodes is given, it receives every graph node's name with the names of its inputs.
@@ -131,13 +131,14 @@ class Runner:
         --no-repack, so a CPU model larger than memory stays mmapped. With return_logits false the
         output positions are still computed (the last layer keeps only their rows) but their logits
         are not kept, and the result is None. expert_cache sets llama_expert_cache_params fields
-        (n_slots, prefetch_k, stats_path, ...) and turns the expert cache on. ctx_params set further
+        (n_slots, prefetch_k, stats_path, ...) and turns the expert cache on. n_gpu_layers offloads
+        only that many layers to dev, the rest stays on the CPU. ctx_params set further
         llama_context_params fields (swa_full, flash_attn_type, type_k, ...)."""
         import numpy as np
 
         self.log.clear()
         devs = self.ffi.new("ggml_backend_dev_t[]", [dev, self.ffi.NULL])
-        mparams = self.ll.model_default_params(devices=devs, n_gpu_layers=-1, use_extra_bufts=not no_repack)
+        mparams = self.ll.model_default_params(devices=devs, n_gpu_layers=n_gpu_layers, use_extra_bufts=not no_repack)
         if overrides:
             kv = self.ffi.new("struct llama_model_kv_override[]", len(overrides) + 1)  # zeroed: the last ends the list
             for o, (key, val) in zip(kv, overrides.items()):

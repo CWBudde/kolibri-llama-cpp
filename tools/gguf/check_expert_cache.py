@@ -17,9 +17,13 @@ the CPU its weights are not repacked (the slots are not either).
 - the ubatch cap is logged, and fewer slots than the experts of one token fail to load;
 - slots per layer (n_slots_layer) give bit-identical logits too, and a model with the cache serves
   one context: a second one fails;
+- placement: with only half the layers on the GPU, every layer's slots go to its own device, and
+  with the CPU's repacking buffer types enabled the slots still hold the file's bytes; both again
+  bit-identical to the resident run without repacking;
 - the command line: llama-completion with --expert-cache-layers, --expert-prefetch and
   --expert-cache-stats generates with the cache as asked (the stats record the slots and the
-  prefetch), and greedily the same text as without it.
+  prefetch), and greedily the same text as without it; with a quote, a backslash and a tab in the
+  model's file name the stats are still valid JSON and name the file.
 
 With --real GGUF it checks a real checkpoint on the GPU instead: the first 160 tokens of a
 locality workload (128 prefilled, 32 decoded), resident against the cache with 128 and 64 slots per
@@ -33,6 +37,7 @@ come from the page cache, since the resident run maps the whole file first.
 import argparse
 import json
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -142,6 +147,22 @@ def main() -> None:
                     report(np.array_equal(got, ref) and (s["slots_min"], s["slots_max"]) == (min(per_layer), max(per_layer)),
                            f"{outtype} {dev_name}, slots per layer {per_layer}, ubatch {ub}: logits bit-identical to the resident run")
 
+                # half the layers on the GPU; and the CPU with repacking on, which the slots never use
+                gpu = [(n, d) for n, d in r.devices() if r.lib.ggml_backend_dev_type(d) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU]
+                cpu = [(n, d) for n, d in r.devices() if r.lib.ggml_backend_dev_type(d) == r.lib.GGML_BACKEND_DEVICE_TYPE_CPU]
+                cases = [(f"{gpu[0][0]} with {n_layer // 2} of {n_layer} layers", gpu[0][1], n_layer // 2, True)] if gpu else []
+                cases.append((f"{cpu[0][0]} with repacking", cpu[0][1], -1, False))
+                for what, dev, ngl, no_repack in cases:
+                    ref = r.logits(gguf, dev, tokens, 2, chunks=[N_PROMPT] + [1] * N_DECODE, no_repack=True, n_gpu_layers=ngl)
+                    stats.unlink(missing_ok=True)
+                    got = r.logits(gguf, dev, tokens, N_PROMPT, chunks=[N_PROMPT] + [1] * N_DECODE, no_repack=no_repack,
+                                   n_gpu_layers=ngl, expert_cache={"n_slots": 16, "stats_path": str(stats)})
+                    log = "".join(r.log)
+                    placed = all(f"MiB for {name}" in log for name in ({gpu[0][0], cpu[0][0]} if ngl > 0 else {cpu[0][0]}))
+                    report(np.array_equal(got, ref) and placed,
+                           f"{outtype} {what}, 16 slots: logits bit-identical to the resident run without repacking"
+                           + ("" if placed else f" (slots not on every layer's device: {[ln for ln in log.splitlines() if 'slots per layer' in ln]})"))
+
             # one context per model
             gguf = model.parent / f"{model.name}-q8_0.gguf"
             ec = r.ffi.new("struct llama_expert_cache_params *", r.lib.llama_expert_cache_default_params())
@@ -178,6 +199,18 @@ def main() -> None:
                 c = s["expert_cache"]
                 ok = (c["slots_min"], c["slots_max"], c["prefetch_k"], c["prefetch_half_life"], c["prefetch_mix"], c["io_threads"]) == \
                      (12, 384, 8, 4, 0.25, 2) and s["decode"]["steps"] > 0
+            odd = Path(tmp) / 'we"ird\\na\tme.gguf'
+            shutil.copyfile(gguf, odd)
+            stats.unlink(missing_ok=True)
+            run = subprocess.run([str(bin_dir / "llama-completion"), "-m", str(odd), "-p", prompt, "-n", "4", "-no-cnv",
+                                  "-c", "256", "--no-warmup", "--expert-cache", "16", "--expert-cache-stats", str(stats)],
+                                 capture_output=True, text=True)
+            try:
+                named = json.loads(stats.read_text())["expert_cache"]["file"]
+            except (OSError, ValueError) as e:
+                named = f"unreadable: {e}"
+            report(run.returncode == 0 and Path(named).name == odd.name,
+                   f"stats of a model named {odd.name!r} are valid JSON and name it ({named!r})")
             report(ok and plain.stdout == cached.stdout and plain.stdout.strip() != "",
                    f"llama-completion --expert-cache-layers/--expert-prefetch/--expert-cache-stats: as asked, same text as without the cache "
                    f"({plain.stdout.strip()[:60]!r})" + ("" if ok else f" rc {plain.returncode}/{cached.returncode}: {cached.stderr.strip()[-300:]}"))
