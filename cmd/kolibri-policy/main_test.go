@@ -158,6 +158,11 @@ func TestMarkdownLabelsOracle(t *testing.T) {
 			t.Fatal(err)
 		}
 		wl.Markov = append(wl.Markov, g)
+		lg, _, err := linearGrid(tr, h, sizes, 0.5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wl.Linear = append(wl.Linear, lg)
 	}
 	results := []result{{"tiny", "w", wl, tr}}
 	g, ok := gateOf(results, "tiny", sizes, []string{"ssd"})
@@ -177,7 +182,9 @@ func TestMarkdownLabelsOracle(t *testing.T) {
 		"## Stage A gate", "| layer budgets allocated on the own prefix | ", "| last-N on shared LRU, n tuned",
 		"## Stage B: the decayed-count Markov predictor", "| mixed, leave one workload out | – |", "**Cost.**",
 		"| tiny | next token | 1 | ", "## Stage B gate", "| next token Markov on shared LRU, k tuned for ssd | ",
-		"| same token Markov on shared LRU, k tuned for ssd | "} {
+		"| same token Markov on shared LRU, k tuned for ssd | ", "## Stage B: a trained linear predictor",
+		"| linear, A and B, leave one workload out | – |", "| next token linear on shared LRU, k tuned for ssd | ",
+		"| Linear ssd |", "ECE, calibrated"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("the report lacks %q", want)
 		}
@@ -527,7 +534,8 @@ func TestMarkovNoLeak(t *testing.T) {
 		t.Fatalf("with the cost %g s, without %g s", x.Links[0].Seconds, y.Links[0].Seconds)
 	}
 	// on the trace as it is now, the online predictor replays as the ranking
-	if err := checkOnline(tr, after, locality.NextToken, sizes, 1, 0.002); err != nil {
+	if err := checkOnline(tr, after.Prefetches, locality.NewMarkov(3, 8, after.Params[after.Own]), locality.NextToken,
+		sizes, 1, 0.002); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -572,7 +580,7 @@ func TestStageBGate(t *testing.T) {
 	// the predictor of both horizons, k tuned per link: the next token's k 6 is faster than the shared
 	// LRU on ssd but not than ARC, its k 12 faster than both on pcie
 	horizon := func(runs ...Run) HorizonGrid {
-		g := HorizonGrid{K: []int{6, 12}, OwnK: [][]int{{6, 12}}}
+		g := HorizonGrid{Prefetches: Prefetches{K: []int{6, 12}, OwnK: [][]int{{6, 12}}}}
 		for _, r := range runs {
 			g.Runs = append(g.Runs, Runs{Runs: []Run{r}})
 		}
@@ -593,5 +601,103 @@ func TestStageBGate(t *testing.T) {
 		if e.Retained != (i == 1) || e.Policy != markovName(horizons[i/2], links[i%2]) {
 			t.Errorf("%s: retained %v, wins %v", e.Policy, e.Retained, e.Sizes[0].Wins)
 		}
+	}
+}
+
+func TestPickFit(t *testing.T) {
+	// two L2s, three epochs: the most is 7, first reached by the second L2 at epoch 2
+	if i, e := pickFit([][]int{{3, 5, 6}, {4, 7, 7}}); i != 1 || e != 2 {
+		t.Fatalf("pickFit = %d, %d, want 1, 2", i, e)
+	}
+	if i, e := pickFit([][]int{{2, 2}, {2, 2}}); i != 0 || e != 1 {
+		t.Fatalf("all equal: %d, %d, want 0, 1", i, e)
+	}
+}
+
+func TestLinearData(t *testing.T) {
+	// token 0 a prompt, 1 and 2 decoded, 3 the next prompt, 4 and 5 decoded; the test suffix from
+	// token 3 on: fit on token 0, validate on 1 and 2, calibrate on 4 and 5
+	spans := []locality.Span{{Phase: locality.Prefill, First: 0, End: 1}, {Phase: locality.Decode, First: 1, End: 2},
+		{Phase: locality.Decode, First: 2, End: 3}, {Phase: locality.Prefill, First: 3, End: 4},
+		{Phase: locality.Decode, First: 4, End: 5}, {Phase: locality.Decode, First: 5, End: 6}}
+	fit, valid, test := linearData(trace{spans: spans, cut: 3})
+	if !slices.Equal(fit.Targets, []int{0}) || !slices.Equal(valid.Targets, []int{1, 2}) ||
+		!slices.Equal(test.Targets, []int{4, 5}) {
+		t.Fatalf("fit %v, valid %v, test %v", fit.Targets, valid.Targets, test.Targets)
+	}
+	// leaving one workload out takes the model's other workloads only
+	results := []result{{model: "A", workload: "w1", t: trace{spans: spans, cut: 3}},
+		{model: "A", workload: "w2", t: trace{spans: spans, cut: 3}}, {model: "B", workload: "w3",
+			t: trace{spans: spans, cut: 3}}}
+	if f, v := lowoLinearData(results, "A", "w1"); len(f) != 1 || len(v) != 1 {
+		t.Fatalf("leave one workload out of A/w1: %d and %d traces, want 1 and 1", len(f), len(v))
+	}
+}
+
+func TestLinearNoLeakCmd(t *testing.T) {
+	// the random trace of TestMarkovNoLeak: redrawing the test suffix changes no fit's choice,
+	// validation recall or temperature, and no training prefix's replay
+	r := rand.New(rand.NewPCG(9, 10))
+	sel := locality.Selections{Layers: 3, Tokens: 400, K: 2, IDs: make([]int32, 3*400*2)}
+	draw := func(i int) {
+		a := int32(min(r.IntN(8), r.IntN(8)))
+		sel.IDs[i], sel.IDs[i+1] = a, (a+1+int32(r.IntN(7)))%8
+	}
+	for i := 0; i < len(sel.IDs); i += 2 {
+		draw(i)
+	}
+	answers := []locality.Answer{{Prompt: 100, Tokens: make([]int32, 80)}, {Prompt: 250, Tokens: make([]int32, 80)}}
+	spans, err := locality.OnlineSpans(400, answers, true, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut, err := locality.SplitAfter(spans, answers, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m Model
+	if err := json.Unmarshal([]byte(`{"n_expert": 8, "layers": [{"bytes_per_expert": 10}, {"bytes_per_expert": 10},
+		{"bytes_per_expert": 10}]}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	tm := locality.Timing{Links: []locality.Link{{Name: "ssd", BytesPerSecond: 1000}}, DecodeStep: 0.01,
+		PrefillToken: 0.001}
+	tr := trace{sel, spans, cut, m, tm}
+	sizes := []int{1, 4}
+	for _, h := range horizons {
+		before, _, err := linearGrid(tr, h, sizes, 0.002)
+		if err != nil {
+			t.Fatal(err)
+		}
+		saved := slices.Clone(sel.IDs)
+		for l := range sel.Layers {
+			for tok := spans[cut].First; tok < sel.Tokens; tok++ {
+				draw((l*sel.Tokens + tok) * sel.K)
+			}
+		}
+		after, model, err := linearGrid(tr, h, sizes, 0.002)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range before.Fits {
+			x, y := before.Fits[i], after.Fits[i]
+			if x.Config != y.Config || !reflect.DeepEqual(x.Valid, y.Valid) || x.Temperature != y.Temperature {
+				t.Fatalf("%v, %s: the fit depends on the test suffix: %+v, %+v", h, x.Name, x.Config, y.Config)
+			}
+		}
+		for k := range before.Runs {
+			for s := range sizes {
+				if !reflect.DeepEqual(before.Runs[k].Runs[s].Split.Train, after.Runs[k].Runs[s].Split.Train) {
+					t.Fatalf("%v, k %d: the training prefix's replay depends on the test suffix", h, before.K[k])
+				}
+			}
+		}
+		if !reflect.DeepEqual(before.OwnK, after.OwnK) {
+			t.Fatalf("%v: k depends on the test suffix", h)
+		}
+		if err := checkOnline(tr, after.Prefetches, model.Online(), h, sizes, 1, 0.002); err != nil {
+			t.Fatal(err)
+		}
+		copy(sel.IDs, saved)
 	}
 }

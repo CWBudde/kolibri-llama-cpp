@@ -41,7 +41,10 @@
 // the own training prefix by recall (leaving one workload out reported beside it); its k best
 // candidates are prefetched into the shared LRU, k tuned per size and link on the own prefix, with
 // its measured cost per decoded layer step (-predict-us) added to every decoded step's compute.
-// Stage B's gate retains it only where it beats the best Stage A policy at that size.
+// Stage B's gate retains it only where it beats the best Stage A policy at that size. So does a
+// linear predictor (locality.Linear) fitted on the training prefix before its last answer's
+// decoded tokens and chosen and calibrated on those, then frozen, with its own measured cost
+// (-linear-us).
 //
 // For each model and workload it reads <dir>/<workload>.<model>.experts.npy and the token IDs
 // <dir>/<workload>.tokens.npy, and the answers' prompt lengths and generated tokens from
@@ -58,7 +61,8 @@
 //   - at every size, the layer miss curves give the uniform layer LRU's per-layer decode misses, in
 //     the training prefix and in the test suffix;
 //   - for each horizon, the predictor as an online policy, learning from Use alone, replays exactly
-//     as its precomputed ranking at the largest k and the -detail size.
+//     as its precomputed ranking at the largest k and the -detail size, and so does the frozen
+//     linear predictor.
 //
 // It writes <dir>/policy-<model>.json and, given -md, a Markdown report.
 package main
@@ -159,6 +163,7 @@ type Workload struct {
 	Allocation Allocations   `json:"allocation"`
 	LastN      LastNGrid     `json:"last_n"`
 	Markov     []HorizonGrid `json:"markov"`
+	Linear     []LinearGrid  `json:"linear,omitempty"`
 }
 
 // Assumptions are the declared, unmeasured inputs of the replays.
@@ -175,6 +180,10 @@ type Assumptions struct {
 	MarkovHalfLives        []int              `json:"markov_half_lives"`
 	MarkovMixes            []float64          `json:"markov_mixes"`
 	MarkovK                []int              `json:"markov_k"`
+	LinearSeconds          float64            `json:"linear_seconds_per_step"`
+	LinearL2s              []float64          `json:"linear_l2"`
+	LinearEpochs           int                `json:"linear_max_epochs"`
+	LinearRate             float64            `json:"linear_rate"`
 }
 
 // Output is <dir>/policy-<model>.json.
@@ -531,6 +540,7 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 	writeLastN(w, sizes, links, results)
 	writeGate(w, "Stage A gate", stageAIntro, gates, modelsOf(results))
 	writeMarkov(w, a, links, sizes, d, results, gatesB)
+	writeLinear(w, a, links, sizes, d, results, gatesB)
 	writeGate(w, "Stage B gate", stageBIntro, gatesB, modelsOf(results))
 }
 
@@ -704,6 +714,8 @@ func main() {
 	halfLife := flag.Int("lfu-halflife", 512, "LFU: halve all counts every this many tokens")
 	predictUS := flag.Float64("predict-us", 4.4, "measured predictor cost per decoded layer step, µs "+
 		"(BenchmarkMarkovStep in internal/locality, the slowest of six runs on an Apple M5 Pro)")
+	linearUS := flag.Float64("linear-us", 6.8, "measured linear predictor cost per decoded layer step, µs "+
+		"(BenchmarkLinearStep in internal/locality, the slowest of six runs on an Apple M5 Pro)")
 	splitsPath := flag.String("splits", "testdata/locality/splits.json", "the workloads' train/test splits")
 	detail := flag.Int("detail", 128, "the size the detail tables show")
 	layersFlag := flag.String("layers", "0,1,2,10,25,49", "the layers whose recall the report shows")
@@ -720,18 +732,19 @@ func main() {
 		log.Fatalf("-bw: %v", err)
 	}
 	if !positive(*decodeTPS) || !positive(*prefillTPS) || *halfLife <= 0 || at(sizes, *detail) < 0 ||
-		!(*predictUS >= 0) || math.IsInf(*predictUS, 1) {
+		!(*predictUS >= 0) || math.IsInf(*predictUS, 1) || !(*linearUS >= 0) || math.IsInf(*linearUS, 1) {
 		log.Fatal("-decode-tps and -prefill-tps must be finite and positive, -lfu-halflife positive, -detail one " +
-			"of -sizes, -predict-us finite and not negative")
+			"of -sizes, -predict-us and -linear-us finite and not negative")
 	}
-	cost := *predictUS * 1e-6
+	cost, linearCost := *predictUS*1e-6, *linearUS*1e-6
 	var splits SplitManifest
 	readJSON(*splitsPath, &splits)
 	hs := halfLives(*halfLife)
 	a := Assumptions{Ubatch: *ubatch, LinkGBPerSecond: map[string]float64{}, DecodeTokensPerSecond: *decodeTPS,
 		PrefillTokensPerSecond: *prefillTPS, LFUHalfLife: *halfLife, LFUHalfLives: hs, SplitRule: splits.Rule,
 		LastN: lastNs, PredictSeconds: cost, MarkovHalfLives: markovHalfLives, MarkovMixes: markovMixes,
-		MarkovK: markovKs}
+		MarkovK: markovKs, LinearSeconds: linearCost, LinearL2s: linearL2s, LinearEpochs: linearEpochs,
+		LinearRate: linearRate}
 	for _, l := range links {
 		a.LinkGBPerSecond[l.Name] = l.BytesPerSecond / 1e9
 	}
@@ -859,15 +872,29 @@ func main() {
 				if err != nil {
 					log.Fatalf("%s %s: %v", name, wl, err)
 				}
-				if err := checkOnline(t, g, h, sizes, at(sizes, *detail), cost); err != nil {
+				if err := checkOnline(t, g.Prefetches, locality.NewMarkov(sel.Layers, m.NExpert, g.Params[g.Own]), h,
+					sizes, at(sizes, *detail), cost); err != nil {
 					log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
 				}
 				fmt.Printf("PASS %s %s: the %s predictor, learning online from Use alone, replays as its ranking "+
 					"at k %d and %d experts per layer\n", short(name), wl, h, slices.Max(markovKs), *detail)
 				markov = append(markov, g)
 			}
+			var linear []LinearGrid
+			for _, h := range horizons {
+				g, model, err := linearGrid(t, h, sizes, linearCost)
+				if err != nil {
+					log.Fatalf("%s %s: %v", name, wl, err)
+				}
+				if err := checkOnline(t, g.Prefetches, model.Online(), h, sizes, at(sizes, *detail), linearCost); err != nil {
+					log.Fatalf("FAIL %s %s: the %s linear predictor: %v", short(name), wl, h, err)
+				}
+				fmt.Printf("PASS %s %s: the %s linear predictor, frozen, replays online as its ranking at k %d and "+
+					"%d experts per layer\n", short(name), wl, h, slices.Max(markovKs), *detail)
+				linear = append(linear, g)
+			}
 			w := Workload{Tokens: sel.Tokens, Answers: len(answers), Split: d, NoCache: noCache, Policies: runs,
-				TraceOrder: tr, LFUGrid: grid, LastN: lastN, Markov: markov}
+				TraceOrder: tr, LFUGrid: grid, LastN: lastN, Markov: markov, Linear: linear}
 			for _, s := range spans {
 				if s.Phase == locality.Prefill {
 					w.Ubatches++
@@ -889,6 +916,9 @@ func main() {
 		}
 		for hi := range horizons {
 			r.w.Markov[hi].LOWO = lowoParams(results, r.model, r.workload, hi)
+			if f, ok := lowoLinear(results, i, hi); ok {
+				r.w.Linear[hi].Fits = append(r.w.Linear[hi].Fits, f)
+			}
 		}
 	}
 	var linkNames []string
