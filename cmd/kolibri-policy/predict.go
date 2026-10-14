@@ -309,8 +309,9 @@ func writeMarkov(w io.Writer, a Assumptions, links []locality.Link, sizes []int,
 		"prediction is made %d steps before the step it is for. It uses only earlier tokens' experts;\n", layers-1,
 		locality.NextToken.Lead(layers))
 	fmt.Fprintf(w, "- **same token:** before layer l of token t it predicts the token's layer l+1, from its set in "+
-		"layer l−1, %d step ahead. It also uses the token's own completed layers. Layers 0 and 1 have no "+
-		"prediction of this horizon.\n\n", locality.SameToken.Lead(layers))
+		"layer l−1, %d step ahead. It also uses the token's own completed layers. Nothing is predicted before "+
+		"layer 0, where no layer of the token has run, nor before the last layer, which no layer follows; so layers 0 "+
+		"and 1 are never predicted.\n\n", locality.SameToken.Lead(layers))
 	fmt.Fprintf(w, "The parameters are chosen per horizon on the own training prefix, as the most needed experts "+
 		"covered summed over k = %s: half-lives %s tokens with mixes %s, the transitions alone (mix 1) having no "+
 		"half-life. **Counts only** is the best mix 0 on the own prefix, **Markov only** mix 1. **Leaving one "+
