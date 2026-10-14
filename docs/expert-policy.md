@@ -798,7 +798,7 @@ Experts per layer allocated on the own prefix at a budget of 128 per layer:
 
 ## Last-N reuse, the first prediction baseline
 
-The last-N predictor expects a layer to need again the experts it needed in its last n steps. As a policy it prefetches them one layer ahead, before the layer before it runs, into a shared LRU of the budget, which keeps or evicts them like any other expert. It knows only steps that have run. n is chosen per budget from 1, 2, 4, 8 on the own training prefix, as the one whose decode misses and unused prefetches load the fewest bytes.
+The last-N predictor expects a layer to need again the experts it needed in its last n steps. As a policy it prefetches them one layer ahead, before the layer before it runs, into a shared LRU of the budget, which keeps or evicts them like any other expert. It knows only steps that have run. n is chosen per budget from 1, 2, 4, 8 on the own training prefix, as the one whose decode loads the fewest bytes, missed or prefetched, as the gate counts them.
 
 Recall of the test suffixes' decoded experts, per layer and token:
 

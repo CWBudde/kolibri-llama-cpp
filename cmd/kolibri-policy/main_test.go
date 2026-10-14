@@ -387,3 +387,11 @@ func TestGate(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadedBytes(t *testing.T) {
+	// a useful prefetch loads as many bytes as the miss it saves: 30 missed, 20 prefetched of which
+	// 5 unused load 50
+	if b := loadedBytes(locality.Counts{MissBytes: 30, PrefetchBytes: 20, UnusedPrefetchBytes: 5}); b != 50 {
+		t.Fatalf("loaded %d bytes, want 50", b)
+	}
+}

@@ -24,7 +24,8 @@ type LastNGrid struct {
 }
 
 // lastNGrid replays last-N at every n of ns and size and tunes n per size on the training prefix:
-// the fewest decode bytes missed or prefetched in vain, the first of equal ones.
+// the fewest decode bytes loaded, missed or prefetched, as the gate counts them, the first of equal
+// ones.
 func lastNGrid(sel locality.Selections, spans []locality.Span, cut int, m Model, sizes, ns []int,
 	timing locality.Timing) (LastNGrid, error) {
 	bases := make([]baseline, len(ns))
@@ -46,12 +47,16 @@ func lastNGrid(sel locality.Selections, spans []locality.Span, cut int, m Model,
 		v := make([]int64, len(ns))
 		for i := range ns {
 			tr := runs[i].Runs[s].Split.Train.Decode
-			v[i] = tr.MissBytes + tr.UnusedPrefetchBytes
+			v[i] = loadedBytes(tr)
 		}
 		g.Own = append(g.Own, ns[argmin(v)])
 	}
 	return g, nil
 }
+
+// loadedBytes is the expert bytes a phase loads, missed or prefetched, used or not: what the gate
+// judges and last-N is tuned on.
+func loadedBytes(c locality.Counts) int64 { return c.MissBytes + c.PrefetchBytes }
 
 // GateSize is a policy's decode in all test suffixes of a model together at one size: the expert
 // bytes it loads, missed or prefetched, its estimated seconds on every link, and what of these is
@@ -92,7 +97,7 @@ func sumHeld(h heldOut, sizes []int, links int) GateEntry {
 		g := GateSize{ExpertsPerLayer: c, Seconds: make([]float64, links)}
 		for _, t := range h.tests {
 			d := t[s].Decode
-			g.LoadedBytes += d.MissBytes + d.PrefetchBytes
+			g.LoadedBytes += loadedBytes(d)
 			for i := range g.Seconds {
 				g.Seconds[i] += d.Links[i].Seconds
 			}
@@ -206,8 +211,8 @@ func writeLastN(w io.Writer, sizes []int, links []locality.Link, results []resul
 	fmt.Fprintf(w, "The last-N predictor expects a layer to need again the experts it needed in its last n steps. "+
 		"As a policy it prefetches them one layer ahead, before the layer before it runs, into a shared LRU of "+
 		"the budget, which keeps or evicts them like any other expert. It knows only steps that have run. n is "+
-		"chosen per budget from %s on the own training prefix, as the one whose decode misses and unused "+
-		"prefetches load the fewest bytes.\n\n", joinInts(ns))
+		"chosen per budget from %s on the own training prefix, as the one whose decode loads the fewest "+
+		"bytes, missed or prefetched, as the gate counts them.\n\n", joinInts(ns))
 	fmt.Fprintf(w, "Recall of the test suffixes' decoded experts, per layer and token:\n\n| Model | n | Candidates | "+
 		"Experts covered | Sets covered |\n|---|--:|--:|--:|--:|\n")
 	for _, m := range modelsOf(results) {
@@ -249,8 +254,8 @@ func writeLastN(w io.Writer, sizes []int, links []locality.Link, results []resul
 				x := r.w.Policies[sharedLRU].Runs[s].Split.Test.Decode
 				y := r.w.LastN.Runs[slices.Index(r.w.LastN.N, n)].Runs[s].Split.Test.Decode
 				tokens += x.Tokens
-				ref += x.MissBytes + x.PrefetchBytes
-				got += y.MissBytes + y.PrefetchBytes
+				ref += loadedBytes(x)
+				got += loadedBytes(y)
 				unused += y.UnusedPrefetchBytes
 				for i := range links {
 					rs[i] += x.Links[i].Seconds
