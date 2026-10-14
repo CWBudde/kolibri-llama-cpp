@@ -55,8 +55,12 @@ func lastNGrid(sel locality.Selections, spans []locality.Span, cut int, m Model,
 }
 
 // loadedBytes is the expert bytes a phase loads, missed or prefetched, used or not: what the gate
-// judges and last-N is tuned on.
-func loadedBytes(c locality.Counts) int64 { return c.MissBytes + c.PrefetchBytes }
+// judges and last-N is tuned on. Experts prefetched before a cut and first used after it count in
+// the later segment, which has them without having loaded them, as if it had: else a prefetcher
+// would save a test suffix bytes by loading them in the training prefix, unused there.
+func loadedBytes(c locality.Counts) int64 {
+	return c.MissBytes + c.PrefetchBytes + c.CarriedPrefetchBytes
+}
 
 // GateSize is a policy's decode in all test suffixes of a model together at one size: the expert
 // bytes it loads, missed or prefetched, its estimated seconds on every link, and what of these is
@@ -115,8 +119,14 @@ const sameTime = 1e-9
 // gate judges every candidate against ref: a size where it loads fewer bytes, or takes less time on
 // a link by more than sameTime, is a win; a policy with a win is retained. Equal is no win.
 func gate(ref heldOut, cands []heldOut, sizes []int, links []string, tokens int) Gate {
-	g := Gate{Tokens: tokens, Links: links, Reference: sumHeld(ref, sizes, len(links))}
-	for _, c := range cands {
+	return judge(sumHeld(ref, sizes, len(links)), cands, nil, sizes, links, tokens)
+}
+
+// judge is gate against a reference already summed. A candidate i with only[i] set is judged on
+// bytes and on those links alone, as a policy tuned for one link is.
+func judge(ref GateEntry, cands []heldOut, only [][]int, sizes []int, links []string, tokens int) Gate {
+	g := Gate{Tokens: tokens, Links: links, Reference: ref}
+	for ci, c := range cands {
 		e := sumHeld(c, sizes, len(links))
 		for s := range e.Sizes {
 			x, r := &e.Sizes[s], g.Reference.Sizes[s]
@@ -124,6 +134,9 @@ func gate(ref heldOut, cands []heldOut, sizes []int, links []string, tokens int)
 				x.Wins = append(x.Wins, "bytes")
 			}
 			for i, l := range links {
+				if ci < len(only) && only[ci] != nil && !slices.Contains(only[ci], i) {
+					continue
+				}
 				if x.Seconds[i] < r.Seconds[i]*(1-sameTime) {
 					x.Wins = append(x.Wins, l)
 				}
@@ -272,14 +285,16 @@ func writeLastN(w io.Writer, sizes []int, links []locality.Link, results []resul
 	}
 }
 
-// writeGate reports Stage A's gate.
-func writeGate(w io.Writer, gates map[string]Gate, models []string) {
-	fmt.Fprintf(w, "\n## Stage A gate\n\n")
-	fmt.Fprintf(w, "A causal policy is retained if, on the decode of all test suffixes of a model together, it beats "+
-		"the shared LRU at one or more budgets: it loads fewer expert bytes, missed or prefetched, or its estimated "+
-		"time per token is lower on a declared link. Equal is no win, and times within a part in 10⁹ are equal. "+
-		"Tuned and allocated policies use the parameter chosen on training prefixes; the oracle and the hindsight "+
-		"fits are bounds and not judged. A size alone under faster means faster on every link.\n")
+// stageAIntro is the rule of Stage A's gate as the report states it.
+const stageAIntro = "A causal policy is retained if, on the decode of all test suffixes of a model together, it " +
+	"beats the shared LRU at one or more budgets: it loads fewer expert bytes, missed or prefetched, or its " +
+	"estimated time per token is lower on a declared link. Equal is no win, and times within a part in 10⁹ are " +
+	"equal. Tuned and allocated policies use the parameter chosen on training prefixes; the oracle and the " +
+	"hindsight fits are bounds and not judged. A size alone under faster means faster on every link.\n"
+
+// writeGate reports a gate under title, its rule stated by intro.
+func writeGate(w io.Writer, title, intro string, gates map[string]Gate, models []string) {
+	fmt.Fprintf(w, "\n## %s\n\n%s", title, intro)
 	for _, m := range models {
 		g, ok := gates[m]
 		if !ok {

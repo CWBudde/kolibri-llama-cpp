@@ -152,21 +152,32 @@ func TestMarkdownLabelsOracle(t *testing.T) {
 		sizes); err != nil {
 		t.Fatal(err)
 	}
+	for _, h := range horizons {
+		g, err := markovGrid(tr, h, sizes, 0.5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wl.Markov = append(wl.Markov, g)
+	}
 	results := []result{{"tiny", "w", wl, tr}}
 	g, ok := gateOf(results, "tiny", sizes, []string{"ssd"})
 	if !ok {
 		t.Fatal("no gate")
 	}
+	gb := stageBGate(results, "tiny", sizes, []string{"ssd"}, g)
 	var b bytes.Buffer
 	writeMarkdown(&b, "cmd", Assumptions{Ubatch: 512, DecodeTokensPerSecond: 63.7, PrefillTokensPerSecond: 1347,
 		LFUHalfLife: 512, LFUHalfLives: hs, SplitRule: "the rule."}, tinyTiming.Links, sizes, 2, []int{0, 1},
-		results, map[string]Gate{"tiny": g})
+		results, map[string]Gate{"tiny": g}, map[string]Gate{"tiny": gb})
 	md := b.String()
 	for _, want := range []string{"| oracle, shared † |", "unattainable upper bound", "not a measurement",
 		"| ssd ms/token |", "| layer LRU | decode |", "| no cache | prefill |", "Held-out test suffix",
 		"| w | 2 | 1 | 2 | 1 | 1 | 0 |", "tuned on the test data", "| tiny | w | 512: ", "| 2 | ",
 		"| Hindsight † | Compulsory |", "fitted on the test data", "## Last-N reuse", "| tiny | 1 | ",
-		"## Stage A gate", "| layer budgets allocated on the own prefix | ", "| last-N on shared LRU, n tuned"} {
+		"## Stage A gate", "| layer budgets allocated on the own prefix | ", "| last-N on shared LRU, n tuned",
+		"## Stage B: the decayed-count Markov predictor", "| mixed, leave one workload out | – |", "**Cost.**",
+		"| tiny | next token | 1 | ", "## Stage B gate", "| next token Markov on shared LRU, k tuned for ssd | ",
+		"| same token Markov on shared LRU, k tuned for ssd | "} {
 		if !strings.Contains(md, want) {
 			t.Errorf("the report lacks %q", want)
 		}
@@ -393,5 +404,194 @@ func TestLoadedBytes(t *testing.T) {
 	// 5 unused load 50
 	if b := loadedBytes(locality.Counts{MissBytes: 30, PrefetchBytes: 20, UnusedPrefetchBytes: 5}); b != 50 {
 		t.Fatalf("loaded %d bytes, want 50", b)
+	}
+	// an expert prefetched before the test suffix and first used in it counts in the test suffix, as
+	// if it had loaded it: 50 and 7 carried load 57
+	if b := loadedBytes(locality.Counts{MissBytes: 30, PrefetchBytes: 20, CarriedPrefetchBytes: 7}); b != 57 {
+		t.Fatalf("loaded %d bytes with a carried prefetch, want 57", b)
+	}
+}
+
+func TestChooseMarkov(t *testing.T) {
+	// three parameters: the training prefix covers most with the second, the test suffix with the
+	// third; the first is the only one of the counts alone
+	g := HorizonGrid{Params: []locality.MarkovParams{{HalfLife: 64}, {HalfLife: 64, Mix: 0.5}, {Mix: 1}},
+		Train: [][]locality.Recall{{{Covered: 3}}, {{Covered: 9}}, {{Covered: 9}}},
+		Test:  [][]locality.Recall{{{Covered: 1}}, {{Covered: 2}}, {{Covered: 8}}}}
+	chooseParams(&g)
+	if g.Own != 1 || g.CountsOnly != 0 {
+		t.Fatalf("own %d, counts only %d, want 1 (the first of equal) and 0", g.Own, g.CountsOnly)
+	}
+	// leaving one workload out: A/w1 covers most with 0, A/w2 and A/w3 with 1 together, B/w1 with 2
+	grid := func(c ...int) HorizonGrid {
+		h := HorizonGrid{Params: g.Params}
+		for _, x := range c {
+			h.Train = append(h.Train, []locality.Recall{{Covered: x}})
+		}
+		return h
+	}
+	results := []result{
+		{model: "A", workload: "w1", w: Workload{Markov: []HorizonGrid{grid(100, 0, 0)}}},
+		{model: "A", workload: "w2", w: Workload{Markov: []HorizonGrid{grid(4, 6, 0)}}},
+		{model: "A", workload: "w3", w: Workload{Markov: []HorizonGrid{grid(4, 6, 0)}}},
+		{model: "B", workload: "w1", w: Workload{Markov: []HorizonGrid{grid(0, 0, 1000)}}},
+	}
+	if got := lowoParams(results, "A", "w1", 0); got != 1 {
+		t.Fatalf("leave one workload out for A/w1: %d, want 1", got)
+	}
+	if got := lowoParams(results, "B", "w1", 0); got != -1 {
+		t.Fatalf("B has one workload, chose %d", got)
+	}
+}
+
+// timed is a run whose decode took train seconds in the training prefix and test in the test
+// suffix on each link.
+func timed(train, test []float64) Run {
+	var r Run
+	for i := range train {
+		r.Split.Train.Decode.Links = append(r.Split.Train.Decode.Links, locality.LinkTime{Seconds: train[i]})
+		r.Split.Test.Decode.Links = append(r.Split.Test.Decode.Links, locality.LinkTime{Seconds: test[i]})
+	}
+	return r
+}
+
+func TestChooseK(t *testing.T) {
+	// two links, one size, k 6 and 12: on the first link 12 trains faster, on the second they tie;
+	// the test suffix would have chosen otherwise on both
+	runs := []Runs{{Runs: []Run{timed([]float64{5, 3}, []float64{1, 9})}},
+		{Runs: []Run{timed([]float64{4, 3}, []float64{2, 1})}}}
+	if got := chooseK(runs, []int{6, 12}, 2); !reflect.DeepEqual(got, [][]int{{12, 6}}) {
+		t.Fatalf("chooseK = %v, want [[12 6]]", got)
+	}
+}
+
+func TestMarkovNoLeak(t *testing.T) {
+	// a random trace of 3 layers x 400 tokens, 2 of 8 experts, skewed; two answers
+	r := rand.New(rand.NewPCG(7, 8))
+	sel := locality.Selections{Layers: 3, Tokens: 400, K: 2, IDs: make([]int32, 3*400*2)}
+	draw := func(i int) {
+		a := int32(min(r.IntN(8), r.IntN(8)))
+		sel.IDs[i], sel.IDs[i+1] = a, (a+1+int32(r.IntN(7)))%8
+	}
+	for i := 0; i < len(sel.IDs); i += 2 {
+		draw(i)
+	}
+	answers := []locality.Answer{{Prompt: 100, Tokens: make([]int32, 80)}, {Prompt: 250, Tokens: make([]int32, 80)}}
+	spans, err := locality.OnlineSpans(400, answers, true, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut, err := locality.SplitAfter(spans, answers, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m Model
+	if err := json.Unmarshal([]byte(`{"n_expert": 8, "layers": [{"bytes_per_expert": 10}, {"bytes_per_expert": 10},
+		{"bytes_per_expert": 10}]}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	tm := locality.Timing{Links: []locality.Link{{Name: "ssd", BytesPerSecond: 1000}}, DecodeStep: 0.01,
+		PrefillToken: 0.001}
+	tr := trace{sel, spans, cut, m, tm}
+	sizes := []int{1, 2, 4}
+	before, err := markovGrid(tr, locality.NextToken, sizes, 0.002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for l := range sel.Layers {
+		for tok := spans[cut].First; tok < sel.Tokens; tok++ {
+			draw((l*sel.Tokens + tok) * sel.K)
+		}
+	}
+	after, err := markovGrid(tr, locality.NextToken, sizes, 0.002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before.Train, after.Train) || before.Own != after.Own ||
+		before.CountsOnly != after.CountsOnly || !reflect.DeepEqual(before.OwnK, after.OwnK) {
+		t.Fatalf("the training prefix's recall or choices depend on the test suffix")
+	}
+	for k := range before.Runs {
+		for s := range sizes {
+			if !reflect.DeepEqual(before.Runs[k].Runs[s].Split.Train, after.Runs[k].Runs[s].Split.Train) {
+				t.Fatalf("k %d, size %d: the training prefix's replay depends on the test suffix", before.K[k], sizes[s])
+			}
+		}
+	}
+	if reflect.DeepEqual(before.Test, after.Test) {
+		t.Fatal("a redrawn test suffix scores the same")
+	}
+	// the cost is on every decoded step: without it the training prefix's decode is faster by it
+	x, y := before.Runs[0].Runs[0].Split.Train.Decode, before.Free[0].Runs[0].Split.Train.Decode
+	if x.Links[0].Seconds <= y.Links[0].Seconds {
+		t.Fatalf("with the cost %g s, without %g s", x.Links[0].Seconds, y.Links[0].Seconds)
+	}
+	// on the trace as it is now, the online predictor replays as the ranking
+	if err := checkOnline(tr, after, locality.NextToken, sizes, 1, 0.002); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStageBGate(t *testing.T) {
+	sizes := []int{8}
+	links := []string{"ssd", "pcie"}
+	// Stage A: the shared LRU loads 100 bytes in 10 s on ssd and 4 s on pcie; ARC 90 bytes in 9 and 5
+	entry := func(name string, b int64, ssd, pcie float64) GateEntry {
+		return GateEntry{Policy: name, Sizes: []GateSize{{ExpertsPerLayer: 8, LoadedBytes: b,
+			Seconds: []float64{ssd, pcie}}}}
+	}
+	a := Gate{Tokens: 3, Links: links, Reference: entry("shared LRU", 100, 10, 4),
+		Policies: []GateEntry{entry("ARC", 90, 9, 5)}}
+	best := bestOf(append([]GateEntry{a.Reference}, a.Policies...), "best")
+	if b := best.Sizes[0]; b.LoadedBytes != 90 || !slices.Equal(b.Seconds, []float64{9, 4}) {
+		t.Fatalf("best of Stage A: %+v", b)
+	}
+	if a.Reference.Sizes[0].Seconds[0] != 10 {
+		t.Fatal("bestOf changed its entries")
+	}
+	run := func(b int64, ssd, pcie float64) heldOut {
+		return heldOut{tests: [][]locality.Result{{{Decode: locality.Counts{MissBytes: b,
+			Links: []locality.LinkTime{{Seconds: ssd}, {Seconds: pcie}}}}}}}
+	}
+	cands := []heldOut{
+		run(100, 9.5, 4),    // beats the shared LRU on ssd, not ARC: no win
+		run(100, 9, 4),      // ties the best: no win
+		run(100, 8, 4),      // beats the best on ssd, judged on ssd: a win
+		run(100, 9, 3),      // beats the best on pcie, judged on ssd only: no win
+		run(100, 9, 3.9),    // beats the best on pcie, judged on pcie: a win
+		run(100, 9, 4-4e-9), // faster on pcie by rounding alone: no win
+	}
+	only := [][]int{{0}, {0}, {0}, {0}, {1}, {1}}
+	g := judge(best, cands, only, sizes, links, 3)
+	want := [][]string{nil, nil, {"ssd"}, nil, {"pcie"}, nil}
+	for i, e := range g.Policies {
+		if !slices.Equal(e.Sizes[0].Wins, want[i]) || e.Retained != (want[i] != nil) {
+			t.Errorf("candidate %d: wins %v, retained %v; want %v", i, e.Sizes[0].Wins, e.Retained, want[i])
+		}
+	}
+	// the predictor of both horizons, k tuned per link: the next token's k 6 is faster than the shared
+	// LRU on ssd but not than ARC, its k 12 faster than both on pcie
+	horizon := func(runs ...Run) HorizonGrid {
+		g := HorizonGrid{K: []int{6, 12}, OwnK: [][]int{{6, 12}}}
+		for _, r := range runs {
+			g.Runs = append(g.Runs, Runs{Runs: []Run{r}})
+		}
+		return g
+	}
+	at := func(ssd, pcie float64) Run {
+		r := timed([]float64{0, 0}, []float64{ssd, pcie})
+		r.Split.Test.Decode.MissBytes = 100
+		return r
+	}
+	results := []result{{model: "m", workload: "w", w: Workload{Markov: []HorizonGrid{
+		horizon(at(9.5, 9), at(9, 3.5)), horizon(at(20, 20), at(20, 20))}}}}
+	g = stageBGate(results, "m", sizes, links, a)
+	if !reflect.DeepEqual(g.Reference.Sizes, best.Sizes) || len(g.Policies) != 4 {
+		t.Fatalf("Stage B gate against %+v with %d policies", g.Reference, len(g.Policies))
+	}
+	for i, e := range g.Policies {
+		if e.Retained != (i == 1) || e.Policy != markovName(horizons[i/2], links[i%2]) {
+			t.Errorf("%s: retained %v, wins %v", e.Policy, e.Retained, e.Sizes[0].Wins)
+		}
 	}
 }

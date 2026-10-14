@@ -393,7 +393,8 @@ func TestReplaySegments(t *testing.T) {
 		}
 	}
 	// the cache runs on across a cut: tokens 1 and 2 find the experts the first segment loaded. The
-	// prefetch made before token 0 is unused when the first segment ends, its use a plain hit.
+	// prefetch made before token 0 is unused when the first segment ends, its use a plain hit, which
+	// the second segment counts as carried across the cut.
 	sel = Selections{Layers: 1, Tokens: 3, K: 1, IDs: []int32{0, 1, 0}}
 	p := &recorder{seen: map[int]bool{}, prefetch: func(s StepInfo) []int {
 		if s.First == 0 {
@@ -407,7 +408,8 @@ func TestReplaySegments(t *testing.T) {
 	}
 	if a, b := segs[0].Decode, segs[1].Decode; a.Prefetches != 1 || a.UsefulPrefetches != 0 ||
 		a.UnusedPrefetchBytes != 7 || a.Misses != 1 || b.Hits != 2 || b.Misses != 0 || b.UsefulPrefetches != 0 ||
-		b.UnusedPrefetchBytes != 0 || b.Tokens != 2 || segs[1].PeakBytes != 14 {
+		b.UnusedPrefetchBytes != 0 || b.Tokens != 2 || segs[1].PeakBytes != 14 || a.CarriedPrefetches != 0 ||
+		b.CarriedPrefetches != 1 || b.CarriedPrefetchBytes != 7 {
 		t.Fatalf("segments %+v", segs)
 	}
 	for _, bad := range [][]int{{0}, {3}, {2, 1}, {1, 1}} {

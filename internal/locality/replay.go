@@ -84,7 +84,12 @@ type Counts struct {
 	PrefetchBytes       int64 `json:"prefetch_bytes"`
 	UsefulPrefetches    int   `json:"useful_prefetches"`
 	UnusedPrefetchBytes int64 `json:"unused_prefetch_bytes"`
-	Evictions           int   `json:"evictions"`
+	// CarriedPrefetches are hits on experts prefetched before a cut and still unused there, counted
+	// in the segment that uses them first, and CarriedPrefetchBytes their bytes: the earlier segment
+	// counted them unused, so the later one has them without having loaded them (ReplaySegments).
+	CarriedPrefetches    int   `json:"carried_prefetches,omitempty"`
+	CarriedPrefetchBytes int64 `json:"carried_prefetch_bytes,omitempty"`
+	Evictions            int   `json:"evictions"`
 	// FullSteps are the steps that found every expert they need resident: for a decoded token
 	// its exact Top-K set, for a ubatch its whole union.
 	FullSteps int           `json:"full_steps"`
@@ -148,9 +153,10 @@ func ReplayTimed(sel Selections, spans []Span, nExpert int, bytes []int64, p Pol
 // ones, as a server's would. A segment counts what its steps cause and its peak is the most bytes
 // resident during its steps; prefetches count in the segment of the step they were prefetched
 // for. A segment's counts never depend on later steps: at a cut, its prefetches not used yet
-// count as unused, as at the end of a replay, and a later use of them is a plain hit. The first
-// segment is therefore the replay of its spans alone. Merge adds the segments up to the
-// unsegmented replay, except for prefetches used across a cut.
+// count as unused, as at the end of a replay, and a later use of them is a plain hit, which the
+// later segment also counts as carried across the cut. The first segment is therefore the replay
+// of its spans alone. Merge adds the segments up to the unsegmented replay, except for
+// prefetches used across a cut.
 func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes []int64, p Policy,
 	t Timing) ([]Result, error) {
 	if len(bytes) != sel.Layers {
@@ -190,6 +196,7 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 	resident := make([]bool, nKey)
 	prefetched := make([]*Counts, nKey) // the counts a resident key was prefetched in, while unused
 	pending := make([]bool, nKey)       // resident, prefetched and not used yet
+	carried := make([]bool, nKey)       // resident, prefetched before a cut and not used yet
 	needed := make([]int, nKey)         // the last step that needed the key, plus one
 	size := func(k int) int64 { return bytes[k/nExpert] }
 	var cur int64
@@ -203,7 +210,7 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 			if e < 0 || e >= nKey || !resident[e] {
 				return fmt.Errorf("replay: the policy evicts key %d, which is not resident", e)
 			}
-			resident[e] = false
+			resident[e], carried[e] = false, false
 			cur -= size(e)
 			if pending[e] {
 				pending[e] = false
@@ -221,7 +228,7 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 		if seg < len(cuts) && i == cuts[seg] {
 			for k, ok := range pending {
 				if ok {
-					pending[k] = false
+					pending[k], carried[k] = false, true
 					prefetched[k].UnusedPrefetchBytes += size(k)
 				}
 			}
@@ -277,6 +284,10 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 									pc.Links[i].Late++
 								}
 							}
+						} else if carried[k] {
+							carried[k] = false
+							c.CarriedPrefetches++
+							c.CarriedPrefetchBytes += size(k)
 						}
 					} else {
 						full = false
@@ -345,6 +356,8 @@ func (c *Counts) add(o Counts) {
 	c.PrefetchBytes += o.PrefetchBytes
 	c.UsefulPrefetches += o.UsefulPrefetches
 	c.UnusedPrefetchBytes += o.UnusedPrefetchBytes
+	c.CarriedPrefetches += o.CarriedPrefetches
+	c.CarriedPrefetchBytes += o.CarriedPrefetchBytes
 	c.Evictions += o.Evictions
 	c.FullSteps += o.FullSteps
 	for l, x := range o.Layers {
