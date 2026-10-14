@@ -84,18 +84,19 @@ func linearData(t trace) (fit, valid, test locality.LinearTrace) {
 		locality.LinearTrace{Sel: t.sel, Targets: decodedIn(t.spans, t.cut, len(t.spans))}
 }
 
-// pickFit is the L2 index and epoch whose validation score is highest, scores[i][e-1] for L2 i and
-// epoch e, the smaller L2 and then the fewer epochs of equal ones.
-func pickFit(scores [][]int) (int, int) {
-	bi, be := 0, 1
-	for i, row := range scores {
-		for e, v := range row {
-			if v > scores[bi][be-1] {
-				bi, be = i, e+1
-			}
-		}
+// fitChoice is the best fit offered so far, by validation score. Fits are offered by L2 index and
+// then epoch, ascending, and a fit replaces the best only with a strictly higher score, so of equal
+// ones the smaller L2 and then the fewer epochs stay.
+type fitChoice struct{ score, l2, epoch int } // epoch 0: none offered yet
+
+// offer records the fit of L2 index i after epoch e with score if it is the best so far, and
+// reports whether it is.
+func (c *fitChoice) offer(score, i, e int) bool {
+	if c.epoch > 0 && score <= c.score {
+		return false
 	}
-	return bi, be
+	*c = fitChoice{score, i, e}
+	return true
 }
 
 // fitBest fits a linear predictor of horizon h with blocks on fit at every L2 of linearL2s and
@@ -103,26 +104,25 @@ func pickFit(scores [][]int) (int, int) {
 // experts summed over markovKs.
 func fitBest(fit, valid []locality.LinearTrace, nExpert int, h locality.Horizon,
 	blocks locality.LinearBlocks) (*locality.Linear, LinearFit) {
-	scores := make([][]int, len(linearL2s))
-	models := make([][]*locality.Linear, len(linearL2s))
-	recalls := make([][][]locality.Recall, len(linearL2s))
+	var c fitChoice
+	var best *locality.Linear // a copy of the best fit only, not of every epoch's
+	var recall []locality.Recall
 	for i, l2 := range linearL2s {
 		cfg := locality.LinearConfig{Blocks: blocks, L2: l2, Rate: linearRate, Epochs: linearEpochs, Seed: linearSeed}
-		locality.FitLinear(fit, nExpert, h, cfg, func(_ int, m *locality.Linear) {
+		locality.FitLinear(fit, nExpert, h, cfg, func(e int, m *locality.Linear) {
 			sums := make([]locality.Recall, len(markovKs))
 			for _, v := range valid {
 				for k, x := range m.Recall(v, markovKs) {
 					sums[k] = sumRecall([]locality.Recall{sums[k], x})
 				}
 			}
-			scores[i] = append(scores[i], covered(sums))
-			models[i] = append(models[i], m.Clone())
-			recalls[i] = append(recalls[i], sums)
+			if c.offer(covered(sums), i, e) {
+				best, recall = m.Clone(), sums
+			}
 		})
 	}
-	i, e := pickFit(scores)
-	return models[i][e-1], LinearFit{Config: locality.LinearConfig{Blocks: blocks, L2: linearL2s[i],
-		Rate: linearRate, Epochs: e, Seed: linearSeed}, Valid: recalls[i][e-1]}
+	return best, LinearFit{Config: locality.LinearConfig{Blocks: blocks, L2: linearL2s[c.l2], Rate: linearRate,
+		Epochs: c.epoch, Seed: linearSeed}, Valid: recall}
 }
 
 // testRecall is m's recall on t's test suffix as replayed, at every k of markovKs.

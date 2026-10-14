@@ -604,13 +604,25 @@ func TestStageBGate(t *testing.T) {
 	}
 }
 
-func TestPickFit(t *testing.T) {
-	// two L2s, three epochs: the most is 7, first reached by the second L2 at epoch 2
-	if i, e := pickFit([][]int{{3, 5, 6}, {4, 7, 7}}); i != 1 || e != 2 {
-		t.Fatalf("pickFit = %d, %d, want 1, 2", i, e)
+func TestFitChoice(t *testing.T) {
+	// fits offered by L2 and then epoch; the best is replaced only by a strictly higher score
+	choose := func(scores [][]int) (fitChoice, []bool) {
+		var c fitChoice
+		var taken []bool
+		for i, row := range scores {
+			for e, v := range row {
+				taken = append(taken, c.offer(v, i, e+1))
+			}
+		}
+		return c, taken
 	}
-	if i, e := pickFit([][]int{{2, 2}, {2, 2}}); i != 0 || e != 1 {
-		t.Fatalf("all equal: %d, %d, want 0, 1", i, e)
+	// two L2s, three epochs: the most is 7, first reached by the second L2 at epoch 2
+	c, taken := choose([][]int{{3, 5, 6}, {4, 7, 7}})
+	if c.l2 != 1 || c.epoch != 2 || !slices.Equal(taken, []bool{true, true, true, false, true, false}) {
+		t.Fatalf("choice %+v, taken %v", c, taken)
+	}
+	if c, _ := choose([][]int{{2, 2}, {2, 2}}); c.l2 != 0 || c.epoch != 1 {
+		t.Fatalf("all equal: %+v, want the first", c)
 	}
 }
 
