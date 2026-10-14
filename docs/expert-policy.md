@@ -878,18 +878,18 @@ The predictor ranks a layer's experts for a step that has not run yet, from step
 - **next token:** before layer l of token t it predicts layer l−1 of token t+1, from token t's set in layer l−1, which has just run; before layer 0, layer 49 of token t from token t−1's. The prediction is made 49 steps before the step it is for. It uses only earlier tokens' experts;
 - **same token:** before layer l of token t it predicts the token's layer l+1, from its set in layer l−1, 1 step ahead. It also uses the token's own completed layers. Nothing is predicted before layer 0, where no layer of the token has run, nor before the last layer, which no layer follows; so layers 0 and 1 are never predicted.
 
-The parameters are chosen per horizon on the own training prefix, as the most needed experts covered summed over k = 6, 12, 24, 48: half-lives 64, 256, 1024, 4096 tokens with mixes 0, 0.25, 0.5, 0.75, 1, the transitions alone (mix 1) having no half-life. **Counts only** is the best mix 0 on the own prefix, **Markov only** mix 1. **Leaving one workload out**, the other workloads' training prefixes of the same model choose them. Choices on the own prefix and leaving one workload out:
+The parameters are chosen per horizon on the own training prefix, as the most needed experts covered summed over k = 6, 12, 24, 48: half-lives 1, 4, 16, 64, 256, 1024, 4096 tokens with mixes 0, 0.25, 0.5, 0.75, 1, the transitions alone (mix 1) having no half-life. **Counts only** is the best mix 0 on the own prefix, **Markov only** mix 1. **Leaving one workload out**, the other workloads' training prefixes of the same model choose them. Choices on the own prefix and leaving one workload out:
 
 | Model | Workload | Next token, own | Next token, leave one out | Same token, own | Same token, leave one out |
 |---|---|---|---|---|---|
-| IQ3_XXS-IQ4_XS-down-imx | coding | half-life 64, mix 0 | half-life 64, mix 0 | half-life 64, mix 0.75 | half-life 64, mix 0.75 |
-| IQ3_XXS-IQ4_XS-down-imx | research | half-life 64, mix 0 | half-life 64, mix 0 | half-life 64, mix 0.75 | half-life 64, mix 0.75 |
-| IQ3_XXS-IQ4_XS-down-imx | hr | half-life 64, mix 0 | half-life 64, mix 0 | mix 1 | half-life 64, mix 0.75 |
-| IQ3_XXS-IQ4_XS-down-imx | medtech | half-life 64, mix 0 | half-life 64, mix 0 | half-life 64, mix 0.75 | half-life 64, mix 0.75 |
-| Q8_0 | coding | half-life 64, mix 0 | half-life 64, mix 0 | half-life 64, mix 0.75 | half-life 64, mix 0.75 |
-| Q8_0 | research | half-life 64, mix 0 | half-life 64, mix 0 | half-life 64, mix 0.75 | half-life 64, mix 0.75 |
-| Q8_0 | hr | half-life 64, mix 0 | half-life 64, mix 0 | mix 1 | half-life 64, mix 0.75 |
-| Q8_0 | medtech | half-life 64, mix 0 | half-life 64, mix 0 | half-life 64, mix 0.75 | half-life 64, mix 0.75 |
+| IQ3_XXS-IQ4_XS-down-imx | coding | half-life 4, mix 0.25 | half-life 4, mix 0.25 | half-life 1, mix 0.75 | half-life 1, mix 0.75 |
+| IQ3_XXS-IQ4_XS-down-imx | research | half-life 4, mix 0 | half-life 4, mix 0.25 | half-life 1, mix 0.75 | half-life 1, mix 0.75 |
+| IQ3_XXS-IQ4_XS-down-imx | hr | half-life 4, mix 0.25 | half-life 4, mix 0.25 | half-life 1, mix 0.75 | half-life 1, mix 0.75 |
+| IQ3_XXS-IQ4_XS-down-imx | medtech | half-life 4, mix 0.25 | half-life 4, mix 0 | half-life 1, mix 0.75 | half-life 1, mix 0.75 |
+| Q8_0 | coding | half-life 4, mix 0.25 | half-life 4, mix 0.25 | half-life 1, mix 0.75 | half-life 1, mix 0.75 |
+| Q8_0 | research | half-life 4, mix 0 | half-life 4, mix 0.25 | half-life 1, mix 0.75 | half-life 1, mix 0.75 |
+| Q8_0 | hr | half-life 4, mix 0.25 | half-life 4, mix 0.25 | half-life 1, mix 0.75 | half-life 1, mix 0.75 |
+| Q8_0 | medtech | half-life 4, mix 0.25 | half-life 4, mix 0.25 | half-life 1, mix 0.75 | half-life 1, mix 0.75 |
 
 Recall of the test suffixes' decoded experts per layer and token, all workloads together: the needed experts covered (whole Top-6 sets covered). A step its horizon does not predict counts with nothing covered, as in last-N's table above, which is the baseline. The prefetch budget is k experts of the mean size per predicted step, in MB per decoded token.
 
@@ -897,40 +897,40 @@ IQ3_XXS-IQ4_XS-down-imx, next token:
 
 | Predictor | k 6 | k 12 | k 24 | k 48 |
 |---|--:|--:|--:|--:|
-| counts only | 31.6% (0.1%) | 45.7% (2.5%) | 60.8% (10.2%) | 75.5% (26.5%) |
+| counts only | 35.3% (0.2%) | 50.0% (3.3%) | 63.0% (11.7%) | 75.1% (26.4%) |
 | Markov only | 18.1% (0.0%) | 27.9% (1.0%) | 40.1% (3.5%) | 54.0% (8.7%) |
-| mixed, own prefix | 31.6% (0.1%) | 45.7% (2.5%) | 60.8% (10.2%) | 75.5% (26.5%) |
-| mixed, leave one workload out | 31.6% (0.1%) | 45.7% (2.5%) | 60.8% (10.2%) | 75.5% (26.5%) |
+| mixed, own prefix | 35.6% (0.2%) | 50.3% (3.3%) | 63.5% (11.9%) | 75.2% (26.0%) |
+| mixed, leave one workload out | 35.5% (0.2%) | 50.1% (3.3%) | 63.3% (11.7%) | 74.7% (25.1%) |
 | prefetch budget, MB/token | 509 | 1017 | 2034 | 4068 |
 
 IQ3_XXS-IQ4_XS-down-imx, same token:
 
 | Predictor | k 6 | k 12 | k 24 | k 48 |
 |---|--:|--:|--:|--:|
-| counts only | 29.5% (0.0%) | 42.6% (1.2%) | 57.2% (7.2%) | 71.6% (22.7%) |
+| counts only | 33.2% (0.1%) | 47.1% (2.4%) | 59.4% (9.1%) | 71.3% (22.7%) |
 | Markov only | 30.9% (0.1%) | 44.7% (2.1%) | 60.1% (10.2%) | 74.7% (28.5%) |
-| mixed, own prefix | 32.3% (0.1%) | 46.2% (2.1%) | 61.6% (10.7%) | 76.0% (29.9%) |
-| mixed, leave one workload out | 32.6% (0.1%) | 46.6% (2.2%) | 62.0% (10.9%) | 76.3% (30.3%) |
+| mixed, own prefix | 37.9% (0.2%) | 52.1% (3.5%) | 65.8% (13.8%) | 78.3% (34.0%) |
+| mixed, leave one workload out | 37.9% (0.2%) | 52.1% (3.5%) | 65.8% (13.8%) | 78.3% (34.0%) |
 | prefetch budget, MB/token | 490 | 979 | 1958 | 3916 |
 
 Q8_0, next token:
 
 | Predictor | k 6 | k 12 | k 24 | k 48 |
 |---|--:|--:|--:|--:|
-| counts only | 31.6% (0.1%) | 45.6% (2.4%) | 60.8% (10.2%) | 75.4% (26.5%) |
+| counts only | 35.2% (0.2%) | 50.0% (3.4%) | 62.9% (11.7%) | 75.1% (26.3%) |
 | Markov only | 18.2% (0.0%) | 27.9% (1.0%) | 40.0% (3.5%) | 54.0% (8.7%) |
-| mixed, own prefix | 31.6% (0.1%) | 45.6% (2.4%) | 60.8% (10.2%) | 75.4% (26.5%) |
-| mixed, leave one workload out | 31.6% (0.1%) | 45.6% (2.4%) | 60.8% (10.2%) | 75.4% (26.5%) |
+| mixed, own prefix | 35.6% (0.2%) | 50.3% (3.4%) | 63.5% (11.9%) | 75.2% (25.9%) |
+| mixed, leave one workload out | 35.6% (0.2%) | 50.3% (3.3%) | 63.6% (11.9%) | 75.0% (25.3%) |
 | prefetch budget, MB/token | 1250 | 2500 | 5000 | 10000 |
 
 Q8_0, same token:
 
 | Predictor | k 6 | k 12 | k 24 | k 48 |
 |---|--:|--:|--:|--:|
-| counts only | 29.5% (0.0%) | 42.6% (1.2%) | 57.1% (7.2%) | 71.6% (22.7%) |
+| counts only | 33.2% (0.1%) | 47.1% (2.4%) | 59.3% (9.1%) | 71.2% (22.6%) |
 | Markov only | 30.9% (0.1%) | 44.7% (2.1%) | 60.0% (10.2%) | 74.7% (28.5%) |
-| mixed, own prefix | 32.3% (0.1%) | 46.2% (2.2%) | 61.6% (10.7%) | 76.0% (29.9%) |
-| mixed, leave one workload out | 32.6% (0.1%) | 46.6% (2.2%) | 62.0% (10.9%) | 76.3% (30.4%) |
+| mixed, own prefix | 37.9% (0.2%) | 52.1% (3.5%) | 65.8% (13.8%) | 78.3% (34.0%) |
+| mixed, leave one workload out | 37.9% (0.2%) | 52.1% (3.5%) | 65.8% (13.8%) | 78.3% (34.0%) |
 | prefetch budget, MB/token | 1203 | 2406 | 4813 | 9626 |
 
 **Lead time.** In the replay's schedule (transfer.go) a layer of a decoded token computes for 0.314 ms once its experts have arrived (15.7 ms per token over 50 layers). A prefetch made before a step has its horizon's lead of steps' compute to arrive, if it never waits behind other loads on the link; the experts of the largest size that fit through a link in that time:
@@ -950,78 +950,78 @@ IQ3_XXS-IQ4_XS-down-imx, next token, all workloads' test suffixes together, deco
 
 | Experts per layer | k ssd | Best Stage A ssd | Markov ssd | No cost ssd | k pcie | Best Stage A pcie | Markov pcie | No cost pcie | k ram | Best Stage A ram | Markov ram | No cost ram |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 8 | 6 | 79.0 | 182.4 | 182.2 | 6 | 28.4 | 49.2 | 49.0 | 6 | 18.9 | 24.2 | 24.0 |
-| 16 | 6 | 64.1 | 77.7 | 77.5 | 6 | 25.4 | 28.3 | 28.0 | 6 | 18.1 | 19.0 | 18.8 |
-| 32 | 6 | 48.4 | 51.3 | 51.1 | 6 | 22.2 | 23.0 | 22.8 | 6 | 17.3 | 17.7 | 17.5 |
-| 48 | 6 | 39.7 | 41.9 | 41.7 | 6 | 20.5 | 21.1 | 20.9 | 6 | 16.9 | 17.2 | 17.0 |
-| 64 | 6 | 34.3 | 35.5 | 35.3 | 6 | 19.4 | 19.8 | 19.6 | 6 | 16.6 | 16.9 | 16.7 |
+| 8 | 6 | 79.0 | 115.0 | 114.8 | 6 | 28.4 | 35.7 | 35.5 | 6 | 18.9 | 20.9 | 20.7 |
+| 16 | 6 | 64.1 | 68.6 | 68.4 | 6 | 25.4 | 26.5 | 26.2 | 6 | 18.1 | 18.6 | 18.3 |
+| 32 | 6 | 48.4 | 49.9 | 49.7 | 6 | 22.2 | 22.7 | 22.5 | 6 | 17.3 | 17.6 | 17.4 |
+| 48 | 6 | 39.7 | 41.6 | 41.4 | 6 | 20.5 | 21.1 | 20.8 | 6 | 16.9 | 17.2 | 17.0 |
+| 64 | 6 | 34.3 | 35.4 | 35.2 | 6 | 19.4 | 19.8 | 19.6 | 6 | 16.6 | 16.9 | 16.7 |
 | 96 | 6 | 27.5 | 28.1 | 27.9 | 6 | 18.1 | 18.4 | 18.1 | 6 | 16.3 | 16.5 | 16.3 |
 | 128 | 6 | 23.3 | 23.5 | 23.3 | 6 | 17.2 | 17.4 | 17.2 | 6 | 16.1 | 16.3 | 16.1 |
-| 192 | 6–12 | 18.4 | 18.9 | 18.7 | 6–12 | 16.2 | 16.5 | 16.3 | 6–24 | 15.8 | 16.1 | 15.9 |
-| 256 | 6 | 16.4 | 16.7 | 16.5 | 6 | 15.8 | 16.1 | 15.9 | 6 | 15.7 | 16.0 | 15.7 |
+| 192 | 6 | 18.4 | 18.9 | 18.7 | 6 | 16.2 | 16.5 | 16.3 | 6 | 15.8 | 16.1 | 15.8 |
+| 256 | 6–48 | 16.4 | 16.7 | 16.5 | 6–48 | 15.8 | 16.1 | 15.9 | 6–48 | 15.7 | 16.0 | 15.7 |
 | 384 | 6 | 15.7 | 16.0 | 15.7 | 6 | 15.7 | 15.9 | 15.7 | 6 | 15.7 | 15.9 | 15.7 |
 
 IQ3_XXS-IQ4_XS-down-imx, same token, all workloads' test suffixes together, decode ms/token: the best Stage A policy, the predictor with its cost and without; k the range of the workloads' choices:
 
 | Experts per layer | k ssd | Best Stage A ssd | Markov ssd | No cost ssd | k pcie | Best Stage A pcie | Markov pcie | No cost pcie | k ram | Best Stage A ram | Markov ram | No cost ram |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 8 | 6 | 79.0 | 182.9 | 182.6 | 6 | 28.4 | 49.3 | 49.1 | 6 | 18.9 | 24.3 | 24.0 |
-| 16 | 6 | 64.1 | 88.2 | 88.0 | 6 | 25.4 | 30.3 | 30.1 | 6 | 18.1 | 19.5 | 19.3 |
-| 32 | 6 | 48.4 | 56.0 | 55.8 | 6 | 22.2 | 23.9 | 23.7 | 6 | 17.3 | 17.9 | 17.7 |
-| 48 | 6 | 39.7 | 44.3 | 44.1 | 6 | 20.5 | 21.6 | 21.3 | 6 | 16.9 | 17.3 | 17.1 |
-| 64 | 6 | 34.3 | 37.0 | 36.8 | 6 | 19.4 | 20.1 | 19.9 | 6 | 16.6 | 17.0 | 16.8 |
-| 96 | 6 | 27.5 | 28.7 | 28.4 | 6 | 18.1 | 18.5 | 18.2 | 6 | 16.3 | 16.6 | 16.3 |
-| 128 | 6 | 23.3 | 23.7 | 23.5 | 6 | 17.2 | 17.5 | 17.3 | 6 | 16.1 | 16.3 | 16.1 |
-| 192 | 6 | 18.4 | 19.0 | 18.8 | 6–12 | 16.2 | 16.5 | 16.3 | 6–12 | 15.8 | 16.1 | 15.9 |
+| 8 | 6 | 79.0 | 176.1 | 175.9 | 6 | 28.4 | 47.9 | 47.7 | 6 | 18.9 | 23.9 | 23.7 |
+| 16 | 6 | 64.1 | 73.0 | 72.8 | 6 | 25.4 | 27.3 | 27.1 | 6 | 18.1 | 18.8 | 18.5 |
+| 32 | 6 | 48.4 | 52.2 | 52.0 | 6 | 22.2 | 23.2 | 22.9 | 6 | 17.3 | 17.7 | 17.5 |
+| 48 | 6 | 39.7 | 42.7 | 42.5 | 6 | 20.5 | 21.3 | 21.1 | 6 | 16.9 | 17.3 | 17.0 |
+| 64 | 6 | 34.3 | 36.1 | 35.9 | 6 | 19.4 | 20.0 | 19.7 | 6 | 16.6 | 16.9 | 16.7 |
+| 96 | 6 | 27.5 | 28.4 | 28.2 | 6 | 18.1 | 18.4 | 18.2 | 6 | 16.3 | 16.5 | 16.3 |
+| 128 | 6 | 23.3 | 23.6 | 23.4 | 6 | 17.2 | 17.5 | 17.2 | 6 | 16.1 | 16.3 | 16.1 |
+| 192 | 6–12 | 18.4 | 19.0 | 18.7 | 6–24 | 16.2 | 16.5 | 16.3 | 6–24 | 15.8 | 16.1 | 15.9 |
 | 256 | 6–48 | 16.4 | 16.7 | 16.5 | 6–48 | 15.8 | 16.1 | 15.9 | 6–48 | 15.7 | 16.0 | 15.7 |
-| 384 | 6 | 15.7 | 16.0 | 15.7 | 6–24 | 15.7 | 15.9 | 15.7 | 6–48 | 15.7 | 15.9 | 15.7 |
+| 384 | 6 | 15.7 | 16.0 | 15.7 | 6 | 15.7 | 15.9 | 15.7 | 6 | 15.7 | 15.9 | 15.7 |
 
 Q8_0, next token, all workloads' test suffixes together, decode ms/token: the best Stage A policy, the predictor with its cost and without; k the range of the workloads' choices:
 
 | Experts per layer | k ssd | Best Stage A ssd | Markov ssd | No cost ssd | k pcie | Best Stage A pcie | Markov pcie | No cost pcie | k ram | Best Stage A ram | Markov ram | No cost ram |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 8 | 6 | 171.4 | 425.9 | 425.7 | 6 | 46.8 | 97.9 | 97.7 | 6 | 23.5 | 36.4 | 36.2 |
-| 16 | 6 | 134.7 | 168.4 | 168.2 | 6 | 39.5 | 46.3 | 46.1 | 6 | 21.6 | 23.5 | 23.3 |
-| 32 | 6 | 96.2 | 103.3 | 103.1 | 6 | 31.8 | 33.3 | 33.1 | 6 | 19.7 | 20.3 | 20.1 |
-| 48 | 6 | 74.7 | 80.0 | 79.8 | 6 | 27.5 | 28.7 | 28.5 | 6 | 18.7 | 19.1 | 18.9 |
-| 64 | 6 | 61.4 | 64.2 | 64.0 | 6 | 24.8 | 25.6 | 25.4 | 6 | 18.0 | 18.3 | 18.1 |
+| 8 | 6 | 171.4 | 267.6 | 267.4 | 6 | 46.8 | 66.2 | 66.0 | 6 | 23.5 | 28.5 | 28.3 |
+| 16 | 6 | 134.7 | 145.6 | 145.4 | 6 | 39.5 | 41.8 | 41.6 | 6 | 21.6 | 22.4 | 22.2 |
+| 32 | 6 | 96.2 | 99.6 | 99.4 | 6 | 31.8 | 32.7 | 32.4 | 6 | 19.7 | 20.1 | 19.9 |
+| 48 | 6 | 74.7 | 79.2 | 79.0 | 6 | 27.5 | 28.6 | 28.4 | 6 | 18.7 | 19.1 | 18.9 |
+| 64 | 6 | 61.4 | 64.0 | 63.8 | 6 | 24.8 | 25.5 | 25.3 | 6 | 18.0 | 18.3 | 18.1 |
 | 96 | 6 | 44.6 | 46.0 | 45.8 | 6 | 21.5 | 21.9 | 21.7 | 6 | 17.1 | 17.4 | 17.2 |
-| 128 | 6 | 34.4 | 34.7 | 34.5 | 6–12 | 19.4 | 19.7 | 19.5 | 6–12 | 16.6 | 16.9 | 16.6 |
-| 192 | 6 | 22.2 | 23.4 | 23.1 | 6–12 | 17.0 | 17.4 | 17.2 | 6–12 | 16.0 | 16.3 | 16.1 |
-| 256 | 6 | 17.5 | 17.9 | 17.6 | 6 | 16.1 | 16.3 | 16.1 | 6 | 15.8 | 16.0 | 15.8 |
+| 128 | 6 | 34.4 | 34.7 | 34.5 | 6 | 19.4 | 19.7 | 19.5 | 6 | 16.6 | 16.9 | 16.6 |
+| 192 | 6 | 22.2 | 23.4 | 23.1 | 6 | 17.0 | 17.4 | 17.2 | 6 | 16.0 | 16.3 | 16.1 |
+| 256 | 6–48 | 17.5 | 17.9 | 17.6 | 6–48 | 16.1 | 16.3 | 16.1 | 6–48 | 15.8 | 16.0 | 15.8 |
 | 384 | 6 | 15.8 | 16.0 | 15.8 | 6 | 15.7 | 15.9 | 15.7 | 6 | 15.7 | 15.9 | 15.7 |
 
 Q8_0, same token, all workloads' test suffixes together, decode ms/token: the best Stage A policy, the predictor with its cost and without; k the range of the workloads' choices:
 
 | Experts per layer | k ssd | Best Stage A ssd | Markov ssd | No cost ssd | k pcie | Best Stage A pcie | Markov pcie | No cost pcie | k ram | Best Stage A ram | Markov ram | No cost ram |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 8 | 6 | 171.4 | 426.3 | 426.0 | 6 | 46.8 | 98.0 | 97.8 | 6 | 23.5 | 36.4 | 36.2 |
-| 16 | 6 | 134.7 | 194.4 | 194.2 | 6 | 39.5 | 51.3 | 51.1 | 6 | 21.6 | 24.8 | 24.5 |
-| 32 | 6 | 96.2 | 115.6 | 115.4 | 6 | 31.8 | 35.6 | 35.4 | 6 | 19.7 | 20.8 | 20.6 |
-| 48 | 6 | 74.7 | 86.4 | 86.2 | 6 | 27.5 | 29.8 | 29.6 | 6 | 18.7 | 19.4 | 19.2 |
-| 64 | 6 | 61.4 | 68.4 | 68.2 | 6 | 24.8 | 26.3 | 26.1 | 6 | 18.0 | 18.5 | 18.3 |
-| 96 | 6 | 44.6 | 47.5 | 47.3 | 6 | 21.5 | 22.2 | 22.0 | 6 | 17.1 | 17.5 | 17.3 |
-| 128 | 6 | 34.4 | 35.3 | 35.1 | 6 | 19.4 | 19.8 | 19.5 | 6 | 16.6 | 16.9 | 16.7 |
-| 192 | 6 | 22.2 | 23.5 | 23.3 | 6–12 | 17.0 | 17.4 | 17.2 | 6–24 | 16.0 | 16.3 | 16.1 |
+| 8 | 6 | 171.4 | 409.7 | 409.5 | 6 | 46.8 | 94.7 | 94.4 | 6 | 23.5 | 35.6 | 35.4 |
+| 16 | 6 | 134.7 | 156.5 | 156.3 | 6 | 39.5 | 43.9 | 43.7 | 6 | 21.6 | 22.9 | 22.7 |
+| 32 | 6 | 96.2 | 105.5 | 105.3 | 6 | 31.8 | 33.8 | 33.5 | 6 | 19.7 | 20.4 | 20.2 |
+| 48 | 6 | 74.7 | 82.2 | 82.0 | 6 | 27.5 | 29.1 | 28.9 | 6 | 18.7 | 19.2 | 19.0 |
+| 64 | 6 | 61.4 | 66.0 | 65.7 | 6 | 24.8 | 25.9 | 25.7 | 6 | 18.0 | 18.4 | 18.2 |
+| 96 | 6 | 44.6 | 46.8 | 46.6 | 6 | 21.5 | 22.1 | 21.8 | 6 | 17.1 | 17.5 | 17.2 |
+| 128 | 6 | 34.4 | 35.0 | 34.8 | 6 | 19.4 | 19.7 | 19.5 | 6 | 16.6 | 16.9 | 16.7 |
+| 192 | 6 | 22.2 | 23.4 | 23.2 | 6–12 | 17.0 | 17.4 | 17.2 | 6–24 | 16.0 | 16.3 | 16.1 |
 | 256 | 6–24 | 17.5 | 17.9 | 17.6 | 6–48 | 16.1 | 16.3 | 16.1 | 6–48 | 15.8 | 16.0 | 15.8 |
-| 384 | 6 | 15.8 | 16.0 | 15.8 | 6 | 15.7 | 15.9 | 15.7 | 6–24 | 15.7 | 15.9 | 15.7 |
+| 384 | 6 | 15.8 | 16.0 | 15.8 | 6 | 15.7 | 15.9 | 15.7 | 6 | 15.7 | 15.9 | 15.7 |
 
 At 128 experts per layer, the test suffixes' decode with the cost and k tuned for each link: the used prefetches, those that arrived before their step started (timely) and those it waited for (late), and the bytes prefetched in vain:
 
 | Model | Horizon | Link | k per workload | Used prefetches | Timely | Late | Unused MB/token |
 |---|---|---|---|--:|--:|--:|--:|
-| IQ3_XXS-IQ4_XS-down-imx | next token | ssd | 6, 6, 6, 6 | 0 | 0.0% | 0 | 0 |
-| IQ3_XXS-IQ4_XS-down-imx | next token | pcie | 6, 6, 6, 6 | 0 | 0.0% | 0 | 0 |
-| IQ3_XXS-IQ4_XS-down-imx | next token | ram | 6, 6, 6, 6 | 0 | 0.0% | 0 | 0 |
-| IQ3_XXS-IQ4_XS-down-imx | same token | ssd | 6, 6, 6, 6 | 3891 | 94.2% | 224 | 1 |
-| IQ3_XXS-IQ4_XS-down-imx | same token | pcie | 6, 6, 6, 6 | 3891 | 100.0% | 0 | 1 |
-| IQ3_XXS-IQ4_XS-down-imx | same token | ram | 6, 6, 6, 6 | 3891 | 100.0% | 0 | 1 |
-| Q8_0 | next token | ssd | 6, 6, 6, 6 | 1 | 100.0% | 0 | 0 |
-| Q8_0 | next token | pcie | 6, 6, 6, 12 | 170 | 100.0% | 0 | 0 |
-| Q8_0 | next token | ram | 6, 6, 6, 12 | 170 | 100.0% | 0 | 0 |
-| Q8_0 | same token | ssd | 6, 6, 6, 6 | 3913 | 93.9% | 240 | 2 |
-| Q8_0 | same token | pcie | 6, 6, 6, 6 | 3913 | 98.6% | 55 | 2 |
-| Q8_0 | same token | ram | 6, 6, 6, 6 | 3913 | 100.0% | 0 | 2 |
+| IQ3_XXS-IQ4_XS-down-imx | next token | ssd | 6, 6, 6, 6 | 33 | 100.0% | 0 | 0 |
+| IQ3_XXS-IQ4_XS-down-imx | next token | pcie | 6, 6, 6, 6 | 33 | 100.0% | 0 | 0 |
+| IQ3_XXS-IQ4_XS-down-imx | next token | ram | 6, 6, 6, 6 | 33 | 100.0% | 0 | 0 |
+| IQ3_XXS-IQ4_XS-down-imx | same token | ssd | 6, 6, 6, 6 | 2386 | 94.8% | 123 | 1 |
+| IQ3_XXS-IQ4_XS-down-imx | same token | pcie | 6, 6, 6, 6 | 2386 | 100.0% | 0 | 1 |
+| IQ3_XXS-IQ4_XS-down-imx | same token | ram | 6, 6, 6, 6 | 2386 | 100.0% | 0 | 1 |
+| Q8_0 | next token | ssd | 6, 6, 6, 6 | 26 | 100.0% | 0 | 0 |
+| Q8_0 | next token | pcie | 6, 6, 6, 6 | 26 | 100.0% | 0 | 0 |
+| Q8_0 | next token | ram | 6, 6, 6, 6 | 26 | 100.0% | 0 | 0 |
+| Q8_0 | same token | ssd | 6, 6, 6, 6 | 2399 | 94.0% | 143 | 1 |
+| Q8_0 | same token | pcie | 6, 6, 6, 6 | 2399 | 99.0% | 24 | 1 |
+| Q8_0 | same token | ram | 6, 6, 6, 6 | 2399 | 100.0% | 0 | 1 |
 
 ## Stage B: a trained linear predictor
 
@@ -1053,7 +1053,7 @@ IQ3_XXS-IQ4_XS-down-imx, next token:
 | linear, A only | 29.1% (0.2%) | 41.5% (2.6%) | 54.7% (8.7%) | 67.4% (19.1%) |
 | linear, B only | 23.7% (0.1%) | 34.9% (1.8%) | 47.7% (6.2%) | 61.1% (13.9%) |
 | linear, A and B, leave one workload out | 24.5% (0.1%) | 35.5% (2.0%) | 47.3% (6.5%) | 59.1% (13.4%) |
-| Markov, own prefix | 31.6% (0.1%) | 45.7% (2.5%) | 60.8% (10.2%) | 75.5% (26.5%) |
+| Markov, own prefix | 35.6% (0.2%) | 50.3% (3.3%) | 63.5% (11.9%) | 75.2% (26.0%) |
 
 IQ3_XXS-IQ4_XS-down-imx, same token:
 
@@ -1063,7 +1063,7 @@ IQ3_XXS-IQ4_XS-down-imx, same token:
 | linear, A only | 31.2% (0.4%) | 43.7% (3.4%) | 56.6% (10.4%) | 68.9% (23.1%) |
 | linear, B only | 27.0% (0.1%) | 38.5% (1.3%) | 51.1% (5.8%) | 63.6% (15.4%) |
 | linear, A and B, leave one workload out | 29.2% (0.3%) | 40.9% (2.8%) | 52.8% (8.4%) | 64.3% (17.5%) |
-| Markov, own prefix | 32.3% (0.1%) | 46.2% (2.1%) | 61.6% (10.7%) | 76.0% (29.9%) |
+| Markov, own prefix | 37.9% (0.2%) | 52.1% (3.5%) | 65.8% (13.8%) | 78.3% (34.0%) |
 
 Q8_0, next token:
 
@@ -1073,7 +1073,7 @@ Q8_0, next token:
 | linear, A only | 29.1% (0.2%) | 41.5% (2.6%) | 54.7% (8.7%) | 67.5% (19.1%) |
 | linear, B only | 23.7% (0.1%) | 35.0% (1.8%) | 47.7% (6.1%) | 61.1% (13.8%) |
 | linear, A and B, leave one workload out | 24.4% (0.1%) | 35.4% (2.0%) | 47.2% (6.5%) | 59.0% (13.3%) |
-| Markov, own prefix | 31.6% (0.1%) | 45.6% (2.4%) | 60.8% (10.2%) | 75.4% (26.5%) |
+| Markov, own prefix | 35.6% (0.2%) | 50.3% (3.4%) | 63.5% (11.9%) | 75.2% (25.9%) |
 
 Q8_0, same token:
 
@@ -1083,7 +1083,7 @@ Q8_0, same token:
 | linear, A only | 31.1% (0.4%) | 43.6% (3.4%) | 56.6% (10.3%) | 68.8% (22.9%) |
 | linear, B only | 27.1% (0.1%) | 38.5% (1.3%) | 51.0% (5.7%) | 63.7% (15.3%) |
 | linear, A and B, leave one workload out | 29.1% (0.3%) | 40.8% (2.9%) | 52.8% (8.4%) | 64.2% (17.5%) |
-| Markov, own prefix | 32.3% (0.1%) | 46.2% (2.2%) | 61.6% (10.7%) | 76.0% (29.9%) |
+| Markov, own prefix | 37.9% (0.2%) | 52.1% (3.5%) | 65.8% (13.8%) | 78.3% (34.0%) |
 
 **Calibration** of the own fit with both blocks on the test suffixes' decoded tokens, from their recorded inputs, all workloads together: the experts its best k are expected to cover, the sum of their probabilities, against those they cover, before the temperature (raw) and after it (calibrated); and the expected calibration error over its best 48 per target in ten bins of probability, the workloads' weighted by their candidates:
 
