@@ -40,23 +40,29 @@ func markovParams() []locality.MarkovParams {
 	return out
 }
 
+// Prefetches are a predictor's prefetches into the shared LRU at every k of K and size, replayed
+// with the predictor's cost and without it, and the k chosen per size and link on the own
+// training prefix.
+type Prefetches struct {
+	K    []int   `json:"k"`
+	Runs []Runs  `json:"runs"`
+	Free []Runs  `json:"runs_without_cost"`
+	OwnK [][]int `json:"own_prefix_k"` // per size and link
+}
+
 // HorizonGrid is the predictor of one horizon on a workload: its recall at every parameter and
 // candidate count in the training prefix and the test suffix, the parameters chosen, and its
-// prefetches with the own prefix's parameters at every k into the shared LRU, replayed with the
-// predictor's cost and without it. Indexes are into Params and K.
+// prefetches with the own prefix's parameters. Indexes are into Params.
 type HorizonGrid struct {
 	Horizon    string                  `json:"horizon"`
 	LeadSteps  int                     `json:"lead_steps"`
 	Params     []locality.MarkovParams `json:"params"`
-	K          []int                   `json:"k"`
 	Train      [][]locality.Recall     `json:"train_recall"`
 	Test       [][]locality.Recall     `json:"test_recall"`
 	Own        int                     `json:"own_prefix_params"`
 	CountsOnly int                     `json:"counts_only_params"`
 	LOWO       int                     `json:"leave_one_workload_out_params"` // -1: no other workload
-	Runs       []Runs                  `json:"runs"`
-	Free       []Runs                  `json:"runs_without_cost"`
-	OwnK       [][]int                 `json:"own_prefix_k"` // per size and link
+	Prefetches
 }
 
 // covered is the needed experts covered summed over the candidate counts: what tuning maximizes.
@@ -121,7 +127,7 @@ func withCost(t locality.Timing, cost float64) locality.Timing {
 // prefix and replays its prefetches at every k and size.
 func markovGrid(t trace, h locality.Horizon, sizes []int, cost float64) (HorizonGrid, error) {
 	params := markovParams()
-	g := HorizonGrid{Horizon: h.String(), LeadSteps: h.Lead(t.sel.Layers), Params: params, K: markovKs,
+	g := HorizonGrid{Horizon: h.String(), LeadSteps: h.Lead(t.sel.Layers), Params: params,
 		Train: make([][]locality.Recall, len(params)), Test: make([][]locality.Recall, len(params)), LOWO: -1}
 	kmax := slices.Max(markovKs)
 	var wg sync.WaitGroup
@@ -139,37 +145,49 @@ func markovGrid(t trace, h locality.Horizon, sizes []int, cost float64) (Horizon
 	wg.Wait()
 	chooseParams(&g)
 	ranking := locality.Rank(t.sel, t.spans, t.m.NExpert, h, params[g.Own], kmax)
+	var err error
+	g.Prefetches, err = replayPrefetches(t, fmt.Sprintf("%s Markov", h), ranking, sizes, cost)
+	return g, err
+}
+
+// replayPrefetches replays ranking's best k into the shared LRU at every k of markovKs and size,
+// with the cost per decoded layer step and without it, and chooses k per size and link on the own
+// training prefix.
+func replayPrefetches(t trace, name string, ranking *locality.Ranking, sizes []int, cost float64) (Prefetches,
+	error) {
+	p := Prefetches{K: markovKs}
 	bases := make([]baseline, len(markovKs))
 	for i, k := range markovKs {
-		bases[i] = baseline{fmt.Sprintf("%s Markov, k %d, on shared LRU", h, k), false,
+		bases[i] = baseline{fmt.Sprintf("%s, k %d, on shared LRU", name, k), false,
 			func(c int) (locality.Policy, error) {
 				return locality.NewRanked(locality.NewSharedLRU(t.m.NExpert, t.m.bytes(), t.m.budget(c)), ranking, k), nil
 			}}
 	}
 	var err error
-	if g.Runs, err = replayAll(t.sel, t.spans, t.cut, t.m, sizes, bases, withCost(t.timing, cost)); err != nil {
-		return g, err
+	if p.Runs, err = replayAll(t.sel, t.spans, t.cut, t.m, sizes, bases, withCost(t.timing, cost)); err != nil {
+		return p, err
 	}
-	if g.Free, err = replayAll(t.sel, t.spans, t.cut, t.m, sizes, bases, t.timing); err != nil {
-		return g, err
+	if p.Free, err = replayAll(t.sel, t.spans, t.cut, t.m, sizes, bases, t.timing); err != nil {
+		return p, err
 	}
-	g.OwnK = chooseK(g.Runs, markovKs, len(t.timing.Links))
-	return g, nil
+	p.OwnK = chooseK(p.Runs, markovKs, len(t.timing.Links))
+	return p, nil
 }
 
-// checkOnline fails unless the online predictor, learning from Use alone, replays exactly as the
-// ranking g's runs prefetch, with the largest k at size index s.
-func checkOnline(t trace, g HorizonGrid, h locality.Horizon, sizes []int, s int, cost float64) error {
-	k := len(g.K) - 1
-	p := locality.NewPrefetcher(locality.NewSharedLRU(t.m.NExpert, t.m.bytes(), t.m.budget(sizes[s])),
-		locality.NewMarkov(t.sel.Layers, t.m.NExpert, g.Params[g.Own]), h, g.K[k])
-	got, err := replayed(t.sel, t.spans, t.cut, t.m, p, withCost(t.timing, cost))
+// checkOnline fails unless pred, a predictor that has seen nothing, as an online policy that
+// learns from Use alone replays exactly as p's runs prefetch, with the largest k at size index s.
+func checkOnline(t trace, p Prefetches, pred locality.Predictor, h locality.Horizon, sizes []int, s int,
+	cost float64) error {
+	k := len(p.K) - 1
+	q := locality.NewPrefetcher(locality.NewSharedLRU(t.m.NExpert, t.m.bytes(), t.m.budget(sizes[s])), pred,
+		t.m.NExpert, h, p.K[k])
+	got, err := replayed(t.sel, t.spans, t.cut, t.m, q, withCost(t.timing, cost))
 	if err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(got, g.Runs[k].Runs[s].Replayed) {
+	if !reflect.DeepEqual(got, p.Runs[k].Runs[s].Replayed) {
 		return fmt.Errorf("the online predictor's replay differs from its ranking's at k %d, %d experts per layer",
-			g.K[k], sizes[s])
+			p.K[k], sizes[s])
 	}
 	return nil
 }
@@ -213,29 +231,64 @@ func bestOf(entries []GateEntry, name string) GateEntry {
 	return out
 }
 
-// markovName is the gate's name of horizon h's predictor tuned for link.
-func markovName(h locality.Horizon, link string) string {
-	return fmt.Sprintf("%s Markov on shared LRU, k tuned for %s", h, link)
+// predictorName is the gate's name of the predictor kind of horizon h tuned for link.
+func predictorName(kind string, h locality.Horizon, link string) string {
+	return fmt.Sprintf("%s %s on shared LRU, k tuned for %s", h, kind, link)
 }
 
-// stageBGate judges the predictor of every horizon, k tuned per link, against the best Stage A
-// policy of gate a at every size, each on bytes and on its own link.
+// markovName is the gate's name of horizon h's Markov predictor tuned for link.
+func markovName(h locality.Horizon, link string) string { return predictorName("Markov", h, link) }
+
+// predictorKind is a kind of Stage B predictor: its name and its prefetches of horizon hi in a
+// workload, nil if the workload has none.
+type predictorKind struct {
+	name string
+	pick func(w Workload, hi int) *Prefetches
+}
+
+// predictorKinds are the Stage B predictors in the order the report and the gate list them.
+var predictorKinds = []predictorKind{
+	{"Markov", func(w Workload, hi int) *Prefetches {
+		if hi >= len(w.Markov) {
+			return nil
+		}
+		return &w.Markov[hi].Prefetches
+	}},
+	{"linear", func(w Workload, hi int) *Prefetches {
+		if hi >= len(w.Linear) {
+			return nil
+		}
+		return &w.Linear[hi].Prefetches
+	}},
+}
+
+// stageBGate judges every predictor of every horizon, k tuned per link, against the best Stage A
+// policy of gate a at every size, each on bytes and on its own link. A predictor some workload of
+// the model lacks is not judged.
 func stageBGate(results []result, model string, sizes []int, links []string, a Gate) Gate {
 	ref := bestOf(append([]GateEntry{a.Reference}, a.Policies...), "best Stage A policy")
 	var cands []heldOut
 	var only [][]int
-	for hi, h := range horizons {
-		for li, l := range links {
-			c := heldOut{policy: markovName(h, l)}
-			for _, r := range results {
-				if r.model != model {
-					continue
+	for _, kind := range predictorKinds {
+		for hi, h := range horizons {
+			for li, l := range links {
+				c := heldOut{policy: predictorName(kind.name, h, l)}
+				for _, r := range results {
+					if r.model != model {
+						continue
+					}
+					p := kind.pick(r.w, hi)
+					if p == nil {
+						c.policy = ""
+						break
+					}
+					c.tests = append(c.tests, tuned(p.Runs, p.K, func(s int) int { return p.OwnK[s][li] }))
 				}
-				g := r.w.Markov[hi]
-				c.tests = append(c.tests, tuned(g.Runs, g.K, func(s int) int { return g.OwnK[s][li] }))
+				if c.policy != "" {
+					cands = append(cands, c)
+					only = append(only, []int{li})
+				}
 			}
-			cands = append(cands, c)
-			only = append(only, []int{li})
 		}
 	}
 	return judge(ref, cands, only, sizes, links, a.Tokens)
@@ -437,6 +490,15 @@ func writeMarkov(w io.Writer, a Assumptions, links []locality.Link, sizes []int,
 		"chosen per budget and link from %s on the own training prefix, as the one whose decode takes the least "+
 		"estimated time with the cost. Prefetching cannot load fewer bytes than the misses it replaces, only hide "+
 		"their time.\n", joinInts(markovKs))
+	writePrefetches(w, "Markov", links, sizes, d, results, gatesB, func(w Workload, hi int) Prefetches {
+		return w.Markov[hi].Prefetches
+	})
+}
+
+// writePrefetches reports the held-out replays of the prefetches pick selects, the predictor named
+// kind in the tables.
+func writePrefetches(w io.Writer, kind string, links []locality.Link, sizes []int, d int, results []result,
+	gatesB map[string]Gate, pick func(w Workload, hi int) Prefetches) {
 	for _, m := range modelsOf(results) {
 		gb, ok := gatesB[m]
 		if !ok {
@@ -447,7 +509,7 @@ func writeMarkov(w io.Writer, a Assumptions, links []locality.Link, sizes []int,
 				"policy, the predictor with its cost and without; k the range of the workloads' choices:\n\n"+
 				"| Experts per layer |", m, h)
 			for _, l := range links {
-				fmt.Fprintf(w, " k %s | Best Stage A %s | Markov %s | No cost %s |", l.Name, l.Name, l.Name, l.Name)
+				fmt.Fprintf(w, " k %s | Best Stage A %s | %s %s | No cost %s |", l.Name, l.Name, kind, l.Name, l.Name)
 			}
 			fmt.Fprintf(w, "\n|--:|%s\n", strings.Repeat("--:|--:|--:|--:|", len(links)))
 			for s, c := range sizes {
@@ -460,7 +522,7 @@ func writeMarkov(w io.Writer, a Assumptions, links []locality.Link, sizes []int,
 						if r.model != m {
 							continue
 						}
-						g := r.w.Markov[hi]
+						g := pick(r.w, hi)
 						k := g.OwnK[s][i]
 						ks = append(ks, k)
 						j := slices.Index(g.K, k)
@@ -494,7 +556,7 @@ func writeMarkov(w io.Writer, a Assumptions, links []locality.Link, sizes []int,
 					if r.model != m {
 						continue
 					}
-					g := r.w.Markov[hi]
+					g := pick(r.w, hi)
 					k := g.OwnK[d][i]
 					ks = append(ks, fmt.Sprint(k))
 					x := g.Runs[slices.Index(g.K, k)].Runs[d].Split.Test.Decode
