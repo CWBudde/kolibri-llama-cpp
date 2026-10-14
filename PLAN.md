@@ -747,7 +747,7 @@ GB Mac.
 
 ## Phase 10 --- Predictive expert caching and prefetch (proposed)
 
-**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist, and a trained linear predictor (item 2). Neither passes the gate: no predictor beats the best Stage A policy, even without its CPU cost. By the stop condition below, the negative result is documented and llama.cpp is not complicated; only the half-life follow-up stays open. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
+**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist, and a trained linear predictor (item 2). Neither passes the gate: no predictor beats the best Stage A policy, even without its CPU cost, also with the half-life grid extended down to 1 token. Stage B is done. By the stop condition below, the negative result is documented and llama.cpp is not complicated. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
 
 ### Objective and constraints
 
@@ -839,7 +839,7 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
     - At 128 experts per layer no causal policy beats the shared LRU for IQ3; for Q8_0 only the untuned LFU does.
     - The largest time saved is 5.3% on SSD (Q8_0, tuned LFU at 48). Last-N's recall is the baseline Stage B's predictors have to beat.
 
-### Stage B --- Small causal router predictor
+### Stage B --- Small causal router predictor — ✅ DONE (2026-10-14)
 
 - [x] Start with a CPU-cheap frequency/Markov predictor per layer, with one feature set per prediction horizon:
     - next token, any layer (predicted before that token is sampled): only prior tokens' state, i.e. recent expert IDs, recency, exponentially decayed counts and the layer index;
@@ -853,7 +853,7 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
       - **next token:** before layer l of token t, layer l−1 of token t+1, from token t's set in l−1, 49 steps ahead;
       - **same token:** before layer l, the token's layer l+1 from its set in l−1, one step ahead.
     - `Rank` precomputes the candidates a replay meets and `Ranked` prefetches them; `Prefetcher` is the same predictor as an online policy.
-    - Parameters are chosen per horizon on the own training prefix (half-lives 64–4096 tokens, mixes 0–1), as the most needed experts covered over k = 6–48; leaving one workload out is reported beside it.
+    - Parameters are chosen per horizon on the own training prefix (half-lives 1–4096 tokens, mixes 0–1), as the most needed experts covered over k = 6–48; leaving one workload out is reported beside it.
     - Checks:
       - `TestMarkovScores` is hand-computed.
       - `TestMarkovCausal`: redrawing every expert from a step on leaves every earlier prediction unchanged. Learning the running step before ranking fails it.
@@ -861,8 +861,9 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
       - `TestPredictRecall` checks recall by brute force.
       - On the real traces, 16 new PASS lines show the online predictor replaying exactly as its ranking, e.g. "PASS IQ3_XXS-IQ4_XS-down-imx coding: the same token predictor, learning online from Use alone, replays as its ranking at k 48 and 128 experts per layer" (64 PASS lines in all).
     - Test-suffix recall, IQ3 (Q8_0 within 0.1 points), experts covered (whole Top-6 sets):
-      - **next token:** the own prefix chooses counts alone with the shortest half-life, 64, for every workload. 31.6% (0.1%) at k 6, 60.8% (10.2%) at 24, 75.5% (26.5%) at 48; Markov only 18.1–54.0%.
-      - **same token:** a mix of 0.75 (hr: transitions alone). 32.3% (0.1%) at k 6, 76.0% (29.9%) at 48; leaving one workload out 32.6% / 76.3%.
+      - **next token:** the own prefix chooses half-life 4 with a mix of 0.25 (research: counts alone) for both models. 35.6% (0.2%) at k 6, 63.5% (11.9%) at 24, 75.2% (26.0%) at 48; counts alone 35.3% at k 6; Markov only 18.1–54.0%.
+      - **same token:** half-life 1 with a mix of 0.75 for every workload. 37.9% (0.2%) at k 6, 78.3% (34.0%) at 48; leaving one workload out chooses the same.
+      - Both beat last-N with n 1 (34.4% with 6.3 candidates) at k 6.
       - For comparison, last-N with n 1 covers 34.4% with 6.3 candidates.
     - The prefetch budget is k × 1.7 MB per predicted step: 509 MB per IQ3 token at k 6 ([docs/expert-policy.md](docs/expert-policy.md)).
 - [x] If heuristics plateau, train a small multi-label model (linear classifier or tiny MLP/GRU) against the recorded expert-ID sets. Use chronological/workload-held-out splits, calibrated scores and ablations; do not train on the target token's own router logits or hidden state unless those are actually available before the intended prefetch deadline. (2026-10-14) — The condition was met: the Markov predictor did not pass the gate (below). The user chose, on 2026-10-14, a linear logistic model per layer trained on every recorded training-prefix token, prompts included (`locality.Linear`, `internal/locality/linear.go`).
@@ -885,8 +886,8 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
       - `TestLinearCausal`, `TestLinearOnline`, `TestTemperature`, `TestCalibration`.
       - On the real traces, 16 new PASS lines show the frozen model replaying online exactly as its ranking (80 PASS lines in all; the run takes 14 minutes, most of it training).
     - **Test-suffix recall** (IQ3; Q8_0 within 0.1 points), experts covered (whole sets):
-      - next token: 29.6% (0.2%) at k 6 and 68.2% (19.7%) at k 48, below the Markov predictor's 31.6% and 75.5%;
-      - same token: 36.1% (0.5%) at k 6 and 49.6% at 12, above the Markov predictor's 32.3% and 46.2%, but 73.1% against 76.0% at 48.
+      - next token: 29.6% (0.2%) at k 6 and 68.2% (19.7%) at k 48, below the Markov predictor's 35.6% and 75.2%;
+      - same token: 36.1% (0.5%) at k 6, 49.6% at 12 and 73.1% at 48, below the Markov predictor's 37.9%, 52.1% and 78.3%. Against the Markov predictor with half-lives of 64 or more, it was above at k 6 and 12 (32.3% and 46.2%).
       - Block A carries most of it (same token, A alone: 31.2% at k 6).
       - Leaving one workload out loses 5–7 points (29.2% at k 6, same token), so what it learns is largely workload-specific.
     - **Cost.** `BenchmarkLinearStep` measures 6.5–6.7 µs per decoded layer step (`-linear-us` 6.8 µs, Apple M5 Pro), 0.34 ms per token (2.2% of 15.7 ms); the weights take 59 MB.
@@ -899,19 +900,19 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
       - **same token:** one step, 0.31 ms, 0 / 4 / 18 (Q8_0 0 / 1 / 7).
     - `TestOverlap`: a same-token prefetch that fits its window arrives in time, and one slower than a step's compute arrives late, apart from the first token's.
     - The timed replays split used prefetches into timely and late. At 128 experts per layer:
-      - same token: 94.2% timely on SSD (224 late) and 100% on PCIe and RAM (IQ3), 93.9% / 98.6% / 100% for Q8_0;
-      - next token: its top 6, the most used experts, are resident already, so it prefetches next to nothing (IQ3: no used prefetch) ([docs/expert-policy.md](docs/expert-policy.md)).
+      - same token: 94.8% timely on SSD (123 late) and 100% on PCIe and RAM (IQ3), 94.0% / 99.0% / 100% for Q8_0;
+      - next token: its top 6, the most used experts, are resident already, so it prefetches next to nothing (IQ3: 33 used prefetches, all timely) ([docs/expert-policy.md](docs/expert-policy.md)).
 - [x] Bound inference overhead: report predictor wall time, CPU use, memory footprint and net estimated latency saved. Compare against the ~15.7 ms/token resident baseline; a predictor that costs more than its hidden transfer latency is a failure. (2026-10-14) — `BenchmarkMarkovStep` (`go test ./internal/locality/ -run '^$' -bench Markov -benchmem -count 3`, Apple M5 Pro) measures one rank and learn at 50 layers × 384 experts and 48 candidates.
     - It takes 3.8–4.4 µs per decoded layer step with no allocation. The slowest run, 4.4 µs, is the declared `-predict-us` default.
     - That is 0.22 ms of one CPU core per decoded token, 1.4% of the 15.7 ms resident decode. The tables (`MarkovBytes`) take 59 MB.
     - The timed replays add the cost to every decoded step's compute, on the critical path, and are also run without it.
-    - The net saving against the best Stage A policy is negative everywhere: on its own link, every size and both horizons, the predictor with its cost is at least 0.9% slower for IQ3 and 0.8% for Q8_0. IQ3 at 128 experts per layer, SSD: 23.3 ms/token for the best Stage A policy, 23.5 for next token and 23.7 for same token with the cost (23.3 and 23.5 without).
-    - At 8 experts per layer, wrong prefetches crowd out the cache: 182 against 79 ms/token on SSD.
+    - The net saving against the best Stage A policy is negative everywhere: on its own link, every size and both horizons, the predictor with its cost is at least 0.96% slower for IQ3 and 0.77% for Q8_0. IQ3 at 128 experts per layer, SSD: 23.3 ms/token for the best Stage A policy, 23.5 for next token and 23.6 for same token with the cost (23.3 and 23.4 without).
+    - At 8 experts per layer, wrong prefetches crowd out the cache: 115 (next token) and 176 ms/token (same token) against 79 on SSD.
     - `TestMarkovNoLeak` checks that the cost lengthens the replay; dropping it fails the test ([docs/expert-policy.md](docs/expert-policy.md)).
 - [x] Gate: require an improvement over Stage A on held-out workloads, with prediction cost included; otherwise keep the simpler policy. (2026-10-14) — The user's rule of 2026-10-14: retained only at a budget where it beats the best Stage A policy there.
     - The reference is the fewest bytes, and the least time on each link, of the shared LRU and all seven policies Stage A judged, last-N included.
     - Each horizon is judged once per link, with k chosen per budget for that link on the own training prefix, by its decode time with the cost.
-    - **Not retained:** none of the 12 variants (2 horizons × 3 links × 2 models) beats the best Stage A policy anywhere, so the simpler Stage A policies stay. Without its cost, same token would be faster only at 384 experts per layer, by at most 0.007%, through carried experts (below).
+    - **Not retained:** none of the 12 variants (2 horizons × 3 links × 2 models) beats the best Stage A policy anywhere, so the simpler Stage A policies stay. Without its cost, no variant is faster anywhere either: at best equal, at 384 experts per layer.
     - **Carried prefetches.** The first run showed same token "retained" at 384 experts per layer on 0.8–7.7% fewer bytes. Those bytes came entirely from wrong predictions in the training prefix that loaded experts the test suffix first needed: for hr, 671 MB were prefetched in vain before the cut, and the test suffix had no prefetch of its own.
       - `ReplaySegments` now counts such hits as `CarriedPrefetches` / `CarriedPrefetchBytes` in the later segment, and the gate's `loadedBytes` charges them there.
       - No Stage A policy carries any, so every Stage A table is byte-identical.
@@ -919,7 +920,14 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
       - `TestStageBGate`: beating the shared LRU but not the best is no win, ties and 10⁻⁹ noise are no win, and a link-tuned variant is judged on its link only. Gating against the shared LRU, letting ties pass, or ignoring the link restriction fails it.
       - `TestReplaySegments` and `TestLoadedBytes` fail without the carried accounting.
       - `TestChooseMarkov`, `TestChooseK` and `TestMarkovNoLeak` fail when parameters or k are tuned on the test suffix, or when leaving one workload out includes the held-out workload ([docs/expert-policy.md](docs/expert-policy.md)).
-- [ ] Extend the next-token half-life grid below 64 tokens: the own prefix chose 64, the grid's shortest, for every workload of both models, and last-N with n 1 (pure recency) covers more at the same candidate count (34.4% against 31.6%). It is not expected to change the gate, since those candidates are resident already.
+- [x] Extend the next-token half-life grid below 64 tokens: the own prefix chose 64, the grid's shortest, for every workload of both models, and last-N with n 1 (pure recency) covers more at the same candidate count (34.4% against 31.6%). It is not expected to change the gate, since those candidates are resident already. (2026-10-14) — `markovHalfLives` (`cmd/kolibri-policy/predict.go`) now runs 1, 4, 16, 64, 256, 1024, 4096 tokens, for both horizons, since same token also chose 64 everywhere. `TestMarkovParams` checks the grid; it failed on the old one.
+    - **Choices:** next token now takes half-life 4 (mix 0.25, research 0), inside the grid. Same token takes 1, the shortest that exists: its counts are nearly the previous token's set.
+    - **Recall at k 6 (IQ3):** next token 31.6% → 35.6%, same token 32.3% → 37.9%, both above last-N with n 1 (34.4%). At k 48, next token 75.5% → 75.2% and same token 76.0% → 78.3%. Q8_0 is within 0.1 points.
+    - The Markov predictor now covers more experts than the linear one at every k for both horizons; only in whole Top-6 sets, the linear one stays ahead for same token (0.5% against 0.2% at k 6).
+    - **Gate: still not retained** (none of 12 variants), as expected.
+      - With the cost it is at least 0.96% (IQ3) and 0.77% (Q8_0) slower; without the cost it is at best equal.
+      - The fewer wasted prefetches help at small budgets: at 8 experts per layer on SSD, next token takes 115 instead of 182 ms/token, against 79.
+    - 80 PASS lines, 22 min run ([docs/expert-policy.md](docs/expert-policy.md)).
 
 ### Stage C --- Optional go-laya workload controller (not token-level routing)
 
