@@ -147,7 +147,7 @@ func TestPrefetcher(t *testing.T) {
 		ranking := Rank(sel, spans, 12, h, p, 12)
 		for _, k := range []int{1, 3, 12} {
 			// online, learning from Use only, it prefetches the ranking's top k
-			online := &prefetchLog{Policy: NewPrefetcher(&NoCache{}, NewMarkov(sel.Layers, 12, p), h, k)}
+			online := &prefetchLog{Policy: NewPrefetcher(&NoCache{}, NewMarkov(sel.Layers, 12, p), 12, h, k)}
 			ranked := &prefetchLog{Policy: NewRanked(&NoCache{}, ranking, k)}
 			for _, q := range []*prefetchLog{online, ranked} {
 				if _, err := Replay(sel, spans, 12, bytes, q); err != nil {

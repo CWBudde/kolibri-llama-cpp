@@ -162,7 +162,7 @@ func markovGrid(t trace, h locality.Horizon, sizes []int, cost float64) (Horizon
 func checkOnline(t trace, g HorizonGrid, h locality.Horizon, sizes []int, s int, cost float64) error {
 	k := len(g.K) - 1
 	p := locality.NewPrefetcher(locality.NewSharedLRU(t.m.NExpert, t.m.bytes(), t.m.budget(sizes[s])),
-		locality.NewMarkov(t.sel.Layers, t.m.NExpert, g.Params[g.Own]), h, g.K[k])
+		locality.NewMarkov(t.sel.Layers, t.m.NExpert, g.Params[g.Own]), t.m.NExpert, h, g.K[k])
 	got, err := replayed(t.sel, t.spans, t.cut, t.m, p, withCost(t.timing, cost))
 	if err != nil {
 		return err

@@ -56,6 +56,15 @@ func LeadSeconds(t Timing, h Horizon, layers int) float64 {
 	return float64(h.Lead(layers)) * t.DecodeStep
 }
 
+// A Predictor ranks the experts of a step that has not run yet from steps that have. Observe tells
+// it that step s, now run, used the experts ids of its layer, each once; Predict returns, before
+// step s, the layer of the step horizon h predicts and its k best experts, best first, in out's
+// storage, or nil when h predicts nothing before s.
+type Predictor interface {
+	Observe(s StepInfo, ids []int)
+	Predict(h Horizon, s StepInfo, k int, out []int) (int, []int)
+}
+
 // MarkovParams are the predictor's parameters: the half-life of its use counts in tokens, and the
 // weight of the transitions in a score, Mix 0 for the counts alone and 1 for the transitions
 // alone.
@@ -245,11 +254,15 @@ type Ranking struct {
 	ids                []int16 // per step, its k candidates
 }
 
-// Rank runs a predictor with p through spans in Replay's order, predicting before every step with
-// horizon h and learning each step's experts after it.
+// Rank is RankWith a Markov predictor with p.
 func Rank(sel Selections, spans []Span, nExpert int, h Horizon, p MarkovParams, k int) *Ranking {
+	return RankWith(NewMarkov(sel.Layers, nExpert, p), sel, spans, nExpert, h, k)
+}
+
+// RankWith runs m, which has seen nothing, through spans in Replay's order, predicting before
+// every step with horizon h and letting it observe each step's experts after it.
+func RankWith(m Predictor, sel Selections, spans []Span, nExpert int, h Horizon, k int) *Ranking {
 	k = min(k, nExpert)
-	m := NewMarkov(sel.Layers, nExpert, p)
 	steps := len(spans) * sel.Layers
 	r := &Ranking{h: h, layers: sel.Layers, nExpert: nExpert, k: k, has: make([]bool, steps),
 		ids: make([]int16, steps*k)}
@@ -377,12 +390,13 @@ func (p *Ranked) Prefetch(s StepInfo) []int {
 	return p.out
 }
 
-// Prefetcher is the predictor as a policy: it learns a step's experts from Use and prefetches,
+// Prefetcher is a predictor as a policy: it learns a step's experts from Use and prefetches,
 // before every step, its k best candidates for horizon h into the cache it wraps. Replayed on the
 // same spans it prefetches what Rank ranks.
 type Prefetcher struct {
 	Policy
-	m       *Markov
+	m       Predictor
+	nExpert int
 	h       Horizon
 	k       int
 	step    StepInfo
@@ -392,9 +406,10 @@ type Prefetcher struct {
 	out     []int
 }
 
-// NewPrefetcher wraps base with m's predictions for horizon h, k of them before every step.
-func NewPrefetcher(base Policy, m *Markov, h Horizon, k int) *Prefetcher {
-	return &Prefetcher{Policy: base, m: m, h: h, k: k}
+// NewPrefetcher wraps base with m's predictions for horizon h, k of them before every step, for
+// layers of nExpert experts.
+func NewPrefetcher(base Policy, m Predictor, nExpert int, h Horizon, k int) *Prefetcher {
+	return &Prefetcher{Policy: base, m: m, nExpert: nExpert, h: h, k: k}
 }
 
 // flush lets the predictor learn the last step's experts.
@@ -410,7 +425,7 @@ func (p *Prefetcher) Prefetch(s StepInfo) []int {
 	p.out = append(p.out[:0], p.Policy.Prefetch(s)...)
 	l, ids := p.m.Predict(p.h, s, p.k, p.ids)
 	for _, e := range ids {
-		p.out = append(p.out, l*p.m.nExpert+e)
+		p.out = append(p.out, l*p.nExpert+e)
 	}
 	if ids != nil {
 		p.ids = ids
@@ -423,6 +438,6 @@ func (p *Prefetcher) Use(s StepInfo, k int) {
 		p.flush()
 		p.step, p.pending = s, true
 	}
-	p.set = append(p.set, k%p.m.nExpert)
+	p.set = append(p.set, k%p.nExpert)
 	p.Policy.Use(s, k)
 }
