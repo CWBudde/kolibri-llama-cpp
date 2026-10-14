@@ -747,7 +747,7 @@ GB Mac.
 
 ## Phase 10 --- Predictive expert caching and prefetch (proposed)
 
-**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist; it did not pass the gate either, so item 2's condition, a heuristic plateau, is met, and whether to train a model is open. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
+**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist, and a trained linear predictor (item 2). Neither passes the gate: no predictor beats the best Stage A policy, even without its CPU cost. By the stop condition below, the negative result is documented and llama.cpp is not complicated; only the half-life follow-up stays open. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
 
 ### Objective and constraints
 
@@ -865,7 +865,34 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
       - **same token:** a mix of 0.75 (hr: transitions alone). 32.3% (0.1%) at k 6, 76.0% (29.9%) at 48; leaving one workload out 32.6% / 76.3%.
       - For comparison, last-N with n 1 covers 34.4% with 6.3 candidates.
     - The prefetch budget is k × 1.7 MB per predicted step: 509 MB per IQ3 token at k 6 ([docs/expert-policy.md](docs/expert-policy.md)).
-- [ ] If heuristics plateau, train a small multi-label model (linear classifier or tiny MLP/GRU) against the recorded expert-ID sets. Use chronological/workload-held-out splits, calibrated scores and ablations; do not train on the target token's own router logits or hidden state unless those are actually available before the intended prefetch deadline. (2026-10-14) — condition met: the decayed-count Markov predictor did not pass the Stage B gate (below). Whether to train a model is the user's call; nothing has been trained.
+- [x] If heuristics plateau, train a small multi-label model (linear classifier or tiny MLP/GRU) against the recorded expert-ID sets. Use chronological/workload-held-out splits, calibrated scores and ablations; do not train on the target token's own router logits or hidden state unless those are actually available before the intended prefetch deadline. (2026-10-14) — The condition was met: the Markov predictor did not pass the gate (below). The user chose, on 2026-10-14, a linear logistic model per layer trained on every recorded training-prefix token, prompts included (`locality.Linear`, `internal/locality/linear.go`).
+    - **Model.** Its inputs are two multi-hot blocks of known experts, with 768 × 384 weights per layer plus a bias, fitted by AdaGrad on the binary cross-entropy of all 384 outputs.
+      - next token: token t's set (A) and t−1's (B) predict token t+1 in the layer;
+      - same token: the token's set two layers below the target (A) and the previous token's set in the target layer (B).
+      - Only expert IDs are recorded, so no router logits or hidden states are used.
+    - **Splits.**
+      - Fit on the training prefix before its last answer's decoded tokens.
+      - Choose the L2 penalty (10⁻³, 10⁻², 10⁻¹) and the epochs (1–6) on those decoded tokens, then freeze.
+      - Leaving one workload out, fit and choose on the other workloads' prefixes.
+      - The first grid, 0–10⁻⁴, put every choice at its largest penalty, so it was moved up. Now 10⁻² is chosen for 14 of 16 own fits; research's next-token fits take the edge, 10⁻¹ with 5–6 epochs.
+    - **Calibration.** A temperature per fit is fitted on the validation tokens: 1.00–1.26, which flattens the scores. Over the top 48, the raw scores expected to cover fewer experts than they did: 0.81 M against 0.90 M for IQ3 next token, 0.93 M after the temperature. On the test suffixes the ECE over the top 48 drops from 0.019 to 0.012 (next token) and from 0.026 to 0.016 (same token, IQ3).
+    - **Ablations.** Block A alone, block B alone, and leaving one workload out.
+    - **Checks:**
+      - `TestLinearLearns`: a shifted-expert mapping is learned exactly; dropping block A fails it.
+      - `TestLinearInputs`: feeding the target's own set fails it.
+      - `TestLinearNoLeak` and `TestLinearNoLeakCmd`: the fit reads no token after its targets. Redrawing the test suffix changes no choice, temperature or training replay. Validating on the test suffix, fitting on the validation answer, or fitting the temperature on the test suffix fails them.
+      - `TestLinearData`: leaving one workload out with the held-out workload in fails it.
+      - `TestLinearCausal`, `TestLinearOnline`, `TestTemperature`, `TestCalibration`.
+      - On the real traces, 16 new PASS lines show the frozen model replaying online exactly as its ranking (80 PASS lines in all; the run takes 14 minutes, most of it training).
+    - **Test-suffix recall** (IQ3; Q8_0 within 0.1 points), experts covered (whole sets):
+      - next token: 29.6% (0.2%) at k 6 and 68.2% (19.7%) at k 48, below the Markov predictor's 31.6% and 75.5%;
+      - same token: 36.1% (0.5%) at k 6 and 49.6% at 12, above the Markov predictor's 32.3% and 46.2%, but 73.1% against 76.0% at 48.
+      - Block A carries most of it (same token, A alone: 31.2% at k 6).
+      - Leaving one workload out loses 5–7 points (29.2% at k 6, same token), so what it learns is largely workload-specific.
+    - **Cost.** `BenchmarkLinearStep` measures 6.5–6.7 µs per decoded layer step (`-linear-us` 6.8 µs, Apple M5 Pro), 0.34 ms per token (2.2% of 15.7 ms); the weights take 59 MB.
+    - **Gate: not retained** (none of 12 variants), with or without its cost. It prefetches far more than the Markov predictor, and many prefetches are used (IQ3 same token at 128 experts per layer on SSD: 29,829 used, 82.9% in time). But it wastes 10–56 MB/token and crowds out cached experts.
+      - At 128 on SSD: 24.9 (next token) and 25.3 ms/token (same token) against 23.3 for the best Stage A policy, 24.6 and 25.0 without the cost.
+      - With the cost it is at least 2.2% slower everywhere, and without the cost it is never faster ([docs/expert-policy.md](docs/expert-policy.md)).
 - [x] Evaluate two prediction horizons separately: next-token same-layer (can prefetch during other work) and same-token later-layer (only after preceding-layer activations exist). Explicitly calculate available overlap time from the layer execution schedule. No speculative claim that the next token is known before sampling. (2026-10-14) — Each horizon is ranked, tuned, replayed and gated on its own. The next-token horizon uses only earlier tokens' experts, so nothing is known before sampling.
     - `Horizon.Lead` and `LeadSeconds` give the lead from the replay's schedule (`transfer.go`, a decoded layer computing 0.314 ms once its experts are there).
       - **next token:** 49 steps, 15.38 ms, time for 45 / 226 / 905 IQ3 experts on SSD / PCIe / RAM (Q8_0 18 / 92 / 368).
