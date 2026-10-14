@@ -25,8 +25,8 @@
 // straight through and is counted for both apart (locality.ReplaySegments), so the test suffix
 // starts warm from the prefix. LFU's half-life is replayed at every value of a grid and chosen
 // per size on training prefixes only: the workload's own, the other workloads' (leave one
-// workload out) and the other model's; the choice in hindsight on the test suffix is reported as
-// the leaky bound of tuning.
+// workload out) and, with exactly two -models, the other model's; the choice in hindsight on the
+// test suffix is reported as the leaky bound of tuning.
 //
 // For each model and workload it reads <dir>/<workload>.<model>.experts.npy and the token IDs
 // <dir>/<workload>.tokens.npy, and the answers' prompt lengths and generated tokens from

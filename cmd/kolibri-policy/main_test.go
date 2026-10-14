@@ -188,6 +188,12 @@ func TestTune(t *testing.T) {
 		b.OtherModel == nil || a2.OtherModel != nil || a2.LOWO == nil || a2.LOWO.HalfLife != 64 {
 		t.Fatalf("B/w1 %+v, A/w2 %+v", b, a2)
 	}
+	// a third model leaves no single other model to tune on, and is never pooled with B
+	grids["C"] = map[string]Grid{"w1": g([]int64{1, 9}, []int64{4, 4})}
+	if c := tune(grids, "A", "w1", 0, 128, 512); c.OtherModel != nil || c.LOWO.HalfLife != 512 {
+		t.Fatalf("with three models: %+v", c)
+	}
+	delete(grids, "C")
 	// the test suffix moves only hindsight
 	grids["A"]["w1"] = g([]int64{10, 20}, []int64{1, 7})
 	got = tune(grids, "A", "w1", 0, 128, 512)

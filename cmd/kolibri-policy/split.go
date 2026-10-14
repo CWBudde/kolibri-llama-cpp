@@ -92,8 +92,9 @@ type Choice struct {
 
 // Tuning is LFU's half-life for one workload at one size: the untuned default and the half-life
 // tuned on the workload's own training prefix, on the other workloads' training prefixes (leave
-// one workload out), on the other models' training prefixes of the workload, and in hindsight on
+// one workload out), on the other model's training prefix of the workload, and in hindsight on
 // the test suffix itself. Only the last sees test data: it is the bound of tuning, not a result.
+// The other model's choice needs exactly one other model: more are never pooled into one.
 type Tuning struct {
 	ExpertsPerLayer int     `json:"experts_per_layer"`
 	Default         Choice  `json:"default"`
@@ -115,7 +116,8 @@ func argmin(v []int64) int {
 }
 
 // tune chooses the half-life for grids[model][wl] at size index s; grids holds every model's
-// workloads, all on the same half-lives and sizes.
+// workloads, all on the same half-lives and sizes. The other model's choice is nil unless grids
+// holds exactly two models.
 func tune(grids map[string]map[string]Grid, model, wl string, s, size, def int) Tuning {
 	own := grids[model][wl]
 	pick := func(score func(h int) int64) Choice {
@@ -154,7 +156,7 @@ func tune(grids map[string]map[string]Grid, model, wl string, s, size, def int) 
 		Default:         Choice{def, own.Test[d][s]},
 		Own:             pick(func(h int) int64 { return own.Train[h][s] }),
 		LOWO:            sum(func(m, w string) bool { return m == model && w != wl }),
-		OtherModel:      sum(func(m, w string) bool { return m != model && w == wl }),
+		OtherModel:      sum(func(m, w string) bool { return len(grids) == 2 && m != model && w == wl }),
 		Hindsight:       pick(func(h int) int64 { return own.Test[h][s] }),
 	}
 }
