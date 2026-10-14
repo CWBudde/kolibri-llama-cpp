@@ -55,26 +55,28 @@ func halfLives(def int) []int {
 }
 
 // Grid is a workload's LFU decode miss bytes per half-life and size, in its training prefix and in
-// its test suffix.
+// its test suffix, and the replays they come from.
 type Grid struct {
 	HalfLives []int     `json:"half_lives"`
 	Train     [][]int64 `json:"train_decode_miss_bytes"`
 	Test      [][]int64 `json:"test_decode_miss_bytes"`
+	runs      []Runs
 }
 
-// lfuGrid replays LFU at every half-life and size, untimed.
-func lfuGrid(sel locality.Selections, spans []locality.Span, cut int, m Model, sizes, hs []int) (Grid, error) {
+// lfuGrid replays LFU at every half-life and size.
+func lfuGrid(sel locality.Selections, spans []locality.Span, cut int, m Model, sizes, hs []int,
+	timing locality.Timing) (Grid, error) {
 	bases := make([]baseline, len(hs))
 	for i, h := range hs {
 		bases[i] = baseline{fmt.Sprintf("LFU %d", h), false, func(c int) (locality.Policy, error) {
 			return locality.NewLFU(m.NExpert, m.bytes(), m.budget(c), h), nil
 		}}
 	}
-	runs, err := replayAll(sel, spans, cut, m, sizes, bases, locality.Timing{})
+	runs, err := replayAll(sel, spans, cut, m, sizes, bases, timing)
 	if err != nil {
 		return Grid{}, err
 	}
-	g := Grid{HalfLives: hs, Train: make([][]int64, len(hs)), Test: make([][]int64, len(hs))}
+	g := Grid{HalfLives: hs, Train: make([][]int64, len(hs)), Test: make([][]int64, len(hs)), runs: runs}
 	for i := range hs {
 		for _, r := range runs[i].Runs {
 			g.Train[i] = append(g.Train[i], r.Split.Train.Decode.MissBytes)
