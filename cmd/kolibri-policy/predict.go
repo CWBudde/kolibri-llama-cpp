@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	markovHalfLives = []int{64, 256, 1024, 4096}
+	markovHalfLives = []int{1, 4, 16, 64, 256, 1024, 4096}
 	markovMixes     = []float64{0, 0.25, 0.5, 0.75, 1}
 	markovKs        = []int{6, 12, 24, 48}
 	horizons        = []locality.Horizon{locality.NextToken, locality.SameToken}
