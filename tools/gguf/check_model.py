@@ -112,7 +112,7 @@ class Runner:
                nodes: dict[str, list[str]] | None = None, capture: dict | None = None,
                chunks: list[int] | None = None, n_ctx: int = 256, outputs: list[int] | None = None,
                rows: dict[str, tuple[int, list[int]]] | None = None, cpu_moe: bool = False, no_repack: bool = False,
-               return_logits: bool = True, **ctx_params):
+               return_logits: bool = True, expert_cache: dict | None = None, n_gpu_layers: int = -1, **ctx_params):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
         overrides maps GGUF keys to int, float or bool values that replace the file's.
         If nodes is given, it receives every graph node's name with the names of its inputs.
@@ -130,13 +130,15 @@ class Runner:
         while the rest stays on dev. no_repack keeps the weights in their file layout, as llama-cli
         --no-repack, so a CPU model larger than memory stays mmapped. With return_logits false the
         output positions are still computed (the last layer keeps only their rows) but their logits
-        are not kept, and the result is None. ctx_params set further
+        are not kept, and the result is None. expert_cache sets llama_expert_cache_params fields
+        (n_slots, prefetch_k, stats_path, ...) and turns the expert cache on. n_gpu_layers offloads
+        only that many layers to dev, the rest stays on the CPU. ctx_params set further
         llama_context_params fields (swa_full, flash_attn_type, type_k, ...)."""
         import numpy as np
 
         self.log.clear()
         devs = self.ffi.new("ggml_backend_dev_t[]", [dev, self.ffi.NULL])
-        mparams = self.ll.model_default_params(devices=devs, n_gpu_layers=-1, use_extra_bufts=not no_repack)
+        mparams = self.ll.model_default_params(devices=devs, n_gpu_layers=n_gpu_layers, use_extra_bufts=not no_repack)
         if overrides:
             kv = self.ffi.new("struct llama_model_kv_override[]", len(overrides) + 1)  # zeroed: the last ends the list
             for o, (key, val) in zip(kv, overrides.items()):
@@ -155,6 +157,19 @@ class Runner:
             buft = self.ffi.new("struct llama_model_tensor_buft_override[]", 2)  # zeroed: the last ends the list
             buft[0].pattern, buft[0].buft = pattern, self.lib.ggml_backend_dev_buffer_type(cpu)
             mparams.tensor_buft_overrides = buft
+        keepalive = []
+        if expert_cache is not None:
+            ec = self.ffi.new("struct llama_expert_cache_params *", self.lib.llama_expert_cache_default_params())
+            for key, val in expert_cache.items():
+                if isinstance(val, str):
+                    val = self.ffi.new("char[]", val.encode())
+                    keepalive.append(val)
+                elif isinstance(val, list):  # n_slots_layer
+                    ec.n_layer_slots = len(val)
+                    val = self.ffi.new("int32_t[]", val)
+                    keepalive.append(val)
+                setattr(ec, key, val)
+            mparams.expert_cache = ec
         model = self.lib.llama_model_load_from_file(str(path).encode(), mparams)
         if not model:
             raise RuntimeError("load failed: " + self.errors())
