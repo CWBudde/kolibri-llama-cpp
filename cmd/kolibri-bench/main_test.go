@@ -77,6 +77,24 @@ func TestServerArgs(t *testing.T) {
 	}
 }
 
+func TestFits(t *testing.T) {
+	const gib = 1 << 30
+	resident := config{Args: nil}
+	// IQ3 is 33.1 GiB; with every weight on Metal it is wired, and 16 GiB more
+	// is beyond 48 GiB: the run that hung this Mac on 2026-10-15
+	if ok, why := fits(resident, 16, 35556257600, 48*gib); ok || !strings.Contains(why, "33.1 GiB") {
+		t.Errorf("resident IQ3 at 16 GiB: fits = %v, %q", ok, why)
+	}
+	if ok, _ := fits(resident, 0, 35556257600, 48*gib); !ok {
+		t.Error("resident IQ3 without a ceiling does not fit")
+	}
+	for _, args := range [][]string{{"--cpu-moe"}, {"--expert-cache", "128"}} {
+		if ok, why := fits(config{Args: args}, 16, 83135393312, 48*gib); !ok {
+			t.Errorf("%v keeps the experts pageable, yet does not fit: %s", args, why)
+		}
+	}
+}
+
 func TestMedianRange(t *testing.T) {
 	if got := median([]float64{3, 1, 2}); got != 2 {
 		t.Errorf("median odd = %v", got)

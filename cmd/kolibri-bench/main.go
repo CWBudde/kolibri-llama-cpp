@@ -22,7 +22,8 @@
 // Each run writes <out>/<config>/<ceiling>g/r<rep>/run.json; a run that has
 // one is skipped, so an interrupted benchmark resumes. A server that fails to
 // load or a request that fails is recorded, not fatal: at a ceiling it is a
-// result. The report goes to stdout and <out>/report.md; it exits 1 if an
+// result. A resident run whose wired weights and hog exceed the memory is
+// recorded as "does not fit" without starting it (see fits). The report goes to stdout and <out>/report.md; it exits 1 if an
 // exact equivalence fails or a cache run failed to load an expert.
 package main
 
@@ -126,6 +127,25 @@ func (m matrix) config(name string) (config, bool) {
 
 func usesCache(args []string) bool { return slices.Contains(args, "--expert-cache") }
 
+// fits reports whether a run can start: with neither --cpu-moe nor
+// --expert-cache, -ngl 99 puts every weight into Metal buffers, which are
+// wired like the hog's memory, and the two together must stay below the
+// physical memory. Beyond it macOS does not fail the load, it hangs: on
+// 2026-10-15 IQ3 resident beside a 16 GiB hog ended in a watchdog panic.
+// Experts that stay pageable (on the CPU or in the cache) always fit.
+func fits(c config, ceilingGiB float64, modelBytes, memBytes int64) (bool, string) {
+	if usesCache(c.Args) || slices.Contains(c.Args, "--cpu-moe") {
+		return true, ""
+	}
+	const gib = 1 << 30
+	need := float64(modelBytes)/gib + ceilingGiB
+	if need < float64(memBytes)/gib {
+		return true, ""
+	}
+	return false, fmt.Sprintf("the resident weights (%.1f GiB) and the %g GiB hog are %.1f GiB wired, beyond the %.0f GiB of memory",
+		float64(modelBytes)/gib, ceilingGiB, need, float64(memBytes)/gib)
+}
+
 func (m matrix) serverArgs(c config, port int, stats string) []string {
 	args := append([]string{"-m", c.Model, "--port", strconv.Itoa(port)}, m.ServerArgs...)
 	args = append(args, c.Args...)
@@ -139,6 +159,7 @@ const (
 	statusOK            = "ok"
 	statusLoadFailed    = "load failed"
 	statusRequestFailed = "request failed"
+	statusDoesNotFit    = "does not fit" // not started, see fits
 )
 
 type request struct {
@@ -285,6 +306,7 @@ type bench struct {
 	every     time.Duration
 	reqTO     time.Duration
 	loadTO    time.Duration
+	memBytes  int64 // hw.memsize
 }
 
 func (b *bench) logf(format string, args ...any) {
@@ -353,6 +375,14 @@ func (b *bench) run(spec runSpec) (res runResult) {
 	}()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Fatal(err)
+	}
+	st, err := os.Stat(spec.Config.Model)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if ok, why := fits(spec.Config, spec.Ceiling, st.Size(), b.memBytes); !ok {
+		res.Status, res.Error = statusDoesNotFit, why
+		return res
 	}
 
 	wait, m, err := waitQuiet(b.quiet, b.every, b.logf)
@@ -556,6 +586,13 @@ func main() {
 		b := &bench{m: m, out: dir, bin: filepath.Join(dir, "bin"), server: abs(*server), manifest: abs(*manifest),
 			workloads: abs(*workloads), port: *port, quiet: quietRule{*quietLoad, *quietSwap, 2},
 			every: 30 * time.Second, reqTO: 30 * time.Minute, loadTO: 20 * time.Minute}
+		mem, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
+		if err != nil {
+			log.Fatalf("sysctl hw.memsize: %v", err)
+		}
+		if b.memBytes, err = strconv.ParseInt(strings.TrimSpace(string(mem)), 10, 64); err != nil {
+			log.Fatalf("hw.memsize %q: %v", mem, err)
+		}
 		build := exec.Command("go", "build", "-o", b.bin+"/", "./cmd/kolibri-stream", "./cmd/kolibri-evict", "./cmd/kolibri-memhog")
 		build.Stdout, build.Stderr = os.Stderr, os.Stderr
 		if err := build.Run(); err != nil {
