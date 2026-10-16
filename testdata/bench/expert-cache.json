@@ -12,7 +12,7 @@
     {"name": "iq3-resident-ub21", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["-ub", "21"], "ceilings_gib": [0], "reps": 1},
     {"name": "q8-cache128", "model": "~/models/Kolibri-1-Q8_0.gguf", "args": ["--expert-cache", "128"], "ceilings_gib": [0], "reps": 3},
     {"name": "q8-cache128-prefetch12", "model": "~/models/Kolibri-1-Q8_0.gguf", "args": ["--expert-cache", "128", "--expert-prefetch", "12"], "ceilings_gib": [0], "reps": 3},
-    {"name": "q8-cpu-moe", "model": "~/models/Kolibri-1-Q8_0.gguf", "args": ["--cpu-moe"], "ceilings_gib": [0], "reps": 3}
+    {"name": "q8-cpu-moe", "model": "~/models/Kolibri-1-Q8_0.gguf", "args": ["--cpu-moe", "--no-repack"], "ceilings_gib": [0], "reps": 3}
   ],
   "equivalence": [
     {"reference": "iq3-resident-ub21", "arms": ["iq3-cache128", "iq3-cache128-prefetch12"], "exact": true},
