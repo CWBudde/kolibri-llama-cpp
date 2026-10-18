@@ -19,6 +19,8 @@
 //  6. stops the server with SIGINT, so it writes --expert-cache-stats, and
 //     the hog.
 //
+// The machine is kept from idle sleep (caffeinate -i) while the driver runs.
+//
 // Each run writes <out>/<config>/<ceiling>g/r<rep>/run.json; a run that has
 // one is skipped, so an interrupted benchmark resumes. A server that fails to
 // load or a request that fails is recorded, not fatal: at a ceiling it is a
@@ -586,6 +588,13 @@ func main() {
 		b := &bench{m: m, out: dir, bin: filepath.Join(dir, "bin"), server: abs(*server), manifest: abs(*manifest),
 			workloads: abs(*workloads), port: *port, quiet: quietRule{*quietLoad, *quietSwap, 2},
 			every: 30 * time.Second, reqTO: 30 * time.Minute, loadTO: 20 * time.Minute}
+		// rates timed across a sleep are meaningless; on 2026-10-16 idle
+		// sleep spread four runs over hours
+		awake := exec.Command("caffeinate", "-i", "-w", strconv.Itoa(os.Getpid()))
+		if err := awake.Start(); err != nil {
+			log.Fatalf("caffeinate: %v", err)
+		}
+		go awake.Wait()
 		mem, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
 		if err != nil {
 			log.Fatalf("sysctl hw.memsize: %v", err)
