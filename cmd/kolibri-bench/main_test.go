@@ -35,14 +35,26 @@ func TestQuiet(t *testing.T) {
 		samples []machine
 		want    bool
 	}{
-		{"too few samples", []machine{{1, 100}, {1, 100}}, false},
-		{"quiet", []machine{{1, 100}, {2, 150}, {2.9, 199}}, true},
-		{"load too high", []machine{{1, 100}, {1, 100}, {3, 100}}, false},
-		{"swap growing", []machine{{1, 100}, {1, 150}, {1, 200}}, false},
-		{"only the last window counts", []machine{{9, 0}, {1, 100}, {1, 120}, {1, 130}}, true},
+		{"too few samples", []machine{{1, 100, true}, {1, 100, true}}, false},
+		{"quiet", []machine{{1, 100, true}, {2, 150, true}, {2.9, 199, true}}, true},
+		{"load too high", []machine{{1, 100, true}, {1, 100, true}, {3, 100, true}}, false},
+		{"swap growing", []machine{{1, 100, true}, {1, 150, true}, {1, 200, true}}, false},
+		{"only the last window counts", []machine{{9, 0, true}, {1, 100, true}, {1, 120, true}, {1, 130, true}}, true},
+		{"on battery", []machine{{1, 100, true}, {1, 100, true}, {1, 100, false}}, false},
 	} {
 		if got := q.quiet(c.samples); got != c.want {
 			t.Errorf("%s: quiet = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestParseOnAC(t *testing.T) {
+	for s, want := range map[string]bool{
+		"Now drawing from 'AC Power'\n -InternalBattery-0 (id=7864419)\t80%; charging; present: true\n":         true,
+		"Now drawing from 'Battery Power'\n -InternalBattery-0 (id=7864419)\t34%; discharging; present: true\n": false,
+	} {
+		if got := parseOnAC(s); got != want {
+			t.Errorf("parseOnAC(%q) = %v, want %v", s, got, want)
 		}
 	}
 }

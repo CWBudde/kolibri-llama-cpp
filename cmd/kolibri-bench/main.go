@@ -8,8 +8,9 @@
 //	go run ./cmd/kolibri-bench -matrix testdata/bench/expert-cache.json -out ~/models/eval/expert-bench -report
 //
 // Every run of a config, a ceiling and a repetition:
-//  1. waits until the machine is quiet: a 1-minute load below -quiet-load and
-//     swap growing by less than -quiet-swap MiB over the last minute;
+//  1. waits until the machine is quiet: a 1-minute load below -quiet-load,
+//     swap growing by less than -quiet-swap MiB over the last minute, and
+//     AC power;
 //  2. evicts the GGUF from the page cache (cmd/kolibri-evict), for a cold start;
 //  3. at a ceiling above 0, wires that much memory (cmd/kolibri-memhog);
 //  4. starts llama-server and times it until /health answers;
@@ -19,7 +20,8 @@
 //  6. stops the server with SIGINT, so it writes --expert-cache-stats, and
 //     the hog.
 //
-// The machine is kept from idle sleep (caffeinate -i) while the driver runs.
+// A run starts only on AC power, and the machine is kept from sleep
+// (caffeinate -i -s) while the driver runs.
 //
 // Each run writes <out>/<config>/<ceiling>g/r<rep>/run.json; a run that has
 // one is skipped, so an interrupted benchmark resumes. A server that fails to
@@ -201,6 +203,7 @@ func (r runResult) key() string { return runKey(r.Config, r.CeilingGiB, r.Rep) }
 type machine struct {
 	Load1   float64
 	SwapMiB float64
+	OnAC    bool
 }
 
 type quietRule struct {
@@ -209,15 +212,20 @@ type quietRule struct {
 	Window           int // samples back to compare the swap with
 }
 
-// quiet holds if the last sample's load is below the limit and swap grew by
-// less than the limit over the window.
+// quiet holds if the last sample's load is below the limit, swap grew by
+// less than the limit over the window, and the machine runs on AC power: on
+// battery a closed Mac sleeps despite caffeinate, and the valid runs were all
+// on AC.
 func (q quietRule) quiet(s []machine) bool {
 	if len(s) <= q.Window {
 		return false
 	}
 	last, then := s[len(s)-1], s[len(s)-1-q.Window]
-	return last.Load1 < q.MaxLoad && last.SwapMiB-then.SwapMiB < q.MaxSwapGrowthMiB
+	return last.OnAC && last.Load1 < q.MaxLoad && last.SwapMiB-then.SwapMiB < q.MaxSwapGrowthMiB
 }
+
+// parseOnAC reads pmset -g ps.
+func parseOnAC(s string) bool { return strings.Contains(s, "'AC Power'") }
 
 func parseLoadavg(s string) (float64, error) {
 	f := strings.Fields(strings.Trim(strings.TrimSpace(s), "{}"))
@@ -250,7 +258,11 @@ func sample() (machine, error) {
 	if m.Load1, err = parseLoadavg(string(la)); err != nil {
 		return m, err
 	}
-	m.SwapMiB, err = parseSwapUsed(string(sw))
+	if m.SwapMiB, err = parseSwapUsed(string(sw)); err != nil {
+		return m, err
+	}
+	ps, err := exec.Command("pmset", "-g", "ps").Output()
+	m.OnAC = parseOnAC(string(ps))
 	return m, err
 }
 
@@ -268,7 +280,7 @@ func waitQuiet(q quietRule, every time.Duration, logf func(string, ...any)) (tim
 			return time.Since(start), m, nil
 		}
 		if len(hist)%10 == 0 {
-			logf("waiting for a quiet machine for %s: load %.2f, swap %.0f MiB", time.Since(start).Round(time.Second), m.Load1, m.SwapMiB)
+			logf("waiting for a quiet machine for %s: load %.2f, swap %.0f MiB, on AC %v", time.Since(start).Round(time.Second), m.Load1, m.SwapMiB, m.OnAC)
 		}
 		time.Sleep(every)
 	}
@@ -590,7 +602,7 @@ func main() {
 			every: 30 * time.Second, reqTO: 30 * time.Minute, loadTO: 20 * time.Minute}
 		// rates timed across a sleep are meaningless; on 2026-10-16 idle
 		// sleep spread four runs over hours
-		awake := exec.Command("caffeinate", "-i", "-w", strconv.Itoa(os.Getpid()))
+		awake := exec.Command("caffeinate", "-i", "-s", "-w", strconv.Itoa(os.Getpid()))
 		if err := awake.Start(); err != nil {
 			log.Fatalf("caffeinate: %v", err)
 		}
