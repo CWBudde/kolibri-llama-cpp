@@ -375,40 +375,44 @@ func stop(cmd *exec.Cmd, done <-chan error, timeout time.Duration) {
 	}
 }
 
-func (b *bench) run(spec runSpec) (res runResult) {
+// run runs one spec and writes its run.json. An error is the driver's own,
+// not a result: it is returned only after the server and the hog are
+// stopped, and no run.json is written, so a resume repeats the run.
+func (b *bench) run(spec runSpec) (res runResult, err error) {
 	dir := filepath.Join(b.out, spec.key())
 	res = runResult{Config: spec.Config.Name, CeilingGiB: spec.Ceiling, Rep: spec.Rep, Status: statusOK}
 	defer func() {
-		data, err := json.MarshalIndent(res, "", "  ")
-		if err == nil {
-			err = os.WriteFile(filepath.Join(dir, "run.json"), append(data, '\n'), 0o644)
-		}
 		if err != nil {
-			log.Fatal(err)
+			return
 		}
+		data, merr := json.MarshalIndent(res, "", "  ")
+		if merr == nil {
+			merr = os.WriteFile(filepath.Join(dir, "run.json"), append(data, '\n'), 0o644)
+		}
+		err = merr
 	}()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		log.Fatal(err)
+		return res, err
 	}
 	st, err := os.Stat(spec.Config.Model)
 	if err != nil {
-		log.Fatal(err)
+		return res, err
 	}
 	if ok, why := fits(spec.Config, spec.Ceiling, st.Size(), b.memBytes); !ok {
 		res.Status, res.Error = statusDoesNotFit, why
-		return res
+		return res, nil
 	}
 
 	wait, m, err := waitQuiet(b.quiet, b.every, b.logf)
 	if err != nil {
-		log.Fatal(err)
+		return res, err
 	}
 	res.QuietWaitS, res.Load1, res.SwapMiB = wait.Seconds(), m.Load1, m.SwapMiB
 	res.Started = time.Now()
 
 	ev, err := exec.Command(filepath.Join(b.bin, "kolibri-evict"), spec.Config.Model).CombinedOutput()
 	if err != nil {
-		log.Fatalf("kolibri-evict: %v: %s", err, ev)
+		return res, fmt.Errorf("kolibri-evict: %v: %s", err, ev)
 	}
 	res.Evict = strings.TrimSpace(string(ev))
 
@@ -416,7 +420,7 @@ func (b *bench) run(spec runSpec) (res runResult) {
 	if spec.Ceiling > 0 {
 		hog, line, err := b.startHog(spec.Ceiling, dir)
 		if err != nil {
-			log.Fatal(err)
+			return res, err
 		}
 		res.Hog = line
 		hogPids = append(hogPids, hog.Process.Pid)
@@ -429,14 +433,14 @@ func (b *bench) run(spec runSpec) (res runResult) {
 	serverLog := filepath.Join(dir, "server.log")
 	lf, err := os.Create(serverLog)
 	if err != nil {
-		log.Fatal(err)
+		return res, err
 	}
 	defer lf.Close()
 	srv := exec.Command(b.server, b.m.serverArgs(spec.Config, b.port, filepath.Join(dir, "stats.json"))...)
 	srv.Stdout, srv.Stderr = lf, lf
 	t0 := time.Now()
 	if err := srv.Start(); err != nil {
-		log.Fatal(err)
+		return res, err
 	}
 	done := make(chan error, 1)
 	go func() { done <- srv.Wait() }()
@@ -488,7 +492,7 @@ func (b *bench) run(spec runSpec) (res runResult) {
 		case err := <-done:
 			exited = true
 			res.Status, res.Error, res.LogTail = statusLoadFailed, fmt.Sprintf("llama-server exited while loading: %v", err), tail(serverLog, 15)
-			return res
+			return res, nil
 		default:
 		}
 		if resp, err := http.Get(health); err == nil {
@@ -499,7 +503,7 @@ func (b *bench) run(spec runSpec) (res runResult) {
 		}
 		if time.Now().After(deadline) {
 			res.Status, res.Error, res.LogTail = statusLoadFailed, fmt.Sprintf("no /health after %s", b.loadTO), tail(serverLog, 15)
-			return res
+			return res, nil
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -522,21 +526,21 @@ func (b *bench) run(spec runSpec) (res runResult) {
 		out, err := cmd.CombinedOutput()
 		cancel()
 		if werr := os.WriteFile(filepath.Join(rdir+".txt"), out, 0o644); werr != nil {
-			log.Fatal(werr)
+			return res, werr
 		}
 		if err != nil {
 			q.Error = fmt.Sprintf("%v: %s", err, tail(rdir+".txt", 3))
 			res.Requests = append(res.Requests, q)
 			res.Status, res.Error, res.LogTail = statusRequestFailed, q.Error, tail(serverLog, 15)
-			return res
+			return res, nil
 		}
 		data, err := os.ReadFile(filepath.Join(rdir, "summary.json"))
 		if err != nil {
-			log.Fatal(err)
+			return res, err
 		}
 		var s streamSummary
 		if err := json.Unmarshal(data, &s); err != nil {
-			log.Fatal(err)
+			return res, fmt.Errorf("%s: %v", filepath.Join(rdir, "summary.json"), err)
 		}
 		q.Summary = &s
 		res.Requests = append(res.Requests, q)
@@ -548,7 +552,7 @@ func (b *bench) run(spec runSpec) (res runResult) {
 		b.logf("%s: %s %s: prompt %.1f t/s, decode %.2f t/s, p95 %.1f ms", spec.key(), q.Phase, q.Workload,
 			s.Timings.PromptPerSecond, s.DecodeTokensPerSecond, s.LatencyMs.P95)
 	}
-	return res
+	return res, nil
 }
 
 func expandHome(p string) string {
@@ -634,7 +638,10 @@ func main() {
 				log.Fatal(err)
 			}
 			b.logf("run %d of %d: %s", i+1, len(specs), spec.key())
-			r := b.run(spec)
+			r, err := b.run(spec)
+			if err != nil {
+				log.Fatalf("%s: %v", spec.key(), err)
+			}
 			b.logf("%s: %s %s (others' CPU %.0f%% mean, %.0f%% max)", spec.key(), r.Status, r.Error, r.OthersCPU.Mean, r.OthersCPU.Max)
 		}
 	}
