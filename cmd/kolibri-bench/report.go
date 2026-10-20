@@ -155,24 +155,71 @@ func perRep(runs []runResult, cfg string, ceiling float64, f func(*streamSummary
 }
 
 type verdict struct {
-	Gate      gate
-	Baseline  string // the best baseline that runs at this ceiling; "" if none does
-	Candidate []float64
-	Best      []float64 // the baseline's decode tokens/s per repetition
-	CandP95   []float64
-	BestP95   []float64
-	DecodeWin bool
-	TailWin   bool
-	Pass      bool
+	Gate       gate
+	Incomplete string // the configs with some but not all repetitions completed; no verdict then
+	Baseline   string // the best baseline that runs at this ceiling; "" if none does
+	Candidate  []float64
+	Best       []float64 // the baseline's decode tokens/s per repetition
+	CandP95    []float64
+	BestP95    []float64
+	DecodeWin  bool
+	TailWin    bool
+	Pass       bool
+}
+
+// expectedRequests is the number of requests the arms make over all their
+// ceilings and repetitions: the cold one and the warm ones per run.
+func (m matrix) expectedRequests(arms []string) int {
+	n := 0
+	for _, name := range arms {
+		if c, ok := m.config(name); ok {
+			n += c.Reps * len(c.Ceilings) * (1 + len(m.Warm))
+		}
+	}
+	return n
+}
+
+// completed counts a config's completed repetitions at a ceiling against the
+// configured ones.
+func completed(m matrix, runs []runResult, cfg string, ceiling float64) (ok, want int) {
+	if c, found := m.config(cfg); found && slices.Contains(c.Ceilings, ceiling) {
+		want = c.Reps
+	}
+	for _, r := range runs {
+		if r.Config == cfg && r.CeilingGiB == ceiling && r.Status == statusOK {
+			ok++
+		}
+	}
+	return ok, want
 }
 
 // evalGate applies the performance gate fixed in the plan: the candidate wins
 // against the baseline with the highest median warm decode tokens/s that runs
 // at the same ceiling if every repetition of the candidate is faster than
 // that baseline's fastest one, or if every one of its warm p95 latencies is
-// below the baseline's lowest one.
-func evalGate(g gate, runs []runResult) verdict {
+// below the baseline's lowest one. A config runs at a ceiling if all its
+// repetitions completed and does not if all were recorded and none
+// completed; anything in between, missing runs included, withholds the
+// verdict.
+func evalGate(m matrix, g gate, runs []runResult) verdict {
 	v := verdict{Gate: g}
+	var partial []string
+	for _, name := range append([]string{g.Candidate}, g.Baselines...) {
+		ok, want := completed(m, runs, name, g.CeilingGiB)
+		recorded := 0
+		for _, r := range runs {
+			if r.Config == name && r.CeilingGiB == g.CeilingGiB {
+				recorded++
+			}
+		}
+		if ok != want && !(ok == 0 && recorded == want) {
+			partial = append(partial, fmt.Sprintf("%s %d of %d", name, ok, want))
+		}
+	}
+	if len(partial) > 0 {
+		v.Incomplete = strings.Join(partial, ", ")
+		return v
+	}
 	v.Candidate = perRep(runs, g.Candidate, g.CeilingGiB, decodeRate)
 	v.CandP95 = perRep(runs, g.Candidate, g.CeilingGiB, p95)
 	best := math.Inf(-1)
@@ -200,8 +247,8 @@ type comparison struct {
 	Diff     int // the first differing token position, -1 if equal
 }
 
-// checkEquivalence compares the token IDs of every request of the arms with
-// the reference's for the same workload.
+// checkEquivalence compares the token IDs of every request of the arms' completed
+// runs with the reference's for the same workload.
 func checkEquivalence(e equivalence, runs []runResult) []comparison {
 	ref := map[string][]int{}
 	for _, r := range runs {
@@ -216,8 +263,8 @@ func checkEquivalence(e equivalence, runs []runResult) []comparison {
 	}
 	var out []comparison
 	for _, r := range runs {
-		if !slices.Contains(e.Arms, r.Config) {
-			continue
+		if !slices.Contains(e.Arms, r.Config) || r.Status != statusOK {
+			continue // a run that did not complete counts as missing
 		}
 		for _, q := range r.Requests {
 			want, ok := ref[q.Workload]
@@ -311,14 +358,15 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 				diffs = append(diffs, fmt.Sprintf("%s %s %s at token %d", c.Run, c.Phase, c.Workload, c.Diff))
 			}
 		}
+		want := m.expectedRequests(e.Arms)
 		kind := "INFO"
 		if e.Exact {
 			kind = "PASS"
-			if len(diffs) > 0 || len(res) == 0 {
+			if len(diffs) > 0 || equal != want {
 				kind, allEqual = "FAIL", false
 			}
 		}
-		fmt.Fprintf(w, "- %s equivalence %s against %s: %d of %d requests generate the same token IDs", kind, strings.Join(e.Arms, ", "), e.Reference, equal, len(res))
+		fmt.Fprintf(w, "- %s equivalence %s against %s: %d of %d requests generate the same token IDs", kind, strings.Join(e.Arms, ", "), e.Reference, equal, want)
 		if len(diffs) > 0 {
 			fmt.Fprintf(w, "; first differences: %s", strings.Join(diffs, "; "))
 		}
@@ -326,9 +374,13 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 	}
 
 	cacheRuns, withStats, failures := 0, 0, int64(0)
+	for _, c := range m.Configs {
+		if usesCache(c.Args) {
+			cacheRuns += c.Reps * len(c.Ceilings)
+		}
+	}
 	for _, r := range runs {
 		if c, ok := m.config(r.Config); ok && usesCache(c.Args) && r.Status == statusOK {
-			cacheRuns++
 			if r.Stats != nil {
 				withStats++
 				failures += r.Stats.Decode.Failures + r.Stats.Prefill.Failures
@@ -339,17 +391,19 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 	if failures > 0 || withStats < cacheRuns {
 		kind, allEqual = "FAIL", false
 	}
-	fmt.Fprintf(w, "- %s expert load failures: %d in the %d of %d completed cache runs that wrote their stats\n", kind, failures, withStats, cacheRuns)
+	fmt.Fprintf(w, "- %s expert load failures: %d in the %d of %d cache runs that completed and wrote their stats\n", kind, failures, withStats, cacheRuns)
 
 	fmt.Fprintln(w)
 	for _, g := range m.Gates {
-		v := evalGate(g, runs)
+		v := evalGate(m, g, runs)
 		kind := "INFO"
 		if g.Decides {
 			kind = "GATE"
 		}
 		result := "no verdict (no baseline runs at this ceiling, or the candidate does not)"
-		if v.Baseline != "" {
+		if v.Incomplete != "" {
+			result = "no verdict, repetitions incomplete: " + v.Incomplete
+		} else if v.Baseline != "" {
 			result = "not passed"
 			if v.Pass {
 				result = "passed"

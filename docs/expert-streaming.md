@@ -133,6 +133,7 @@ Stage D, items 2 and 3: resident Metal, `--cpu-moe`, the demand-loaded cache and
 
 **The gates, fixed before the runs** (`gates` in the matrix, `evalGate`):
 - **Correctness:** `check_expert_cache.py` (tiny) and `--real` IQ3 give "PASS: 0 failures" on the final build; every cache and prefetch run generates the same token IDs as the resident `-ub 21` control in all five requests; no expert load failure.
+- **Complete:** an exact equivalence passes only if every request of every configured run of its arms was compared; an arm runs at a ceiling only if all its repetitions completed, does not if none did, and anything in between withholds the gate's verdict.
 - **Performance, at 16 GiB:** the demand cache wins if every repetition's warm decode rate is above the best repetition of the best other arm that runs at that ceiling, or every repetition's p95 below that arm's best. The prefetch arm is kept only if it beats the demand cache by the same rule. Prefill is reported, not gated; no hit rate counts. The same comparisons at 0 GiB and for Q8_0 are INFO.
 
 ### What happened on the way
@@ -169,7 +170,7 @@ Cold TTFT is the cold request's time to the first token, which includes its 2048
 
 - PASS equivalence iq3-cache128, iq3-cache128-prefetch12 against iq3-resident-ub21: 60 of 60 requests generate the same token IDs
 - PASS equivalence q8-cache128-prefetch12 against q8-cache128: 15 of 15 requests generate the same token IDs
-- PASS expert load failures: 0 in the 18 of 18 completed cache runs that wrote their stats
+- PASS expert load failures: 0 in the 18 of 18 cache runs that completed and wrote their stats
 - INFO equivalence against resident IQ3 at the default ubatch: 0 of 65 requests are the same. The `-ub 21` control and the demand cache (every repetition, both ceilings) first differ at token 15, 15, 12, 14 and 22 (cold coding, then warm coding, research, hr, medtech); `--cpu-moe` at token 57, 57, 13, 27 and 15.
 - INFO equivalence of Q8_0 `--cpu-moe --no-repack` against the Q8_0 cache: 0 of 15 the same, first differences at token 74, 74, 16, 2 and 0.
 

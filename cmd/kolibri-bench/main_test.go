@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -144,23 +145,35 @@ func fakeRun(cfg string, ceiling float64, rep int, decode []float64, p95 []float
 }
 
 func TestGate(t *testing.T) {
+	m := matrix{Configs: []config{
+		{Name: "cache", Ceilings: []float64{16}, Reps: 3},
+		{Name: "cpu-moe", Ceilings: []float64{16}, Reps: 3},
+		{Name: "resident", Ceilings: []float64{16}, Reps: 1},
+	}}
 	g := gate{CeilingGiB: 16, Candidate: "cache", Baselines: []string{"cpu-moe", "resident"}, Decides: true}
-	var runs []runResult
+	var cache, cpuMoe []runResult
 	for rep, d := range []float64{20, 21, 22} {
-		runs = append(runs, fakeRun("cache", 16, rep+1, []float64{d, d}, []float64{80, 80}, nil))
+		cache = append(cache, fakeRun("cache", 16, rep+1, []float64{d, d}, []float64{80, 80}, nil))
 	}
 	for rep, d := range []float64{10, 12, 11} {
-		runs = append(runs, fakeRun("cpu-moe", 16, rep+1, []float64{d, d}, []float64{60, 60}, nil))
+		cpuMoe = append(cpuMoe, fakeRun("cpu-moe", 16, rep+1, []float64{d, d}, []float64{60, 60}, nil))
 	}
-	failed := runResult{Config: "resident", CeilingGiB: 16, Rep: 1, Status: statusLoadFailed}
-	v := evalGate(g, append(runs, failed))
-	if !v.Pass || v.Baseline != "cpu-moe" || !v.DecodeWin || v.TailWin {
+	failed := func(cfg string, rep int) runResult {
+		return runResult{Config: cfg, CeilingGiB: 16, Rep: rep, Status: statusLoadFailed}
+	}
+	join := func(parts ...[]runResult) []runResult { return slices.Concat(parts...) }
+
+	v := evalGate(m, g, join(cache, cpuMoe, []runResult{failed("resident", 1)}))
+	if !v.Pass || v.Baseline != "cpu-moe" || !v.DecodeWin || v.TailWin || v.Incomplete != "" {
 		t.Fatalf("verdict = %+v, want a decode win over cpu-moe (resident does not run)", v)
 	}
 
 	// overlapping repetitions are no win, although the median is higher
-	runs = append(runs[:3:3], fakeRun("cpu-moe", 16, 1, []float64{21, 21}, []float64{90, 90}, nil))
-	v = evalGate(g, runs)
+	var overlap []runResult
+	for rep, d := range []float64{10, 21, 11} {
+		overlap = append(overlap, fakeRun("cpu-moe", 16, rep+1, []float64{d, d}, []float64{90, 90}, nil))
+	}
+	v = evalGate(m, g, join(cache, overlap, []runResult{failed("resident", 1)}))
 	if v.DecodeWin {
 		t.Fatalf("verdict = %+v: overlapping repetitions must not win on decode", v)
 	}
@@ -169,9 +182,53 @@ func TestGate(t *testing.T) {
 	}
 
 	// no baseline that runs: no verdict
-	v = evalGate(g, append(runs[:3:3], failed))
-	if v.Pass || v.Baseline != "" {
+	v = evalGate(m, g, join(cache, []runResult{failed("cpu-moe", 1), failed("cpu-moe", 2), failed("cpu-moe", 3), failed("resident", 1)}))
+	if v.Pass || v.Baseline != "" || v.Incomplete != "" {
 		t.Fatalf("verdict = %+v, want none without a running baseline", v)
+	}
+
+	// a repetition missing or failed, of the candidate or a baseline: no verdict
+	for name, runs := range map[string][]runResult{
+		"cpu-moe":  join(cache, cpuMoe[:2], []runResult{failed("resident", 1)}),
+		"cache":    join(cache[:2], []runResult{failed("cache", 3)}, cpuMoe, []runResult{failed("resident", 1)}),
+		"resident": join(cache, cpuMoe),
+	} {
+		v = evalGate(m, g, runs)
+		if v.Pass || !strings.Contains(v.Incomplete, name) {
+			t.Errorf("%s incomplete: verdict = %+v, want none", name, v)
+		}
+	}
+}
+
+func TestReportCountsRequests(t *testing.T) {
+	m := matrix{Cold: "coding", Warm: []string{"coding"},
+		Configs: []config{
+			{Name: "ref", Ceilings: []float64{0}, Reps: 1},
+			{Name: "cache", Ceilings: []float64{0}, Reps: 2},
+		},
+		Equivalence: []equivalence{{Reference: "ref", Arms: []string{"cache"}, Exact: true}}}
+	if got := m.expectedRequests([]string{"cache"}); got != 4 {
+		t.Fatalf("expectedRequests = %d, want 4", got)
+	}
+	ids := []int{1, 2, 3}
+	ref := fakeRun("ref", 0, 1, []float64{50}, []float64{20}, ids)
+	r1 := fakeRun("cache", 0, 1, []float64{20}, []float64{50}, ids)
+	r2 := fakeRun("cache", 0, 2, []float64{20}, []float64{50}, ids)
+	var out strings.Builder
+	if report(&out, m, []runResult{ref, r1}) {
+		t.Fatalf("a missing repetition passes:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "FAIL equivalence cache against ref: 2 of 4 requests") {
+		t.Errorf("report:\n%s", out.String())
+	}
+	r2.Status = statusRequestFailed
+	if report(io.Discard, m, []runResult{ref, r1, r2}) {
+		t.Fatal("a failed repetition passes")
+	}
+	r2.Status = statusOK
+	out.Reset()
+	if !report(&out, m, []runResult{ref, r1, r2}) {
+		t.Fatalf("all requests equal, yet:\n%s", out.String())
 	}
 }
 
