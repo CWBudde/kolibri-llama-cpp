@@ -1,0 +1,31 @@
+{
+  "server_args": ["-ngl", "99", "-t", "10", "-c", "4096", "-np", "1", "--fit", "off"],
+  "prompt_first": 2048,
+  "n_predict": 128,
+  "cold": "coding",
+  "warm": ["coding", "research", "hr", "medtech"],
+  "configs": [
+    {"name": "iq3-resident", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": [], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-cpu-moe", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--cpu-moe"], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-cache128", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128"], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-cache128-prefetch12", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128", "--expert-prefetch", "12"], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-resident-ub21", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["-ub", "21"], "ceilings_gib": [0], "reps": 1},
+    {"name": "q8-cache128", "model": "~/models/Kolibri-1-Q8_0.gguf", "args": ["--expert-cache", "128"], "ceilings_gib": [0], "reps": 3},
+    {"name": "q8-cache128-prefetch12", "model": "~/models/Kolibri-1-Q8_0.gguf", "args": ["--expert-cache", "128", "--expert-prefetch", "12"], "ceilings_gib": [0], "reps": 3},
+    {"name": "q8-cpu-moe", "model": "~/models/Kolibri-1-Q8_0.gguf", "args": ["--cpu-moe", "--no-repack"], "ceilings_gib": [0], "reps": 3}
+  ],
+  "equivalence": [
+    {"reference": "iq3-resident-ub21", "arms": ["iq3-cache128", "iq3-cache128-prefetch12"], "exact": true},
+    {"reference": "q8-cache128", "arms": ["q8-cache128-prefetch12"], "exact": true},
+    {"reference": "iq3-resident", "arms": ["iq3-resident-ub21", "iq3-cpu-moe", "iq3-cache128"], "exact": false},
+    {"reference": "q8-cache128", "arms": ["q8-cpu-moe"], "exact": false}
+  ],
+  "gates": [
+    {"ceiling_gib": 16, "candidate": "iq3-cache128", "baselines": ["iq3-resident", "iq3-cpu-moe"], "decides": true},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-prefetch12", "baselines": ["iq3-cache128"], "decides": true},
+    {"ceiling_gib": 0, "candidate": "iq3-cache128", "baselines": ["iq3-resident", "iq3-cpu-moe"], "decides": false},
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-prefetch12", "baselines": ["iq3-cache128"], "decides": false},
+    {"ceiling_gib": 0, "candidate": "q8-cache128", "baselines": ["q8-cpu-moe"], "decides": false},
+    {"ceiling_gib": 0, "candidate": "q8-cache128-prefetch12", "baselines": ["q8-cache128"], "decides": false}
+  ]
+}

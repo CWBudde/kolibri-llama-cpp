@@ -747,7 +747,7 @@ GB Mac.
 
 ## Phase 10 --- Predictive expert caching and prefetch (proposed)
 
-**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist, and a trained linear predictor (item 2). Neither passes the gate: no predictor beats the best Stage A policy, even without its CPU cost, also with the half-life grid extended down to 1 token. Stage B is done. By the stop condition below, the negative result is documented. Stage D was nevertheless started by the user's decision (2026-10-14), as a separately reviewed prototype behind an experimental option: item 1, the runtime expert cache (patch 0011), exists; its benchmark and gates are open. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
+**Status:** Stage A done (2026-10-14): the causal trace-replay evaluator, the cache baselines with a labelled oracle bound, the metric set with a declared-bandwidth transfer model, chronological and leave-one-workload-out train/test splits with held-out replays, layer budgets allocated on training prefixes, the last-N reuse predictor and the gate exist. The only Stage A predictor, last-N, did not pass the gate. Stage B (2026-10-14): the decayed-count Markov predictor with two horizons, its lead times, measured cost and gate exist, and a trained linear predictor (item 2). Neither passes the gate: no predictor beats the best Stage A policy, even without its CPU cost, also with the half-life grid extended down to 1 token. Stage B is done. By the stop condition below, the negative result is documented. Stage D was nevertheless started by the user's decision (2026-10-14), as a separately reviewed prototype behind an experimental option: item 1, the runtime expert cache (patch 0011), exists. Its benchmark and gates are done (2026-10-20): the correctness gate passes, and at a 16 GiB ceiling the demand cache beats `--cpu-moe`, the best arm that runs there, in decode and p95. Prefetch passes on p95 alone, by about 5%. Without a ceiling, resident Metal stays 3.2 times faster. Whether the patch is kept is the user's call. Keep this work independent of the correctness gates in Phases 0/6 and of the measured CPU-offload baseline in Phase 8.
 
 ### Objective and constraints
 
@@ -936,7 +936,7 @@ Reduce *critical-path* expert transfer latency and bytes transferred per generat
 - [ ] Benchmark against keyword/metadata routing and a single generic profile. Include Laya's model loading/residency and its CPU inference cost *measured on this Mac* through the API in end-to-end economics. Its BENCHMARKS.md reports ~160 ms for the multilingual 128-token case on an i7-1255U (ONNX), which is only an order of magnitude. Avoid per-token Laya calls.
 - [ ] Calibrate on held-out requests, measure wrong-profile penalty and retain a safe default when classification confidence is low. Only keep Laya if it improves net cost enough to justify its resident memory and setup complexity.
 
-### Stage D --- Real streaming prototype, after offline gates
+### Stage D --- Real streaming prototype, after offline gates — ✅ DONE (2026-10-20)
 
 No predictor passed the offline gates (Stages A and B). The user decided on 2026-10-14 to build the prototype anyway. It stays behind an experimental option, `--expert-cache`, and the gates below decide whether it is kept.
 
@@ -971,8 +971,36 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
       - M32, an off-by-one slot id: all 32 tiny logit checks fail.
       - M33, victims chosen without pins: `test-expert-cache` fails.
       - M34, a changed fixture prediction: the C++ check fails with the first differing step.
-- [ ] Benchmark resident Metal, current `--cpu-moe`, demand-loaded cache, and predictive prefetch on the same checkpoint and workload, both warm and cold, under controlled memory pressure. Report prompt processing and decode separately, including tokens/s, p50/p95 token latency and output equivalence.
-- [ ] Correctness gate: the original router chooses every expert; outputs remain within existing quantization/reference tolerances, with deterministic regression checks. Performance gate: net tokens/s or tail-latency improvement at the *same* memory ceiling; no win may be claimed from simulated hit rates alone.
+- [x] Benchmark resident Metal, current `--cpu-moe`, demand-loaded cache, and predictive prefetch on the same checkpoint and workload, both warm and cold, under controlled memory pressure. Report prompt processing and decode separately, including tokens/s, p50/p95 token latency and output equivalence. (2026-10-20) — `cmd/kolibri-bench` runs `testdata/bench/expert-cache.json` through `llama-server` and `kolibri-stream -summary` ([docs/expert-streaming.md](docs/expert-streaming.md), "Benchmark"; results in `~/models/eval/expert-bench/`).
+    - **Setup:** IQ3 resident, `--cpu-moe`, `--expert-cache 128` and the same with `--expert-prefetch 12` at ceilings of 0 and 16 GiB, plus resident `-ub 21` as the equivalence control. Q8_0 at 0 GiB: the cache, the cache with prefetch, and `--cpu-moe --no-repack`. Each arm and ceiling has 3 repetitions, 34 runs in all.
+    - **Per run:** one cold request after `kolibri-evict` has dropped the GGUF from the page cache, then four warm ones; each request is 2048 prompt tokens and 128 generated. The ceiling is memory wired by `kolibri-memhog` (`internal/memctl`, mlock without root). A run starts only on a quiet machine on AC power.
+    - **Measured:** load time, cold TTFT, prompt and decode tokens/s, p50/p95 per-token latency, page-ins, peak RSS and footprint, cache hits and disk reads.
+    - **Result,** warm decode in tokens/s with p95 in ms:
+      - at 0 GiB: resident 60.1 (17.1 ms), `--cpu-moe` 17.4 (60.9 ms), cache 18.5 (78.9 ms);
+      - at 16 GiB: resident does not fit, `--cpu-moe` 11.9 (135.9 ms), cache 17.1 (81.9 ms), prefetch 18.3 (77.4 ms);
+      - Q8_0: cache 13.0, `--cpu-moe` 6.5.
+    - **Prefill:** the cache prefills at 83 tokens/s, against 1110 resident and 273 for `--cpu-moe` at 0 GiB. Per IQ3 run it reads 406 GB in prefill and 29.6 GB in decode.
+    - **Equivalence:** `kolibri-bench -report` prints "PASS equivalence iq3-cache128, iq3-cache128-prefetch12 against iq3-resident-ub21: 60 of 60 requests generate the same token IDs" and the same for Q8_0 with prefetch against without, 15 of 15. Exit 0.
+    - **Found on the way:**
+      - Resident IQ3 with the 16 GiB hog wires 49.1 GiB on a 48 GiB Mac and hung it until a watchdog panic. The driver now records such a run as "does not fit".
+      - Q8_0 `--cpu-moe` repacks its experts by default and was killed while loading.
+      - Runs on battery slept and were repeated on AC.
+      - Other sessions' CPU averaged up to 5.6 cores in a run; it is recorded per run.
+    - **Controls:**
+      - M35, `Evict` without `MS_INVALIDATE`: the memctl test fails;
+      - M36, the percentile one rank off: the stream test fails;
+      - M37, one token ID changed in a stored run: "FAIL equivalence … first differences: iq3-cache128/16g/r2 warm hr at token 40", exit 1;
+      - M38, the fit check disabled: `TestFits` fails;
+      - M39, the AC condition dropped: `TestQuiet` fails "on battery".
+- [x] Correctness gate: the original router chooses every expert; outputs remain within existing quantization/reference tolerances, with deterministic regression checks. Performance gate: net tokens/s or tail-latency improvement at the *same* memory ceiling; no win may be claimed from simulated hit rates alone. (2026-10-20) — verdict recorded in [docs/expert-streaming.md](docs/expert-streaming.md), "Gates". The rules were fixed in the matrix and `evalGate` before the runs: every repetition of the candidate must be above the best repetition of the best arm that runs at that ceiling, in decode or in p95.
+    - **Correctness: passed.**
+      - On fork `2da6ec661`, `check_expert_cache.py` (tiny, 102 checks) and `--real` IQ3 both give "PASS: 0 failures".
+      - In the benchmark, all cache and prefetch requests generate the token IDs of the resident `-ub 21` control bit for bit.
+      - No expert load failed.
+    - **Demand cache at 16 GiB: passed,** on both decode and p95. Every repetition decodes at 16.9 to 19.1 tokens/s against at most 12.6 for `--cpu-moe`, with a p95 of 81.6 to 85.3 ms against at least 123.2. Resident does not fit at this ceiling.
+    - **Without a ceiling (INFO):** resident Metal is 3.2 times faster in decode, and `--cpu-moe` prefills faster with a lower p95. So the cache pays off only once the experts no longer fit.
+    - **Prefetch at 16 GiB: passed by the rule, on p95 alone,** about 5%: 77.0 to 80.7 ms against the demand cache's best, 81.6. Its decode overlaps the demand cache's. Without a ceiling and for Q8_0 the effect does not hold (INFO), and prefetch reads 6.8 GB more per run with hardly fewer misses.
+    - Whether the patch and `--expert-prefetch` are kept is the user's decision.
 
 ### Suggested deliverables
 

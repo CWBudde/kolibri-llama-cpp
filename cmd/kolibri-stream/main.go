@@ -18,7 +18,10 @@
 // kern.memorystatus_vm_pressure_level, the token count and the system's
 // page-ins so far). At the end it prints the server's timings, the tokens/s per
 // -window tokens and the system's page-ins from the first generated token to
-// the last, the pages read from disk while generating. The sampler uses ps,
+// the last, the pages read from disk while generating. With -summary FILE it
+// also writes the request as JSON for cmd/kolibri-bench: the time to the first
+// token, decode tokens/s, the nearest-rank p50, p95 and p99 of the per-token
+// latency, the server's timings and the generated token IDs. The sampler uses ps,
 // footprint, sysctl and vm_stat, so it is macOS only.
 package main
 
@@ -33,11 +36,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -54,9 +59,10 @@ type chunk struct {
 }
 
 // readStream parses llama-server's SSE stream, calls onToken with the running
-// token count and the chunk's text, and returns the final chunk's timings.
-// A chunk without "tokens" (no return_tokens) counts as one token.
-func readStream(r io.Reader, onToken func(count int, content string)) (json.RawMessage, error) {
+// token count, the chunk's token IDs and its text, and returns the final
+// chunk's timings. A chunk without "tokens" (no return_tokens) counts as one
+// token.
+func readStream(r io.Reader, onToken func(count int, ids []int, content string)) (json.RawMessage, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 1<<20), 1<<24)
 	count := 0
@@ -73,7 +79,7 @@ func readStream(r io.Reader, onToken func(count int, content string)) (json.RawM
 			return c.Timings, nil
 		}
 		count += max(len(c.Tokens), 1)
-		onToken(count, c.Content)
+		onToken(count, c.Tokens, c.Content)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
@@ -116,6 +122,78 @@ func windowRates(stamps []stamp, size int) []window {
 	}
 	return out
 }
+
+// latencies returns one decode latency per token after the first: the time
+// between consecutive stamps, split evenly over the tokens of a chunk.
+func latencies(stamps []stamp) []time.Duration {
+	var out []time.Duration
+	for i := 1; i < len(stamps); i++ {
+		k := stamps[i].count - stamps[i-1].count
+		if k <= 0 {
+			continue
+		}
+		dt := stamps[i].at.Sub(stamps[i-1].at) / time.Duration(k)
+		for range k {
+			out = append(out, dt)
+		}
+	}
+	return out
+}
+
+// percentile is the nearest-rank p-th percentile of d (0 for none); d is not
+// changed.
+func percentile(d []time.Duration, p float64) time.Duration {
+	if len(d) == 0 {
+		return 0
+	}
+	s := slices.Clone(d)
+	slices.Sort(s)
+	rank := int(math.Ceil(p / 100 * float64(len(s))))
+	return s[min(max(rank, 1), len(s))-1]
+}
+
+// summary is one request's result, written by -summary for cmd/kolibri-bench.
+type summary struct {
+	PromptTokens          int     `json:"prompt_tokens"` // 0 for a text prompt
+	Generated             int     `json:"generated"`
+	TTFTMs                float64 `json:"ttft_ms"` // from sending the request to the first token
+	DecodeTokensPerSecond float64 `json:"decode_tokens_per_second"`
+	LatencyMs             struct {
+		P50 float64 `json:"p50"`
+		P95 float64 `json:"p95"`
+		P99 float64 `json:"p99"`
+		Max float64 `json:"max"`
+	} `json:"latency_ms"` // per decoded token after the first
+	Timings      json.RawMessage `json:"timings"` // the server's
+	Pageins      int64           `json:"pageins"` // the system's while generating; -1 unknown
+	TokenIDs     []int           `json:"token_ids"`
+	TokensSHA256 string          `json:"tokens_sha256"`
+}
+
+func summarize(sent time.Time, stamps []stamp, ids []int, timings json.RawMessage, promptTokens int, pageins int64) summary {
+	s := summary{PromptTokens: promptTokens, Timings: timings, Pageins: pageins, TokenIDs: ids}
+	if len(stamps) > 0 {
+		last := stamps[len(stamps)-1]
+		s.Generated = last.count
+		s.TTFTMs = msec(stamps[0].at.Sub(sent))
+		if dt := last.at.Sub(stamps[0].at).Seconds(); dt > 0 {
+			s.DecodeTokensPerSecond = float64(last.count-stamps[0].count) / dt
+		}
+	}
+	lat := latencies(stamps)
+	s.LatencyMs.P50 = msec(percentile(lat, 50))
+	s.LatencyMs.P95 = msec(percentile(lat, 95))
+	s.LatencyMs.P99 = msec(percentile(lat, 99))
+	s.LatencyMs.Max = msec(percentile(lat, 100))
+	ids32 := make([]int32, len(ids))
+	for i, id := range ids {
+		ids32[i] = int32(id)
+	}
+	s.TokensSHA256 = idsSHA256(ids32)
+	return s
+}
+
+func msec(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
 var footprintRe = regexp.MustCompile(`phys_footprint:\s+([0-9.]+)\s+(KB|MB|GB)`)
 
@@ -239,12 +317,14 @@ func main() {
 	every := flag.Duration("every", 10*time.Second, "sampling interval")
 	size := flag.Int("window", 2048, "tokens per reported window")
 	dir := flag.String("out", ".", "output directory")
+	summaryPath := flag.String("summary", "", "also write the request's summary as JSON: latency percentiles, tokens/s, token IDs")
 	flag.Parse()
 	if (*prompt == "") == (*tokens == "") {
 		flag.Usage()
 		os.Exit(2)
 	}
 	var promptValue any = *prompt
+	promptTokens := 0
 	if *tokens != "" {
 		f, err := os.Open(*tokens)
 		if err != nil {
@@ -268,6 +348,7 @@ func main() {
 			ids = ids[:*first]
 		}
 		promptValue = ids
+		promptTokens = len(ids)
 		fmt.Printf("prompt: %d token IDs of %s, as recorded\n", len(ids), *tokens)
 	}
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
@@ -314,6 +395,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	sent := time.Now()
 	resp, err := http.Post(*url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Fatal(err)
@@ -325,14 +407,16 @@ func main() {
 	}
 
 	var stamps []stamp
+	var ids []int
 	firstPageins := int64(-1)
-	timings, err := readStream(resp.Body, func(c int, content string) {
+	timings, err := readStream(resp.Body, func(c int, chunkIDs []int, content string) {
 		if len(stamps) == 0 {
 			firstPageins = pageins()
 		}
 		now := time.Now()
 		count.Store(int64(c))
 		stamps = append(stamps, stamp{c, now})
+		ids = append(ids, chunkIDs...)
 		fmt.Fprintf(tokLog, "%d %d\n", now.UnixMilli(), c)
 		text.WriteString(content)
 	})
@@ -343,10 +427,24 @@ func main() {
 	}
 	lastPageins := pageins()
 	fmt.Printf("tokens %d, timings %s\n", count.Load(), timings)
+	pages := int64(-1)
 	if firstPageins >= 0 && lastPageins >= 0 && len(stamps) > 1 {
-		pages, gen := lastPageins-firstPageins, stamps[len(stamps)-1].count-stamps[0].count
+		gen := stamps[len(stamps)-1].count - stamps[0].count
+		pages = lastPageins - firstPageins
 		fmt.Printf("system page-ins while generating: %d pages of 16 KiB (%.1f MiB) over %d tokens, %.3f MiB per token\n",
 			pages, float64(pages)/64, gen, float64(pages)/64/float64(gen))
+	}
+	if *summaryPath != "" {
+		s := summarize(sent, stamps, ids, timings, promptTokens, pages)
+		fmt.Printf("time to first token %.1f ms; decode %.2f tokens/s, latency p50 %.2f ms, p95 %.2f ms, max %.2f ms\n",
+			s.TTFTMs, s.DecodeTokensPerSecond, s.LatencyMs.P50, s.LatencyMs.P95, s.LatencyMs.Max)
+		out, err := json.MarshalIndent(s, "", "  ")
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := os.WriteFile(*summaryPath, append(out, '\n'), 0o644); err != nil {
+			log.Fatal(err)
+		}
 	}
 	for _, w := range windowRates(stamps, *size) {
 		fmt.Printf("%6d-%6d %.1f tokens/s\n", w.from, w.to, w.rate)
