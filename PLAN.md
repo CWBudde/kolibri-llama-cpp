@@ -1011,6 +1011,136 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
 
 **Stop condition:** If held-out trace predictions cannot reduce critical-path transfer costs enough to offset predictor/runtime overhead, document the negative result and do not complicate llama.cpp.
 
+## Phase 11 --- Expert streaming on par with other offloaders (proposed)
+
+**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 in progress.
+
+### Where Stage D stands against other work
+
+**Ahead; keep these:**
+- **Lossless.** The router chooses every expert, and the output is bit-identical to resident at the same ubatch. flash-moe cuts Top-K from 10 to 4, and #25294 retracted its byte-identity claim.
+- **Zero-copy on unified memory.** `pread` writes straight into Metal-visible slots. Upstream #29887 uploads misses from host RAM to the GPU instead.
+- **Bounded footprint under a memory ceiling.** 11 GiB with `F_NOCACHE`, and it holds at a 16 GiB hog.
+- **Per-layer budgets** (`--expert-cache-layers`).
+- **Measurement and gates.** Cold runs, ceilings, repetitions, equivalence and Belady-bounded replays. Most outside numbers are unreproduced self-reports.
+
+**Behind:**
+
+| Gap | Ours (Stage D, IQ3, 128 slots, 0 GiB) | Reference |
+|---|---|---|
+| Prefill | 83 tokens/s, 406 GB of demand loads per 10,240 prompt tokens. Cause: the ubatch is capped at 21 | #25294 loads each expert once per ubatch ("waves"), 2–2.5× prefill; FlexGen's block schedule |
+| Decode overhead | 54 ms/token = 16.6 ms resident compute + 14.4 ms load wait (9.2 s per run / 640 tokens) + about 23 ms unexplained. Likely cause: the CPU remap op, a scheduler split and sync in each of the 50 layers | flash-moe pre-encodes command buffers; kTransformers uses CUDA graphs; the Metal slot-pool PoC (#23324) measures 19–21% interception overhead |
+| I/O layout | three `pread`s per expert (gate, up, down) | one contiguous extent per expert: +14–32% decode (mlx-lm #1438), 36× fewer page faults (#27149) |
+| Page cache as a second tier | `F_NOCACHE` discards it, even when RAM is free | flash-moe: about 71% of its hits come from the page cache |
+| Lossy miss handling | none, every miss waits | HOBBIT (low-bit copy), MoE-CORE (substitution), flash-moe (lower K) |
+| Upstream | patches 0001–0011 on a pinned commit | Kolibri merged (#30673, 2026-10-17); `--moe-cache-mib` merged (#29887, 2026-10-07); `--moe-stream` open (#25294) |
+
+### Objective and constraints
+
+Close these gaps without giving up the lead.
+
+- **Default stays lossless.** Every stage except E5 keeps Phase 10's constraint: the router chooses every expert, and logits are bit-identical to resident at the same ubatch (`check_expert_cache.py`, `kolibri-bench` equivalence).
+- **E5 is a separate mode.** It deliberately breaks this constraint, so it is opt-in and gated on KLD.
+- **Same benchmark throughout.** Every performance claim comes from `kolibri-bench` on `testdata/bench/expert-cache.json` at the same ceiling (0 and 16 GiB). The rules are fixed in the matrix before the runs, as in Stage D.
+- **Controls** are numbered from M40.
+- **Upstream contact.** Upstream forbids AI-written PRs, issues and comments. All upstream contact (E7) is evidence the user files by hand.
+
+**"On par" means** (targets confirmed 2026-10-22):
+- decode at 128 slots of at least 30 tokens/s (half of resident);
+- warm prefill above `--cpu-moe`'s 273 tokens/s at 0 GiB;
+- cold TTFT for 2,048 tokens under 10 s (now 33 s);
+- each at the 16 GiB ceiling as well;
+- and at least equal to #25294 wherever it runs on the same file.
+
+### Stage E0 --- Rebase onto upstream Kolibri support
+
+- [ ] Rebase the fork onto an upstream commit that contains #30673.
+  - Compare upstream's Kolibri model with ours on the BF16 and IQ3 GGUFs with the existing harnesses: bit identity on the tiny checkpoints, KLD against our BF16 on the real one, and the vLLM capture where it applies.
+  - Check in particular the router (bias on the logits, sigmoid without renormalization), the RoPE/NoPE layer split, the window of 513, the pre-tokenizer and the GGUF keys. HF discussion #3 reports that most Hub GGUFs need `--override-kv` for the pre-tokenizer and the gating function.
+  - Retire every fork patch that upstream now covers; document the remaining differences in `docs/upstream.md`.
+  - Rebase patch 0011 on top.
+- [ ] Check upstream's two expert-cache paths on this Mac:
+  - **#29887** (`--moe-cache-mib`): does it activate on Metal at all (it accepts the IGPU device type)? If it does, run one arm at 0 GiB.
+  - **#25294** (`--moe-stream`): build the PR branch and check whether its auto-sizing aborts at `n_expert_used >= 6`. If it runs on Kolibri, add it to the matrix as a reference arm at 0 and 16 GiB.
+- [ ] Gate: Phase 11 builds on upstream's Kolibri only if it matches ours within the existing tolerances. Otherwise the differences are documented and the fork stays ahead.
+
+### Stage E1 --- Cheap diagnostics before building anything
+
+- [ ] **Overhead control.** Run IQ3 with `--expert-cache 384` (no misses after warmup) against resident `-ub 21` at 0 GiB, with the decode timing split as in Stage D.
+  - This measures the interception cost alone: remap op, splits and syncs.
+  - Also count the graph splits and command-buffer commits per decoded token.
+  - **E2 starts only if** the gap to resident is a material share (at least 10 ms/token of the roughly 23 ms unexplained). Otherwise look for the time elsewhere first.
+- [ ] **Page-cache A/B.** Add an option that reads misses buffered instead of with `F_NOCACHE`.
+  - Run both at 0 and 16 GiB, for IQ3 and Q8_0.
+  - Report page-cache residency of the GGUF alongside `phys_footprint`, so a hidden page-cache tier is not passed off as a smaller footprint.
+  - Keep buffered reads as the default only where they win at the same ceiling.
+- [ ] **SSD curve.** A Go `pread` sweep on the M5 Pro's internal SSD, for example `cmd/kolibri-ssd` reusing `internal/memctl` for eviction.
+  - Cold file; chunks of 64 KiB to 8 MiB; queue depth 1–16; `F_NOCACHE` and buffered.
+  - No trustworthy M5 Pro figure exists. This curve sets E3's thread count and tells whether one 1.7 MB IQ3 expert per read is latency- or bandwidth-bound.
+- [ ] **Eviction policies offline.** Add upstream's SLRU (#29887: probation/protected, protected at most half, shared per layer group) and #25294's decaying hotness with LRU tie-break to `internal/locality`, and replay them through `cmd/kolibri-policy` with the Stage A splits and gate.
+  - Also check that the replay treats a decoded step's six experts as one event. Zhang (arXiv 2608.07911) shows that per-access replays inflate LRU's misses.
+  - A policy enters the runtime only if it passes the Stage A gate on held-out decode, or on prefill for E4's admission.
+
+### Stage E2 --- Remove the per-layer CPU sync from decode
+
+Only if E1's overhead control shows the overhead.
+
+- [ ] Encode the expert path so a decoded token no longer needs a scheduler split and CPU sync at every MoE layer. Candidates, decided by a measured prototype:
+  - **GPU remap.** The slot table lives in a shared Metal buffer, and a small kernel maps router ids to slots. The CPU is involved only when a layer misses: an `MTLSharedEvent` wait that the I/O side signals once the slot is written (the #23324 PoC's handshake). Hit layers then run without a CPU round trip.
+  - **Fewer, larger splits.** Keep the CPU remap, but let the scheduler fuse a layer's attention and the next layer's router into one Metal split.
+- [ ] Gate: lossless as above. Decode tokens/s and p95 at both ceilings must beat Stage D by the Stage D rule. The miss path must still pin, cancel and fall back as `test-expert-cache` requires. Controls from M40, including a wrong slot id in the GPU table.
+
+### Stage E3 --- One read per expert
+
+- [ ] A repacked side-file next to the GGUF, written by a tool and verified by a manifest with sha256.
+  - Each expert's gate, up and down rows, scales included, sit in one aligned extent.
+  - The loader reads a miss with one `pread`. An option names the file; without it, the GGUF path stays.
+  - A layer's misses are issued concurrently, with the thread count taken from E1's curve.
+- [ ] Gate: the bytes in the slots are identical to the GGUF path (a unit check, plus `check_expert_cache.py` on both paths). Decode and prefill must beat the GGUF path at the same ceiling. Expected upside: about the 14 ms load wait in decode, and more in prefill, where loads waited 51.6 s per run.
+
+### Stage E4 --- Prefill without the ubatch cap
+
+- [ ] Lift the cap of 21 tokens with a prefill path that does not go through the decode slots. Compare two variants:
+  - **Layer streaming** (AirLLM/FlexGen applied to experts). Per layer and large ubatch, read the stacked `ffn_{gate,up,down}_exps` tensors sequentially into a double-buffered staging area: about 0.6 GiB per layer at IQ3, 1.6 at Q8_0. That is about 29 GB per 2,048-token ubatch against about 81 GB today.
+  - **Waves** (as in #25294). Load only the ubatch's union of experts per layer, in waves of at most the slot count. The tokens routed to each wave are computed together.
+- [ ] Admission: prefill must not flush the decode working set. Either it bypasses the slots, or it seeds them with the prompt's most-used experts (LFU, which nearly doubles the prefill hit rate in the Stage A replay: 27–41% against 17–21%), as decided by E1's offline replay.
+- [ ] Gate:
+  - Lossless against a resident control at the same ubatch size.
+  - Warm prefill tokens/s and cold TTFT at both ceilings must beat Stage D and the E0 reference arms.
+  - Decode must not get slower.
+  - The staging buffers count against the ceiling.
+
+### Stage E5 --- Optional lossy miss path
+
+The user decides before this stage starts. It deliberately breaks Phase 10's "router decides" constraint.
+
+- [ ] An opt-in mode for misses with a low router weight (at sigmoid rank 4–6, below a weight threshold).
+  - Either skip the expert, or read a low-bit copy (IQ1/IQ2) from E3's side-file: about half the bytes of an IQ3 expert.
+  - Try skipping first; it costs no extra file.
+  - Threshold and mode are fixed on a tuning split before the test runs.
+- [ ] Gate: KLD against our BF16 on the existing KLD harness, at most a declared fraction above plain IQ3 (proposed: +10% over 0.095). Fix the threshold before the runs. Then p95 and decode at the 16 GiB ceiling must beat the lossless cache. Report how many experts were skipped or degraded per token.
+
+### Stage E6 --- Optional hidden-state predictor experiment
+
+Only if E2 and E3 leave the load wait as the largest remaining cost.
+
+- [ ] Record residual streams on the frozen traces. Offline, apply layer l+1's and l+2's sigmoid routers to layer l's hidden state; measure recall at k = 6 and 12 on the Stage A test suffixes.
+  - Stage B used expert ids only.
+  - The literature reports 90–96% one layer ahead on Mixtral/DeepSeek-MoE, but 67% on Qwen2-MoE, and nothing for sigmoid Top-6 over 384 experts.
+- [ ] Gate: the Stage B gate, cost included. Only a pass reopens runtime prefetch.
+
+### Stage E7 --- Write-up and upstream evidence
+
+- [ ] Write the negative predictor result up as a document, using Zhang's reporting checklist: per-event replay, decode-only hit rate, per-step union against capacity, and the Belady gap.
+  - No public study covers 384 experts with Top-6 sigmoid routing on unified memory.
+- [ ] For #25294 and #29887, collect what upstream can use in `docs/upstream.md`, for the user to file by hand. That includes:
+  - the Top-6 auto-size abort, if E0 confirms it;
+  - the zero-copy Metal slot path;
+  - the equivalence and ceiling methodology;
+  - the Kolibri benchmark matrix.
+
+**Stop condition:** a stage whose gate fails is documented, and its code stays out of the patch set. If E0 shows #25294 matching or beating the fork's cache on Kolibri, move the remaining work onto #25294's design instead of extending patch 0011.
+
 ## Phase 9 --- User-facing inference behavior
 
 Template, reasoning modes, tool calls, parsers and stop tokens are done
