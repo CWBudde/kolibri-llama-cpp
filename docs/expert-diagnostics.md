@@ -31,7 +31,7 @@ APPLE SSD AP1024Z), on AC power, with no other heavy process.
 
 ## Overhead control and decode split
 
-Patch 0012 (`patches/llama.cpp/0012-kolibri-expert-cache-diag.patch`, fork
+Patch 0012 (`patches/llama.cpp/0012-kolibri-expert-cache-diag.patch`, measured at fork
 `746be1eae`) adds decode wall time, remap time, graph splits and Metal
 command-buffer commits to the stats JSON, also for resident runs. "Other" is
 wall time minus load wait minus remap.

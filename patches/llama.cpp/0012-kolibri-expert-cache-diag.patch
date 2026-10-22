@@ -259,10 +259,10 @@ index 4a37b49f4..60d081380 100644
  
      struct llama_model_params {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f23755917..4f9b0c760 100644
+index f23755917..4effb46d3 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -493,6 +493,13 @@ llama_context::llama_context(
+@@ -493,6 +493,14 @@ llama_context::llama_context(
          }
      }
  
@@ -271,12 +271,13 @@ index f23755917..4f9b0c760 100644
 +        if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL")) {
 +            metal_n_commits = (uint64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_get_n_commits");
 +        }
++        model.decode_diag->set_metal(metal_n_commits != nullptr);
 +    }
 +
      // [EXPERIMENTAL] the expert cache serves one context; taken last, so that a constructor that
      // throws before never holds it (its destructor would not run to give it back)
      if (model.expert_cache) {
-@@ -1915,6 +1922,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1915,6 +1923,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
          ggml_status status;
  
@@ -289,19 +290,15 @@ index f23755917..4f9b0c760 100644
          const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
  
          if (!res) {
-@@ -2076,6 +2089,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2076,6 +2090,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
              copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
          }
  
 +        if (diag) {
 +            // the outputs are read right after anyway; waiting here closes the measurement
 +            ggml_backend_sched_synchronize(sched.get());
-+            auto & d = *model.decode_diag;
-+            d.tokens++;
-+            d.wall_seconds  += (ggml_time_us() - diag_t0)/1e6;
-+            d.splits        += ggml_backend_sched_get_n_splits(sched.get());
-+            d.has_metal      = metal_n_commits != nullptr;
-+            d.metal_commits += metal_n_commits ? metal_n_commits() - diag_c0 : 0;
++            model.decode_diag->add((ggml_time_us() - diag_t0)/1e6, ggml_backend_sched_get_n_splits(sched.get()),
++                metal_n_commits ? metal_n_commits() - diag_c0 : 0);
 +        }
 +
          n_outputs_prev += n_outputs;
@@ -322,7 +319,7 @@ index c76fd8583..3b0b94925 100644
      bool graph_reuse_disable = false;
  
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 2a328401d..276a43946 100644
+index 2a328401d..12eca257f 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -5,6 +5,7 @@
@@ -333,7 +330,7 @@ index 2a328401d..276a43946 100644
  #include <cerrno>
  #include <cstring>
  #include <fstream>
-@@ -97,29 +98,63 @@ void remap_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+@@ -97,29 +98,77 @@ void remap_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
      ud->cache->remap(ud->il, dst->src[0], dst);
  }
  
@@ -365,7 +362,21 @@ index 2a328401d..276a43946 100644
  
  } // namespace
  
++void llama_decode_diag::set_metal(bool has) {
++    std::lock_guard<std::mutex> lock(mtx);
++    has_metal = has;
++}
++
++void llama_decode_diag::add(double seconds, uint64_t n_splits, uint64_t n_commits) {
++    std::lock_guard<std::mutex> lock(mtx);
++    tokens++;
++    wall_seconds  += seconds;
++    splits        += n_splits;
++    metal_commits += n_commits;
++}
++
 +std::string llama_decode_diag::json_fields() const {
++    std::lock_guard<std::mutex> lock(mtx);
 +    return format("\"tokens\": %llu, \"wall_seconds\": %.6f, \"splits\": %llu, \"metal_commits\": %s",
 +        (unsigned long long) tokens, wall_seconds, (unsigned long long) splits, json_u64(has_metal, metal_commits).c_str());
 +}
@@ -401,7 +412,7 @@ index 2a328401d..276a43946 100644
      if (p.n_slots_layer && p.n_layer_slots > 0) {
          if (p.n_layer_slots != n_layer) {
              throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
-@@ -287,9 +322,12 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -287,9 +336,12 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      if (fd < 0) {
          throw std::runtime_error(format("expert cache: open %s: %s", p, strerror(errno)));
      }
@@ -416,7 +427,7 @@ index 2a328401d..276a43946 100644
      path = format("/proc/self/fd/%d", fd_loader);
      fd = open(path.c_str(), O_RDONLY);
      if (fd < 0) {
-@@ -322,9 +360,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -322,9 +374,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      for (const auto & gr : groups) {
          where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
      }
@@ -428,7 +439,7 @@ index 2a328401d..276a43946 100644
  }
  
  uint32_t llama_expert_cache::max_ubatch() const {
-@@ -350,6 +388,7 @@ ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor *
+@@ -350,6 +402,7 @@ ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor *
  
  void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * dst) {
      GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
@@ -436,7 +447,7 @@ index 2a328401d..276a43946 100644
      const int n_tokens = (int) ids->ne[1];
  
      // a graph runs its layers in order; layer 0 starts the next ubatch (the last layer may see
-@@ -378,6 +417,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -378,6 +431,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
              slots->prefetch(target, pred.data(), (int) pred.size(), decode);
          }
      }
@@ -444,7 +455,7 @@ index 2a328401d..276a43946 100644
  }
  
  bool llama_expert_cache::load(int il, int e, int s) {
-@@ -414,14 +454,18 @@ std::string llama_expert_cache::stats_json() const {
+@@ -414,14 +468,18 @@ std::string llama_expert_cache::stats_json() const {
      const auto pc = process_now();
      const int s_min = *std::min_element(n_slots.begin(), n_slots.end());
      const int s_max = *std::max_element(n_slots.begin(), n_slots.end());
@@ -471,7 +482,7 @@ index 2a328401d..276a43946 100644
 +        process_json(pc, disk_read0, pageins0, faults0).c_str());
  }
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
-index ec772aeaf..8654d92c6 100644
+index ec772aeaf..9370af36f 100644
 --- a/src/llama-expert-cache.h
 +++ b/src/llama-expert-cache.h
 @@ -5,7 +5,7 @@
@@ -483,7 +494,11 @@ index ec772aeaf..8654d92c6 100644
  // then read the slots. The router chooses every expert: the expert weights keep its own ids, and a
  // prediction only ever decides what to read ahead.
  
-@@ -20,6 +20,31 @@
+@@ -17,9 +17,42 @@
+ 
+ #include <atomic>
+ #include <memory>
++#include <mutex>
  #include <string>
  #include <vector>
  
@@ -493,8 +508,13 @@ index ec772aeaf..8654d92c6 100644
 +    uint64_t tokens        = 0; // decode ubatches, one token each
 +    double   wall_seconds  = 0; // their wall time: graph build or reuse, compute and the output copy, synchronized
 +    uint64_t splits        = 0; // the scheduler's graph splits, summed over them
-+    uint64_t metal_commits = 0; // Metal command buffers committed during them
++    uint64_t metal_commits = 0; // Metal command buffers committed during them (process-wide, so with
++                                // concurrent contexts also those of the others)
 +    bool     has_metal     = false; // whether a Metal backend counts its commits (else metal_commits is null)
++
++    // contexts of one model decode concurrently: they update the fields above only through these
++    void set_metal(bool has);
++    void add(double seconds, uint64_t n_splits, uint64_t n_commits);
 +
 +    // the fields above as JSON members, without braces
 +    std::string json_fields() const;
@@ -507,6 +527,8 @@ index ec772aeaf..8654d92c6 100644
 +    void write() const;
 +
 +private:
++    mutable std::mutex mtx;
++
 +    uint64_t disk_read0 = 0;
 +    uint64_t pageins0   = 0;
 +    uint64_t faults0    = 0;
@@ -515,7 +537,7 @@ index ec772aeaf..8654d92c6 100644
  struct llama_expert_cache {
      // the gate, up and down tensors of one layer, with their data offsets in the file
      struct tensors {
-@@ -60,6 +85,9 @@ struct llama_expert_cache {
+@@ -60,6 +93,9 @@ struct llama_expert_cache {
      // the remap op's work
      void remap(int il, const ggml_tensor * ids, ggml_tensor * dst);
  
@@ -525,7 +547,7 @@ index ec772aeaf..8654d92c6 100644
      std::string stats_json() const;
  
  private:
-@@ -72,6 +100,7 @@ private:
+@@ -72,6 +108,7 @@ private:
      int    prefetch_half_life;
      double prefetch_mix;
      std::string stats_path;
@@ -533,7 +555,7 @@ index ec772aeaf..8654d92c6 100644
  
      std::vector<tensors>  stacked;
      std::vector<tensors>  slot_t; // the slot tensors; offs unused
-@@ -101,6 +130,11 @@ private:
+@@ -101,6 +138,11 @@ private:
      int64_t tok_next  = 0;
      bool    decode    = false;
  
@@ -546,24 +568,26 @@ index ec772aeaf..8654d92c6 100644
      uint64_t disk_read0 = 0;
      uint64_t pageins0   = 0;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index ebb726607..6997bfb34 100644
+index ebb726607..01505de1d 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1291,8 +1291,12 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
+@@ -1291,8 +1291,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
  }
  
  llama_model::~llama_model() {
 -    // the cache's I/O threads go before anything they could touch
 +    // the cache's I/O threads go before anything they could touch; it writes its stats, with the
 +    // decode timing
++    // the cache writes the stats itself; params.expert_cache is borrowed and may be gone by now
++    const bool cache_writes = expert_cache != nullptr;
      expert_cache.reset();
-+    if (decode_diag && !expert_cache_requested()) {
++    if (decode_diag && !cache_writes) {
 +        decode_diag->write();
 +    }
  
      for (auto * lora : loras) {
          delete lora;
-@@ -2024,6 +2028,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2024,6 +2030,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          expert_cache->init(stacked, devs, fd);
      }
  
@@ -580,7 +604,7 @@ index ebb726607..6997bfb34 100644
      return true;
  }
  
-@@ -3022,6 +3036,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
+@@ -3022,6 +3038,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
          /*.prefetch_half_life =*/ 1,
          /*.prefetch_mix       =*/ 0.75f,
          /*.stats_path         =*/ nullptr,
