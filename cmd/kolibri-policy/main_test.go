@@ -39,7 +39,7 @@ var (
 
 func TestReplay(t *testing.T) {
 	sizes := []int{1, 2, 4}
-	noCache, runs, err := replay(tiny, tinySpans, 2, tinyModel, sizes, baselines(tiny, tinySpans, tinyModel, 512),
+	noCache, runs, err := replay(tiny, tinySpans, 2, tinyModel, sizes, baselines(tiny, tinySpans, tinyModel, defaultKnobs),
 		tinyTiming)
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestReplay(t *testing.T) {
 		sp.Test.Prefill.Tokens != 0 {
 		t.Fatalf("no cache split: %+v", sp)
 	}
-	if len(runs) != 6 || runs[sharedOracle].Policy != "oracle, shared" || !runs[sharedOracle].Oracle ||
+	if len(runs) != 12 || runs[sharedOracle].Policy != "oracle, shared" || !runs[sharedOracle].Oracle ||
 		!runs[layerOracle].Oracle || runs[arc].Oracle {
 		t.Fatalf("policies %+v", runs)
 	}
@@ -120,7 +120,7 @@ func TestParseLinks(t *testing.T) {
 
 func TestMarkdownLabelsOracle(t *testing.T) {
 	sizes := []int{1, 2}
-	noCache, runs, err := replay(tiny, tinySpans, 2, tinyModel, sizes, baselines(tiny, tinySpans, tinyModel, 512),
+	noCache, runs, err := replay(tiny, tinySpans, 2, tinyModel, sizes, baselines(tiny, tinySpans, tinyModel, defaultKnobs),
 		tinyTiming)
 	if err != nil {
 		t.Fatal(err)
@@ -135,10 +135,16 @@ func TestMarkdownLabelsOracle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	hot, err := hotnessGrid(tiny, tinySpans, 2, tinyModel, sizes, hotnessHalfLives(512), tinyTiming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hotGrids := map[string]map[string]Grid{"tiny": {"w": hot}}
 	wl := Workload{Tokens: 3, Split: SplitWorkload{2, 1, 2}, NoCache: noCache, Policies: runs, LFUGrid: grid,
-		LastN: lastN}
+		HotnessGrid: hot, LastN: lastN}
 	for s, c := range sizes {
 		wl.LFUTuning = append(wl.LFUTuning, tune(grids, "tiny", "w", s, c, 512))
+		wl.HotnessTuning = append(wl.HotnessTuning, tune(hotGrids, "tiny", "w", s, c, 512))
 	}
 	tr := trace{tiny, tinySpans, 2, tinyModel, tinyTiming}
 	var c curves
@@ -169,10 +175,20 @@ func TestMarkdownLabelsOracle(t *testing.T) {
 	if !ok {
 		t.Fatal("no gate")
 	}
-	gb := stageBGate(results, "tiny", sizes, []string{"ssd"}, g)
+	gb := stageBGate(results, "tiny", sizes, []string{"ssd"}, stageAOnly(g))
+	if len(g.Policies) != len(stageAOnly(g).Policies)+len(stageE1) {
+		t.Fatalf("Stage A's gate judges %d policies, %d without Stage E1's", len(g.Policies),
+			len(stageAOnly(g).Policies))
+	}
+	for _, e := range g.Policies[len(g.Policies)-len(stageE1):] {
+		if !slices.Contains(stageE1, e.Policy) {
+			t.Fatalf("Stage A's gate ends with %q, not a Stage E1 policy", e.Policy)
+		}
+	}
 	var b bytes.Buffer
 	writeMarkdown(&b, "cmd", Assumptions{Ubatch: 512, DecodeTokensPerSecond: 63.7, PrefillTokensPerSecond: 1347,
-		LFUHalfLife: 512, LFUHalfLives: hs, SplitRule: "the rule."}, tinyTiming.Links, sizes, 2, []int{0, 1},
+		LFUHalfLife: 512, LFUHalfLives: hs, SplitRule: "the rule.", SLRUProtected: 0.5, HotnessHalfLife: 512,
+		HotnessHalfLives: hotnessHalfLives(512)}, tinyTiming.Links, sizes, 2, []int{0, 1},
 		results, map[string]Gate{"tiny": g}, map[string]Gate{"tiny": gb})
 	md := b.String()
 	for _, want := range []string{"| oracle, shared † |", "unattainable upper bound", "not a measurement",
@@ -184,7 +200,10 @@ func TestMarkdownLabelsOracle(t *testing.T) {
 		"| tiny | next token | 1 | ", "## Stage B gate", "| next token Markov on shared LRU, k tuned for ssd | ",
 		"| same token Markov on shared LRU, k tuned for ssd | ", "## Stage B: a trained linear predictor",
 		"| linear, A and B, leave one workload out | – |", "| next token linear on shared LRU, k tuned for ssd | ",
-		"| Linear ssd |", "ECE, calibrated"} {
+		"| Linear ssd |", "ECE, calibrated", "| Step evictions |", "| SLRU, per layer |", "| hotness, per layer |",
+		"## Stage E1: upstream eviction policies", "| LFU, step-pinned | ", "| SLRU, shared | ",
+		"| hotness, per layer, half-life tuned on the own prefix | ", "| ARC, step-pinned | ",
+		"| layer LRU, step-pinned | ", "tiny, prefill:", "| hotness, tuned |"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("the report lacks %q", want)
 		}
@@ -345,7 +364,7 @@ func TestFits(t *testing.T) {
 
 func TestCheckCurves(t *testing.T) {
 	sizes := []int{1, 2, 4}
-	_, runs, err := replay(tiny, tinySpans, 2, tinyModel, sizes, baselines(tiny, tinySpans, tinyModel, 512), tinyTiming)
+	_, runs, err := replay(tiny, tinySpans, 2, tinyModel, sizes, baselines(tiny, tinySpans, tinyModel, defaultKnobs), tinyTiming)
 	if err != nil {
 		t.Fatal(err)
 	}

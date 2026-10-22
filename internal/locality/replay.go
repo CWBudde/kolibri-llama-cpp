@@ -90,6 +90,10 @@ type Counts struct {
 	CarriedPrefetches    int   `json:"carried_prefetches,omitempty"`
 	CarriedPrefetchBytes int64 `json:"carried_prefetch_bytes,omitempty"`
 	Evictions            int   `json:"evictions"`
+	// StepEvictions are the evictions of experts the running step has used already: a step's
+	// experts are one event, which a server runs together and never evicts while it runs them
+	// (eviction.go).
+	StepEvictions int `json:"step_evictions"`
 	// FullSteps are the steps that found every expert they need resident: for a decoded token
 	// its exact Top-K set, for a ubatch its whole union.
 	FullSteps int           `json:"full_steps"`
@@ -200,6 +204,7 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 	needed := make([]int, nKey)         // the last step that needed the key, plus one
 	size := func(k int) int64 { return bytes[k/nExpert] }
 	var cur int64
+	step := 0 // the running step, plus one, once it has begun
 	load := func(k int, c *Counts) error {
 		for i := range qs {
 			qs[i].load(k, size(k))
@@ -218,12 +223,15 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 			}
 			if e != k {
 				c.Evictions++
+				if needed[e] == step {
+					c.StepEvictions++
+				}
 			}
 		}
 		r.PeakBytes = max(r.PeakBytes, cur)
 		return nil
 	}
-	step, seg := 0, 0
+	seg := 0
 	for i, s := range spans {
 		if seg < len(cuts) && i == cuts[seg] {
 			for k, ok := range pending {
@@ -359,6 +367,7 @@ func (c *Counts) add(o Counts) {
 	c.CarriedPrefetches += o.CarriedPrefetches
 	c.CarriedPrefetchBytes += o.CarriedPrefetchBytes
 	c.Evictions += o.Evictions
+	c.StepEvictions += o.StepEvictions
 	c.FullSteps += o.FullSteps
 	for l, x := range o.Layers {
 		c.Layers[l].Accesses += x.Accesses

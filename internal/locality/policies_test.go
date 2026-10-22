@@ -321,10 +321,18 @@ func policies(sel Selections, spans []Span, nExpert int, bytes []int64, c int) [
 		budget += int64(c) * b
 	}
 	arc, _ := NewARC(nExpert, bytes, budget)
+	layerSLRU, _ := NewLayerSLRU(nExpert, bytes, c, 0.5)
+	sharedSLRU, _ := NewSLRU(nExpert, bytes, budget, 0.5)
+	hot, _ := NewHotness(sel.Layers, nExpert, c, 16)
+	pinnedARC, _ := NewPinnedARC(nExpert, bytes, budget)
 	return []Policy{&NoCache{}, NewLayerLRU(sel.Layers, nExpert, c), NewSharedLRU(nExpert, bytes, budget),
-		NewLFU(nExpert, bytes, budget, 16), arc, NewLayerOracle(sel, spans, nExpert, bytes, c),
-		NewOracle(sel, spans, nExpert, bytes, budget)}
+		NewLFU(nExpert, bytes, budget, 16), arc, NewPinnedLFU(nExpert, bytes, budget, 16), layerSLRU, sharedSLRU, hot,
+		pinnedARC, NewLayerOracle(sel, spans, nExpert, bytes, c), NewOracle(sel, spans, nExpert, bytes, budget)}
 }
+
+// perLayer are the indexes in policies of those of the same capacity in every layer, which the
+// per-layer oracle bounds: the layer LRU, the per-layer SLRU and hotness.
+var perLayer = []int{1, 6, 8}
 
 func TestPolicyOracleBounds(t *testing.T) {
 	r := rand.New(rand.NewPCG(17, 18))
@@ -347,10 +355,14 @@ func TestPolicyOracleBounds(t *testing.T) {
 				loads = append(loads, res.Prefill.Misses+res.Decode.Misses)
 			}
 			n := len(loads)
-			if layerOracle, oracle := loads[n-2], loads[n-1]; oracle > slices.Min(loads) || layerOracle > loads[1] ||
-				oracle > layerOracle {
-				t.Fatalf("trial %d, %d per layer: misses %v (no cache, layer LRU, shared LRU, LFU, ARC, layer "+
-					"oracle, oracle)", trial, c, loads)
+			layerOracle, oracle := loads[n-2], loads[n-1]
+			bad := oracle > slices.Min(loads) || oracle > layerOracle
+			for _, i := range perLayer {
+				bad = bad || layerOracle > loads[i]
+			}
+			if bad {
+				t.Fatalf("trial %d, %d per layer: misses %v (no cache, layer LRU, shared LRU, LFU, ARC, pinned LFU, "+
+					"layer SLRU, shared SLRU, hotness, pinned ARC, layer oracle, oracle)", trial, c, loads)
 			}
 		}
 	}

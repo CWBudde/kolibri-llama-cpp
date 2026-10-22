@@ -144,6 +144,20 @@ type LFU struct {
 	clock       int
 	h           keyHeap
 	evict       []int
+	// pinned (NewPinnedLFU): the keys the running step has used are out of h, pins, and never
+	// evicted; pinBytes are their bytes and step the running step, plus one.
+	pinned   bool
+	pins     []int
+	pinBytes int64
+	step     int
+}
+
+// NewPinnedLFU is NewLFU that never evicts an expert the running step has used (eviction.go): a
+// load that does not fit beside them is used once and not kept.
+func NewPinnedLFU(nExpert int, bytes []int64, budget int64, halfLife int) *LFU {
+	c := NewLFU(nExpert, bytes, budget, halfLife)
+	c.pinned = true
+	return c
 }
 
 // NewLFU returns an empty LFU; halfLife is in tokens and must be positive.
@@ -167,6 +181,13 @@ func (c *LFU) size(k int) int64 { return c.bytes[k/c.nExpert] }
 
 // Prefetch ages the counts once per halfLife tokens reached; it prefetches nothing.
 func (c *LFU) Prefetch(s StepInfo) []int {
+	if c.pinned && s.Index+1 != c.step {
+		c.step = s.Index + 1
+		for _, k := range c.pins {
+			heap.Push(&c.h, k)
+		}
+		c.pins, c.pinBytes = c.pins[:0], 0
+	}
 	if s.First/c.halfLife > c.aged {
 		for ; c.aged < s.First/c.halfLife; c.aged++ {
 			for k := range c.count {
@@ -180,7 +201,7 @@ func (c *LFU) Prefetch(s StepInfo) []int {
 
 func (c *LFU) Load(k int) []int {
 	c.evict = c.evict[:0]
-	if c.size(k) > c.budget {
+	if c.size(k) > c.budget || (c.pinned && c.pinBytes+c.size(k) > c.budget) {
 		return append(c.evict, k)
 	}
 	for c.cur+c.size(k) > c.budget {
@@ -197,8 +218,14 @@ func (c *LFU) Use(_ StepInfo, k int) {
 	c.count[k]++
 	c.last[k] = c.clock
 	c.clock++
-	if c.h.pos[k] >= 0 {
-		heap.Fix(&c.h, c.h.pos[k])
+	if p := c.h.pos[k]; p >= 0 {
+		if c.pinned {
+			heap.Remove(&c.h, p)
+			c.pins = append(c.pins, k)
+			c.pinBytes += c.size(k)
+		} else {
+			heap.Fix(&c.h, p)
+		}
 	}
 }
 
@@ -213,6 +240,26 @@ type ARC struct {
 	l      *lists // t1, t2, b1, b2
 	loaded int    // the key the last Load fetched, whose Use is part of that miss
 	evict  []int
+	// pinned (NewPinnedARC): the experts the running step has used are never evicted; used is
+	// every key's last step that used it, step the running step, both plus one, and pins the
+	// resident experts the running step has used.
+	pinned bool
+	used   []int
+	step   int
+	pins   int
+}
+
+// NewPinnedARC is NewARC that never evicts an expert the running step has used (eviction.go):
+// REPLACE takes the least recent other expert of the list it chooses, of the other list if that
+// has none, and a load that finds every resident expert used by the running step is used once
+// and not kept, the lists and p unchanged.
+func NewPinnedARC(nExpert int, bytes []int64, budget int64) (*ARC, error) {
+	a, err := NewARC(nExpert, bytes, budget)
+	if err != nil {
+		return nil, err
+	}
+	a.pinned, a.used = true, make([]int, len(bytes)*nExpert)
+	return a, nil
 }
 
 const (
@@ -237,7 +284,24 @@ func NewARC(nExpert int, bytes []int64, budget int64) (*ARC, error) {
 	return &ARC{c: c, l: newLists(len(bytes)*nExpert, 4), loaded: -1}, nil
 }
 
-func (a *ARC) Prefetch(StepInfo) []int { return nil }
+// Prefetch notes the running step; it prefetches nothing.
+func (a *ARC) Prefetch(s StepInfo) []int {
+	if a.pinned && s.Index+1 != a.step {
+		a.step, a.pins = s.Index+1, 0
+	}
+	return nil
+}
+
+// victim is list i's least recent expert, the running step's skipped when pinned; -1 for none.
+func (a *ARC) victim(i int) int {
+	h := a.l.nKey + i
+	for v := a.l.prev[h]; v != h; v = a.l.prev[v] {
+		if !a.pinned || a.used[v] != a.step {
+			return v
+		}
+	}
+	return -1
+}
 
 // replace evicts T1's or T2's least recent expert into its ghost list, as the paper's REPLACE.
 func (a *ARC) replace(inB2 bool) {
@@ -249,7 +313,11 @@ func (a *ARC) replace(inB2 bool) {
 	if t1 >= 1 && ((inB2 && float64(t1) == a.p) || float64(t1) > a.p) || t2 == 0 {
 		from, to = arcT1, arcB1
 	}
-	v := a.l.back(from)
+	v := a.victim(from)
+	if v < 0 { // pinned: every expert of the list is the running step's
+		from, to = arcT1+arcT2-from, arcB1+arcB2-to
+		v = a.victim(from)
+	}
 	a.l.remove(v)
 	a.l.pushFront(to, v)
 	a.evict = append(a.evict, v)
@@ -262,6 +330,9 @@ func (a *ARC) Load(k int) []int {
 		return append(a.evict, k)
 	}
 	s := a.l.size
+	if a.pinned && s[arcT1]+s[arcT2] == a.c && a.pins == a.c {
+		return append(a.evict, k)
+	}
 	switch a.l.in[k] {
 	case arcB1:
 		d := 1.0
@@ -287,7 +358,7 @@ func (a *ARC) Load(k int) []int {
 				a.l.remove(a.l.back(arcB1))
 				a.replace(false)
 			} else {
-				v := a.l.back(arcT1)
+				v := a.victim(arcT1)
 				a.l.remove(v)
 				a.evict = append(a.evict, v)
 			}
@@ -304,11 +375,18 @@ func (a *ARC) Load(k int) []int {
 
 // Use moves a hit to T2's front; the Use of the expert just loaded belongs to its miss.
 func (a *ARC) Use(_ StepInfo, k int) {
+	in := a.l.in[k]
+	if a.pinned && (in == arcT1 || in == arcT2) && a.used[k] != a.step {
+		a.pins++
+	}
+	if a.pinned {
+		a.used[k] = a.step
+	}
 	if k == a.loaded {
 		a.loaded = -1
 		return
 	}
-	if in := a.l.in[k]; in == arcT1 || in == arcT2 {
+	if in == arcT1 || in == arcT2 {
 		a.l.remove(k)
 		a.l.pushFront(arcT2, k)
 	}

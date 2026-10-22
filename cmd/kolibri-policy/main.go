@@ -13,6 +13,11 @@
 //   - shared LRU: one LRU cache of the whole budget for all layers, cmd/kolibri-cache's shared one;
 //   - LFU: shared, the least used experts evicted, counts halved every -lfu-halflife tokens;
 //   - ARC: shared, the Adaptive Replacement Cache;
+//   - Stage E1's upstream policies (eviction.go), none of which evicts an expert the running step
+//     has used: LFU, ARC and the layer LRU step-pinned; the segmented LRU of llama.cpp's --moe-cache-mib, per layer and
+//     shared, protected holding -slru-protected of the budget; and the decayed hotness of
+//     --moe-stream, per layer, scores halved every -hotness-halflife tokens, the half-life also
+//     tuned as LFU's;
 //   - oracle, per layer and shared: Belady's MIN, which knows the future. It is no baseline but
 //     the unattainable bound, marked † wherever it is reported.
 //
@@ -160,10 +165,13 @@ type Workload struct {
 	TraceOrder TraceOrder    `json:"trace_order"`
 	LFUGrid    Grid          `json:"lfu_grid"`
 	LFUTuning  []Tuning      `json:"lfu_tuning"`
-	Allocation Allocations   `json:"allocation"`
-	LastN      LastNGrid     `json:"last_n"`
-	Markov     []HorizonGrid `json:"markov"`
-	Linear     []LinearGrid  `json:"linear,omitempty"`
+	// HotnessGrid and HotnessTuning are the hotness policy's half-life, replayed and tuned as LFU's.
+	HotnessGrid   Grid          `json:"hotness_grid"`
+	HotnessTuning []Tuning      `json:"hotness_tuning"`
+	Allocation    Allocations   `json:"allocation"`
+	LastN         LastNGrid     `json:"last_n"`
+	Markov        []HorizonGrid `json:"markov"`
+	Linear        []LinearGrid  `json:"linear,omitempty"`
 }
 
 // Assumptions are the declared, unmeasured inputs of the replays.
@@ -184,6 +192,9 @@ type Assumptions struct {
 	LinearL2s              []float64          `json:"linear_l2"`
 	LinearEpochs           int                `json:"linear_max_epochs"`
 	LinearRate             float64            `json:"linear_rate"`
+	SLRUProtected          float64            `json:"slru_protected_fraction"`
+	HotnessHalfLife        int                `json:"hotness_half_life_tokens"`
+	HotnessHalfLives       []int              `json:"hotness_tuning_half_lives"`
 }
 
 // Output is <dir>/policy-<model>.json.
@@ -206,12 +217,28 @@ const (
 	sharedLRU
 	lfu
 	arc
+	lfuPinned
+	arcPinned
+	layerLRUPinned
+	layerSLRU
+	sharedSLRU
+	hotness
 	layerOracle
 	sharedOracle
 )
 
-func baselines(sel locality.Selections, spans []locality.Span, m Model, halfLife int) []baseline {
-	b := m.bytes()
+// knobs are the declared parameters of the baselines.
+type knobs struct {
+	lfuHalfLife     int
+	slruProtected   float64
+	hotnessHalfLife int
+}
+
+// defaultKnobs are the flags' defaults.
+var defaultKnobs = knobs{512, 0.5, 512}
+
+func baselines(sel locality.Selections, spans []locality.Span, m Model, k knobs) []baseline {
+	b, halfLife := m.bytes(), k.lfuHalfLife
 	return []baseline{
 		layerLRU: {"layer LRU", false, func(c int) (locality.Policy, error) {
 			return locality.NewLayerLRU(sel.Layers, m.NExpert, c), nil
@@ -223,6 +250,26 @@ func baselines(sel locality.Selections, spans []locality.Span, m Model, halfLife
 			return locality.NewLFU(m.NExpert, b, m.budget(c), halfLife), nil
 		}},
 		arc: {"ARC", false, func(c int) (locality.Policy, error) { return locality.NewARC(m.NExpert, b, m.budget(c)) }},
+		lfuPinned: {"LFU, step-pinned", false, func(c int) (locality.Policy, error) {
+			return locality.NewPinnedLFU(m.NExpert, b, m.budget(c), halfLife), nil
+		}},
+		arcPinned: {"ARC, step-pinned", false, func(c int) (locality.Policy, error) {
+			return locality.NewPinnedARC(m.NExpert, b, m.budget(c))
+		}},
+		// the per-layer SLRU without a protected segment: control M40 shows it is the layer LRU
+		// except that it never evicts the running step's experts
+		layerLRUPinned: {"layer LRU, step-pinned", false, func(c int) (locality.Policy, error) {
+			return locality.NewLayerSLRU(m.NExpert, b, c, 0)
+		}},
+		layerSLRU: {"SLRU, per layer", false, func(c int) (locality.Policy, error) {
+			return locality.NewLayerSLRU(m.NExpert, b, c, k.slruProtected)
+		}},
+		sharedSLRU: {"SLRU, shared", false, func(c int) (locality.Policy, error) {
+			return locality.NewSLRU(m.NExpert, b, m.budget(c), k.slruProtected)
+		}},
+		hotness: {"hotness, per layer", false, func(c int) (locality.Policy, error) {
+			return locality.NewHotness(sel.Layers, m.NExpert, c, float64(k.hotnessHalfLife))
+		}},
 		layerOracle: {"oracle, per layer", true, func(c int) (locality.Policy, error) {
 			return locality.NewLayerOracle(sel, spans, m.NExpert, b, c), nil
 		}},
@@ -452,10 +499,12 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 		"data;\n", a.LFUHalfLife)
 	fmt.Fprintf(w, "- **ARC:** shared, the Adaptive Replacement Cache (Megiddo and Modha 2003), which has no "+
 		"parameters;\n")
+	writeE1Policies(w, a)
 	fmt.Fprintf(w, "- **oracle †:** Belady's MIN, per layer and shared: it knows every future step and drops the "+
 		"expert needed furthest ahead, the incoming one included. **It uses future knowledge and is an "+
 		"unattainable upper bound, not a policy a server can run.** With equal expert sizes no cache of the "+
 		"budget, prefetching or not, loads fewer bytes.\n\n")
+	writeE1Note(w)
 	var bw []string
 	for _, l := range links {
 		bw = append(bw, fmt.Sprintf("%s %.0f GB/s", l.Name, l.BytesPerSecond/1e9))
@@ -542,21 +591,22 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 	writeMarkov(w, a, links, sizes, d, results, gatesB)
 	writeLinear(w, a, links, sizes, d, results, gatesB)
 	writeGate(w, "Stage B gate", stageBIntro, gatesB, modelsOf(results))
+	writeE1(w, a, sizes, d, results)
 }
 
 // detailTable is one row per policy and phase of the result pick selects, at one size.
 func detailTable(w io.Writer, rows []Runs, links []locality.Link, pick func(Replayed) locality.Result) {
-	fmt.Fprintf(w, "| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Peak GB |")
+	fmt.Fprintf(w, "| Policy | Phase | Hit rate | Set recall | MB/token | Evictions | Step evictions | Peak GB |")
 	for _, l := range links {
 		fmt.Fprintf(w, " %s ms/token |", l.Name)
 	}
-	fmt.Fprintf(w, "\n|---|---|--:|--:|--:|--:|--:|%s\n", strings.Repeat("--:|", len(links)))
+	fmt.Fprintf(w, "\n|---|---|--:|--:|--:|--:|--:|--:|%s\n", strings.Repeat("--:|", len(links)))
 	for _, ph := range []locality.Phase{locality.Decode, locality.Prefill} {
 		for _, pr := range rows {
 			res := pick(pr.Runs[0].Replayed)
 			x := phase(res, ph)
-			fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %d | %s |", label(pr), ph, pct(rate(x)), pct(recall(x)),
-				perToken(x), x.Evictions, gb(res.PeakBytes))
+			fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %d | %d | %s |", label(pr), ph, pct(rate(x)), pct(recall(x)),
+				perToken(x), x.Evictions, x.StepEvictions, gb(res.PeakBytes))
 			for i := range links {
 				fmt.Fprintf(w, " %s |", msPerToken(x, i))
 			}
@@ -612,44 +662,50 @@ func writeTuning(w io.Writer, a Assumptions, sizes []int, d int, results []resul
 		}
 	}
 	for _, m := range models {
-		fmt.Fprintf(w, "\n%s, all workloads' test suffixes together, decode MB/token:\n\n| Experts per layer %s\n"+
-			"|--:|--:|--:|--:|--:|--:|\n", m, header)
-		for s, c := range sizes {
-			var tokens int
-			var sum [5]int64
-			lowo, other := true, true
-			for _, r := range results {
-				if r.model != m {
-					continue
-				}
-				t := r.w.LFUTuning[s]
-				tokens += r.w.NoCache.Split.Test.Decode.Tokens
-				sum[0] += t.Default.TestBytes
-				sum[1] += t.Own.TestBytes
-				if t.LOWO != nil {
-					sum[2] += t.LOWO.TestBytes
-				} else {
-					lowo = false
-				}
-				if t.OtherModel != nil {
-					sum[3] += t.OtherModel.TestBytes
-				} else {
-					other = false
-				}
-				sum[4] += t.Hindsight.TestBytes
+		tuningTotals(w, m, header, sizes, results, func(w Workload) []Tuning { return w.LFUTuning })
+	}
+}
+
+// tuningTotals is the table of a tuned half-life's test decode MB/token of model m's workloads
+// together, per size, as pick gives the tuning of a workload.
+func tuningTotals(w io.Writer, m, header string, sizes []int, results []result, pick func(Workload) []Tuning) {
+	fmt.Fprintf(w, "\n%s, all workloads' test suffixes together, decode MB/token:\n\n| Experts per layer %s\n"+
+		"|--:|--:|--:|--:|--:|--:|\n", m, header)
+	for s, c := range sizes {
+		var tokens int
+		var sum [5]int64
+		lowo, other := true, true
+		for _, r := range results {
+			if r.model != m {
+				continue
 			}
-			cells := make([]string, 5)
-			for i, b := range sum {
-				cells[i] = mbPer(b, tokens)
+			t := pick(r.w)[s]
+			tokens += r.w.NoCache.Split.Test.Decode.Tokens
+			sum[0] += t.Default.TestBytes
+			sum[1] += t.Own.TestBytes
+			if t.LOWO != nil {
+				sum[2] += t.LOWO.TestBytes
+			} else {
+				lowo = false
 			}
-			if !lowo {
-				cells[2] = "–"
+			if t.OtherModel != nil {
+				sum[3] += t.OtherModel.TestBytes
+			} else {
+				other = false
 			}
-			if !other {
-				cells[3] = "–"
-			}
-			fmt.Fprintf(w, "| %d | %s |\n", c, strings.Join(cells, " | "))
+			sum[4] += t.Hindsight.TestBytes
 		}
+		cells := make([]string, 5)
+		for i, b := range sum {
+			cells[i] = mbPer(b, tokens)
+		}
+		if !lowo {
+			cells[2] = "–"
+		}
+		if !other {
+			cells[3] = "–"
+		}
+		fmt.Fprintf(w, "| %d | %s |\n", c, strings.Join(cells, " | "))
 	}
 }
 
@@ -711,7 +767,11 @@ func main() {
 	bwFlag := flag.String("bw", "ssd=5,pcie=25,ram=100", "declared links, name=GB/s, each estimated on its own")
 	decodeTPS := flag.Float64("decode-tps", 63.7, "measured resident decode speed, tokens/s (tg128 on Metal)")
 	prefillTPS := flag.Float64("prefill-tps", 1347, "measured resident prefill speed, tokens/s (pp512 on Metal)")
-	halfLife := flag.Int("lfu-halflife", 512, "LFU: halve all counts every this many tokens")
+	halfLife := flag.Int("lfu-halflife", defaultKnobs.lfuHalfLife, "LFU: halve all counts every this many tokens")
+	slruProtected := flag.Float64("slru-protected", defaultKnobs.slruProtected,
+		"SLRU: the most of the budget the protected segment holds, a fraction")
+	hotHalfLife := flag.Int("hotness-halflife", defaultKnobs.hotnessHalfLife,
+		"hotness: halve all scores every this many tokens")
 	predictUS := flag.Float64("predict-us", 4.4, "measured predictor cost per decoded layer step, µs "+
 		"(BenchmarkMarkovStep in internal/locality, the slowest of six runs on an Apple M5 Pro)")
 	linearUS := flag.Float64("linear-us", 6.8, "measured linear predictor cost per decoded layer step, µs "+
@@ -731,6 +791,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("-bw: %v", err)
 	}
+	if !(*slruProtected >= 0 && *slruProtected <= 1) || *hotHalfLife <= 0 {
+		log.Fatal("-slru-protected must be in [0, 1], -hotness-halflife positive")
+	}
+	k := knobs{*halfLife, *slruProtected, *hotHalfLife}
 	if !positive(*decodeTPS) || !positive(*prefillTPS) || *halfLife <= 0 || at(sizes, *detail) < 0 ||
 		!(*predictUS >= 0) || math.IsInf(*predictUS, 1) || !(*linearUS >= 0) || math.IsInf(*linearUS, 1) {
 		log.Fatal("-decode-tps and -prefill-tps must be finite and positive, -lfu-halflife positive, -detail one " +
@@ -744,14 +808,15 @@ func main() {
 		PrefillTokensPerSecond: *prefillTPS, LFUHalfLife: *halfLife, LFUHalfLives: hs, SplitRule: splits.Rule,
 		LastN: lastNs, PredictSeconds: cost, MarkovHalfLives: markovHalfLives, MarkovMixes: markovMixes,
 		MarkovK: markovKs, LinearSeconds: linearCost, LinearL2s: linearL2s, LinearEpochs: linearEpochs,
-		LinearRate: linearRate}
+		LinearRate: linearRate, SLRUProtected: *slruProtected, HotnessHalfLife: *hotHalfLife,
+		HotnessHalfLives: hotnessHalfLives(*hotHalfLife)}
 	for _, l := range links {
 		a.LinkGBPerSecond[l.Name] = l.BytesPerSecond / 1e9
 	}
 	var known map[string]Model
 	readJSON(*bytesPath, &known)
 	var results []result
-	grids := map[string]map[string]Grid{}
+	grids, hotGrids := map[string]map[string]Grid{}, map[string]map[string]Grid{}
 	allCurves := map[string]map[string]curves{}
 	names := strings.Split(*models, ",")
 	for _, name := range names {
@@ -767,6 +832,7 @@ func main() {
 		var cache map[string]CacheSizes
 		readJSON(filepath.Join(*dir, "cache-"+name+".json"), &cache)
 		grids[short(name)] = map[string]Grid{}
+		hotGrids[short(name)] = map[string]Grid{}
 		allCurves[short(name)] = map[string]curves{}
 		for wl := range strings.SplitSeq(*workloads, ",") {
 			sel, err := locality.ReadNPYFile(filepath.Join(*dir, fmt.Sprintf("%s.%s.experts.npy", wl, name)))
@@ -834,7 +900,7 @@ func main() {
 				wl, short(name), len(sizes))
 			timing := locality.Timing{Links: links, DecodeStep: 1 / (*decodeTPS * float64(sel.Layers)),
 				PrefillToken: 1 / (*prefillTPS * float64(sel.Layers))}
-			noCache, runs, err := replay(sel, spans, cut, m, sizes, baselines(sel, spans, m, *halfLife), timing)
+			noCache, runs, err := replay(sel, spans, cut, m, sizes, baselines(sel, spans, m, k), timing)
 			if err != nil {
 				log.Fatalf("%s %s: %v", name, wl, err)
 			}
@@ -843,6 +909,11 @@ func main() {
 				log.Fatalf("%s %s: %v", name, wl, err)
 			}
 			grids[short(name)][wl] = grid
+			hotGrid, err := hotnessGrid(sel, spans, cut, m, sizes, a.HotnessHalfLives, timing)
+			if err != nil {
+				log.Fatalf("%s %s: %v", name, wl, err)
+			}
+			hotGrids[short(name)][wl] = hotGrid
 			var c curves
 			if c.train, err = locality.MissCurves(sel, spans, 0, cut, m.NExpert, m.bytes()); err == nil {
 				c.test, err = locality.MissCurves(sel, spans, cut, len(spans), m.NExpert, m.bytes())
@@ -894,7 +965,7 @@ func main() {
 				linear = append(linear, g)
 			}
 			w := Workload{Tokens: sel.Tokens, Answers: len(answers), Split: d, NoCache: noCache, Policies: runs,
-				TraceOrder: tr, LFUGrid: grid, LastN: lastN, Markov: markov, Linear: linear}
+				TraceOrder: tr, LFUGrid: grid, HotnessGrid: hotGrid, LastN: lastN, Markov: markov, Linear: linear}
 			for _, s := range spans {
 				if s.Phase == locality.Prefill {
 					w.Ubatches++
@@ -909,6 +980,7 @@ func main() {
 		r := &results[i]
 		for s, c := range sizes {
 			r.w.LFUTuning = append(r.w.LFUTuning, tune(grids, r.model, r.workload, s, c, *halfLife))
+			r.w.HotnessTuning = append(r.w.HotnessTuning, tune(hotGrids, r.model, r.workload, s, c, *hotHalfLife))
 		}
 		r.w.Allocation, err = replayAllocations(r.t, fits(allCurves, r.model, r.workload), sizes)
 		if err != nil {
@@ -929,7 +1001,7 @@ func main() {
 	for _, m := range modelsOf(results) {
 		if g, ok := gateOf(results, m, sizes, linkNames); ok {
 			gates[m] = g
-			gatesB[m] = stageBGate(results, m, sizes, linkNames, g)
+			gatesB[m] = stageBGate(results, m, sizes, linkNames, stageAOnly(g))
 		}
 	}
 	for _, name := range names {

@@ -66,10 +66,19 @@ type Grid struct {
 // lfuGrid replays LFU at every half-life and size.
 func lfuGrid(sel locality.Selections, spans []locality.Span, cut int, m Model, sizes, hs []int,
 	timing locality.Timing) (Grid, error) {
+	return halfLifeGrid(sel, spans, cut, m, sizes, hs, timing, "LFU", func(c, h int) (locality.Policy, error) {
+		return locality.NewLFU(m.NExpert, m.bytes(), m.budget(c), h), nil
+	})
+}
+
+// halfLifeGrid replays the policy build makes at size c and half-life h at every half-life of hs
+// and size.
+func halfLifeGrid(sel locality.Selections, spans []locality.Span, cut int, m Model, sizes, hs []int,
+	timing locality.Timing, name string, build func(c, h int) (locality.Policy, error)) (Grid, error) {
 	bases := make([]baseline, len(hs))
 	for i, h := range hs {
-		bases[i] = baseline{fmt.Sprintf("LFU %d", h), false, func(c int) (locality.Policy, error) {
-			return locality.NewLFU(m.NExpert, m.bytes(), m.budget(c), h), nil
+		bases[i] = baseline{fmt.Sprintf("%s %d", name, h), false, func(c int) (locality.Policy, error) {
+			return build(c, h)
 		}}
 	}
 	runs, err := replayAll(sel, spans, cut, m, sizes, bases, timing)

@@ -297,8 +297,8 @@ func stageBGate(results []result, model string, sizes []int, links []string, a G
 // stageBIntro is the rule of Stage B's gate as the report states it.
 const stageBIntro = "The predictor is retained if, on the decode of all test suffixes of a model together, it " +
 	"beats the best Stage A policy at one or more budgets: the fewest bytes and the least time on each link of " +
-	"the shared LRU and every policy judged at Stage A's gate, last-N included, at that budget. Each horizon's " +
-	"predictor is judged once per link, with k tuned for that link on the own prefix, on bytes and on that link's " +
+	"the shared LRU and every Stage A policy judged at Stage A's gate, last-N included and Stage E1's not, at " +
+	"that budget. Each horizon's predictor is judged once per link, with k tuned for that link on the own prefix, on bytes and on that link's " +
 	"time, its CPU cost included. Equal is no win, and times within a part in 10⁹ are equal. An expert " +
 	"prefetched in the training prefix and first used in the test suffix counts in the test suffix's bytes, as " +
 	"if it had loaded it (carried across the cut, `Counts.CarriedPrefetchBytes`): else a wrong prediction in " +

@@ -174,6 +174,7 @@ func gateOf(results []result, model string, sizes []int, links []string) (Gate, 
 	names := []string{"layer LRU", "LFU", "LFU, half-life tuned on the own prefix", "ARC",
 		"layer budgets allocated on the own prefix", "layer budgets allocated leaving one workload out",
 		"last-N on shared LRU, n tuned on the own prefix"}
+	names = append(names, stageE1...)
 	cands := make([]heldOut, len(names))
 	for i, n := range names {
 		cands[i].policy = n
@@ -188,8 +189,17 @@ func gateOf(results []result, model string, sizes []int, links []string) (Gate, 
 		ref.tests = append(ref.tests, tests(w.Policies[sharedLRU].Runs))
 		lfuTuned := tuned(w.LFUGrid.runs, w.LFUGrid.HalfLives, func(s int) int { return w.LFUTuning[s].Own.HalfLife })
 		lastN := tuned(w.LastN.Runs, w.LastN.N, func(s int) int { return w.LastN.Own[s] })
+		var hotTuned []locality.Result
+		if len(w.HotnessGrid.runs) > 0 && len(w.HotnessTuning) > 0 {
+			hotTuned = tuned(w.HotnessGrid.runs, w.HotnessGrid.HalfLives,
+				func(s int) int { return w.HotnessTuning[s].Own.HalfLife })
+		}
 		per := [][]locality.Result{tests(w.Policies[layerLRU].Runs), tests(w.Policies[lfu].Runs), lfuTuned,
-			tests(w.Policies[arc].Runs), nil, nil, lastN}
+			tests(w.Policies[arc].Runs), nil, nil, lastN,
+			// Stage E1, in the order of stageE1
+			tests(w.Policies[lfuPinned].Runs), tests(w.Policies[arcPinned].Runs),
+			tests(w.Policies[layerLRUPinned].Runs), tests(w.Policies[layerSLRU].Runs),
+			tests(w.Policies[sharedSLRU].Runs), tests(w.Policies[hotness].Runs), hotTuned}
 		for i, f := range []int{ownFit, lowoFit} {
 			if a := fitRuns(r, f); a != nil {
 				per[4+i] = tests(a.Runs)
