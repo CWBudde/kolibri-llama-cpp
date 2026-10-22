@@ -15,8 +15,8 @@
 // It writes run/tokens.log (one "unix_ms count" line per streamed chunk),
 // run/text.txt (the generated text) and run/samples.txt (every -every: time,
 // RSS and phys_footprint in MiB, system swap used in MiB, the
-// kern.memorystatus_vm_pressure_level, the token count and the system's
-// page-ins so far). At the end it prints the server's timings, the tokens/s per
+// kern.memorystatus_vm_pressure_level, the token count, the system's
+// page-ins so far and, with -model, the MiB of that file in the page cache). At the end it prints the server's timings, the tokens/s per
 // -window tokens and the system's page-ins from the first generated token to
 // the last, the pages read from disk while generating. With -summary FILE it
 // also writes the request as JSON for cmd/kolibri-bench: the time to the first
@@ -289,8 +289,9 @@ func command(name string, args ...string) (string, error) {
 }
 
 // sample appends one line for the process pid to w; it returns false once the
-// process is gone.
-func sample(w io.Writer, pid int, tokens int) bool {
+// process is gone. The last column is the page cache's share of the model
+// file in MiB, "-" without a model or off macOS.
+func sample(w io.Writer, pid int, tokens int, model string) bool {
 	p := strconv.Itoa(pid)
 	rss, err := command("ps", "-o", "rss=", "-p", p)
 	if err != nil {
@@ -302,7 +303,13 @@ func sample(w io.Writer, pid int, tokens int) bool {
 	swOut, _ := command("sysctl", "-n", "vm.swapusage")
 	sw, _ := parseSwapUsed(swOut)
 	level, _ := command("sysctl", "-n", "kern.memorystatus_vm_pressure_level")
-	fmt.Fprintf(w, "%s %.0f %.0f %.0f %s %d %d\n", time.Now().Format("15:04:05"), rssKiB/1024, fp, sw, level, tokens, pageins())
+	cached := "-"
+	if model != "" {
+		if v, err := pageCacheMiB(model); err == nil {
+			cached = fmt.Sprintf("%.0f", v)
+		}
+	}
+	fmt.Fprintf(w, "%s %.0f %.0f %.0f %s %d %d %s\n", time.Now().Format("15:04:05"), rssKiB/1024, fp, sw, level, tokens, pageins(), cached)
 	return true
 }
 
@@ -315,6 +322,7 @@ func main() {
 	n := flag.Int("n", 32000, "tokens to generate (n_predict, with ignore_eos)")
 	pid := flag.Int("pid", 0, "llama-server PID to sample; 0 disables sampling")
 	every := flag.Duration("every", 10*time.Second, "sampling interval")
+	model := flag.String("model", "", "with -pid: also sample how much of this file (the GGUF) the page cache holds")
 	size := flag.Int("window", 2048, "tokens per reported window")
 	dir := flag.String("out", ".", "output directory")
 	summaryPath := flag.String("summary", "", "also write the request's summary as JSON: latency percentiles, tokens/s, token IDs")
@@ -371,12 +379,12 @@ func main() {
 	if *pid > 0 {
 		samples := create("samples.txt")
 		defer samples.Close()
-		fmt.Fprintln(samples, "time rss_mib footprint_mib swap_used_mib pressure tokens pageins")
+		fmt.Fprintln(samples, "time rss_mib footprint_mib swap_used_mib pressure tokens pageins page_cache_mib")
 		go func() {
 			defer close(sampled)
 			tick := time.NewTicker(*every)
 			defer tick.Stop()
-			for sample(samples, *pid, int(count.Load())) {
+			for sample(samples, *pid, int(count.Load()), *model) {
 				select {
 				case <-done:
 					return

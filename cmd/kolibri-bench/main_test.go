@@ -84,8 +84,9 @@ func TestServerArgs(t *testing.T) {
 	if got != want {
 		t.Fatalf("serverArgs = %s, want %s", got, want)
 	}
-	c.Args = []string{"--cpu-moe"}
-	if got := strings.Join(m.serverArgs(c, 8099, "/run/stats.json"), " "); strings.Contains(got, "stats") {
+	// resident arms write the decode timing too (patch 0012)
+	c.Args = []string{"-ub", "21"}
+	if got := strings.Join(m.serverArgs(c, 8099, "/run/stats.json"), " "); !strings.HasSuffix(got, "-ub 21 --expert-cache-stats /run/stats.json") {
 		t.Fatalf("serverArgs without the cache = %s", got)
 	}
 }
@@ -274,15 +275,82 @@ func TestLoadResults(t *testing.T) {
 func TestPeaks(t *testing.T) {
 	samples := "time rss_mib footprint_mib swap_used_mib pressure tokens pageins\n" +
 		"02:00:00 100 2048 9000 1 0 5\n02:00:02 120 4096 9000 1 10 5\n02:00:04 110 3000 9000 1 20 5\n"
-	if rss, fp := peaks(strings.NewReader(samples)); rss != 120 || fp != 4096 {
-		t.Fatalf("peaks = %v, %v; want 120, 4096", rss, fp)
+	// a file without the page_cache_mib column (kolibri-stream before E1)
+	if p := peaks(strings.NewReader(samples)); p != (samplePeaks{120, 4096, -1}) {
+		t.Fatalf("peaks = %+v; want 120, 4096, -1", p)
+	}
+	samples = "time rss_mib footprint_mib swap_used_mib pressure tokens pageins page_cache_mib\n" +
+		"02:00:00 100 2048 9000 1 0 5 300\n02:00:02 120 4096 9000 1 10 5 -\n02:00:04 110 3000 9000 1 20 5 2500\n"
+	if p := peaks(strings.NewReader(samples)); p != (samplePeaks{120, 4096, 2500}) {
+		t.Fatalf("peaks = %+v; want 120, 4096, 2500", p)
 	}
 }
 
-// TestShippedMatrix checks that every config the equivalence checks and gates
-// name exists, at the ceilings they compare.
-func TestShippedMatrix(t *testing.T) {
-	data, err := os.ReadFile("../../testdata/bench/expert-cache.json")
+func TestDecodeSplit(t *testing.T) {
+	// a cache run's stats (patch 0012): 640 decoded tokens
+	var cache cacheStats
+	if err := json.Unmarshal([]byte(`{"expert_cache": {"buffered": true}, "decode": {"needed": 10, "wait_seconds": 9.2,
+		"remap_seconds": 1.6, "tokens": 640, "wall_seconds": 34.56, "splits": 65280, "metal_commits": 66560},
+		"process": {"max_phys_footprint": 11811160064}}`), &cache); err != nil {
+		t.Fatal(err)
+	}
+	d, ok := cache.split()
+	if !ok || !cache.ExpertCache.Buffered {
+		t.Fatalf("split = %+v, %v; buffered %v", d, ok, cache.ExpertCache)
+	}
+	near := func(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
+	if !near(d.Wall, 54) || !near(d.Wait, 14.375) || !near(d.Remap, 2.5) || !near(d.Other, 37.125) || d.Splits != 102 || d.Commits != 104 {
+		t.Fatalf("split = %+v", d)
+	}
+	// a resident run: no cache, only the timing; metal_commits null without Metal
+	var res cacheStats
+	if err := json.Unmarshal([]byte(`{"expert_cache": null, "decode": {"tokens": 640, "wall_seconds": 10.56, "splits": 1280,
+		"metal_commits": null}, "process": {}}`), &res); err != nil {
+		t.Fatal(err)
+	}
+	d, ok = res.split()
+	if !ok || res.ExpertCache != nil || !near(d.Wall, 16.5) || !near(d.Other, 16.5) || d.Splits != 2 || !math.IsNaN(d.Commits) {
+		t.Fatalf("resident split = %+v, %v", d, ok)
+	}
+	// Stage D's stats have no timing
+	var old cacheStats
+	if err := json.Unmarshal([]byte(`{"expert_cache": {}, "decode": {"wait_seconds": 9.2}}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := old.split(); ok {
+		t.Fatal("stats without decode tokens give a split")
+	}
+	if _, ok := (*cacheStats)(nil).split(); ok {
+		t.Fatal("no stats give a split")
+	}
+}
+
+func TestDecodeTable(t *testing.T) {
+	m := matrix{Configs: []config{{Name: "res", Ceilings: []float64{0}, Reps: 2}, {Name: "old", Ceilings: []float64{0}, Reps: 1}}}
+	commits := int64(1920)
+	fp := int64(2 << 30)
+	r1 := runResult{Config: "res", Rep: 1, Status: statusOK, Stats: &cacheStats{}}
+	r1.Stats.Decode.Tokens, r1.Stats.Decode.WallSeconds, r1.Stats.Decode.Splits, r1.Stats.Decode.MetalCommits = 640, 10.56, 1280, &commits
+	r1.Stats.Process.MaxPhysFootprint = &fp
+	peak, end := 4096.0, 1024.0
+	r1.PeakPageCacheMiB, r1.EndPageCacheMiB = &peak, &end
+	r2 := r1
+	r2.Rep = 2
+	var out strings.Builder
+	decodeTable(&out, m, []runResult{r1, r2, {Config: "old", Rep: 1, Status: statusOK}})
+	for _, want := range []string{
+		"| res | 0 GiB | 16.50 (16.50–16.50) | 0.00 (0.00–0.00) | 0.000 (0.000–0.000) | 16.50 (16.50–16.50) | 2.0 (2.0–2.0) | 3.0 (3.0–3.0) | 2.0 (2.0–2.0) | 4.0 (4.0–4.0) | 1.0 (1.0–1.0) |",
+		"| old | 0 GiB | – | – | – | – | – | – | – | – | – |",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("decode table lacks %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func loadMatrix(t *testing.T, path string) matrix {
+	t.Helper()
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,6 +358,45 @@ func TestShippedMatrix(t *testing.T) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		t.Fatal(err)
 	}
+	return m
+}
+
+// TestShippedMatrix checks that every config the equivalence checks and gates
+// name exists, at the ceilings they compare.
+func TestShippedMatrix(t *testing.T) {
+	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json"} {
+		t.Run(filepath.Base(path), func(t *testing.T) { checkMatrix(t, loadMatrix(t, path)) })
+	}
+}
+
+// TestE1Matrix keeps E1's settings comparable with Stage D's and its wired
+// memory safe: the resident arm and the 384-slot cache (all experts, about
+// as much memory as resident) only without a ceiling.
+func TestE1Matrix(t *testing.T) {
+	d, e := loadMatrix(t, "../../testdata/bench/expert-cache.json"), loadMatrix(t, "../../testdata/bench/e1.json")
+	if !slices.Equal(d.ServerArgs, e.ServerArgs) || d.PromptFirst != e.PromptFirst || d.NPredict != e.NPredict ||
+		d.Cold != e.Cold || !slices.Equal(d.Warm, e.Warm) {
+		t.Errorf("E1's workload settings differ from Stage D's")
+	}
+	for _, name := range []string{"iq3-resident-ub21", "iq3-cache384-ub21"} {
+		c, ok := e.config(name)
+		if !ok || !slices.Equal(c.Ceilings, []float64{0}) {
+			t.Errorf("%s: ceilings %v, want only 0", name, c.Ceilings)
+		}
+	}
+	const gib = 1 << 30
+	for _, c := range e.Configs {
+		for _, ceil := range c.Ceilings {
+			if ceil > 0 && !usesCache(c.Args) {
+				if ok, _ := fits(c, ceil, 35556257600, 48*gib); ok {
+					t.Errorf("%s fits at %g GiB", c.Name, ceil)
+				}
+			}
+		}
+	}
+}
+
+func checkMatrix(t *testing.T, m matrix) {
 	if m.PromptFirst <= 0 || m.NPredict <= 0 || m.Cold == "" || len(m.Warm) == 0 || len(m.Configs) == 0 {
 		t.Fatalf("incomplete matrix %+v", m)
 	}

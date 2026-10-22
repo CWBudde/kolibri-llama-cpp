@@ -34,14 +34,24 @@ type streamSummary struct {
 	TokensSHA256 string `json:"tokens_sha256"`
 }
 
-// cacheStats is the part of --expert-cache-stats the report uses.
+// cacheStats is the part of --expert-cache-stats the report uses. Without the
+// cache (patch 0012) expert_cache is null and decode has only the timing:
+// tokens, wall_seconds, splits and metal_commits.
 type cacheStats struct {
+	ExpertCache *struct {
+		Buffered bool `json:"buffered"`
+	} `json:"expert_cache"`
 	Decode struct {
-		Needed      int64   `json:"needed"`
-		Hits        int64   `json:"hits"`
-		DemandBytes int64   `json:"demand_bytes"`
-		WaitSeconds float64 `json:"wait_seconds"`
-		Failures    int64   `json:"load_failures"`
+		Needed       int64   `json:"needed"`
+		Hits         int64   `json:"hits"`
+		DemandBytes  int64   `json:"demand_bytes"`
+		WaitSeconds  float64 `json:"wait_seconds"`
+		Failures     int64   `json:"load_failures"`
+		RemapSeconds float64 `json:"remap_seconds"`
+		Tokens       int64   `json:"tokens"`
+		WallSeconds  float64 `json:"wall_seconds"`
+		Splits       int64   `json:"splits"`
+		MetalCommits *int64  `json:"metal_commits"`
 	} `json:"decode"`
 	Prefill struct {
 		Failures int64 `json:"load_failures"`
@@ -72,9 +82,15 @@ func loadResults(dir string) ([]runResult, error) {
 	return out, nil
 }
 
-// peaks returns the largest rss_mib and footprint_mib of a kolibri-stream
-// samples.txt.
-func peaks(r io.Reader) (rss, footprint float64) {
+// samplePeaks are the largest values of a kolibri-stream samples.txt, in MiB;
+// PageCache is -1 if no line has the page_cache_mib column (older files, or
+// not measured).
+type samplePeaks struct {
+	RSS, Footprint, PageCache float64
+}
+
+func peaks(r io.Reader) samplePeaks {
+	p := samplePeaks{PageCache: -1}
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
@@ -82,13 +98,45 @@ func peaks(r io.Reader) (rss, footprint float64) {
 			continue
 		}
 		if v, err := strconv.ParseFloat(f[1], 64); err == nil {
-			rss = max(rss, v)
+			p.RSS = max(p.RSS, v)
 		}
 		if v, err := strconv.ParseFloat(f[2], 64); err == nil {
-			footprint = max(footprint, v)
+			p.Footprint = max(p.Footprint, v)
+		}
+		if len(f) > 7 {
+			if v, err := strconv.ParseFloat(f[7], 64); err == nil {
+				p.PageCache = max(p.PageCache, v)
+			}
 		}
 	}
-	return rss, footprint
+	return p
+}
+
+// decodeSplit is one run's decode time per token from its stats, in ms: the
+// wall time, the wait on expert loads, the remap op's own time and the rest
+// (compute, syncs, graph handling); and the splits and Metal commits per token.
+type decodeSplit struct {
+	Wall, Wait, Remap, Other float64
+	Splits, Commits          float64 // Commits is NaN without a Metal count
+}
+
+func (s *cacheStats) split() (decodeSplit, bool) {
+	if s == nil || s.Decode.Tokens <= 0 {
+		return decodeSplit{}, false
+	}
+	n := float64(s.Decode.Tokens)
+	d := decodeSplit{
+		Wall:    1e3 * s.Decode.WallSeconds / n,
+		Wait:    1e3 * s.Decode.WaitSeconds / n,
+		Remap:   1e3 * s.Decode.RemapSeconds / n,
+		Splits:  float64(s.Decode.Splits) / n,
+		Commits: math.NaN(),
+	}
+	d.Other = d.Wall - d.Wait - d.Remap
+	if s.Decode.MetalCommits != nil {
+		d.Commits = float64(*s.Decode.MetalCommits) / n
+	}
+	return d, true
 }
 
 func median(v []float64) float64 {
@@ -345,6 +393,8 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 		}
 	}
 
+	decodeTable(w, m, runs)
+
 	allEqual := true
 	fmt.Fprintln(w)
 	for _, e := range m.Equivalence {
@@ -414,4 +464,45 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 		fmt.Fprintf(w, "- %s %s at %g GiB against the best of %s: %s\n", kind, g.Candidate, g.CeilingGiB, strings.Join(g.Baselines, ", "), result)
 	}
 	return allEqual
+}
+
+// decodeTable writes the decode time per token from the stats, split into the
+// wait on loads, the remap op and the rest, with the splits and Metal commits
+// per token, and the memory beside it: the stats' lifetime peak
+// phys_footprint and the model file's pages in the page cache, at their peak
+// during the requests and after the server stopped. A page cache that keeps
+// the file is memory too, which the footprint does not show.
+func decodeTable(w io.Writer, m matrix, runs []runResult) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "| Config | Ceiling | Decode ms/token | Wait ms/token | Remap ms/token | Other ms/token | Splits/token | Commits/token | Max footprint GiB | Page cache peak GiB | Page cache end GiB |")
+	fmt.Fprintln(w, "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+	for _, c := range m.Configs {
+		for _, ceil := range c.Ceilings {
+			var wall, wait, remap, other, splits, commits, foot, pcPeak, pcEnd []float64
+			for _, r := range runs {
+				if r.Config != c.Name || r.CeilingGiB != ceil || r.Status != statusOK {
+					continue
+				}
+				if d, ok := r.Stats.split(); ok {
+					wall, wait, remap, other = append(wall, d.Wall), append(wait, d.Wait), append(remap, d.Remap), append(other, d.Other)
+					splits = append(splits, d.Splits)
+					if !math.IsNaN(d.Commits) {
+						commits = append(commits, d.Commits)
+					}
+				}
+				if r.Stats != nil && r.Stats.Process.MaxPhysFootprint != nil {
+					foot = append(foot, float64(*r.Stats.Process.MaxPhysFootprint)/(1<<30))
+				}
+				if r.PeakPageCacheMiB != nil {
+					pcPeak = append(pcPeak, *r.PeakPageCacheMiB/1024)
+				}
+				if r.EndPageCacheMiB != nil {
+					pcEnd = append(pcEnd, *r.EndPageCacheMiB/1024)
+				}
+			}
+			fmt.Fprintf(w, "| %s | %g GiB | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", c.Name, ceil,
+				fmtRange(wall, 2), fmtRange(wait, 2), fmtRange(remap, 3), fmtRange(other, 2), fmtRange(splits, 1), fmtRange(commits, 1),
+				fmtRange(foot, 1), fmtRange(pcPeak, 1), fmtRange(pcEnd, 1))
+		}
+	}
 }

@@ -150,13 +150,13 @@ func fits(c config, ceilingGiB float64, modelBytes, memBytes int64) (bool, strin
 		float64(modelBytes)/gib, ceilingGiB, need, float64(memBytes)/gib)
 }
 
+// serverArgs asks every arm for --expert-cache-stats: with the cache the
+// cache's counters and the decode timing, without it (patch 0012) the decode
+// timing alone, so that resident and cache arms split their ms per token alike.
 func (m matrix) serverArgs(c config, port int, stats string) []string {
 	args := append([]string{"-m", c.Model, "--port", strconv.Itoa(port)}, m.ServerArgs...)
 	args = append(args, c.Args...)
-	if usesCache(c.Args) {
-		args = append(args, "--expert-cache-stats", stats)
-	}
-	return args
+	return append(args, "--expert-cache-stats", stats)
 }
 
 const (
@@ -191,8 +191,12 @@ type runResult struct {
 		Mean float64 `json:"mean"`
 		Max  float64 `json:"max"`
 	} `json:"others_cpu_percent"` // the other processes' CPU while the server ran, in % of one core
-	PeakRSSMiB       float64     `json:"peak_rss_mib"`
-	PeakFootprintMiB float64     `json:"peak_footprint_mib"`
+	PeakRSSMiB       float64 `json:"peak_rss_mib"`
+	PeakFootprintMiB float64 `json:"peak_footprint_mib"`
+	// the model file's pages in the page cache: the largest sample during the
+	// requests, and once after the server stopped (nil: not measured)
+	PeakPageCacheMiB *float64    `json:"peak_page_cache_mib,omitempty"`
+	EndPageCacheMiB  *float64    `json:"end_page_cache_mib,omitempty"`
 	Requests         []request   `json:"requests"`
 	Stats            *cacheStats `json:"stats,omitempty"`
 }
@@ -449,12 +453,15 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 		if !exited {
 			stop(srv, done, 3*time.Minute)
 		}
-		if usesCache(spec.Config.Args) {
-			if data, err := os.ReadFile(filepath.Join(dir, "stats.json")); err == nil {
-				var st cacheStats
-				if json.Unmarshal(data, &st) == nil {
-					res.Stats = &st
-				}
+		// what the page cache keeps of the file once the server is gone: a
+		// hidden tier that phys_footprint does not show
+		if v, err := pageCacheMiB(spec.Config.Model); err == nil {
+			res.EndPageCacheMiB = &v
+		}
+		if data, err := os.ReadFile(filepath.Join(dir, "stats.json")); err == nil {
+			var st cacheStats
+			if json.Unmarshal(data, &st) == nil {
+				res.Stats = &st
 			}
 		}
 	}()
@@ -521,7 +528,7 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 			"-url", fmt.Sprintf("http://127.0.0.1:%d/completion", b.port),
 			"-tokens", filepath.Join(b.workloads, q.Workload+".tokens.npy"), "-first", strconv.Itoa(b.m.PromptFirst),
 			"-manifest", b.manifest, "-n", strconv.Itoa(b.m.NPredict),
-			"-pid", strconv.Itoa(srv.Process.Pid), "-every", "2s", "-window", "1000000",
+			"-pid", strconv.Itoa(srv.Process.Pid), "-model", spec.Config.Model, "-every", "2s", "-window", "1000000",
 			"-out", rdir, "-summary", filepath.Join(rdir, "summary.json"))
 		out, err := cmd.CombinedOutput()
 		cancel()
@@ -545,8 +552,11 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 		q.Summary = &s
 		res.Requests = append(res.Requests, q)
 		if f, err := os.Open(filepath.Join(rdir, "samples.txt")); err == nil {
-			rss, fp := peaks(f)
-			res.PeakRSSMiB, res.PeakFootprintMiB = max(res.PeakRSSMiB, rss), max(res.PeakFootprintMiB, fp)
+			pk := peaks(f)
+			res.PeakRSSMiB, res.PeakFootprintMiB = max(res.PeakRSSMiB, pk.RSS), max(res.PeakFootprintMiB, pk.Footprint)
+			if pk.PageCache >= 0 && (res.PeakPageCacheMiB == nil || pk.PageCache > *res.PeakPageCacheMiB) {
+				res.PeakPageCacheMiB = &pk.PageCache
+			}
 			f.Close()
 		}
 		b.logf("%s: %s %s: prompt %.1f t/s, decode %.2f t/s, p95 %.1f ms", spec.key(), q.Phase, q.Workload,
