@@ -4,7 +4,7 @@
 The fixture is cmd/kolibri-tiny -router (384 experts, top 6), converted to F32 and to Q8_0. On
 every device, 40 prompt tokens are prefilled and 60 more decoded one by one, once with the experts
 resident and once through the expert cache with 6, 16, 64 and 384 slots per layer, with and without
-prefetch. The cache caps the ubatch at slots / 6, so the resident run uses that ubatch too, and on
+prefetch, and with buffered reads (no F_NOCACHE). The cache caps the ubatch at slots / 6, so the resident run uses that ubatch too, and on
 the CPU its weights are not repacked (the slots are not either).
 
 - logits: bit-identical to the resident run, at every position. The slots hold the same bytes as
@@ -13,16 +13,21 @@ the CPU its weights are not repacked (the slots are not either).
   demand bytes are misses times an expert's bytes; every step of every layer is a remap (a ubatch
   of one token counts as decode, so with a ubatch of 1 the prompt does too); loads into a slot
   never outnumber the slots plus what freed one (evictions, cancellations, failed loads); and the
-  predictor runs in decode exactly when asked for, never in prefill;
+  predictor runs in decode exactly when asked for, never in prefill; the read mode is recorded; the
+  decode timing counts every decode ubatch, and its remap and wait fit within its wall time. The
+  resident run writes the decode timing alone (stats without the cache). Control M42: the graph
+  splits per decoded token are the known counts, on the GPU 2 resident and 2 + 2 per layer with
+  the cache (each remap is a CPU split), on the CPU 1;
 - the ubatch cap is logged, and fewer slots than the experts of one token fail to load;
 - slots per layer (n_slots_layer) give bit-identical logits too, and a model with the cache serves
   one context: a second one fails;
 - placement: with only half the layers on the GPU, every layer's slots go to its own device, and
   with the CPU's repacking buffer types enabled the slots still hold the file's bytes; both again
   bit-identical to the resident run without repacking;
-- the command line: llama-completion with --expert-cache-layers, --expert-prefetch and
-  --expert-cache-stats generates with the cache as asked (the stats record the slots and the
-  prefetch), and greedily the same text as without it; with a quote, a backslash and a tab in the
+- the command line: llama-completion with --expert-cache-layers, --expert-prefetch,
+  --expert-cache-buffered and --expert-cache-stats generates with the cache as asked (the stats
+  record the slots, the prefetch and the read mode), and greedily the same text as without it;
+  --expert-cache-stats without the cache writes the decode timing alone; with a quote, a backslash and a tab in the
   model's file name the stats are still valid JSON and name the file.
 
 With --real GGUF it checks a real checkpoint on the GPU instead: the first 160 tokens of a
@@ -48,7 +53,7 @@ from tiny import convert, generate_tiny
 
 N_PROMPT, N_DECODE = 40, 60
 SLOTS = [6, 16, 64, 384]
-PREFETCH = [0, 12]
+VARIANTS = [(0, False), (12, False), (0, True)]  # (prefetch, buffered reads)
 
 
 def main() -> None:
@@ -74,12 +79,30 @@ def main() -> None:
         chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
         for slots in slots_list:
             ub = min(n_prompt, max(1, slots // k))  # n_batch is the largest chunk, the prompt
-            ref = r.logits(gguf, dev, tokens, ub, chunks=chunks, no_repack=True)
-            for pf in PREFETCH:
-                what = f"{label} {dev_name}, {slots} slots, ubatch {ub}, prefetch {pf}"
+            # the prompt's ubatches; one of a single token counts as decode
+            sizes = [ub] * (n_prompt // ub) + ([n_prompt % ub] if n_prompt % ub else [])
+            n_pre = sum(n > 1 for n in sizes)
+            n_dec = len(tokens) - n_prompt + sum(n == 1 for n in sizes)
+
+            # resident, with the decode timing only (stats without the cache)
+            stats.unlink(missing_ok=True)
+            ref = r.logits(gguf, dev, tokens, ub, chunks=chunks, no_repack=True, expert_cache={"stats_path": str(stats)})
+            s = json.loads(stats.read_text())
+            d = s["decode"]
+            # M42: the scheduler's splits per decoded token are known: on the GPU 2 resident (docs/real-checkpoint.md)
+            # and 2 more per layer with the cache (each layer's remap is a CPU split); on the CPU 1 either way
+            on_gpu = r.lib.ggml_backend_dev_type(dev) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU
+            splits_resident, splits_cache = (2, 2 + 2 * n_layer) if on_gpu else (1, 1)
+            report(s["expert_cache"] is None and d["tokens"] == n_dec and d["wall_seconds"] > 0
+                   and d["splits"] == splits_resident * d["tokens"] and "max_phys_footprint" in s["process"],
+                   f"{label} {dev_name}, resident, ubatch {ub}: decode timing without the cache ({d['tokens']} tokens, "
+                   f"{d['splits'] / max(d['tokens'], 1):.2f} splits and {(d['metal_commits'] or 0) / max(d['tokens'], 1):.2f} "
+                   f"Metal commits per token, {1e3 * d['wall_seconds'] / max(d['tokens'], 1):.3f} ms per token)")
+            for pf, buffered in VARIANTS:
+                what = f"{label} {dev_name}, {slots} slots, ubatch {ub}, prefetch {pf}" + (", buffered" if buffered else "")
                 stats.unlink(missing_ok=True)
                 got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True,
-                               expert_cache={"n_slots": slots, "prefetch_k": pf, "stats_path": str(stats)})
+                               expert_cache={"n_slots": slots, "prefetch_k": pf, "stats_path": str(stats), "buffered": buffered})
                 log = "".join(r.log)
                 same = np.array_equal(got, ref)
                 diff = "" if same else f", max |diff| {float(np.abs(got - ref).max()):.3g}"
@@ -92,11 +115,11 @@ def main() -> None:
                 pre, dec = s["prefill"], s["decode"]
                 ok = all(c["hits"] + c["hits_loading"] + c["misses"] == c["needed"] and c["demand_bytes"] == c["misses"] * eb
                          for c in (pre, dec))
-                # the prompt's ubatches; one of a single token counts as decode
-                sizes = [ub] * (n_prompt // ub) + ([n_prompt % ub] if n_prompt % ub else [])
-                n_pre = sum(n > 1 for n in sizes)
-                n_dec = len(tokens) - n_prompt + sum(n == 1 for n in sizes)
                 ok = ok and pre["steps"] == n_pre * n_layer and dec["steps"] == n_dec * n_layer
+                # the read mode as asked; the decode timing: every decode ubatch, its remaps and waits within its wall time
+                ok = ok and s["expert_cache"]["buffered"] == (buffered or sys.platform != "darwin")
+                ok = ok and dec["tokens"] == n_dec and min(pre["remap_seconds"], dec["remap_seconds"]) >= 0 \
+                    and dec["remap_seconds"] + dec["wait_seconds"] <= dec["wall_seconds"] and dec["splits"] == splits_cache * dec["tokens"]
                 tot = {key: pre[key] + dec[key] for key in pre}
                 ok = ok and tot["misses"] + tot["prefetch_issued"] <= \
                     slots * n_layer + tot["evictions"] + tot["prefetch_cancelled"] + tot["load_failures"]
@@ -109,6 +132,9 @@ def main() -> None:
                            f"{dec['hits_loading']} awaited, prefetch {dec['prefetch_used']}/{dec['prefetch_issued']} used, "
                            f"{dec['prefetch_skipped']} skipped, {dec['prefetch_cancelled']} cancelled; "
                            f"wait {dec['wait_seconds']:.3f} s, I/O {dec['io_seconds']:.3f} s ({dec['io_prefetch_seconds']:.3f} s prefetch) in decode; "
+                           f"per decoded token {1e3 * dec['wall_seconds'] / max(dec['tokens'], 1):.3f} ms, "
+                           f"{1e3 * dec['remap_seconds'] / max(dec['tokens'], 1):.3f} ms remap, {dec['splits'] / max(dec['tokens'], 1):.2f} splits, "
+                           f"{(dec['metal_commits'] or 0) / max(dec['tokens'], 1):.2f} Metal commits; "
                            f"{s['process']['disk_bytes_read']} bytes read from disk)")
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -191,14 +217,24 @@ def main() -> None:
             plain = subprocess.run(base + ["-ub", "2"], capture_output=True, text=True)
             stats.unlink(missing_ok=True)
             cached = subprocess.run(base + ["--expert-cache-layers", str(layers), "--expert-prefetch", "8,4,0.25",
-                                            "--expert-cache-threads", "2", "--expert-cache-stats", str(stats)],
+                                            "--expert-cache-threads", "2", "--expert-cache-buffered", "--expert-cache-stats", str(stats)],
                                     capture_output=True, text=True)
             ok = plain.returncode == 0 and cached.returncode == 0 and stats.exists()
             if ok:
                 s = json.loads(stats.read_text())
                 c = s["expert_cache"]
-                ok = (c["slots_min"], c["slots_max"], c["prefetch_k"], c["prefetch_half_life"], c["prefetch_mix"], c["io_threads"]) == \
-                     (12, 384, 8, 4, 0.25, 2) and s["decode"]["steps"] > 0
+                ok = (c["slots_min"], c["slots_max"], c["prefetch_k"], c["prefetch_half_life"], c["prefetch_mix"], c["io_threads"], c["buffered"]) == \
+                     (12, 384, 8, 4, 0.25, 2, True) and s["decode"]["steps"] > 0 and s["decode"]["tokens"] > 0
+            # without the cache, --expert-cache-stats writes the decode timing alone
+            stats.unlink(missing_ok=True)
+            resident = subprocess.run(base + ["-ub", "2", "--expert-cache-stats", str(stats)], capture_output=True, text=True)
+            try:
+                rs = json.loads(stats.read_text())
+                rok = rs["expert_cache"] is None and rs["decode"]["tokens"] >= 23 and rs["decode"]["splits"] > 0
+            except (OSError, ValueError, KeyError) as e:
+                rs, rok = str(e), False
+            report(resident.returncode == 0 and rok and resident.stdout == plain.stdout,
+                   f"llama-completion --expert-cache-stats without the cache: decode timing only, same text ({rs if not rok else rs['decode']})")
             odd = Path(tmp) / 'we"ird\\na\tme.gguf'
             shutil.copyfile(gguf, odd)
             stats.unlink(missing_ok=True)
@@ -212,7 +248,7 @@ def main() -> None:
             report(run.returncode == 0 and Path(named).name == odd.name,
                    f"stats of a model named {odd.name!r} are valid JSON and name it ({named!r})")
             report(ok and plain.stdout == cached.stdout and plain.stdout.strip() != "",
-                   f"llama-completion --expert-cache-layers/--expert-prefetch/--expert-cache-stats: as asked, same text as without the cache "
+                   f"llama-completion --expert-cache-layers/--expert-prefetch/--expert-cache-buffered/--expert-cache-stats: as asked, same text as without the cache "
                    f"({plain.stdout.strip()[:60]!r})" + ("" if ok else f" rc {plain.returncode}/{cached.returncode}: {cached.stderr.strip()[-300:]}"))
 
     print(f"{'FAIL' if failed else 'PASS'}: {failed} failures")

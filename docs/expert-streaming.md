@@ -32,7 +32,8 @@ Options of every `common` tool (llama-cli, llama-completion, llama-server):
 | `--expert-cache-layers FNAME` | slots per layer instead: one integer per layer, separated by commas or white space |
 | `--expert-cache-threads N` | I/O threads (default 4) |
 | `--expert-prefetch K[,HALF_LIFE[,MIX]]` | prefetch K experts per layer, ranked by the predictor (default off; half-life 1 token, mix 0.75, Stage B's same-token choice) |
-| `--expert-cache-stats FNAME` | write the counters as JSON when the model is freed |
+| `--expert-cache-stats FNAME` | write the counters as JSON when the model is freed; without `--expert-cache` the decode timing alone (patch 0012) |
+| `--expert-cache-buffered` | read misses through the page cache instead of with `F_NOCACHE` (macOS; default off, patch 0012) |
 
 ```sh
 B=third_party/llama.cpp/build/bin
@@ -56,6 +57,12 @@ In the C API it is `llama_model_params.expert_cache`, a `llama_expert_cache_para
   - `wait_seconds`, the time the remaps blocked on loads, which is the cost on the critical path;
   - `io_seconds`, the loads' own time, summed over the I/O threads;
   - `io_prefetch_seconds`, the part of it that prefetches took. It overlaps compute, unless a remap waited for the prefetch (`hits_loading`). Demand loads overlap nothing, except each other on the I/O threads.
+- Patch 0012 adds (Phase 11, Stage E1):
+  - `expert_cache.buffered`, whether misses are read through the page cache (always true on Linux);
+  - `remap_seconds` per phase, the remap op's time minus its wait on loads: the bookkeeping's own CPU cost;
+  - in `decode`, over every ubatch of one token: `tokens`; `wall_seconds`, from the graph's build or reuse to the outputs' copy, synchronized; `splits`, the scheduler's graph splits; and `metal_commits`, the Metal command buffers committed meanwhile (`null` without the Metal backend). `wall_seconds − wait_seconds − remap_seconds` is the rest: compute, syncs and graph handling.
+  - Without the cache, `--expert-cache-stats` writes `{"expert_cache": null, "decode": {tokens, wall_seconds, splits, metal_commits}, "process": {...}}`, the process counters measured since the model was loaded.
+  - Known counts per decoded token on Metal (control M42, in the tiny check): 2 splits resident, 2 + 2 per layer with the cache (each layer's remap is a CPU split); IQ3: 2 and 102. Commits: 2 per Metal split plus 1 for the output copy, so 3 and 103.
 - `process`, measured since the cache was set up: `disk_bytes_read` and `pageins` from `proc_pid_rusage`, `major_faults` from `getrusage`, and the lifetime peak `max_phys_footprint`. A counter the platform does not measure is `null`: on Linux all but `major_faults`.
 - The file name is a JSON string, escaped.
 
@@ -85,7 +92,7 @@ The fixture comes from `internal/locality`'s `TestMarkovFixture`: a random conve
   - `llama-completion` with `--expert-cache-layers`, `--expert-prefetch 8,4,0.25`, `--expert-cache-threads 2` and `--expert-cache-stats` runs as asked (the stats record it) and generates the same greedy text as without the cache;
   - placement: with 3 of 6 layers on Metal, each layer's slots are on its own device; with the CPU's repacking enabled, the slots still hold the file's bytes. Both are bit-identical to the resident run without repacking;
   - a model file named with a quote, a backslash and a tab still gives valid stats JSON.
-- **Result:** "PASS: 0 failures", 102 checks. The logits of all 100 positions are bit-identical in every configuration, and the counters are consistent.
+- **Result:** "PASS: 0 failures", 102 checks; 163 with patch 0012 (buffered reads, decode timing, M42). The logits of all 100 positions are bit-identical in every configuration, and the counters are consistent.
 
 **IQ3, real weights** (`check_expert_cache.py --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`):
 - **Setup:** the first 160 tokens of the coding workload, 128 prefilled and 32 decoded, on Metal.
