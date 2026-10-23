@@ -26,9 +26,11 @@
 // Each run writes <out>/<config>/<ceiling>g/r<rep>/run.json; a run that has
 // one is skipped, so an interrupted benchmark resumes. A server that fails to
 // load or a request that fails is recorded, not fatal: at a ceiling it is a
-// result. A resident run whose wired weights and hog exceed the memory is
-// recorded as "does not fit" without starting it (see fits). The report goes to stdout and <out>/report.md; it exits 1 if an
-// exact equivalence fails or a cache run failed to load an expert.
+// result. A resident run whose wired weights and hog exceed the memory, or a
+// cache run whose slots do not fit beside the hog, is recorded as "does not
+// fit" without starting it (see fits). The report goes to stdout and
+// <out>/report.md; it exits 1 if an exact equivalence fails or a cache run
+// failed to load an expert.
 package main
 
 import (
@@ -50,6 +52,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"kolibri-llm/internal/gguf"
 )
 
 type config struct {
@@ -131,23 +135,81 @@ func (m matrix) config(name string) (config, bool) {
 
 func usesCache(args []string) bool { return slices.Contains(args, "--expert-cache") }
 
+// weights is what fits needs from a GGUF.
+type weights struct {
+	Bytes       int64 // the file
+	ExpertBytes int64 // the routed experts' tensors (ffn_{gate,up,down}_exps) of all layers
+	SlotBytes   int64 // one expert of every layer: what one cache slot per layer holds
+}
+
+// weightsOf sums a GGUF's expert tensors; size is the file's size.
+func weightsOf(f *gguf.File, size int64) (weights, error) {
+	w := weights{Bytes: size}
+	for _, t := range f.Tensors {
+		if !expertTensor.MatchString(t.Name) {
+			continue
+		}
+		if len(t.Dims) != 3 || t.Dims[2] == 0 {
+			return w, fmt.Errorf("%s: dims %v, want [n_in, n_out, n_expert]", t.Name, t.Dims)
+		}
+		n, err := t.Bytes()
+		if err != nil {
+			return w, err
+		}
+		w.ExpertBytes += n
+		w.SlotBytes += n / int64(t.Dims[2])
+	}
+	return w, nil
+}
+
+var expertTensor = regexp.MustCompile(`^blk\.\d+\.ffn_(gate|up|down)_exps\.weight$`)
+
+// osReserveGiB is the memory left to macOS and everything else beside a
+// cache run's slots, its non-expert weights and the hog. Q8_0's 128 slots
+// (24.9 GiB), its non-expert weights (2.7 GiB) and a 16 GiB hog left
+// 4.4 GiB: the slots were paged out and the cold request produced no token
+// in 20 minutes (2026-10-23). IQ3's cache runs, at 33.1 GiB or less, completed.
+const osReserveGiB = 8
+
 // fits reports whether a run can start: with neither --cpu-moe nor
 // --expert-cache, -ngl 99 puts every weight into Metal buffers, which are
 // wired like the hog's memory, and the two together must stay below the
 // physical memory. Beyond it macOS does not fail the load, it hangs: on
 // 2026-10-15 IQ3 resident beside a 16 GiB hog ended in a watchdog panic.
-// Experts that stay pageable (on the CPU or in the cache) always fit.
-func fits(c config, ceilingGiB float64, modelBytes, memBytes int64) (bool, string) {
-	if usesCache(c.Args) || slices.Contains(c.Args, "--cpu-moe") {
-		return true, ""
-	}
+// With --cpu-moe the experts stay in the page cache and always fit. The
+// cache's slots are anonymous memory that macOS can page out, which keeps
+// the machine up but turns hits into page-ins; they fit only with the
+// non-expert weights, the hog and osReserveGiB beside them.
+func fits(c config, ceilingGiB float64, w weights, memBytes int64) (bool, string) {
 	const gib = 1 << 30
-	need := float64(modelBytes)/gib + ceilingGiB
-	if need < float64(memBytes)/gib {
+	mem := float64(memBytes) / gib
+	if slices.Contains(c.Args, "--cpu-moe") {
 		return true, ""
 	}
-	return false, fmt.Sprintf("the resident weights (%.1f GiB) and the %g GiB hog are %.1f GiB wired, beyond the %.0f GiB of memory",
-		float64(modelBytes)/gib, ceilingGiB, need, float64(memBytes)/gib)
+	if !usesCache(c.Args) {
+		need := float64(w.Bytes)/gib + ceilingGiB
+		if need < mem {
+			return true, ""
+		}
+		return false, fmt.Sprintf("the resident weights (%.1f GiB) and the %g GiB hog are %.1f GiB wired, beyond the %.0f GiB of memory",
+			float64(w.Bytes)/gib, ceilingGiB, need, mem)
+	}
+	arg := ""
+	if i := slices.Index(c.Args, "--expert-cache"); i+1 < len(c.Args) {
+		arg = c.Args[i+1]
+	}
+	slots, err := strconv.Atoi(arg)
+	if err != nil || slots < 0 {
+		return false, fmt.Sprintf("--expert-cache %q is not a slot count", arg)
+	}
+	cache := float64(int64(slots)*w.SlotBytes) / gib
+	rest := float64(w.Bytes-w.ExpertBytes) / gib
+	need := rest + cache + ceilingGiB + osReserveGiB
+	if need < mem {
+		return true, ""
+	}
+	return false, fmt.Sprintf("the non-expert weights (%.1f GiB), %d cache slots (%.1f GiB), the %g GiB hog and %d GiB for the system are %.1f GiB, beyond the %.0f GiB of memory",
+		rest, slots, cache, ceilingGiB, osReserveGiB, need, mem)
 }
 
 // serverArgs asks every arm for --expert-cache-stats: with the cache the
@@ -402,7 +464,15 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 	if err != nil {
 		return res, err
 	}
-	if ok, why := fits(spec.Config, spec.Ceiling, st.Size(), b.memBytes); !ok {
+	f, err := gguf.Open(spec.Config.Model)
+	if err != nil {
+		return res, err
+	}
+	w, err := weightsOf(f, st.Size())
+	if err != nil {
+		return res, err
+	}
+	if ok, why := fits(spec.Config, spec.Ceiling, w, b.memBytes); !ok {
 		res.Status, res.Error = statusDoesNotFit, why
 		return res, nil
 	}

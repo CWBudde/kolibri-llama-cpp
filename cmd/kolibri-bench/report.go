@@ -216,12 +216,24 @@ type verdict struct {
 }
 
 // expectedRequests is the number of requests the arms make over all their
-// ceilings and repetitions: the cold one and the warm ones per run.
-func (m matrix) expectedRequests(arms []string) int {
+// ceilings and repetitions: the cold one and the warm ones per run, except
+// in the runs that do not fit and so never start.
+func (m matrix) expectedRequests(arms []string, runs []runResult) int {
 	n := 0
 	for _, name := range arms {
 		if c, ok := m.config(name); ok {
-			n += c.Reps * len(c.Ceilings) * (1 + len(m.Warm))
+			n += (c.Reps*len(c.Ceilings) - doesNotFit(runs, name)) * (1 + len(m.Warm))
+		}
+	}
+	return n
+}
+
+// doesNotFit counts a config's runs recorded as not fitting.
+func doesNotFit(runs []runResult, cfg string) int {
+	n := 0
+	for _, r := range runs {
+		if r.Config == cfg && r.Status == statusDoesNotFit {
+			n++
 		}
 	}
 	return n
@@ -408,7 +420,7 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 				diffs = append(diffs, fmt.Sprintf("%s %s %s at token %d", c.Run, c.Phase, c.Workload, c.Diff))
 			}
 		}
-		want := m.expectedRequests(e.Arms)
+		want := m.expectedRequests(e.Arms, runs)
 		kind := "INFO"
 		if e.Exact {
 			kind = "PASS"
@@ -423,10 +435,12 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 		fmt.Fprintln(w)
 	}
 
-	cacheRuns, withStats, failures := 0, 0, int64(0)
+	cacheRuns, notFit, withStats, failures := 0, 0, 0, int64(0)
 	for _, c := range m.Configs {
 		if usesCache(c.Args) {
-			cacheRuns += c.Reps * len(c.Ceilings)
+			n := doesNotFit(runs, c.Name)
+			cacheRuns += c.Reps*len(c.Ceilings) - n
+			notFit += n
 		}
 	}
 	for _, r := range runs {
@@ -441,7 +455,11 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 	if failures > 0 || withStats < cacheRuns {
 		kind, allEqual = "FAIL", false
 	}
-	fmt.Fprintf(w, "- %s expert load failures: %d in the %d of %d cache runs that completed and wrote their stats\n", kind, failures, withStats, cacheRuns)
+	fmt.Fprintf(w, "- %s expert load failures: %d in the %d of %d cache runs that completed and wrote their stats", kind, failures, withStats, cacheRuns)
+	if notFit > 0 {
+		fmt.Fprintf(w, " (%d did not fit)", notFit)
+	}
+	fmt.Fprintln(w)
 
 	fmt.Fprintln(w)
 	for _, g := range m.Gates {
