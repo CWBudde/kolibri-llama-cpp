@@ -1,88 +1,154 @@
 package gguf
 
 import (
-	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"slices"
 )
 
-// WriteHeader writes a GGUF v3 header for tests and fixtures: kv in sorted
-// key order (uint32, uint64, int32, float32, bool, string or []string
-// values), then the tensor infos, then zero padding up to the data section,
-// whose offset it returns. The tensors' data is the caller's.
-func WriteHeader(w io.Writer, alignment uint64, kv map[string]any, tensors []Tensor) (int64, error) {
-	bw := bufio.NewWriter(w)
-	var pos int64
-	put := func(v any) {
-		_ = binary.Write(bw, binary.LittleEndian, v)
-		pos += int64(binary.Size(v))
+// enc appends little-endian values to a byte slice.
+type enc []byte
+
+func (e *enc) u8(v uint8)   { *e = append(*e, v) }
+func (e *enc) u32(v uint32) { *e = binary.LittleEndian.AppendUint32(*e, v) }
+func (e *enc) u64(v uint64) { *e = binary.LittleEndian.AppendUint64(*e, v) }
+func (e *enc) str(s string) { e.u64(uint64(len(s))); *e = append(*e, s...) }
+
+func (e *enc) bool(v bool) {
+	if v {
+		e.u8(1)
+	} else {
+		e.u8(0)
 	}
-	str := func(s string) {
-		put(uint64(len(s)))
-		_, _ = bw.WriteString(s)
-		pos += int64(len(s))
-	}
-	put(uint32(Magic))
-	put(uint32(3))
-	put(uint64(len(tensors)))
-	put(uint64(len(kv)))
-	keys := make([]string, 0, len(kv))
-	for k := range kv {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	for _, k := range keys {
-		str(k)
-		switch v := kv[k].(type) {
-		case uint32:
-			put(uint32(tU32))
-			put(v)
-		case uint64:
-			put(uint32(tU64))
-			put(v)
-		case int32:
-			put(uint32(tI32))
-			put(v)
-		case float32:
-			put(uint32(tF32))
-			put(math.Float32bits(v))
-		case bool:
-			put(uint32(tBool))
-			b := uint8(0)
-			if v {
-				b = 1
-			}
-			put(b)
-		case string:
-			put(uint32(tString))
-			str(v)
-		case []string:
-			put(uint32(tArray))
-			put(uint32(tString))
-			put(uint64(len(v)))
-			for _, s := range v {
-				str(s)
-			}
-		default:
-			return 0, fmt.Errorf("metadata %s: unsupported value %T", k, v)
+}
+
+// arr appends an array's element type and count.
+func (e *enc) arr(et uint32, n int) { e.u32(et); e.u64(uint64(n)) }
+
+// NewKV encodes a metadata pair from a Go value: uint8, uint32, int32,
+// uint64, int64, float32, float64, bool, string, or a slice of string, bool,
+// int32, uint32 or float32.
+func NewKV(key string, v any) (KV, error) {
+	var e enc
+	var vt uint32
+	switch v := v.(type) {
+	case uint8:
+		vt = tU8
+		e.u8(v)
+	case uint32:
+		vt = tU32
+		e.u32(v)
+	case int32:
+		vt = tI32
+		e.u32(uint32(v))
+	case uint64:
+		vt = tU64
+		e.u64(v)
+	case int64:
+		vt = tI64
+		e.u64(uint64(v))
+	case float32:
+		vt = tF32
+		e.u32(math.Float32bits(v))
+	case float64:
+		vt = tF64
+		e.u64(math.Float64bits(v))
+	case bool:
+		vt = tBool
+		e.bool(v)
+	case string:
+		vt = tString
+		e.str(v)
+	case []string:
+		vt = tArray
+		e.arr(tString, len(v))
+		for _, s := range v {
+			e.str(s)
 		}
+	case []bool:
+		vt = tArray
+		e.arr(tBool, len(v))
+		for _, b := range v {
+			e.bool(b)
+		}
+	case []int32:
+		vt = tArray
+		e.arr(tI32, len(v))
+		for _, x := range v {
+			e.u32(uint32(x))
+		}
+	case []uint32:
+		vt = tArray
+		e.arr(tU32, len(v))
+		for _, x := range v {
+			e.u32(x)
+		}
+	case []float32:
+		vt = tArray
+		e.arr(tF32, len(v))
+		for _, x := range v {
+			e.u32(math.Float32bits(x))
+		}
+	default:
+		return KV{}, fmt.Errorf("metadata %s: unsupported value %T", key, v)
 	}
+	return KV{Key: key, Type: vt, Value: e}, nil
+}
+
+// EncodeTensorInfos encodes tensor infos as a GGUF header stores them.
+func EncodeTensorInfos(tensors []Tensor) []byte {
+	var e enc
 	for _, t := range tensors {
-		str(t.Name)
-		put(uint32(len(t.Dims)))
+		e.str(t.Name)
+		e.u32(uint32(len(t.Dims)))
 		for _, d := range t.Dims {
-			put(d)
+			e.u64(d)
 		}
-		put(uint32(t.Type))
-		put(t.Offset)
+		e.u32(uint32(t.Type))
+		e.u64(t.Offset)
 	}
+	return e
+}
+
+// EncodeHeader encodes a GGUF header up to the end of its tensor infos,
+// without the padding to the data section: magic, version, the counts, the
+// metadata pairs in the given order and nTensors tensor infos already
+// encoded (EncodeTensorInfos, or bytes copied from another header).
+func EncodeHeader(version uint32, nTensors uint64, kvs []KV, infos []byte) []byte {
+	var e enc
+	e.u32(Magic)
+	e.u32(version)
+	e.u64(nTensors)
+	e.u64(uint64(len(kvs)))
+	for _, kv := range kvs {
+		e.str(kv.Key)
+		e.u32(kv.Type)
+		e = append(e, kv.Value...)
+	}
+	return append(e, infos...)
+}
+
+// WriteHeader writes a GGUF v3 header for tests and fixtures: kv in sorted
+// key order (any value NewKV takes), then the tensor infos, then zero
+// padding up to the data section, whose offset it returns. The tensors'
+// data is the caller's.
+func WriteHeader(w io.Writer, alignment uint64, kv map[string]any, tensors []Tensor) (int64, error) {
+	var kvs []KV
+	for _, k := range slices.Sorted(maps.Keys(kv)) {
+		p, err := NewKV(k, kv[k])
+		if err != nil {
+			return 0, err
+		}
+		kvs = append(kvs, p)
+	}
+	h := EncodeHeader(3, uint64(len(tensors)), kvs, EncodeTensorInfos(tensors))
 	a := int64(alignment)
-	data := (pos + a - 1) / a * a
-	if _, err := bw.Write(make([]byte, data-pos)); err != nil {
+	data := (int64(len(h)) + a - 1) / a * a
+	if _, err := w.Write(append(h, make([]byte, data-int64(len(h)))...)); err != nil {
 		return 0, err
 	}
-	return data, bw.Flush()
+	return data, nil
 }

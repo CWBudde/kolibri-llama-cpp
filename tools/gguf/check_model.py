@@ -45,9 +45,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from tiny import ROOT, convert, generate_tiny
+from tiny import ROOT, arch, convert, generate_tiny
 
-ARCH = "kolibri"
 N_TOKENS = 100
 MAX_NMSE = 1e-4  # tests/test-llama-archs.cpp
 # top-k near-ties allowed under real routing, see the module docstring
@@ -239,6 +238,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llama-cpp", type=Path, required=True, help="llama.cpp checkout with a built libllama")
     ap.add_argument("--seed", type=int, default=1, help="cmd/kolibri-tiny random seed")
+    ap.add_argument("--convert-llama-cpp", type=Path, help="checkout whose converter converts (default --llama-cpp)")
+    ap.add_argument("--rekey", action="store_true", help="rewrite the GGUFs into upstream's kolibri1 layout")
+    ap.add_argument("--no-wiring", action="store_true",
+                    help="skip the graph wiring check, which reads this port's node names (for upstream's kolibri1)")
     args = ap.parse_args()
     import numpy as np
 
@@ -256,7 +259,8 @@ def main() -> None:
         n_expert = json.loads((model / "config.json").read_text())["num_experts"]
         devs = runner.devices()
         cpu_name, cpu = devs[0]
-        ggufs = {t: convert(model, args.llama_cpp, t) for t in ("bf16", "f32")}
+        ggufs = {t: convert(model, args.convert_llama_cpp or args.llama_cpp, t, args.rekey) for t in ("bf16", "f32")}
+        prefix = arch(ggufs["f32"], args.llama_cpp)
 
         for outtype, path in ggufs.items():
             for name, dev in devs:
@@ -272,7 +276,7 @@ def main() -> None:
             sys.exit(1)
 
         for label, n_used in ((f"no routing (top-{n_expert} of {n_expert})", n_expert), ("top-2 routing", None)):
-            used = {f"{ARCH}.expert_used_count": n_used} if n_used else None
+            used = {f"{prefix}.expert_used_count": n_used} if n_used else None
             ref = runner.logits(ggufs["f32"], cpu, tokens, N_TOKENS, used)
             others = [(f"{cpu_name} ubatch 16 vs 100", runner.logits(ggufs["f32"], cpu, tokens, 16, used))]
             others += [(f"{name} vs {cpu_name}", runner.logits(ggufs["f32"], dev, tokens, N_TOKENS, used))
@@ -289,6 +293,9 @@ def main() -> None:
                            f"f32 {label}, {what}: {N_TOKENS - flips}/{N_TOKENS} positions with NMSE <= {MAX_NMSE:g}, "
                            f"greedy token equal at {same}/{N_TOKENS}")
 
+        if args.no_wiring:
+            print(f"SKIP graph wiring ({prefix})")
+            sys.exit(1 if errs else 0)
         nodes: dict[str, list[str]] = {}
         runner.logits(ggufs["f32"], cpu, tokens, N_TOKENS, nodes=nodes)
         layer_types = json.loads((model / "config.json").read_text())["layer_types"]
