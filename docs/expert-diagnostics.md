@@ -16,7 +16,9 @@ APPLE SSD AP1024Z), on AC power, with no other heavy process.
 - **Buffered reads stay opt-in.** They win without a ceiling (IQ3 decode
   21.1 against 17.6 tokens/s) and lose at the 16 GiB ceiling (15.2 against
   16.9), where the page cache competes with the hog. The page cache then
-  holds up to 20.8 GiB that `phys_footprint` does not show.
+  holds up to 20.8 GiB that `phys_footprint` does not show. Q8_0 with 128
+  slots does not fit beside the 16 GiB hog in either mode (24.9 GiB of
+  slots), so the 16 GiB comparison exists for IQ3 only.
 - **The cache's I/O path, not the SSD, limits misses.** One IQ3 expert in
   three reads costs 0.61 ms on the SSD (5,560 experts/s at four in flight);
   about 27 decode misses per token should cost about 5 ms. The cache waits
@@ -75,6 +77,8 @@ sampled during the run.
 | iq3-cache128-buffered | 16 GiB | 15.22 | 94.9 | 24.31 | 414 | 10.9 | 8.3 | not passed |
 | q8-cache128 | 0 GiB | 5.50 | 819.2 | 127.86 | 963 | 25.6 | 10.1 | |
 | q8-cache128-buffered | 0 GiB | 8.10 | 550.8 | 87.07 | 1080 | 25.6 | 9.4 | passed |
+| q8-cache128 | 16 GiB | does not fit | | | | | | |
+| q8-cache128-buffered | 16 GiB | does not fit | | | | | | no verdict |
 
 - Without a ceiling, buffered reads let the page cache act as a second tier
   of about 20 GiB, and disk reads drop from 448 to 107 GB per run. The
@@ -82,6 +86,20 @@ sampled during the run.
 - At 16 GiB the page cache shrinks to about 8 GiB, the hog evicts it, and
   the wait rises above the `F_NOCACHE` run's. Buffered is worse there.
 - Q8_0 at 0 GiB passes by the rule, with wide ranges (6.87–9.34 tokens/s).
+- **Q8_0 does not fit at 16 GiB.** Its 128 slots per layer take 24.9 GiB
+  of anonymous memory. With the 2.7 GiB of non-expert weights on Metal and
+  the 16 GiB hog, 4.4 GiB of the 48 GiB remain for macOS. A first
+  `F_NOCACHE` run (2026-10-23, fork `128787f89`) loaded in 25.5 s. Then
+  macOS paged the slots out: resident memory swung between 3 and 18 GiB at a
+  24 GiB footprint, and swap reached 13 GiB. The 2,048-token cold prompt
+  produced no token in 20 minutes; it takes about 3 minutes without the hog.
+  A watchdog stopped the run before swap could fill the disk. The buffered
+  arm uses the same slots and adds page-cache demand, so it was not
+  started. `kolibri-bench` now counts a cache run's slots, its non-expert
+  weights, the hog and 8 GiB for the system against `hw.memsize`. It
+  records both arms as "does not fit" (51.6 GiB), as it does for resident
+  IQ3 at 16 GiB in Stage D. The aborted run's samples are kept in
+  `~/models/eval/expert-bench-e1/aborted/q8-cache128-16g/`.
 - All buffered runs generate the token IDs of their `F_NOCACHE` arm, and all
   IQ3 cache runs those of resident `-ub 21` (50 of 50 requests). No expert
   load failed.

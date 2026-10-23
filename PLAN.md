@@ -1013,7 +1013,7 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
 
 ## Phase 11 --- Expert streaming on par with other offloaders (proposed)
 
-**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-22) apart from the Q8_0 page-cache run at 16 GiB; E0 and E2 next.
+**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 and E2 next.
 
 ### Where Stage D stands against other work
 
@@ -1064,20 +1064,21 @@ Close these gaps without giving up the lead.
   - **#25294** (`--moe-stream`): build the PR branch and check whether its auto-sizing aborts at `n_expert_used >= 6`. If it runs on Kolibri, add it to the matrix as a reference arm at 0 and 16 GiB.
 - [ ] Gate: Phase 11 builds on upstream's Kolibri only if it matches ours within the existing tolerances. Otherwise the differences are documented and the fork stays ahead.
 
-### Stage E1 --- Cheap diagnostics before building anything
+### Stage E1 --- Cheap diagnostics before building anything — ✅ DONE (2026-10-23)
 
-**Verdict** ([docs/expert-diagnostics.md](docs/expert-diagnostics.md)): E2 is warranted. With all 384 experts cached, decode takes 35.6 ms/token against 16.8 ms resident at `-ub 21`. Only 1.2 ms of the gap is load wait and remap; 17.6 ms come with the 100 extra graph splits per token (102 against 2). Buffered reads stay opt-in. One read per expert is 2.2× faster than three at one in flight (E3). SLRU and hotness pass the Stage A gate, mainly in prefill (E4). Open: Q8_0 decodes at 5.5 tokens/s against Stage D's 13.0, not yet explained. The benchmark ran 2 repetitions instead of 3, and Q8_0 only without a ceiling, to fit a 4-hour budget.
+**Verdict** ([docs/expert-diagnostics.md](docs/expert-diagnostics.md)): E2 is warranted. With all 384 experts cached, decode takes 35.6 ms/token against 16.8 ms resident at `-ub 21`. Only 1.2 ms of the gap is load wait and remap; 17.6 ms come with the 100 extra graph splits per token (102 against 2). Buffered reads stay opt-in. One read per expert is 2.2× faster than three at one in flight (E3). SLRU and hotness pass the Stage A gate, mainly in prefill (E4). Open: Q8_0 decodes at 5.5 tokens/s against Stage D's 13.0, not yet explained. The benchmark ran 2 repetitions instead of 3, to fit a 4-hour budget. Q8_0 with 128 slots does not fit at the 16 GiB ceiling.
 
 - [x] **Overhead control.** Run IQ3 with `--expert-cache 384` (no misses after warmup) against resident `-ub 21` at 0 GiB, with the decode timing split as in Stage D.
   - This measures the interception cost alone: remap op, splits and syncs.
   - Also count the graph splits and command-buffer commits per decoded token.
   - **E2 starts only if** the gap to resident is a material share (at least 10 ms/token of the roughly 23 ms unexplained). Otherwise look for the time elsewhere first.
   - (2026-10-22) — Patch 0012 (fork `746be1eae`, fork PR #12) adds decode wall time, remap time, graph splits and Metal commits to the stats JSON. Resident `-ub 21`: 16.82 ms/token, 2 splits, 3 commits. `--expert-cache 384 -ub 21`: 35.64 ms/token (wait 0.71, remap 0.53), 102 splits, 103 commits. 128 slots: 57.81 (wait 15.27, remap 0.63), so about 7.5 ms more "other" than at 384 that is not yet attributed. **Passed:** 17.6 ms/token is split overhead. Control M42: resident decode runs the documented 2 splits per token.
-- [ ] **Page-cache A/B.** Add an option that reads misses buffered instead of with `F_NOCACHE`.
+- [x] **Page-cache A/B.** Add an option that reads misses buffered instead of with `F_NOCACHE`.
   - Run both at 0 and 16 GiB, for IQ3 and Q8_0.
   - Report page-cache residency of the GGUF alongside `phys_footprint`, so a hidden page-cache tier is not passed off as a smaller footprint.
   - Keep buffered reads as the default only where they win at the same ceiling.
-  - (2026-10-22) — partial: `--expert-cache-buffered` (patch 0012). IQ3 at 0 GiB: 21.13 against 17.61 tokens/s, p95 65.1 against 84.9 ms, gate passed; the GGUF's page cache peaks at 20.8 GiB, which the 10.9 GiB footprint does not show. IQ3 at 16 GiB: 15.22 against 16.94, not passed. Q8_0 at 0 GiB: 8.10 against 5.50, passed with wide ranges. Q8_0 at 16 GiB was not run. **Stays opt-in;** `F_NOCACHE` remains the default. **Remains:** the Q8_0 arm at 16 GiB; IQ3 reverses under that ceiling, so the 0 GiB Q8_0 result does not stand in for it.
+  - (2026-10-22) — `--expert-cache-buffered` (patch 0012). IQ3 at 0 GiB: 21.13 against 17.61 tokens/s, p95 65.1 against 84.9 ms, gate passed; the GGUF's page cache peaks at 20.8 GiB, which the 10.9 GiB footprint does not show. IQ3 at 16 GiB: 15.22 against 16.94, not passed. Q8_0 at 0 GiB: 8.10 against 5.50, passed with wide ranges. **Stays opt-in;** `F_NOCACHE` remains the default.
+  - (2026-10-23) — Q8_0 at 16 GiB **does not fit** in either mode: 128 slots are 24.9 GiB, and with 2.7 GiB of non-expert weights and the 16 GiB hog, 4.4 GiB remain for macOS. The `F_NOCACHE` run paged its slots out (resident 3–18 GiB at a 24 GiB footprint, swap 13 GiB), and its cold request produced no token in 20 minutes before a watchdog stopped it. `kolibri-bench`'s `fits` now counts cache slots, non-expert weights, the hog and 8 GiB for the system, and records both arms as "does not fit" (51.6 GiB). The report passes: equivalence 10 of 10, no expert load failures (4 did not fit); the Q8_0 gate at 16 GiB has no verdict.
 - [x] **SSD curve.** A Go `pread` sweep on the M5 Pro's internal SSD, for example `cmd/kolibri-ssd` reusing `internal/memctl` for eviction.
   - Cold file; chunks of 64 KiB to 8 MiB; queue depth 1–16; `F_NOCACHE` and buffered.
   - No trustworthy M5 Pro figure exists. This curve sets E3's thread count and tells whether one 1.7 MB IQ3 expert per read is latency- or bandwidth-bound.
