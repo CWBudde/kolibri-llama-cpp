@@ -113,11 +113,15 @@ func TestParseServers(t *testing.T) {
 		}
 	}
 	m := matrix{Configs: []config{{Name: "fork"}, {Name: "ref", Server: "pr25294"}}}
-	if missing := m.missingServers(map[string]string{}); !slices.Equal(missing, []string{"pr25294"}) {
+	if missing := m.missingServers(map[string]string{}, nil); !slices.Equal(missing, []string{"pr25294"}) {
 		t.Errorf("missingServers = %v, want [pr25294]", missing)
 	}
-	if missing := m.missingServers(map[string]string{"pr25294": "/b"}); len(missing) != 0 {
+	if missing := m.missingServers(map[string]string{"pr25294": "/b"}, nil); len(missing) != 0 {
 		t.Errorf("missingServers = %v, want none", missing)
+	}
+	// -only fork: the reference build is not needed
+	if missing := m.missingServers(map[string]string{}, []string{"fork"}); len(missing) != 0 {
+		t.Errorf("missingServers with -only fork = %v, want none", missing)
 	}
 }
 
@@ -545,7 +549,7 @@ func TestE0Matrix(t *testing.T) {
 	if c, _ := e.config("iq3-moestream128"); c.Server != "pr25294" {
 		t.Errorf("iq3-moestream128 runs on %q, want the pr25294 build", c.Server)
 	}
-	if missing := e.missingServers(map[string]string{"pr25294": "/b"}); len(missing) != 0 {
+	if missing := e.missingServers(map[string]string{"pr25294": "/b"}, nil); len(missing) != 0 {
 		t.Errorf("E0 names builds beyond pr25294: %v", missing)
 	}
 }

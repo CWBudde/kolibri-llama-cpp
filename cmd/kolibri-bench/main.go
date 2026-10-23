@@ -270,10 +270,14 @@ func parseServers(s string) (map[string]string, error) {
 	return servers, nil
 }
 
-// missingServers lists the builds that configs name but servers lacks.
-func (m matrix) missingServers(servers map[string]string) []string {
+// missingServers lists the builds that configs name but servers lacks, of
+// the configs in only (-only), or of all if only is nil.
+func (m matrix) missingServers(servers map[string]string, only []string) []string {
 	var missing []string
 	for _, c := range m.Configs {
+		if only != nil && !slices.Contains(only, c.Name) {
+			continue
+		}
 		if _, ok := servers[c.Server]; c.Server != "" && !ok && !slices.Contains(missing, c.Server) {
 			missing = append(missing, c.Server)
 		}
@@ -742,11 +746,15 @@ func main() {
 			}
 			return a
 		}
+		var names []string
+		if *only != "" {
+			names = strings.Split(*only, ",")
+		}
 		servers, err := parseServers(*otherServers)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if missing := m.missingServers(servers); len(missing) > 0 {
+		if missing := m.missingServers(servers, names); len(missing) > 0 {
 			log.Fatalf("%s: configs name the builds %v, which -servers does not give", *matrixPath, missing)
 		}
 		for name, path := range servers {
@@ -774,10 +782,6 @@ func main() {
 		build.Stdout, build.Stderr = os.Stderr, os.Stderr
 		if err := build.Run(); err != nil {
 			log.Fatalf("building the tools: %v", err)
-		}
-		var names []string
-		if *only != "" {
-			names = strings.Split(*only, ",")
 		}
 		specs := m.expand()
 		for i, spec := range specs {
