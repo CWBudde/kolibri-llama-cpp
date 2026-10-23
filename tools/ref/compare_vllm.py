@@ -54,10 +54,11 @@ sys.path.insert(0, str(ROOT / "tools" / "gguf"))
 sys.path.insert(0, str(ROOT / "tools" / "ref"))
 
 from check_model import Runner, nmse  # noqa: E402
-from compare_real import (ARCH, EMBD, MAX_NMSE_TINY, MIN_SAME_EXPERTS_TINY, NODES, capture_names,  # noqa: E402
+from compare_real import (EMBD, MAX_NMSE_TINY, MIN_SAME_EXPERTS_TINY, NODES, capture_names,  # noqa: E402
                           chunk_stats, flat, logit_stats, masked_router_nmse, node_lines, router, stats_text)
 from kolibri_ref import Weights, forward  # noqa: E402
 from router_probe import same_experts, summary  # noqa: E402
+from tiny import arch  # noqa: E402
 
 N_CTX = 1024
 
@@ -190,6 +191,7 @@ def main() -> None:
 
         gguf = convert(args.model, args.llama_cpp, "f32")
     W = Weights(gguf, args.llama_cpp)
+    prefix = arch(gguf, args.llama_cpp)  # kolibri, or kolibri1 for upstream's converter and kolibri-rekey
     converted, k = W.n_expert_used, meta["experts_used"]
     W.n_expert_used = k
     n_expert = W.get("blk.0.exp_probs_b.bias").numel()
@@ -236,7 +238,7 @@ def main() -> None:
             lib = runner.lib
             ctx = dict(flash_attn_type=lib.LLAMA_FLASH_ATTN_TYPE_DISABLED, type_k=lib.GGML_TYPE_F32,
                        type_v=lib.GGML_TYPE_F32) if args.gate else {}
-            overrides = {f"{ARCH}.expert_used_count": k} if k != converted else None
+            overrides = {f"{prefix}.expert_used_count": k} if k != converted else None
 
             def run(dev, **kw):
                 capture = capture_names(W.n_layer)
