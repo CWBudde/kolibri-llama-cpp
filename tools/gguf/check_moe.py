@@ -24,9 +24,10 @@ own input to that step:
   check tells the two bias placements apart;
 - weights: ffn_moe_weights = sigmoid(logits[selected]), and the experts are
   multiplied with exactly that node (no renormalization, no scale);
-- routed output (ffn_moe_out), shared expert (ffn_shexp), their sum
-  (ffn_out), the post-FFN norm (ffn_post_norm) and the residual add (l_out),
-  plus the pre-FFN norm (ffn_norm from ffn_inp).
+- routed output (ffn_moe_out), shared expert (ffn_shexp_out), the post-FFN
+  norm of their sum (l_out - ffn_inp: the kolibri1 graph leaves the sum and
+  the norm unnamed) and the residual add (l_out), plus the pre-FFN norm
+  (ffn_norm from ffn_inp).
 
     check_moe.py --llama-cpp third_party/llama.cpp
 """
@@ -47,6 +48,8 @@ MAX_NMSE_CPU = 1e-10
 # Other devices get the backend tolerance of test-llama-archs (MAX_NMSE, 1e-4): Metal's
 # kernel_mul_mm_f32_f32 multiplies F32 matrices in half-precision tiles (observed: up to 1.3e-6).
 MAX_WEIGHT_ERR = 1e-6
+# the post-FFN norm of the routed plus shared output, which the kolibri1 graph does not name
+POST = "post-FFN norm (l_out - ffn_inp)"
 
 
 def sigmoid_logit_add_routing(hidden_states, gating_output, topk, renormalize, e_score_correction_bias):
@@ -74,7 +77,7 @@ def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], max_n
     w = {k: v.double() for k, v in load_file(model / "model.safetensors").items()}
 
     steps = ["ffn_inp", "ffn_norm", "ffn_moe_logits", "ffn_moe_topk", "ffn_moe_weights",
-             "ffn_moe_out", "ffn_shexp", "ffn_out", "ffn_post_norm", "l_out"]
+             "ffn_moe_out", "ffn_shexp_out", "l_out"]
     cap = {f"{s}-{il}": None for il in range(n_layer) for s in steps}
     nodes: dict[str, list[str]] = {}
     runner.logits(gguf, dev, tokens, N_TOKENS, overrides, nodes=nodes, capture=cap)
@@ -95,6 +98,7 @@ def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], max_n
         return (torch.nn.functional.silu(x @ gate.T) * (x @ up.T)) @ down.T
 
     err = {s: 0.0 for s in steps if s not in ("ffn_inp", "ffn_moe_topk", "ffn_moe_weights")}
+    err[POST] = 0.0
     sel_equal, differ, applied, w_err = 0, [], [], 0.0
     for il in range(n_layer):
         p = f"model.layers.{il}."
@@ -131,11 +135,10 @@ def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], max_n
         shared = mlp(h, w[p + "mlp.shared_experts.gate_proj.weight"], w[p + "mlp.shared_experts.up_proj.weight"],
                      w[p + "mlp.shared_experts.down_proj.weight"])
         # Kolibri1SparseMoeBlock returns shared_output + fused_output; the decoder layer applies post_ffn_norm
-        out = shared + routed
-        post = rms_norm(out, w[p + "post_ffn_norm.weight"])
-        for s, ref_v in (("ffn_moe_out", routed), ("ffn_shexp", shared), ("ffn_out", out),
-                         ("ffn_post_norm", post), ("l_out", post + inp)):
+        post = rms_norm(shared + routed, w[p + "post_ffn_norm.weight"])
+        for s, ref_v in (("ffn_moe_out", routed), ("ffn_shexp_out", shared), ("l_out", post + inp)):
             err[s] = max(err[s], nmse(ref_v, g[s].double()))
+        err[POST] = max(err[POST], nmse(post, g["l_out"].double() - inp))
 
     n_sel = n_layer * N_TOKENS
     want_applied = [f"ffn_moe_weights-{il}" for il in range(n_layer)]

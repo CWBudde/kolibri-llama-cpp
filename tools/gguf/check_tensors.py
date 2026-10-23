@@ -30,7 +30,7 @@ from pathlib import Path
 
 from tiny import convert, generate_tiny
 
-ARCH = "kolibri"
+ARCH = "kolibri1"
 # 2D tensors that stay F32 (convert_hf_to_gguf.py prepare_tensors).
 F32_MATRICES = {"ffn_gate_inp"}
 
