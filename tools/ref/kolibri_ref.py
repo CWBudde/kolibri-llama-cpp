@@ -60,7 +60,9 @@ class Weights:
         self.weights_scale = f.get(f"{arch}.expert_weights_scale", 1.0)
         self.window = f[f"{arch}.attention.sliding_window"]
         self.is_swa = f[f"{arch}.attention.sliding_window_pattern"]
-        self.has_rope = f[f"{arch}.attention.rope_pattern"]
+        # upstream's kolibri1 GGUFs have no rope_pattern: RoPE is on exactly the sliding layers,
+        # which is also what this port's converter writes
+        self.has_rope = f.get(f"{arch}.attention.rope_pattern", self.is_swa)
         self.cache: dict | None = None  # a dict keeps the non-expert tensors across forward calls
 
     def rows(self, name: str, ids: list[int]):

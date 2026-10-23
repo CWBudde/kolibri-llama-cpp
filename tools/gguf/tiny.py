@@ -28,9 +28,23 @@ def generate_tiny(tmp: Path, seed: int, preset: str = "") -> Path:
     return model
 
 
-def convert(model: Path, llama_cpp: Path, outtype: str) -> Path:
-    """Converts a checkpoint with convert_hf_to_gguf.py --outtype outtype."""
+def convert(model: Path, llama_cpp: Path, outtype: str, rekey: bool = False) -> Path:
+    """Converts a checkpoint with convert_hf_to_gguf.py --outtype outtype. With rekey, the GGUF
+    is then rewritten by cmd/kolibri-rekey into upstream's kolibri1 layout (only the header
+    changes), so upstream libllama loads what this port's converter wrote."""
     out = model.parent / f"{model.name}-{outtype}.gguf"
     run([sys.executable, str(llama_cpp / "convert_hf_to_gguf.py"), str(model),
          "--outtype", outtype, "--outfile", str(out)], f"convert_hf_to_gguf.py --outtype {outtype}")
-    return out
+    if not rekey:
+        return out
+    keyed = out.with_name(out.stem + "-kolibri1.gguf")
+    run(["go", "run", "./cmd/kolibri-rekey", "-copy", "-in", str(out), "-out", str(keyed)], "cmd/kolibri-rekey")
+    return keyed
+
+
+def arch(path: Path, llama_cpp: Path) -> str:
+    """general.architecture of a GGUF: kolibri for this port's converter, kolibri1 for upstream's."""
+    sys.path.insert(0, str(llama_cpp / "gguf-py"))
+    import gguf
+
+    return gguf.GGUFReader(path).fields["general.architecture"].contents()

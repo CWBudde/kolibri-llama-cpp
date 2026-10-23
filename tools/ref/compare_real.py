@@ -45,6 +45,8 @@ These lines are INFO, not PASS/FAIL: the real model has no tolerance yet
 (PLAN Phase 6), and this reference is a port of the vLLM code, not vLLM.
 
     compare_real.py --llama-cpp third_party/llama.cpp --tiny
+    compare_real.py --llama-cpp UPSTREAM --tiny [--convert-llama-cpp third_party/llama.cpp --rekey] \\
+        [--preset router|attn|pattern] [--save-logits DIR]
     compare_real.py --llama-cpp third_party/llama.cpp --gguf ~/models/Kolibri-1-BF16.gguf \\
         --kld-base ~/models/eval/kld-bf16-c512-n20.bin [--metal] [--probe-out DIR]
 """
@@ -64,25 +66,33 @@ sys.path.insert(0, str(ROOT / "tools" / "ref"))
 from check_model import Runner, nmse  # noqa: E402
 from kolibri_ref import Weights, forward, greedy  # noqa: E402
 from router_probe import probe, same_experts, save, summary, table  # noqa: E402
-from tiny import convert, generate_tiny  # noqa: E402
+from tiny import arch, convert, generate_tiny  # noqa: E402
 
-ARCH = "kolibri"
 NODES = ("Qcur_normed", "Kcur_normed", "attn_out", "attn_post_norm", "ffn_moe_out", "ffn_shexp", "l_out")
 EMBD = "embd"  # the token embeddings (ggml_get_rows of token_embd)
 ROUTER = ("ffn_moe_topk", "ffn_moe_logits")
+# upstream llama.cpp's kolibri1 graph (#30673) names some of these nodes differently
+ALIASES = {"ffn_shexp": "ffn_shexp_out"}
 MAX_NMSE_TINY = 1e-6
 MIN_SAME_EXPERTS_TINY = 0.98
+MAX_ALL_EXPERTS = 64
 GERMAN = "Die Hauptstadt von Deutschland ist"
 N_GREEDY = 16
 
 
 def capture_names(n_layer: int) -> dict:
-    return {EMBD: None, **{f"{node}-{il}": None for il in range(n_layer) for node in NODES + ROUTER}}
+    names = NODES + ROUTER + tuple(ALIASES.values())
+    return {EMBD: None, **{f"{node}-{il}": None for il in range(n_layer) for node in names}}
 
 
 def flat(capture: dict, n_tokens: int) -> dict:
-    """One array per node, [n_tokens, width] (each run is one computation)."""
-    return {name: parts[-1].reshape(n_tokens, -1) for name, parts in capture.items() if parts}
+    """One array per node, [n_tokens, width] (each run is one computation), an alias under its
+    own name where only the alias was captured."""
+    out = {name: parts[-1].reshape(n_tokens, -1) for name, parts in capture.items() if parts}
+    for name, alias in ALIASES.items():
+        for key in [k for k in out if k.rsplit("-", 1)[0] == alias]:
+            out.setdefault(name + "-" + key.rsplit("-", 1)[1], out.pop(key))
+    return out
 
 
 def router(got: dict, ref: dict, W: Weights) -> dict:
@@ -239,7 +249,8 @@ def chunk_stats(base, test, tokens: list[int], first: int) -> dict:
     }
 
 
-def run_tiny(runner: Runner, llama_cpp: Path, seed: int) -> list[str]:
+def run_tiny(runner: Runner, llama_cpp: Path, seed: int, convert_with: Path, rekey: bool = False,
+             preset: str = "", save_logits: Path | None = None, override: dict | None = None) -> list[str]:
     import json
 
     import numpy as np
@@ -254,18 +265,29 @@ def run_tiny(runner: Runner, llama_cpp: Path, seed: int) -> list[str]:
     lib = runner.lib
     ctx = dict(flash_attn_type=lib.LLAMA_FLASH_ATTN_TYPE_DISABLED, type_k=lib.GGML_TYPE_F32, type_v=lib.GGML_TYPE_F32)
     with tempfile.TemporaryDirectory() as tmp:
-        model = generate_tiny(Path(tmp), seed)
+        model = generate_tiny(Path(tmp), seed, preset)
         n_expert = json.loads((model / "config.json").read_text())["num_experts"]
-        path = convert(model, llama_cpp, "f32")
+        path = convert(model, convert_with, "f32", rekey)
         W = Weights(path, llama_cpp)
+        prefix = arch(path, llama_cpp)
+        print(f"INFO tiny{' -' + preset if preset else ''}: {path.name}, architecture {prefix}")
         rng = random.Random(seed)
         tokens = [rng.randrange(128000) for _ in range(100)]
         _, cpu = runner.devices()[0]
         converted = W.n_expert_used
-        for label, n_used in ((f"all {n_expert} experts", n_expert), (f"top-{converted} routing", None)):
+        runs = ((f"all {n_expert} experts", n_expert), (f"top-{converted} routing", None))
+        if n_expert > MAX_ALL_EXPERTS:
+            # with every one of 384 experts active the graph outgrows libllama's graph context
+            print(f"INFO tiny: {n_expert} experts, only the top-{converted} run (all experts at most {MAX_ALL_EXPERTS})")
+            runs = runs[1:]
+        for label, n_used in runs:
             capture = capture_names(W.n_layer)
-            overrides = {f"{ARCH}.expert_used_count": n_used} if n_used else None
+            overrides = {**(override or {}), **({f"{prefix}.expert_used_count": n_used} if n_used else {})} or None
             got_logits = runner.logits(path, cpu, tokens, len(tokens), overrides, capture=capture, **ctx)
+            if save_logits:
+                save_logits.mkdir(parents=True, exist_ok=True)
+                np.save(save_logits / f"tiny{'-' + preset if preset else ''}-{'all' if n_used else 'topk'}.npy",
+                        got_logits)
             got = flat(capture, len(tokens))
             W.n_expert_used = n_used or converted
             ref = {}
@@ -421,11 +443,25 @@ def main() -> None:
     ap.add_argument("--probe-out", type=Path, help="directory for the router probes as .npz (with --gguf)")
     ap.add_argument("--threads", type=int, default=10, help="libllama CPU threads (with --gguf)")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--convert-llama-cpp", type=Path,
+                    help="checkout whose convert_hf_to_gguf.py converts the tiny checkpoint (default --llama-cpp)")
+    ap.add_argument("--rekey", action="store_true",
+                    help="rewrite the converted GGUF into upstream's kolibri1 layout (cmd/kolibri-rekey) (with --tiny)")
+    ap.add_argument("--preset", default="", help="cmd/kolibri-tiny preset: router, attn or pattern (with --tiny)")
+    ap.add_argument("--save-logits", type=Path, help="directory for the tiny runs' logits as .npy (with --tiny)")
+    ap.add_argument("--override-kv", action="append", default=[], metavar="KEY=VALUE",
+                    help="change a GGUF value for libllama only, not for the reference (with --tiny; a control)")
     args = ap.parse_args()
+    override = {}
+    for kv in args.override_kv:
+        key, value = kv.split("=", 1)
+        override[key] = {"true": True, "false": False}.get(value) if value in ("true", "false") else (
+            float(value) if "." in value else int(value))
 
     runner = Runner(args.llama_cpp)
     if args.tiny:
-        errs = run_tiny(runner, args.llama_cpp, args.seed)
+        errs = run_tiny(runner, args.llama_cpp, args.seed, args.convert_llama_cpp or args.llama_cpp, args.rekey,
+                        args.preset, args.save_logits, override)
         if errs:
             print(f"FAIL {len(errs)} problem(s)")
             sys.exit(1)
