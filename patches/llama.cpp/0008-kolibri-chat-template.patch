@@ -118,10 +118,10 @@ index 000000000..a922ccf95
 +{%- endif %}
 \ No newline at end of file
 diff --git a/tests/test-chat-auto-parser.cpp b/tests/test-chat-auto-parser.cpp
-index 5aa948251..4c13d2013 100644
+index b9a407182..956f9d56d 100644
 --- a/tests/test-chat-auto-parser.cpp
 +++ b/tests/test-chat-auto-parser.cpp
-@@ -2426,6 +2426,7 @@ static void test_role_markers_all_templates(testing & t) {
+@@ -2425,6 +2425,7 @@ static void test_role_markers_all_templates(testing & t) {
      // markers it detected first.
      const std::vector<role_marker_case> cases = {
          // ChatML family: <|im_start|>{role} ... <|im_end|>
@@ -130,16 +130,24 @@ index 5aa948251..4c13d2013 100644
          { "HuggingFaceTB-SmolLM3-3B.jinja",                  "<|im_start|>user",       "<|im_start|>assistant"      },
          { "MiMo-VL.jinja",                                   "<|im_start|>user",       "<|im_start|>assistant"      },
 diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
-index c7edf0c2d..23ab26f87 100644
+index 49519eeca..46fe3a163 100644
 --- a/tests/test-chat.cpp
 +++ b/tests/test-chat.cpp
-@@ -5432,6 +5432,115 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+@@ -23,6 +23,7 @@
+ #include <set>
+ #include <stdexcept>
+ #include <string>
++#include <tuple>
+ 
+ using json = common_json;
+ 
+@@ -5653,6 +5654,115 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
              .run();
      }
  
 +    // Aleph-Alpha Kolibri-1 tests - ChatML, <think> reasoning, JSON tool calls in <tool_call> tags.
-+    // Thinking is on by default and the model opens <think> itself; with thinking off the template
-+    // prefills an empty think block. Cases follow aleph-alpha-inference tests/test_reasoning.py.
++    // Thinking is on by default and the model opens <think> itself; with thinking off the template prefills an empty think block.
++    // Cases follow aleph-alpha-inference tests/test_reasoning.py.
 +    {
 +        auto tst = peg_tester("models/templates/Aleph-Alpha-Kolibri-1.jinja", detailed_debug);
 +
@@ -249,7 +257,7 @@ index c7edf0c2d..23ab26f87 100644
  
      // Apertus-8B-Instruct tests - FUNC_NAME_AS_KEY format
      // Format: <|tools_prefix|>[{"function_name": {...arguments...}}]<|tools_suffix|>
-@@ -7586,10 +7695,103 @@ static void test_reasoning_effort_caps() {
+@@ -8012,10 +8122,104 @@ static void test_reasoning_effort_caps() {
      assert_supports_effort("models/templates/openai-gpt-oss-120b.jinja", true);
      assert_supports_effort("models/templates/upstage-Solar-Open-100B.jinja", true);
      assert_supports_effort("models/templates/Cohere2MoE.jinja", true);
@@ -301,7 +309,7 @@ index c7edf0c2d..23ab26f87 100644
 +            inputs.enable_thinking = it == c.kwargs.end() || it->second != "false";
 +
 +            auto params = common_chat_templates_apply(tmpls.get(), inputs);
-+            assert_equals(!c.thinking, string_ends_with(params.prompt, prefilled));
++            assert_equals(!c.thinking, string_ends_with(params.prompt.str(), prefilled));
 +
 +            test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
 +                tc.params = inputs;
@@ -328,11 +336,11 @@ index c7edf0c2d..23ab26f87 100644
 +        common_chat_templates_inputs inputs;
 +        inputs.messages                                 = { message_user };
 +        inputs.chat_template_kwargs["reasoning_effort"] = effort;
-+        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "# Reasoning effort\n\n" + sentence);
++        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt.str(), "# Reasoning effort\n\n" + sentence);
 +    }
 +
 +    // server: the reasoning_effort field wins over an enable_thinking kwarg, as in vLLM
-+    server_chat_params opt;
++    server_chat_params opt{};
 +    opt.tmpls           = read_templates("models/templates/Aleph-Alpha-Kolibri-1.jinja");
 +    opt.use_jinja       = true;
 +    opt.enable_thinking = true;
@@ -345,7 +353,8 @@ index c7edf0c2d..23ab26f87 100644
 +            { "chat_template_kwargs", { { "enable_thinking", enable_thinking } } },
 +        };
 +        std::vector<raw_buffer> out_files;
-+        auto prompt = oaicompat_chat_params_parse(body, opt, out_files).at("prompt").get<std::string>();
++        common_chat_session     out_session;
++        auto prompt = oaicompat_chat_params_parse(nullptr, body, opt, out_files, out_session).at("prompt").get<std::string>();
 +        assert_equals(!thinking, string_ends_with(prompt, prefilled));
 +    }
 +}
@@ -353,19 +362,19 @@ index c7edf0c2d..23ab26f87 100644
  static void test_msg_diffs_compute() {
      LOG_DBG("%s\n", __func__);
      {
-@@ -7750,6 +7952,7 @@ int main(int argc, char ** argv) {
-         test_deepseek_v4_tool_result_ordering();
-         test_template_generation_prompt();
+@@ -8179,6 +8383,7 @@ int main(int argc, char ** argv) {
          test_reasoning_effort_caps();
+         test_prompt_parts();
+         test_chat_session();
 +        test_kolibri_reasoning_effort(detailed_debug);
          test_reasoning_budget_tokens_per_request();
          test_reasoning_budget_message_per_request();
          test_template_output_peg_parsers(detailed_debug);
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index 2d90fcad2..d50ac1ad7 100644
+index 10e04d370..12044a06f 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
-@@ -1374,6 +1374,7 @@ json oaicompat_chat_params_parse(
+@@ -1494,6 +1494,7 @@ json oaicompat_chat_params_parse(
          auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
          if (reasoning_effort == "none") {
              inputs.enable_thinking = false;

@@ -135,7 +135,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `cmd/kolibri-memhog` | Wires memory (mlock, no root) and holds it until SIGINT: the benchmark's memory ceiling, which compression and swap cannot undo (`internal/memctl`). |
 | `cmd/kolibri-evict` | Drops a file from the page cache without root (`msync(MS_INVALIDATE)`) and reports its resident pages (`mincore`), for cold runs (`internal/memctl`). |
 | `cmd/kolibri-ssd` | Measures the SSD's random-read curve inside a GGUF's routed-expert tensors, the way the expert cache reads: chunk size by queue depth (goroutines `pread`ing one shared descriptor), `F_NOCACHE` and buffered, the file evicted before every cell. `-expert` reads whole experts with three `pread`s (gate, up, down) or one contiguous one. JSON lines and a markdown report; `-no-evict` is control M41 (Stage E1, `internal/gguf` for the offsets). |
-| `cmd/kolibri-rekey` | Rewrites a Kolibri GGUF from this port's converter for upstream llama.cpp's Kolibri support (#30673): architecture `kolibri1`, keys renamed, pre-tokenizer `qwen2`, `rope_pattern` dropped after checking it equals the sliding-window pattern. The output is an APFS clone (`cp -c`) whose header is overwritten in place at the same length, so the tensor data stays shared and bit-identical (Stage E0, [docs/upstream.md](docs/upstream.md)). |
+| `cmd/kolibri-rekey` | Rewrites a Kolibri GGUF from this port's converter for upstream llama.cpp's Kolibri support (#30673): architecture `kolibri1`, keys renamed, pre-tokenizer `qwen2`, `rope_pattern` dropped after checking it equals the sliding-window pattern. The output is an APFS clone (`cp -c`) whose header is overwritten in place at the same length, so the tensor data stays shared and bit-identical (Stage E0, [docs/upstream.md](docs/upstream.md)). The local GGUFs were rewritten this way when the fork moved onto upstream's model. |
 | `cmd/kolibri-routing` | Measures the expert-routing overhead from per-op timings with the model's real graph shapes (`test-export-graph-ops`, `test-backend-ops perf`, a `llama-eval-callback` node listing) against `llama-bench`. It backs "Routing overhead" in [docs/real-checkpoint.md](docs/real-checkpoint.md). |
 | `internal/` | Hugging Face client, safetensors header parser and writer, and the Kolibri tensor specs. `internal/kolibri/tensors.go` is the source of truth for the HF → GGUF mapping. |
 | `inventory/{bf16,fp8}/` | Committed inventories: `summary.json` and `tensors.jsonl.gz`. They pin the model revisions and the sha256 of every file. |
@@ -149,7 +149,7 @@ See [`PLAN.md`](PLAN.md) for the full plan.
 | `tools/locality/` | `workloads.py` checks the four fixed chat traces for the expert-locality measurements (coding, research, HR tool use, MedTech QM on the EU MDR) in `testdata/locality/`: pinned sources, frozen answers, identical token IDs from the reference tokenizer and libllama, hashes as recorded. It also fetches the sources and generates the answers. `experts.py` prefills the traces through libllama and records each layer's selected experts per token, pinned by sha256 in `testdata/locality/experts.json`. `expert_bytes.py` records the bytes of one expert per layer from a GGUF in `testdata/locality/expert-bytes.json`. |
 | `tools/chat/` | `check_chat.py` checks the chat template in the GGUFs and in llama-server, compares llama-server's rendered prompts with the reference renderer for every reasoning mode and tool-call shape and for a continued final assistant message (`continue_final_message`), and checks the stop tokens. |
 | `tools/upstream/` | `repro.py` reproduces the upstream llama.cpp issues against any llama.cpp tree, typically current ggml-org master: invalid UTF-8 in `llama_tokenize`, the broken `tests/test-tokenizer-random.py`, and Metal with `--cpu-moe` above the working set. It exits 1 once an issue no longer reproduces. |
-| `patches/llama.cpp/` | The llama.cpp changes, applied in order. The same changes are commits on [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri`. 0009 is a generic llama.cpp fix, not Kolibri code: it lets Metal run with `--cpu-moe` on files above the Metal working set. 0010 adds only tests (Kolibri continuation cases in `test-chat`); it is on the fork branch `feat/kolibri-continuation`, not yet in `feat/kolibri`. 0011 is the experimental expert cache (`--expert-cache`), which keeps a bounded number of routed experts per layer on the device and reads the others from the file on demand; it is on the fork branch `feat/kolibri-expert-cache`, on top of 0010: [docs/expert-streaming.md](docs/expert-streaming.md). 0012 adds the cache's diagnostics for Phase 11, Stage E1: `--expert-cache-buffered` (misses through the page cache) and the decode timing in `--expert-cache-stats` (wall, remap, graph splits and Metal commits per decoded token, also for resident runs); it is on the fork branch `feat/kolibri-expert-cache-diag`, on top of 0011. |
+| `patches/llama.cpp/` | The llama.cpp changes on top of ggml-org master `184f6536`, applied in order. The same changes are commits on the fork branch [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) `feat/kolibri1`. The series starts at 0008: upstream's own Kolibri support (#30673, architecture `kolibri1`) replaced the tokenizer, architecture, converter and model patches 0001–0007, and master's merged mapping ranges replaced 0009 (Phase 11, Stage E0: [docs/upstream.md](docs/upstream.md)). 0008 adds the Kolibri chat template and its tests, and makes `reasoning_effort: none` also set the `enable_thinking` kwarg in llama-server. 0010 adds only tests (Kolibri continuation cases in `test-chat`). 0011 is the experimental expert cache (`--expert-cache`), which keeps a bounded number of routed experts per layer on the device and reads the others from the file on demand: [docs/expert-streaming.md](docs/expert-streaming.md). 0012 adds the cache's diagnostics for Phase 11, Stage E1: `--expert-cache-buffered` (misses through the page cache) and the decode timing in `--expert-cache-stats` (wall, remap, graph splits and Metal commits per decoded token, also for resident runs). |
 | `docs/` | Reference docs per topic (checkpoint, tokenizer, conversion, model, attention, chat, real checkpoint, vLLM reference run, upstream issues), with findings, pitfalls and reproduction steps. |
 
 ## Setup
@@ -163,11 +163,11 @@ go test ./...
 
 # llama.cpp source, option A: the pinned commit with the patches applied
 git clone https://github.com/ggml-org/llama.cpp third_party/llama.cpp
-git -C third_party/llama.cpp checkout -b kolibri 1537a0a8b2f8711d840878b0a0677ab2213c882c
+git -C third_party/llama.cpp checkout -b kolibri1 184f6536024668e8908ab8c86033d56708e62b40
 for p in patches/llama.cpp/*.patch; do git -C third_party/llama.cpp apply "$PWD/$p"; done
 
 # option B, instead of A: the fork, which has the same patches as commits
-git clone --branch feat/kolibri https://github.com/CWBudde/llama.cpp third_party/llama.cpp
+git clone --branch feat/kolibri1 https://github.com/CWBudde/llama.cpp third_party/llama.cpp
 
 # build (either option)
 cmake -S third_party/llama.cpp -B third_party/llama.cpp/build -G Ninja \
@@ -257,12 +257,10 @@ forbids AI-written ones.
   maps and requests residency for the routed experts too. The CPU expert
   matmul (`ggml_compute_forward_mul_mat_id`) then dies with SIGBUS
   (`KERN_PROTECTION_FAILURE`); the 79 GiB Q8_0 and 149 GiB BF16 files crash.
-  The generic fix is patch 0009 (`0009-mmap-buffer-ranges.patch`), which
-  maps only the ranges that hold a backend's tensors. On the fork it is
-  [CWBudde/llama.cpp#10](https://github.com/CWBudde/llama.cpp/pull/10); it is
-  not yet proposed to ggml-org/llama.cpp. On current master the crash
-  alternates between SIGBUS and a failed decode after the Metal OOM, and
-  0009 still applies and fixes it. The mechanism and the crash are
+  The generic fix was patch 0009, which maps only the ranges that hold a
+  backend's tensors ([CWBudde/llama.cpp#10](https://github.com/CWBudde/llama.cpp/pull/10)).
+  Master `184f6536` merges the mapping ranges itself (`merge_ranges`): Metal
+  maps 2,448 MiB of the Q8_0 file and the run exits 0, so 0009 is retired. The mechanism and the crash are
   [#24510](https://github.com/ggml-org/llama.cpp/issues/24510) and
   [#27822](https://github.com/ggml-org/llama.cpp/issues/27822), both closed
   as not planned.

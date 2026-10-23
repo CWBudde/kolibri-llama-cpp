@@ -1,8 +1,8 @@
 diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
-index 478d9c0ea..695c9df2c 100644
+index 46fe3a163..727b88316 100644
 --- a/tests/test-chat.cpp
 +++ b/tests/test-chat.cpp
-@@ -5540,6 +5540,59 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+@@ -5761,6 +5761,59 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                  { "special_function", R"({"arg1": 1})", {} },
              })
              .run();

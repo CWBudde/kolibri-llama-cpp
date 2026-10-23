@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 8c9bc2cdb..42a1940f4 100644
+index 267b84874..7ba3eb424 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -29,6 +29,7 @@
@@ -10,7 +10,7 @@ index 8c9bc2cdb..42a1940f4 100644
  #include <list>
  #include <numeric>
  #include <regex>
-@@ -2763,6 +2764,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2767,6 +2768,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
          }
      ).set_env("LLAMA_ARG_CPU_MOE"));
@@ -86,14 +86,13 @@ index 8c9bc2cdb..42a1940f4 100644
          {"-ncmoe", "--n-cpu-moe"}, "N",
          "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
 diff --git a/common/common.cpp b/common/common.cpp
-index a2f162b6f..12b9567f4 100644
+index 6ef3b785e..0d83fadc5 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1671,6 +1671,21 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
-     mparams.progress_callback           = params.load_progress_callback;
-     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
+@@ -1709,6 +1709,21 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.no_alloc                    = params.no_alloc;
-+
+     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+ 
 +    if (params.expert_cache > 0 || !params.expert_cache_layers.empty()) {
 +        auto & ec = params.expert_cache_lp;
 +        ec = llama_expert_cache_default_params();
@@ -108,14 +107,15 @@ index a2f162b6f..12b9567f4 100644
 +        mparams.expert_cache  = &ec;
 +    }
 +
-     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
- 
++
      return mparams;
+ }
+ 
 diff --git a/common/common.h b/common/common.h
-index 4308b0703..21e6f43a4 100644
+index 70d6a671f..d1d140e46 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -531,6 +531,16 @@ struct common_params {
+@@ -533,6 +533,16 @@ struct common_params {
      std::vector<llama_model_kv_override> kv_overrides;
      std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
  
@@ -133,10 +133,10 @@ index 4308b0703..21e6f43a4 100644
      std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
  
 diff --git a/include/llama.h b/include/llama.h
-index dea4d4606..4a37b49f4 100644
+index 3af6e2223..7dd4378c9 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -316,6 +316,20 @@ extern "C" {
+@@ -317,6 +317,20 @@ extern "C" {
          ggml_backend_buffer_type_t buft;
      };
  
@@ -157,7 +157,7 @@ index dea4d4606..4a37b49f4 100644
      struct llama_model_params {
          // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
          ggml_backend_dev_t * devices;
-@@ -353,6 +367,9 @@ extern "C" {
+@@ -354,6 +368,9 @@ extern "C" {
          bool no_host;         // bypass host buffer allowing extra buffers to be used
          bool no_alloc;        // only load metadata and simulate memory allocations
          bool load_mtp;        // whether to load MTP layers
@@ -167,7 +167,7 @@ index dea4d4606..4a37b49f4 100644
      };
  
      struct llama_sampler_seq_config {
-@@ -478,6 +495,7 @@ extern "C" {
+@@ -481,6 +498,7 @@ extern "C" {
      // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
      LLAMA_API struct llama_model_params          llama_model_default_params(void);
      LLAMA_API struct llama_context_params        llama_context_default_params(void);
@@ -176,7 +176,7 @@ index dea4d4606..4a37b49f4 100644
      LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
  
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index afdaddc79..2d48b0cb8 100644
+index 97250c2e8..03b4efa10 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -16,6 +16,8 @@ set(LLAMA_CORE_SOURCES
@@ -189,7 +189,7 @@ index afdaddc79..2d48b0cb8 100644
      llama-graph.cpp
      llama-hparams.cpp
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 96b5464e6..f23755917 100644
+index ca84fc405..3c994ad91 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,5 @@
@@ -198,7 +198,7 @@ index 96b5464e6..f23755917 100644
  
  #include "ggml.h"
  #include "llama-arch.h"
-@@ -247,6 +248,19 @@ llama_context::llama_context(
+@@ -343,6 +344,19 @@ llama_context::llama_context(
  
      cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
  
@@ -218,7 +218,7 @@ index 96b5464e6..f23755917 100644
      cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
      cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
-@@ -478,12 +492,25 @@ llama_context::llama_context(
+@@ -580,12 +594,25 @@ llama_context::llama_context(
              sampling.token_ids_full_vocab[i] = i;
          }
      }
@@ -245,10 +245,10 @@ index 96b5464e6..f23755917 100644
      if (!model.hparams.no_alloc && !opt_ctx) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 95b722628..c76fd8583 100644
+index 6938fb103..5d5a0e842 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -389,6 +389,9 @@ private:
+@@ -425,6 +425,9 @@ private:
  
      bool has_evaluated_once = false;
  
@@ -1385,7 +1385,7 @@ index 000000000..11e12b66a
 +// the indexes of the k best scores, best first, the lower index first of equal ones (predict.go's topK)
 +void llama_expert_top_k(const std::vector<double> & score, int k, std::vector<int> & out);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 81f75d8e9..d606447ad 100644
+index 415dff33e..69508d4a9 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -1,4 +1,5 @@
@@ -1394,14 +1394,15 @@ index 81f75d8e9..d606447ad 100644
  
  #include "llama-impl.h"
  #include "llama-model.h"
-@@ -2179,6 +2180,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
-     //call early so that topk-moe can be used
-     ggml_build_forward_expand(gf, weights);
+@@ -2357,6 +2358,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // the experts of host-resident layers may be read from the MoE cache
+     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
  
 +    // [EXPERIMENTAL] with an expert cache, the matmuls read the layer's slots, indexed by the
 +    // router's ids mapped to slots; the weights above keep the router's own ids
 +    ggml_tensor * ids_mm = selected_experts;
 +    if (expert_cache && il >= 0) {
++        GGML_ASSERT(!slots);
 +        GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s);
 +        ids_mm    = expert_cache->build_remap(ctx0, selected_experts, il);
 +        cb(ids_mm, "ffn_moe_slots", il);
@@ -1413,38 +1414,38 @@ index 81f75d8e9..d606447ad 100644
      cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
  
      if (weight_before_ffn) {
-@@ -2212,7 +2225,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2390,7 +2404,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(up, "ffn_moe_up", il);
      } else {
          // separate gate and up path
--        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
-+        up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
++        up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
          cb(up, "ffn_moe_up", il);
  
          if (up_exps_s) {
-@@ -2225,7 +2238,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2403,7 +2417,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          }
  
          if (gate_exps) {
--            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
-+            cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
++            cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
              cb(cur, "ffn_moe_gate", il);
          } else {
              cur = up;
-@@ -2326,7 +2339,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
-             GGML_ABORT("fatal error");
-     }
+@@ -2515,7 +2529,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             cur = amax_src1.res;
+         }
  
--    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
-+    experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s); // [n_embd, n_expert_used, n_tokens]
-     if (arch == LLM_ARCH_MISTRAL4) {
-         // src1 can exceed F16 range
-         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+-        experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
++        experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
+         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
+         cb(experts, "ffn_moe_down", il);
+ 
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 366eccbcd..fd1d01102 100644
+index a49f5432d..3e932ffc3 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -94,6 +94,7 @@ struct llama_cross {
+@@ -100,6 +100,7 @@ struct llama_cross {
  };
  
  struct llm_graph_params;
@@ -1452,18 +1453,17 @@ index 366eccbcd..fd1d01102 100644
  
  //
  // llm_graph_input
-@@ -1032,6 +1033,9 @@ struct llm_graph_context {
- 
+@@ -1068,6 +1069,8 @@ struct llm_graph_context {
      const llama_prec_policy * prec_policy;
  
+     const llama_hadamard * hdmd;
 +    // [EXPERIMENTAL] the model's expert cache, set by the archs that read their experts from it
 +    llama_expert_cache * expert_cache = nullptr;
-+
+ 
      std::map<llama_seq_id, llama_sampler *> samplers;
  
-     const llm_graph_cb & cb_func;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index a15984663..ebb726607 100644
+index 4cb04097e..96954cd4a 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -6,6 +6,7 @@
@@ -1474,7 +1474,7 @@ index a15984663..ebb726607 100644
  #include "llama-model-loader.h"
  
  #include "llama-kv-cache.h"
-@@ -1290,11 +1291,19 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
+@@ -1348,11 +1349,19 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
  }
  
  llama_model::~llama_model() {
@@ -1494,13 +1494,13 @@ index a15984663..ebb726607 100644
  void llama_model_base::load_stats(llama_model_loader & ml) {
      pimpl->n_elements = ml.n_elements;
      pimpl->n_bytes = ml.n_bytes;
-@@ -1633,6 +1642,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1713,6 +1722,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
          layers.resize(n_layer_all);
  
 +        if (expert_cache_requested()) {
-+            if (arch != LLM_ARCH_KOLIBRI) {
-+                throw std::runtime_error(format("the expert cache supports the kolibri architecture only, not %s", llm_arch_name(arch)));
++            if (arch != LLM_ARCH_KOLIBRI1) {
++                throw std::runtime_error(format("the expert cache supports the kolibri1 architecture only, not %s", llm_arch_name(arch)));
 +            }
 +            // the stacked experts stay in the file: lazy tensors, mapped on the CPU and never read
 +            ml.lazy.mode = LLAMA_LAZY_MODE_ON;
@@ -1509,10 +1509,10 @@ index a15984663..ebb726607 100644
          // call the per-model loading function
          load_arch_tensors(ml);
  
-@@ -1977,6 +1994,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
-         }
+@@ -2052,6 +2069,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      }
  
+     load_tensors_hadamard();
 +    if (expert_cache_requested()) {
 +        const int n_layer = (int) hparams.n_layer();
 +        expert_cache = std::make_unique<llama_expert_cache>(*params.expert_cache, n_layer, (int) hparams.n_expert, (int) hparams.n_expert_used_max());
@@ -1542,11 +1542,10 @@ index a15984663..ebb726607 100644
 +        }
 +        expert_cache->init(stacked, devs, fd);
 +    }
-+
+ 
      return true;
  }
- 
-@@ -2959,6 +3006,22 @@ llama_model_params llama_model_default_params() {
+@@ -3378,6 +3424,22 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,
@@ -1570,19 +1569,18 @@ index a15984663..ebb726607 100644
  
      return result;
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 2243377cc..9e1009100 100644
+index cdf060db2..87f578b5d 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -633,6 +633,8 @@ struct llama_prec_policy {
-     void load(llama_model_loader & ml, const llama_model & model);
+@@ -704,6 +704,7 @@ struct llama_hadamard {
+     llama_hadamard_rotations rot; // folded weight -> activation transform
+     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
  };
- 
 +struct llama_expert_cache;
-+
+ 
  struct llama_model {
      llm_type type = LLM_TYPE_UNKNOWN;
-     llm_arch arch = LLM_ARCH_UNKNOWN;
-@@ -743,6 +745,10 @@ struct llama_model {
+@@ -852,6 +853,10 @@ struct llama_model {
      // which tensors can be prefetched - driven by TENSOR_READ_LAZY
      std::unordered_set<const ggml_tensor *> can_prefetch;
  
@@ -1593,13 +1591,13 @@ index 2243377cc..9e1009100 100644
      // statically allocated context for assigning
      struct llama_meta_device_get_split_state_userdata get_split_state_ud;
  
-diff --git a/src/models/kolibri.cpp b/src/models/kolibri.cpp
-index ac6de0cc2..7b1fb6b09 100644
---- a/src/models/kolibri.cpp
-+++ b/src/models/kolibri.cpp
-@@ -43,6 +43,9 @@ void llama_model_kolibri::load_arch_tensors(llama_model_loader &) {
-     const int64_t n_ff_exp   = hparams.n_ff_exp();
-     const int64_t n_ff_shexp = hparams.n_ff_shexp;
+diff --git a/src/models/kolibri1.cpp b/src/models/kolibri1.cpp
+index 2301ef272..f82d4ec9a 100644
+--- a/src/models/kolibri1.cpp
++++ b/src/models/kolibri1.cpp
+@@ -35,6 +35,9 @@ void llama_model_kolibri1::load_arch_tensors(llama_model_loader &) {
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
  
 +    // with the expert cache, the stacked experts are read from the file into its slots, never mapped to a device
 +    const int exps_flags = expert_cache_requested() ? TENSOR_READ_LAZY : 0;
@@ -1607,20 +1605,20 @@ index ac6de0cc2..7b1fb6b09 100644
      for (int i = 0; i < n_layer; ++i) {
          auto & layer = layers[i];
  
-@@ -60,9 +63,9 @@ void llama_model_kolibri::load_arch_tensors(llama_model_loader &) {
+@@ -54,9 +57,9 @@ void llama_model_kolibri1::load_arch_tensors(llama_model_loader &) {
          layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
          layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
  
--        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
--        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
--        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
-+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags);
-+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags);
-+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, exps_flags);
+-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
++        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, exps_flags);
++        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, exps_flags);
++        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, exps_flags);
  
-         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,     n_ff_shexp}, 0);
-         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,     n_ff_shexp}, 0);
-@@ -80,6 +83,9 @@ llama_model_kolibri::graph::graph(const llama_model & model, const llm_graph_par
+         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, 0);
+         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, 0);
+@@ -69,6 +72,9 @@ llama_model_kolibri1::graph::graph(const llama_model & model, const llm_graph_pa
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -1629,15 +1627,15 @@ index ac6de0cc2..7b1fb6b09 100644
 +
      ggml_tensor * cur;
      ggml_tensor * inpL = build_inp_embd(model.tok_embd);
- 
+     ggml_tensor * inp_pos = build_inp_pos();
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 8989c2784..93546515f 100644
+index 815cc15a3..c475ae12c 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -161,6 +161,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+@@ -187,6 +187,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
      llama_build_and_test(test-grammar-integration.cpp)
-     llama_build_and_test(test-llama-grammar.cpp)
-     llama_build_and_test(test-batch-alloc.cpp)
+     llama_build_and_test(test-llama-grammar.cpp LINK llama)
+     llama_build_and_test(test-batch-alloc.cpp LINK llama)
 +    llama_build_and_test(test-expert-cache.cpp)
      llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
      target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)

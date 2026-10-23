@@ -19,8 +19,9 @@ ggml-org master):
                     offloaded tensor, routed experts included, and the warmup
                     decode either dies with SIGBUS or fails after a Metal
                     out-of-memory error. The tree must load the GGUF (for
-                    Kolibri: patches 0001-0008); --expect ok checks a build with
-                    the fix (patch 0009) instead.
+                    Kolibri: master since #30673, with a kolibri1 GGUF);
+                    --expect ok checks a build with the fix (master since
+                    merge_ranges, or the former patch 0009) instead.
 
 Each check prints REPRODUCED or NOT REPRODUCED (with --expect ok: RUNS or
 FAILS). The exit code is 0 only if every check met its expectation, so an
