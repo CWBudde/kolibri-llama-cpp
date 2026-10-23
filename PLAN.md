@@ -1013,7 +1013,7 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
 
 ## Phase 11 --- Expert streaming on par with other offloaders (proposed)
 
-**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0's rebase done (2026-10-23); E0.2 and E2 next.
+**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 done (2026-10-23). **Phase 11's stop rule fired at 0 GiB** (E0.2: #25294 matches the fork's decode there and prefills 2.6× faster; the fork still wins decode at 16 GiB). Whether E2 continues on the fork or the work moves onto #25294's design is the user's decision.
 
 ### Where Stage D stands against other work
 
@@ -1052,7 +1052,7 @@ Close these gaps without giving up the lead.
 - each at the 16 GiB ceiling as well;
 - and at least equal to #25294 wherever it runs on the same file.
 
-### Stage E0 --- Rebase onto upstream Kolibri support
+### Stage E0 --- Rebase onto upstream Kolibri support — ✅ DONE (2026-10-23)
 
 - [x] Rebase the fork onto an upstream commit that contains #30673.
   - Compare upstream's Kolibri model with ours on the BF16 and IQ3 GGUFs with the existing harnesses: bit identity on the tiny checkpoints, KLD against our BF16 on the real one, and the vLLM capture where it applies.
@@ -1072,9 +1072,16 @@ Close these gaps without giving up the lead.
     - **Checks:** tokenizer golden 85/85; the GGUF, model, MoE and attention checks and `check_chat.py` pass; `compare_real.py --tiny` gives E0's values, with logits byte-identical to unmodified master; ctest 6/6; `check_expert_cache.py` tiny (rc 0) and `--real` IQ3 ("PASS: 0 failures").
     - **Metal:** master fuses ops differently once the cache's CPU remap splits the graph, so the cache matches a resident run split at the same points bit for bit, not an unsplit one (up to 3.23 in IQ3 logits). As decided on 2026-10-23, `check_expert_cache.py` uses that same-split reference on the GPU and reports the unsplit difference as info.
     - Controls M44 (an un-rewritten `kolibri` GGUF: "unknown model architecture: 'kolibri'") and M45 (the cache reads the neighbouring expert's down rows: every bit-identity line fails).
-- [ ] Check upstream's two expert-cache paths on this Mac:
+- [x] Check upstream's two expert-cache paths on this Mac:
   - **#29887** (`--moe-cache-mib`): does it activate on Metal at all (it accepts the IGPU device type)? If it does, run one arm at 0 GiB.
   - **#25294** (`--moe-stream`): build the PR branch and check whether its auto-sizing aborts at `n_expert_used >= 6`. If it runs on Kolibri, add it to the matrix as a reference arm at 0 and 16 GiB.
+  - (2026-10-23) — [docs/upstream.md](docs/upstream.md), "Upstream's expert caches on this Mac"; matrix `testdata/bench/e0.json` (`kolibri-bench -servers`, a per-arm build).
+    - **#29887** activates on Metal only with `--cpu-moe` ("MTL0 MoE cache size = 10375.00 MiB for 31125.00 MiB of host experts"). It loses to plain `--cpu-moe` at 0 GiB: 11.99 against 16.63 t/s, 285 commits per token. Control M47: without `--cpu-moe`, "MoE cache is disabled".
+    - **#25294** merged onto `184f6536` with only API adaptations (fork branch `ref/pr25294-on-184f6536`, `8a8ddf827`; tiny fixture bit-identical to master on the CPU).
+      - Its auto-sizing aborts on Kolibri: "multi-pass expert GEMMs need an expert cache of at least 3*n_expert_used slots (have 16, need 18)", rc 134. Control M46: `17s` aborts, `18s` starts.
+      - With `128s` it ran as a reference arm at 0 and 16 GiB.
+    - **Gates:** the fork's cache does not beat #25294 at 0 GiB (decode 20.52 buffered and 17.71 `F_NOCACHE` against 20.86 t/s; warm prefill 110 against 283 t/s; cold TTFT 23.8 against 8.6 s), so **the stop rule fires there.** At 16 GiB `F_NOCACHE` passes (17.96 against 12.69 t/s, p95 80.7 against 124.2 ms).
+    - Two fork arms at 16 GiB moved beyond E1's range (`F_NOCACHE` up 1.0 t/s, buffered down 1.75), cause not established. Neither changes a gate.
 - [x] Gate: Phase 11 builds on upstream's Kolibri only if it matches ours within the existing tolerances. Otherwise the differences are documented and the fork stays ahead.
   - (2026-10-23) — **Passed: Phase 11 builds on upstream's Kolibri.**
     - Upstream passes `compare_real.py --tiny` (NMSE 1e-6 against the torch reference) on the default, `attn`, `pattern` and `router` fixtures, and `check_model.py` (1e-4 across devices and ubatches), with the same values as the fork. The logits are bit-identical to the fork's.
