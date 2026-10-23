@@ -2,7 +2,9 @@
 // metadata scalars and its tensor infos, with each tensor's type, shape,
 // byte size and absolute offset in the file. It reads no tensor data, so a
 // 33 GB checkpoint costs only its header (a few MB, mostly the tokenizer).
-// Array values (the vocabulary) are skipped.
+// KV holds the scalar values decoded; Metadata keeps every pair, arrays (the
+// vocabulary) included, as stored, so that a header can be re-encoded
+// (write.go).
 package gguf
 
 import (
@@ -144,7 +146,27 @@ type File struct {
 	Alignment  uint64
 	DataOffset int64          // absolute offset of the data section
 	KV         map[string]any // scalars only: uint64, int64, float64, bool, string
+	Metadata   []KV           // every pair in file order, as stored
 	Tensors    []Tensor
+	InfoOffset int64 // absolute offset of the first tensor info
+	HeaderEnd  int64 // end of the tensor infos, where the padding to DataOffset starts
+}
+
+// KV is one metadata pair as stored: Type is the value's type id (gguf_type)
+// and Value its encoding after the type id; for an array that is the element
+// type, the count and the elements.
+type KV struct {
+	Key   string
+	Type  uint32
+	Value []byte
+}
+
+// String returns a string value.
+func (kv KV) String() (string, bool) {
+	if kv.Type != tString || len(kv.Value) < 8 || binary.LittleEndian.Uint64(kv.Value) != uint64(len(kv.Value)-8) {
+		return "", false
+	}
+	return string(kv.Value[8:]), true
 }
 
 // FileOffset is the absolute offset of a tensor's data, as llama.cpp's
@@ -194,18 +216,34 @@ func Open(path string) (*File, error) {
 	return f, nil
 }
 
+// reader tracks its position and, while rec is non-nil, keeps the bytes it
+// reads (a metadata value).
 type reader struct {
 	r   *bufio.Reader
 	pos int64
+	rec []byte
 }
 
 func (r *reader) read(p []byte) error {
 	n, err := io.ReadFull(r.r, p)
 	r.pos += int64(n)
+	if r.rec != nil {
+		r.rec = append(r.rec, p[:n]...)
+	}
 	return err
 }
 
+// maxRecord bounds a recorded array's elements, so a corrupt count fails
+// instead of allocating gigabytes.
+const maxRecord = 1 << 30
+
 func (r *reader) skip(n uint64) error {
+	if r.rec != nil {
+		if n > maxRecord {
+			return fmt.Errorf("array of %d bytes at %d", n, r.pos)
+		}
+		return r.read(make([]byte, n))
+	}
 	for n > 0 {
 		k := int(min(n, 1<<30))
 		d, err := r.r.Discard(k)
@@ -281,6 +319,9 @@ func (r *reader) value(vt uint32) (any, error) {
 			return nil, err
 		}
 		if sz, ok := scalarSize[et]; ok {
+			if n > maxRecord {
+				return nil, fmt.Errorf("array of %d elements at %d", n, r.pos)
+			}
 			return nil, r.skip(n * uint64(sz))
 		}
 		for range n {
@@ -358,13 +399,17 @@ func Read(rd io.Reader) (*File, error) {
 		if err != nil {
 			return nil, err
 		}
+		r.rec = []byte{}
 		v, err := r.value(vt)
+		raw := r.rec
+		r.rec = nil
 		if err != nil {
 			return nil, fmt.Errorf("metadata %s: %w", key, err)
 		}
 		if v != nil {
 			f.KV[key] = v
 		}
+		f.Metadata = append(f.Metadata, KV{Key: key, Type: vt, Value: raw})
 	}
 	if a, ok := f.Uint("general.alignment"); ok {
 		if a == 0 || a&(a-1) != 0 {
@@ -372,6 +417,7 @@ func Read(rd io.Reader) (*File, error) {
 		}
 		f.Alignment = a
 	}
+	f.InfoOffset = r.pos
 	for range nTensors {
 		var t Tensor
 		if t.Name, err = r.str(); err != nil {
@@ -403,6 +449,7 @@ func Read(rd io.Reader) (*File, error) {
 		}
 		f.Tensors = append(f.Tensors, t)
 	}
+	f.HeaderEnd = r.pos
 	a := int64(f.Alignment)
 	f.DataOffset = (r.pos + a - 1) / a * a
 	return f, nil

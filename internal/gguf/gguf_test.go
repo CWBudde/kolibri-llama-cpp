@@ -2,6 +2,8 @@ package gguf
 
 import (
 	"bytes"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -109,5 +111,83 @@ func TestReadRejects(t *testing.T) {
 	}
 	if _, err := Read(&buf); err == nil {
 		t.Error("alignment 48 accepted")
+	}
+}
+
+// TestMetadata checks the raw metadata pairs: every value kind WriteHeader
+// takes, arrays included, comes back in file order with its type id and
+// encoded value, and the header's byte positions match EncodeHeader and
+// EncodeTensorInfos.
+func TestMetadata(t *testing.T) {
+	tensors := []Tensor{
+		{Name: "token_embd.weight", Dims: []uint64{64, 10}, Type: F32, Offset: 0},
+		{Name: "blk.0.attn_norm.weight", Dims: []uint64{64}, Type: F32, Offset: 2560},
+	}
+	kv := map[string]any{
+		"a.u8":     uint8(7),
+		"b.u32":    uint32(513),
+		"c.i32":    int32(-1),
+		"d.u64":    uint64(1) << 40,
+		"e.i64":    int64(-5),
+		"f.f32":    float32(0.5),
+		"g.f64":    float64(1e-6),
+		"h.bool":   true,
+		"i.str":    "{% chat %}",
+		"j.strs":   []string{"", "ab", "c"},
+		"k.bools":  []bool{true, false, true},
+		"l.i32s":   []int32{1, -2, 3},
+		"m.u32s":   []uint32{4, 5},
+		"n.f32s":   []float32{0.25, -1},
+		"o.string": "last",
+	}
+	var buf bytes.Buffer
+	data, err := WriteHeader(&buf, 32, kv, tensors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := slices.Clone(buf.Bytes())
+	f, err := Read(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.DataOffset != data || len(f.Metadata) != len(kv) {
+		t.Fatalf("data %d, %d pairs; want %d, %d", f.DataOffset, len(f.Metadata), data, len(kv))
+	}
+	keys := slices.Sorted(maps.Keys(kv))
+	var want []KV
+	for i, k := range keys {
+		w, err := NewKV(k, kv[k])
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, w)
+		if got := f.Metadata[i]; got.Key != k || got.Type != w.Type || !bytes.Equal(got.Value, w.Value) {
+			t.Errorf("pair %d = %s type %d %x; want %s type %d %x", i, got.Key, got.Type, got.Value, k, w.Type, w.Value)
+		}
+	}
+	// spot checks of the encoding: a bool array is type 9, element type 7,
+	// count 3, then one byte per element
+	b := f.Metadata[slices.Index(keys, "k.bools")]
+	if b.Type != tArray || !bytes.Equal(b.Value, []byte{tBool, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1}) {
+		t.Errorf("k.bools = type %d %x", b.Type, b.Value)
+	}
+	if s, ok := f.Metadata[slices.Index(keys, "i.str")].String(); !ok || s != "{% chat %}" {
+		t.Errorf("i.str String() = %q, %v", s, ok)
+	}
+	if _, ok := b.String(); ok {
+		t.Error("an array read as a string")
+	}
+	head := EncodeHeader(3, uint64(len(tensors)), want, EncodeTensorInfos(tensors))
+	if f.HeaderEnd != int64(len(head)) || !bytes.Equal(raw[:f.HeaderEnd], head) {
+		t.Fatalf("header end %d, EncodeHeader %d bytes, equal %v", f.HeaderEnd, len(head), bytes.Equal(raw[:min(len(raw), len(head))], head))
+	}
+	if !bytes.Equal(raw[f.InfoOffset:f.HeaderEnd], EncodeTensorInfos(tensors)) {
+		t.Error("tensor infos are not at [InfoOffset, HeaderEnd)")
+	}
+	if !bytes.Equal(raw[f.HeaderEnd:data], make([]byte, data-f.HeaderEnd)) {
+		t.Error("padding is not zero")
+	}
+	if _, err := NewKV("x", struct{}{}); err == nil {
+		t.Error("NewKV accepted a struct")
 	}
 }
