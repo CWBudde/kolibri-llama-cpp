@@ -1,0 +1,27 @@
+{
+  "server_args": ["-ngl", "99", "-t", "10", "-c", "4096", "-np", "1", "--fit", "off"],
+  "prompt_first": 2048,
+  "n_predict": 128,
+  "cold": "coding",
+  "warm": ["coding", "research", "hr", "medtech"],
+  "configs": [
+    {"name": "iq3-cpu-moe", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--cpu-moe"], "ceilings_gib": [0, 16], "reps": 2},
+    {"name": "iq3-cache128", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128"], "ceilings_gib": [0, 16], "reps": 2},
+    {"name": "iq3-cache128-buffered", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128", "--expert-cache-buffered"], "ceilings_gib": [0, 16], "reps": 2},
+    {"name": "iq3-moecache", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--cpu-moe", "--moe-cache-mib", "10375"], "ceilings_gib": [0], "reps": 2},
+    {"name": "iq3-moestream128", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "server": "pr25294", "args": ["--moe-stream-cache", "128s"], "ceilings_gib": [0, 16], "reps": 2}
+  ],
+  "equivalence": [
+    {"reference": "iq3-cache128", "arms": ["iq3-cache128-buffered"], "exact": true},
+    {"reference": "iq3-cpu-moe", "arms": ["iq3-cache128", "iq3-moecache", "iq3-moestream128"], "exact": false}
+  ],
+  "gates": [
+    {"ceiling_gib": 0, "candidate": "iq3-cache128", "baselines": ["iq3-moestream128"], "decides": true},
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-buffered", "baselines": ["iq3-moestream128"], "decides": true},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128", "baselines": ["iq3-moestream128"], "decides": true},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-buffered", "baselines": ["iq3-moestream128"], "decides": true},
+    {"ceiling_gib": 0, "candidate": "iq3-moecache", "baselines": ["iq3-cpu-moe"], "decides": false},
+    {"ceiling_gib": 0, "candidate": "iq3-moestream128", "baselines": ["iq3-cpu-moe"], "decides": false},
+    {"ceiling_gib": 16, "candidate": "iq3-moestream128", "baselines": ["iq3-cpu-moe"], "decides": false}
+  ]
+}

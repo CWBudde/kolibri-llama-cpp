@@ -7,6 +7,11 @@
 //	go run ./cmd/kolibri-bench -matrix testdata/bench/expert-cache.json -out ~/models/eval/expert-bench
 //	go run ./cmd/kolibri-bench -matrix testdata/bench/expert-cache.json -out ~/models/eval/expert-bench -report
 //
+// A config runs the fork's -server unless it names another build ("server"),
+// which -servers maps to a binary: pr25294=<llama-server> for E0.2's matrix
+// (testdata/bench/e0.json, docs/upstream.md). Only the fork's server is asked
+// for --expert-cache-stats.
+//
 // Every run of a config, a ceiling and a repetition:
 //  1. waits until the machine is quiet: a 1-minute load below -quiet-load,
 //     swap growing by less than -quiet-swap MiB over the last minute, and
@@ -59,6 +64,7 @@ import (
 type config struct {
 	Name     string    `json:"name"`
 	Model    string    `json:"model"`
+	Server   string    `json:"server,omitempty"` // a build named in -servers; empty: the fork's -server
 	Args     []string  `json:"args"`
 	Ceilings []float64 `json:"ceilings_gib"`
 	Reps     int       `json:"reps"`
@@ -135,6 +141,20 @@ func (m matrix) config(name string) (config, bool) {
 
 func usesCache(args []string) bool { return slices.Contains(args, "--expert-cache") }
 
+// slotArg finds an arm's slot cache: this fork's --expert-cache N or #25294's
+// --moe-stream-cache Ns, with its value ("" if the flag ends the args).
+func slotArg(args []string) (flag, arg string, ok bool) {
+	for i, a := range args {
+		if a == "--expert-cache" || a == "--moe-stream-cache" {
+			if i+1 < len(args) {
+				arg = args[i+1]
+			}
+			return a, arg, true
+		}
+	}
+	return "", "", false
+}
+
 // weights is what fits needs from a GGUF.
 type weights struct {
 	Bytes       int64 // the file
@@ -179,14 +199,16 @@ const osReserveGiB = 8
 // With --cpu-moe the experts stay in the page cache and always fit. The
 // cache's slots are anonymous memory that macOS can page out, which keeps
 // the machine up but turns hits into page-ins; they fit only with the
-// non-expert weights, the hog and osReserveGiB beside them.
+// non-expert weights, the hog and osReserveGiB beside them. #25294's
+// --moe-stream-cache Ns slots are Metal buffers, wired, and count the same.
 func fits(c config, ceilingGiB float64, w weights, memBytes int64) (bool, string) {
 	const gib = 1 << 30
 	mem := float64(memBytes) / gib
 	if slices.Contains(c.Args, "--cpu-moe") {
 		return true, ""
 	}
-	if !usesCache(c.Args) {
+	flag, arg, ok := slotArg(c.Args)
+	if !ok {
 		need := float64(w.Bytes)/gib + ceilingGiB
 		if need < mem {
 			return true, ""
@@ -194,13 +216,16 @@ func fits(c config, ceilingGiB float64, w weights, memBytes int64) (bool, string
 		return false, fmt.Sprintf("the resident weights (%.1f GiB) and the %g GiB hog are %.1f GiB wired, beyond the %.0f GiB of memory",
 			float64(w.Bytes)/gib, ceilingGiB, need, mem)
 	}
-	arg := ""
-	if i := slices.Index(c.Args, "--expert-cache"); i+1 < len(c.Args) {
-		arg = c.Args[i+1]
+	n := arg
+	if flag == "--moe-stream-cache" {
+		n = strings.TrimSuffix(arg, "s")
+		if n == arg {
+			n = "" // a budget in GiB, not slots
+		}
 	}
-	slots, err := strconv.Atoi(arg)
+	slots, err := strconv.Atoi(n)
 	if err != nil || slots < 0 {
-		return false, fmt.Sprintf("--expert-cache %q is not a slot count", arg)
+		return false, fmt.Sprintf("%s %q is not a slot count", flag, arg)
 	}
 	cache := float64(int64(slots)*w.SlotBytes) / gib
 	rest := float64(w.Bytes-w.ExpertBytes) / gib
@@ -215,10 +240,45 @@ func fits(c config, ceilingGiB float64, w weights, memBytes int64) (bool, string
 // serverArgs asks every arm for --expert-cache-stats: with the cache the
 // cache's counters and the decode timing, without it (patch 0012) the decode
 // timing alone, so that resident and cache arms split their ms per token alike.
+// Another build (c.Server) has no such option and writes no stats.
 func (m matrix) serverArgs(c config, port int, stats string) []string {
 	args := append([]string{"-m", c.Model, "--port", strconv.Itoa(port)}, m.ServerArgs...)
 	args = append(args, c.Args...)
+	if c.Server != "" {
+		return args
+	}
 	return append(args, "--expert-cache-stats", stats)
+}
+
+// parseServers reads -servers: comma-separated name=path pairs of the other
+// llama-server builds that configs name.
+func parseServers(s string) (map[string]string, error) {
+	servers := map[string]string{}
+	if s == "" {
+		return servers, nil
+	}
+	for _, kv := range strings.Split(s, ",") {
+		name, path, ok := strings.Cut(kv, "=")
+		if !ok || name == "" || path == "" {
+			return nil, fmt.Errorf("-servers: %q is not name=path", kv)
+		}
+		if _, dup := servers[name]; dup {
+			return nil, fmt.Errorf("-servers: %s given twice", name)
+		}
+		servers[name] = path
+	}
+	return servers, nil
+}
+
+// missingServers lists the builds that configs name but servers lacks.
+func (m matrix) missingServers(servers map[string]string) []string {
+	var missing []string
+	for _, c := range m.Configs {
+		if _, ok := servers[c.Server]; c.Server != "" && !ok && !slices.Contains(missing, c.Server) {
+			missing = append(missing, c.Server)
+		}
+	}
+	return missing
 }
 
 const (
@@ -377,8 +437,8 @@ func othersCPU(exclude []int) (float64, error) {
 type bench struct {
 	m         matrix
 	out       string
-	bin       string // the built kolibri-stream, -evict and -memhog
-	server    string
+	bin       string            // the built kolibri-stream, -evict and -memhog
+	servers   map[string]string // the llama-server builds by config.Server; "" is -server
 	manifest  string
 	workloads string
 	port      int
@@ -510,7 +570,7 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 		return res, err
 	}
 	defer lf.Close()
-	srv := exec.Command(b.server, b.m.serverArgs(spec.Config, b.port, filepath.Join(dir, "stats.json"))...)
+	srv := exec.Command(b.servers[spec.Config.Server], b.m.serverArgs(spec.Config, b.port, filepath.Join(dir, "stats.json"))...)
 	srv.Stdout, srv.Stderr = lf, lf
 	t0 := time.Now()
 	if err := srv.Start(); err != nil {
@@ -648,6 +708,7 @@ func main() {
 	matrixPath := flag.String("matrix", "testdata/bench/expert-cache.json", "the benchmark matrix")
 	out := flag.String("out", "", "results directory")
 	server := flag.String("server", "third_party/llama.cpp/build/bin/llama-server", "llama-server")
+	otherServers := flag.String("servers", "", "the other llama-server builds that configs name, as name=path,...")
 	workloads := flag.String("workloads", "~/models/eval/locality", "the workloads' <name>.tokens.npy")
 	manifest := flag.String("manifest", "testdata/locality/manifest.json", "the workloads' recorded token IDs")
 	port := flag.Int("port", 8099, "llama-server port")
@@ -681,7 +742,18 @@ func main() {
 			}
 			return a
 		}
-		b := &bench{m: m, out: dir, bin: filepath.Join(dir, "bin"), server: abs(*server), manifest: abs(*manifest),
+		servers, err := parseServers(*otherServers)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if missing := m.missingServers(servers); len(missing) > 0 {
+			log.Fatalf("%s: configs name the builds %v, which -servers does not give", *matrixPath, missing)
+		}
+		for name, path := range servers {
+			servers[name] = abs(path)
+		}
+		servers[""] = abs(*server)
+		b := &bench{m: m, out: dir, bin: filepath.Join(dir, "bin"), servers: servers, manifest: abs(*manifest),
 			workloads: abs(*workloads), port: *port, quiet: quietRule{*quietLoad, *quietSwap, 2},
 			every: 30 * time.Second, reqTO: 30 * time.Minute, loadTO: 20 * time.Minute}
 		// rates timed across a sleep are meaningless; on 2026-10-16 idle

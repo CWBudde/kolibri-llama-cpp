@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -91,6 +92,33 @@ func TestServerArgs(t *testing.T) {
 	if got := strings.Join(m.serverArgs(c, 8099, "/run/stats.json"), " "); !strings.HasSuffix(got, "-ub 21 --expert-cache-stats /run/stats.json") {
 		t.Fatalf("serverArgs without the cache = %s", got)
 	}
+	// another build does not know the fork's --expert-cache-stats
+	c = config{Model: "/m.gguf", Server: "pr25294", Args: []string{"--moe-stream-cache", "128s"}}
+	if got := strings.Join(m.serverArgs(c, 8099, "/run/stats.json"), " "); got != "-m /m.gguf --port 8099 -ngl 99 --moe-stream-cache 128s" {
+		t.Fatalf("serverArgs of another build = %s", got)
+	}
+}
+
+func TestParseServers(t *testing.T) {
+	got, err := parseServers("pr25294=/b/llama-server,master=/c/llama-server")
+	if err != nil || len(got) != 2 || got["pr25294"] != "/b/llama-server" || got["master"] != "/c/llama-server" {
+		t.Fatalf("parseServers = %v, %v", got, err)
+	}
+	if got, err := parseServers(""); err != nil || len(got) != 0 {
+		t.Fatalf(`parseServers("") = %v, %v`, got, err)
+	}
+	for _, bad := range []string{"pr25294", "=/b", "a=/b,a=/c"} {
+		if _, err := parseServers(bad); err == nil {
+			t.Errorf("parseServers(%q) accepted", bad)
+		}
+	}
+	m := matrix{Configs: []config{{Name: "fork"}, {Name: "ref", Server: "pr25294"}}}
+	if missing := m.missingServers(map[string]string{}); !slices.Equal(missing, []string{"pr25294"}) {
+		t.Errorf("missingServers = %v, want [pr25294]", missing)
+	}
+	if missing := m.missingServers(map[string]string{"pr25294": "/b"}); len(missing) != 0 {
+		t.Errorf("missingServers = %v, want none", missing)
+	}
 }
 
 func TestFits(t *testing.T) {
@@ -135,6 +163,17 @@ func TestFits(t *testing.T) {
 	}
 	if ok, why := fits(config{Args: []string{"--expert-cache", "many"}}, 0, q8, 48*gib); ok || !strings.Contains(why, "many") {
 		t.Errorf("an unparsable slot count: fits = %v, %q", ok, why)
+	}
+	// #25294's --moe-stream-cache Ns holds N slots per layer like --expert-cache N;
+	// its budget form (GiB) is not a slot count
+	if ok, why := fits(config{Args: []string{"--moe-stream-cache", "128s"}}, 16, iq3, 48*gib); !ok {
+		t.Errorf("iq3 --moe-stream-cache 128s at 16 GiB does not fit: %s", why)
+	}
+	if ok, why := fits(config{Args: []string{"--moe-stream-cache", "128s"}}, 16, q8, 48*gib); ok || !strings.Contains(why, "24.9 GiB") {
+		t.Errorf("q8 --moe-stream-cache 128s at 16 GiB: fits = %v, %q", ok, why)
+	}
+	if ok, why := fits(config{Args: []string{"--moe-stream-cache", "40"}}, 0, iq3, 48*gib); ok || !strings.Contains(why, `"40"`) {
+		t.Errorf("a budget instead of slots: fits = %v, %q", ok, why)
 	}
 }
 
@@ -450,7 +489,7 @@ func loadMatrix(t *testing.T, path string) matrix {
 // TestShippedMatrix checks that every config the equivalence checks and gates
 // name exists, at the ceilings they compare.
 func TestShippedMatrix(t *testing.T) {
-	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json"} {
+	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json"} {
 		t.Run(filepath.Base(path), func(t *testing.T) { checkMatrix(t, loadMatrix(t, path)) })
 	}
 }
@@ -479,6 +518,35 @@ func TestE1Matrix(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestE0Matrix keeps E0.2's upstream arms comparable with the fork's cache:
+// Stage D's workloads, and the same memory for every cache, 128 IQ3 experts
+// per layer (#29887's budget is that in MiB, as it caches bytes, not slots).
+func TestE0Matrix(t *testing.T) {
+	d, e := loadMatrix(t, "../../testdata/bench/expert-cache.json"), loadMatrix(t, "../../testdata/bench/e0.json")
+	if !slices.Equal(d.ServerArgs, e.ServerArgs) || d.PromptFirst != e.PromptFirst || d.NPredict != e.NPredict ||
+		d.Cold != e.Cold || !slices.Equal(d.Warm, e.Warm) {
+		t.Errorf("E0's workload settings differ from Stage D's")
+	}
+	const iq3Expert = 1699840 // bytes of one IQ3 expert (gate, up and down), see TestFits
+	want := map[string][]string{
+		"iq3-cache128":     {"--expert-cache", "128"},
+		"iq3-moestream128": {"--moe-stream-cache", "128s"},
+		"iq3-moecache":     {"--cpu-moe", "--moe-cache-mib", strconv.Itoa(128 * 50 * iq3Expert >> 20)},
+	}
+	for name, args := range want {
+		c, ok := e.config(name)
+		if !ok || !slices.Equal(c.Args, args) {
+			t.Errorf("%s: args %v, want %v", name, c.Args, args)
+		}
+	}
+	if c, _ := e.config("iq3-moestream128"); c.Server != "pr25294" {
+		t.Errorf("iq3-moestream128 runs on %q, want the pr25294 build", c.Server)
+	}
+	if missing := e.missingServers(map[string]string{"pr25294": "/b"}); len(missing) != 0 {
+		t.Errorf("E0 names builds beyond pr25294: %v", missing)
 	}
 }
 
