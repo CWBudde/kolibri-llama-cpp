@@ -445,3 +445,150 @@ the CPU they still are.
 |---|---|
 | M44: the rebased build loads an un-rewritten `kolibri` GGUF | "error loading model: unknown model architecture: 'kolibri'", rc 1 |
 | M45: the cache reads each odd expert's down rows from its neighbour (`e ^ 1`) | every bit-identity line fails, CPU and Metal (the split reference included); rc 1 |
+
+## Upstream's expert caches on this Mac (Phase 11, Stage E0.2)
+
+Two upstream paths cache experts. E0.2 asks whether they run on this Mac with
+Kolibri-1 and how they compare with the fork's cache. #25294's result also
+decides Phase 11's stop rule ("if #25294 matches or beats the fork's cache on
+Kolibri, move the remaining work onto its design").
+
+### #29887: `--moe-cache-mib` on Metal
+
+Merged on master `184f6536` (`src/llama-moe-cache.cpp`). It accepts GPU and
+IGPU devices; Metal (`MTL0`) reports itself as a GPU. It caches only layers
+whose experts sit in a host buffer, so on Metal it needs `--cpu-moe`:
+
+- With `--cpu-moe --moe-cache-mib 10375` (the bytes of 128 IQ3 experts per
+  layer, as much memory as `--expert-cache 128`) it is on: "MTL0 MoE cache
+  size = 10375.00 MiB for 31125.00 MiB of host experts". Over 48 decode tokens:
+  "hits = 12472, misses = 3986, hit rate = 75.78%, uploaded = 6461.68 MiB",
+  and the same 48 tokens as `--cpu-moe`. The server logs these lines only
+  with `-v`.
+- **Control M47:** without `--cpu-moe` it logs "no layer has all of its experts
+  in host memory, MoE cache is disabled".
+
+On unified memory the upload is a copy from the page cache into another
+buffer of the same RAM, and the benchmark below shows it slower than plain
+`--cpu-moe`.
+
+### #25294: `--moe-stream` on Kolibri
+
+The PR (head `1248fd8fa`, July 2026) predates kolibri1 (#30673) and no longer
+merges. It was merged onto `184f6536` as a reference build, fork branch
+[`ref/pr25294-on-184f6536`](https://github.com/CWBudde/llama.cpp/tree/ref/pr25294-on-184f6536)
+(`8a8ddf827`). It is not a fork patch and not for upstream.
+
+**The port.** The PR's logic is unchanged. Only master's APIs are adapted
+(listed in the merge commit):
+- `load_mode` replaced `use_mmap`, so `--moe-stream` now turns an mmap load
+  mode into `NONE`;
+- `n_expert_used` is per layer now, so the PR reads `n_expert_used_max()`;
+- `TENSOR_STREAMED` moved to `1 << 6`;
+- `build_lora_mm_id` takes both #29887's slots and the PR's `ids_scale`, with
+  an assert that the two caches are never on together.
+
+The PR's hooks are generic (the `ffn_*_exps` tensors, `build_moe_ffn`), so
+kolibri1 needs no model code.
+
+Smoke on the tiny 384-expert top-6 fixture: on the CPU the logits are
+bit-identical to plain master, both with waves (64 slots, a 32-token ubatch)
+and in a single wave (200 slots). On Metal, streaming differs by 4.2e-4: its
+CPU remap splits the graph, as the fork's does (see "The rebase").
+
+**Auto-sizing aborts on Kolibri, as reported.**
+- Without a slot count, `llama_moe_stream_resolve_slots` takes
+  `clamp(2*n_expert_used, 16, n_expert)`, which is 16 slots.
+- A ubatch that touches more experts than that runs in waves, and waves need
+  `3*n_expert_used` = 18 slots.
+- So plain `--moe-stream` aborts while reserving the graph, before any request:
+  "src/llama-graph.cpp:2394: MoE expert streaming: multi-pass expert GEMMs need
+  an expert cache of at least 3*n_expert_used slots (have 16, need 18);
+  increase --moe-stream-cache or reduce -ub", rc 134.
+- Top-5 or fewer fits in 16 slots; Kolibri's top-6 is the first that does not.
+- **Control M46:** `--moe-stream-cache 17s` aborts the same way ("have 17,
+  need 18"), and `18s` starts.
+
+With `--moe-stream-cache 128s`, 48 greedy tokens equal those of the fork's
+`--cpu-moe`.
+
+### The benchmark
+
+`testdata/bench/e0.json`:
+- Stage D's workloads, 2 repetitions, IQ3, 2026-10-23, on AC power.
+- The fork's arms run the rebased fork; `iq3-moestream128` runs the port
+  (`kolibri-bench -servers pr25294=<port>/build/bin/llama-server`).
+- Every cache holds the same memory, 128 experts per layer.
+- The gates were fixed before the runs.
+
+| Arm | Ceiling | Warm decode t/s | Warm p95 ms | Warm prompt t/s | Cold TTFT s | Footprint GiB | Page cache peak GiB |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `iq3-cpu-moe` | 0 | 16.63 (15.87–17.40) | 79.3 | 218.7 | 25.70 | 1.0 | 30.8 |
+| `iq3-cache128` (fork, `F_NOCACHE`) | 0 | 17.71 (17.19–18.23) | 87.3 | 81.5 | 35.05 | 11.0 | 2.7 |
+| `iq3-cache128-buffered` (fork) | 0 | 20.52 (19.81–21.22) | 69.7 | 110.0 | 23.77 | 11.0 | 18.5 |
+| `iq3-moecache` (#29887) | 0 | 11.99 (11.22–12.75) | 174.7 | 71.8 | 97.54 | 11.0 | 21.5 |
+| `iq3-moestream128` (#25294) | 0 | **20.86** (20.42–21.30) | **65.4** | **283.2** | **8.62** | 14.0 | 17.9 |
+| `iq3-cpu-moe` | 16 | 5.89 (5.33–6.46) | 649.5 | 11.4 | 217.07 | 1.1 | 16.8 |
+| `iq3-cache128` (fork, `F_NOCACHE`) | 16 | **17.96** (17.60–18.33) | **80.7** | 79.0 | 35.50 | 11.0 | 2.7 |
+| `iq3-cache128-buffered` (fork) | 16 | 13.47 (12.15–14.79) | 117.6 | 53.8 | 46.30 | 11.0 | 6.2 |
+| `iq3-moestream128` (#25294) | 16 | 12.69 (11.93–13.45) | 124.2 | **165.9** | **15.43** | 14.0 | 3.5 |
+
+**Gates (the fork's cache must beat #25294):**
+- 0 GiB, `F_NOCACHE`: **not passed** (17.71 against 20.86 t/s, p95 87.3 against 65.4 ms).
+- 0 GiB, buffered: **not passed** (20.52 against 20.86 t/s, the ranges overlap; p95 69.7 against 65.4 ms).
+- 16 GiB, `F_NOCACHE`: **passed** (17.96 against 12.69 t/s, p95 80.7 against 124.2 ms).
+- 16 GiB, buffered: not passed (13.47 against 12.69, the ranges overlap).
+
+**Phase 11's stop rule fires at 0 GiB.** There #25294 matches the fork's best
+decode, and its prefill is 2.6× faster (283 against 110 t/s warm, cold TTFT
+8.6 against 23.8 s). This is the wave prefill that E4 planned to build: the
+port runs the default 512-token ubatch, while the fork's cache caps it at 21.
+
+**At the 16 GiB ceiling the fork still wins decode.** Its `F_NOCACHE` slots
+hold, while #25294's buffered reads lose their page cache to the hog
+(macOS has no `O_DIRECT`). #25294 still leads prefill there (166 against
+79 t/s). It also needs more memory: a 14.0 GiB footprint against 11.0, likely because
+it turns mmap off, so the non-expert weights count in its own memory (not
+measured separately).
+
+**#29887 loses to plain `--cpu-moe`** (11.99 against 16.63 t/s, p95 175
+against 79 ms): 285 command-buffer commits per token against 103. It answers
+a host-to-VRAM problem that unified memory does not have.
+
+**Info and checks:**
+- Equivalence (INFO, against `iq3-cpu-moe`): no arm generates `--cpu-moe`'s
+  tokens to the end. #29887 and #25294 both first differ at tokens 15, 13, 14
+  and 15 (the GPU's expert matmuls against the CPU's); the fork's cache at 72,
+  12, 27 and 15.
+- PASS exact equivalence of buffered against `F_NOCACHE`: 20 of 20 requests.
+- PASS no expert load failures in the fork's 8 cache runs.
+- The port writes no `--expert-cache-stats`, so its decode split and hit rate
+  are missing.
+
+**Drift from E1.** Two fork arms moved beyond E1's range on the same matrix
+settings:
+- `iq3-cache128` at 16 GiB: 17.96 against E1's 16.94 (16.58–17.31);
+- `iq3-cache128-buffered` at 16 GiB: 13.47 against 15.22 (15.10–15.34).
+
+The 0 GiB arms are within E1's ranges. E1 ran on the old base; this run uses
+master's Metal backend. The cause is not established, and neither change
+alters a gate: with E1's numbers, the fork's buffered decode at 0 GiB
+(20.96–21.31) still does not beat #25294 (20.42–21.30), and `F_NOCACHE` at
+16 GiB still wins.
+
+**For #25294's author** (evidence for E7, filed by hand):
+- The top-6 abort and its threshold (M46).
+- The port onto current master works unchanged in logic, bit-identical on the CPU.
+- On Apple unified memory its buffered reads lose to `F_NOCACHE` slots under
+  memory pressure.
+
+### Reproduce
+
+```sh
+git -C third_party/llama.cpp fetch origin ref/pr25294-on-184f6536
+git -C third_party/llama.cpp worktree add /tmp/pr25294 FETCH_HEAD
+cmake -S /tmp/pr25294 -B /tmp/pr25294/build -G 'Unix Makefiles' -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+cmake --build /tmp/pr25294/build --target llama-server -j
+go run ./cmd/kolibri-bench -matrix testdata/bench/e0.json -out ~/models/eval/expert-bench-e0 \
+  -servers pr25294=/tmp/pr25294/build/bin/llama-server
+```
