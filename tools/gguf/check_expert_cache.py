@@ -8,7 +8,10 @@ prefetch, and with buffered reads (no F_NOCACHE). The cache caps the ubatch at s
 the CPU its weights are not repacked (the slots are not either).
 
 - logits: bit-identical to the resident run, at every position. The slots hold the same bytes as
-  the stacked tensors and go through the same kernels, so nothing may differ;
+  the stacked tensors and go through the same kernels, so nothing may differ. On the GPU the
+  resident run is split where the cache's CPU remap splits the graph, after each layer's
+  ffn_moe_topk: Metal fuses ops across those points (RMS_NORM + MUL + ADD), and the fused kernels
+  round differently. The difference to an unsplit resident run is reported as info;
 - counters (--expert-cache-stats): per phase, hits + hits_loading + misses = needed, and the
   demand bytes are misses times an expert's bytes; every step of every layer is a remap (a ubatch
   of one token counts as decode, so with a ubatch of 1 the prompt does too); loads into a slot
@@ -74,6 +77,14 @@ def main() -> None:
         print(("PASS " if ok else "FAIL ") + msg, flush=True)
         failed += not ok
 
+    def on_gpu(dev) -> bool:
+        return r.lib.ggml_backend_dev_type(dev) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU
+
+    def resident(gguf: Path, dev, tokens: list[int], ub: int, **kw):
+        """The resident run the cache must match: on the GPU split after each layer's ffn_moe_topk,
+        where the cache's CPU remap splits the graph."""
+        return r.logits(gguf, dev, tokens, ub, no_repack=True, split_after=("ffn_moe_topk",) if on_gpu(dev) else (), **kw)
+
     def check(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
               n_layer: int, k: int, stats: Path, label: str) -> None:
         chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
@@ -86,13 +97,13 @@ def main() -> None:
 
             # resident, with the decode timing only (stats without the cache)
             stats.unlink(missing_ok=True)
-            ref = r.logits(gguf, dev, tokens, ub, chunks=chunks, no_repack=True, expert_cache={"stats_path": str(stats)})
+            plain = r.logits(gguf, dev, tokens, ub, chunks=chunks, no_repack=True, expert_cache={"stats_path": str(stats)})
+            ref = resident(gguf, dev, tokens, ub, chunks=chunks) if on_gpu(dev) else plain
             s = json.loads(stats.read_text())
             d = s["decode"]
             # M42: the scheduler's splits per decoded token are known: on the GPU 2 resident (docs/real-checkpoint.md)
             # and 2 more per layer with the cache (each layer's remap is a CPU split); on the CPU 1 either way
-            on_gpu = r.lib.ggml_backend_dev_type(dev) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU
-            splits_resident, splits_cache = (2, 2 + 2 * n_layer) if on_gpu else (1, 1)
+            splits_resident, splits_cache = (2, 2 + 2 * n_layer) if on_gpu(dev) else (1, 1)
             report(s["expert_cache"] is None and d["tokens"] == n_dec and d["wall_seconds"] > 0
                    and d["splits"] == splits_resident * d["tokens"] and "max_phys_footprint" in s["process"],
                    f"{label} {dev_name}, resident, ubatch {ub}: decode timing without the cache ({d['tokens']} tokens, "
@@ -107,6 +118,8 @@ def main() -> None:
                 same = np.array_equal(got, ref)
                 diff = "" if same else f", max |diff| {float(np.abs(got - ref).max()):.3g}"
                 report(same, f"{what}: logits of {len(tokens)} positions bit-identical to the resident run{diff}")
+                if on_gpu(dev):
+                    print(f"info {what}: max |diff| to the unsplit resident run {float(np.abs(got - plain).max()):.3g}")
                 if ub < n_prompt:
                     report(f"n_ubatch {n_prompt} capped to {ub}" in log, f"{what}: the context caps n_ubatch at {ub}")
 
@@ -165,7 +178,7 @@ def main() -> None:
                 per_layer = [12, 64, 18, 384, 30, 100][:n_layer]
                 ub = min(per_layer) // k
                 for dev_name, dev in r.devices():
-                    ref = r.logits(gguf, dev, tokens, ub, chunks=[N_PROMPT] + [1] * N_DECODE, no_repack=True)
+                    ref = resident(gguf, dev, tokens, ub, chunks=[N_PROMPT] + [1] * N_DECODE)
                     stats.unlink(missing_ok=True)
                     got = r.logits(gguf, dev, tokens, N_PROMPT, chunks=[N_PROMPT] + [1] * N_DECODE, no_repack=True,
                                    expert_cache={"n_slots_layer": per_layer, "prefetch_k": 8, "stats_path": str(stats)})
@@ -179,7 +192,7 @@ def main() -> None:
                 cases = [(f"{gpu[0][0]} with {n_layer // 2} of {n_layer} layers", gpu[0][1], n_layer // 2, True)] if gpu else []
                 cases.append((f"{cpu[0][0]} with repacking", cpu[0][1], -1, False))
                 for what, dev, ngl, no_repack in cases:
-                    ref = r.logits(gguf, dev, tokens, 2, chunks=[N_PROMPT] + [1] * N_DECODE, no_repack=True, n_gpu_layers=ngl)
+                    ref = resident(gguf, dev, tokens, 2, chunks=[N_PROMPT] + [1] * N_DECODE, n_gpu_layers=ngl)
                     stats.unlink(missing_ok=True)
                     got = r.logits(gguf, dev, tokens, N_PROMPT, chunks=[N_PROMPT] + [1] * N_DECODE, no_repack=no_repack,
                                    n_gpu_layers=ngl, expert_cache={"n_slots": 16, "stats_path": str(stats)})

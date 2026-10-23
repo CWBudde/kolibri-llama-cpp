@@ -111,7 +111,8 @@ class Runner:
                nodes: dict[str, list[str]] | None = None, capture: dict | None = None,
                chunks: list[int] | None = None, n_ctx: int = 256, outputs: list[int] | None = None,
                rows: dict[str, tuple[int, list[int]]] | None = None, cpu_moe: bool = False, no_repack: bool = False,
-               return_logits: bool = True, expert_cache: dict | None = None, n_gpu_layers: int = -1, **ctx_params):
+               return_logits: bool = True, expert_cache: dict | None = None, n_gpu_layers: int = -1,
+               split_after: tuple[str, ...] = (), **ctx_params):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
         overrides maps GGUF keys to int, float or bool values that replace the file's.
         If nodes is given, it receives every graph node's name with the names of its inputs.
@@ -131,7 +132,9 @@ class Runner:
         output positions are still computed (the last layer keeps only their rows) but their logits
         are not kept, and the result is None. expert_cache sets llama_expert_cache_params fields
         (n_slots, prefetch_k, stats_path, ...) and turns the expert cache on. n_gpu_layers offloads
-        only that many layers to dev, the rest stays on the CPU. ctx_params set further
+        only that many layers to dev, the rest stays on the CPU. split_after names node prefixes
+        (ffn_moe_topk) after which the scheduler ends each computation and starts the next, as
+        cb_eval does for a captured node, without reading anything. ctx_params set further
         llama_context_params fields (swa_full, flash_attn_type, type_k, ...)."""
         import numpy as np
 
@@ -179,7 +182,7 @@ class Runner:
         want = None if outputs is None else set(outputs)
         span = [0, 0]  # the positions of the current llama_decode call
         keep = {name: np.asarray(sorted(pos)) for name, (_, pos) in (rows or {}).items()}
-        if nodes is not None or capture is not None:
+        if nodes is not None or capture is not None or split_after:
             computation, seen = [0], {}  # the llama_decode call, and per name the call of its last capture
 
             @self.ffi.callback("bool(struct ggml_tensor *, bool, void *)")
@@ -189,7 +192,9 @@ class Runner:
                     if nodes is not None:
                         srcs = [t.src[i] for i in range(len(t.src))]
                         nodes[name] = [self.ffi.string(x.name).decode() for x in srcs if x != self.ffi.NULL]
-                    return capture is not None and name in capture
+                    return (capture is not None and name in capture) or name.startswith(split_after)
+                if capture is None or name not in capture:  # a split_after node
+                    return True
                 parts = capture[name] or []
                 if seen.get(name) == computation[0]:
                     parts.pop()  # a later node of the same name in the same computation
