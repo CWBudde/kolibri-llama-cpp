@@ -1013,7 +1013,7 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
 
 ## Phase 11 --- Expert streaming on par with other offloaders (proposed)
 
-**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 in progress.
+**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 and E2 next.
 
 ### Where Stage D stands against other work
 
@@ -1075,22 +1075,29 @@ Close these gaps without giving up the lead.
     - The full model, INFO as agreed: upstream equals the fork on the CPU, BF16 and IQ3.
     - Control M43: renormalized expert weights fail the gate (logits NMSE 5.08e-01), and the pre-tokenizer `llama-bpe` fails the tokenizer golden (82/85).
 
-### Stage E1 --- Cheap diagnostics before building anything
+### Stage E1 --- Cheap diagnostics before building anything — ✅ DONE (2026-10-23)
 
-- [ ] **Overhead control.** Run IQ3 with `--expert-cache 384` (no misses after warmup) against resident `-ub 21` at 0 GiB, with the decode timing split as in Stage D.
+**Verdict** ([docs/expert-diagnostics.md](docs/expert-diagnostics.md)): E2 is warranted. With all 384 experts cached, decode takes 35.6 ms/token against 16.8 ms resident at `-ub 21`. Only 1.2 ms of the gap is load wait and remap; 17.6 ms come with the 100 extra graph splits per token (102 against 2). Buffered reads stay opt-in. One read per expert is 2.2× faster than three at one in flight (E3). SLRU and hotness pass the Stage A gate, mainly in prefill (E4). Open: Q8_0 decodes at 5.5 tokens/s against Stage D's 13.0, not yet explained. The benchmark ran 2 repetitions instead of 3, to fit a 4-hour budget. Q8_0 with 128 slots does not fit at the 16 GiB ceiling.
+
+- [x] **Overhead control.** Run IQ3 with `--expert-cache 384` (no misses after warmup) against resident `-ub 21` at 0 GiB, with the decode timing split as in Stage D.
   - This measures the interception cost alone: remap op, splits and syncs.
   - Also count the graph splits and command-buffer commits per decoded token.
   - **E2 starts only if** the gap to resident is a material share (at least 10 ms/token of the roughly 23 ms unexplained). Otherwise look for the time elsewhere first.
-- [ ] **Page-cache A/B.** Add an option that reads misses buffered instead of with `F_NOCACHE`.
+  - (2026-10-22) — Patch 0012 (fork `746be1eae`, fork PR #12) adds decode wall time, remap time, graph splits and Metal commits to the stats JSON. Resident `-ub 21`: 16.82 ms/token, 2 splits, 3 commits. `--expert-cache 384 -ub 21`: 35.64 ms/token (wait 0.71, remap 0.53), 102 splits, 103 commits. 128 slots: 57.81 (wait 15.27, remap 0.63), so about 7.5 ms more "other" than at 384 that is not yet attributed. **Passed:** 17.6 ms/token is split overhead. Control M42: resident decode runs the documented 2 splits per token.
+- [x] **Page-cache A/B.** Add an option that reads misses buffered instead of with `F_NOCACHE`.
   - Run both at 0 and 16 GiB, for IQ3 and Q8_0.
   - Report page-cache residency of the GGUF alongside `phys_footprint`, so a hidden page-cache tier is not passed off as a smaller footprint.
   - Keep buffered reads as the default only where they win at the same ceiling.
-- [ ] **SSD curve.** A Go `pread` sweep on the M5 Pro's internal SSD, for example `cmd/kolibri-ssd` reusing `internal/memctl` for eviction.
+  - (2026-10-22) — `--expert-cache-buffered` (patch 0012). IQ3 at 0 GiB: 21.13 against 17.61 tokens/s, p95 65.1 against 84.9 ms, gate passed; the GGUF's page cache peaks at 20.8 GiB, which the 10.9 GiB footprint does not show. IQ3 at 16 GiB: 15.22 against 16.94, not passed. Q8_0 at 0 GiB: 8.10 against 5.50, passed with wide ranges. **Stays opt-in;** `F_NOCACHE` remains the default.
+  - (2026-10-23) — Q8_0 at 16 GiB **does not fit** in either mode: 128 slots are 24.9 GiB, and with 2.7 GiB of non-expert weights and the 16 GiB hog, 4.4 GiB remain for macOS. The `F_NOCACHE` run paged its slots out (resident 3–18 GiB at a 24 GiB footprint, swap 13 GiB), and its cold request produced no token in 20 minutes before a watchdog stopped it. `kolibri-bench`'s `fits` now counts cache slots, non-expert weights, the hog and 8 GiB for the system, and records both arms as "does not fit" (51.6 GiB). The report passes: equivalence 10 of 10, no expert load failures (4 did not fit); the Q8_0 gate at 16 GiB has no verdict.
+- [x] **SSD curve.** A Go `pread` sweep on the M5 Pro's internal SSD, for example `cmd/kolibri-ssd` reusing `internal/memctl` for eviction.
   - Cold file; chunks of 64 KiB to 8 MiB; queue depth 1–16; `F_NOCACHE` and buffered.
   - No trustworthy M5 Pro figure exists. This curve sets E3's thread count and tells whether one 1.7 MB IQ3 expert per read is latency- or bandwidth-bound.
-- [ ] **Eviction policies offline.** Add upstream's SLRU (#29887: probation/protected, protected at most half, shared per layer group) and #25294's decaying hotness with LRU tie-break to `internal/locality`, and replay them through `cmd/kolibri-policy` with the Stage A splits and gate.
+  - (2026-10-22) — `cmd/kolibri-ssd`, [docs/ssd-curve.md](docs/ssd-curve.md). The SSD saturates at 13–14 GB/s from 4 reads in flight. An IQ3 expert in three reads takes 0.61 ms at QD 1 and in one read 0.28 ms; at QD 4, 5,558 against 7,595 experts/s. So it is latency-bound at low depth, and **E3 should use about 4 threads.** About 27 decode misses per token should cost about 5 ms; the cache waits 15.3 ms, so its I/O path loses time beyond the raw reads. Control M41: warm reads are 9–35× faster than evicted ones.
+- [x] **Eviction policies offline.** Add upstream's SLRU (#29887: probation/protected, protected at most half, shared per layer group) and #25294's decaying hotness with LRU tie-break to `internal/locality`, and replay them through `cmd/kolibri-policy` with the Stage A splits and gate.
   - Also check that the replay treats a decoded step's six experts as one event. Zhang (arXiv 2608.07911) shows that per-access replays inflate LRU's misses.
   - A policy enters the runtime only if it passes the Stage A gate on held-out decode, or on prefill for E4's admission.
+  - (2026-10-22) — `internal/locality/eviction.go`, [docs/expert-policy.md](docs/expert-policy.md) "Stage E1". Per-layer and shared SLRU, hotness (untuned and tuned), and step-pinned LFU, ARC and layer LRU all pass the gate on both models. At 128 experts per layer, decode hits move by under 1 point (shared SLRU 93.1% against shared LRU 92.5%), while prefill rises from 20.7% (layer LRU) to 34–36%. The replay now counts step evictions; LFU, ARC and the layer LRU (in prefill) had them, and the existing numbers are unchanged. Upstream's half split collapses when the entry segment holds less than one token's experts (shared SLRU at 8 per layer: 11.5% decode hits). Control M40: SLRU at protected fraction 0 equals LRU. **Carried to E4** as prefill admission candidates.
 
 ### Stage E2 --- Remove the per-layer CPU sync from decode
 

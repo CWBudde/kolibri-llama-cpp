@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"kolibri-llm/internal/gguf"
 )
 
 func TestParseLoadavg(t *testing.T) {
@@ -93,19 +95,71 @@ func TestServerArgs(t *testing.T) {
 
 func TestFits(t *testing.T) {
 	const gib = 1 << 30
+	// the real files: IQ3 experts take 1,699,840 B, Q8_0 ones 4,177,920 B, 384 per layer in 50 layers
+	iq3 := weights{Bytes: 35556257600, ExpertBytes: 384 * 50 * 1699840, SlotBytes: 50 * 1699840}
+	q8 := weights{Bytes: 83135393312, ExpertBytes: 384 * 50 * 4177920, SlotBytes: 50 * 4177920}
 	resident := config{Args: nil}
 	// IQ3 is 33.1 GiB; with every weight on Metal it is wired, and 16 GiB more
 	// is beyond 48 GiB: the run that hung this Mac on 2026-10-15
-	if ok, why := fits(resident, 16, 35556257600, 48*gib); ok || !strings.Contains(why, "33.1 GiB") {
+	if ok, why := fits(resident, 16, iq3, 48*gib); ok || !strings.Contains(why, "33.1 GiB") {
 		t.Errorf("resident IQ3 at 16 GiB: fits = %v, %q", ok, why)
 	}
-	if ok, _ := fits(resident, 0, 35556257600, 48*gib); !ok {
+	if ok, _ := fits(resident, 0, iq3, 48*gib); !ok {
 		t.Error("resident IQ3 without a ceiling does not fit")
 	}
-	for _, args := range [][]string{{"--cpu-moe"}, {"--expert-cache", "128"}} {
-		if ok, why := fits(config{Args: args}, 16, 83135393312, 48*gib); !ok {
-			t.Errorf("%v keeps the experts pageable, yet does not fit: %s", args, why)
+	if ok, why := fits(config{Args: []string{"--cpu-moe"}}, 16, q8, 48*gib); !ok {
+		t.Errorf("--cpu-moe keeps the experts in the page cache, yet does not fit: %s", why)
+	}
+	// Q8_0's 128 slots (24.9 GiB) beside a 16 GiB hog paged the cache out and
+	// produced no token in 20 minutes (2026-10-23); the runs below all completed
+	for _, c := range []struct {
+		name    string
+		args    []string
+		ceiling float64
+		w       weights
+		want    bool
+	}{
+		{"q8 128 slots at 16 GiB", []string{"--expert-cache", "128"}, 16, q8, false},
+		{"q8 128 slots buffered at 16 GiB", []string{"--expert-cache", "128", "--expert-cache-buffered"}, 16, q8, false},
+		{"q8 128 slots at 0 GiB", []string{"--expert-cache", "128"}, 0, q8, true},
+		{"iq3 128 slots at 16 GiB", []string{"--expert-cache", "128"}, 16, iq3, true},
+		{"iq3 384 slots at 0 GiB", []string{"--expert-cache", "384", "-ub", "21"}, 0, iq3, true},
+	} {
+		ok, why := fits(config{Args: c.args}, c.ceiling, c.w, 48*gib)
+		if ok != c.want {
+			t.Errorf("%s: fits = %v (%s), want %v", c.name, ok, why, c.want)
 		}
+		if !ok && !strings.Contains(why, "24.9 GiB") {
+			t.Errorf("%s: %q does not name the slots' 24.9 GiB", c.name, why)
+		}
+	}
+	if ok, why := fits(config{Args: []string{"--expert-cache", "many"}}, 0, q8, 48*gib); ok || !strings.Contains(why, "many") {
+		t.Errorf("an unparsable slot count: fits = %v, %q", ok, why)
+	}
+}
+
+func TestWeightsOf(t *testing.T) {
+	f := &gguf.File{Tensors: []gguf.Tensor{
+		{Name: "token_embd.weight", Dims: []uint64{64, 10}, Type: gguf.F32},
+		{Name: "blk.0.ffn_gate_exps.weight", Dims: []uint64{64, 8, 4}, Type: gguf.F32},
+		{Name: "blk.0.ffn_up_exps.weight", Dims: []uint64{64, 8, 4}, Type: gguf.F32},
+		{Name: "blk.0.ffn_down_exps.weight", Dims: []uint64{8, 64, 4}, Type: gguf.F32},
+		{Name: "blk.1.ffn_gate_exps.weight", Dims: []uint64{64, 8, 4}, Type: gguf.F32},
+		{Name: "blk.1.ffn_up_exps.weight", Dims: []uint64{64, 8, 4}, Type: gguf.F32},
+		{Name: "blk.1.ffn_down_exps.weight", Dims: []uint64{8, 64, 4}, Type: gguf.F32},
+		{Name: "blk.0.ffn_gate_shexp.weight", Dims: []uint64{64, 8}, Type: gguf.F32},
+	}}
+	w, err := weightsOf(f, 1000000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// one expert is 3 matrices of 64*8 F32 = 6144 B; 2 layers of 4 experts
+	if want := (weights{Bytes: 1000000, ExpertBytes: 2 * 4 * 6144, SlotBytes: 2 * 6144}); w != want {
+		t.Errorf("weightsOf = %+v, want %+v", w, want)
+	}
+	f.Tensors = append(f.Tensors, gguf.Tensor{Name: "blk.2.ffn_up_exps.weight", Dims: []uint64{64, 8}, Type: gguf.F32})
+	if _, err := weightsOf(f, 1000000); err == nil {
+		t.Error("weightsOf accepted a 2-D expert tensor")
 	}
 }
 
@@ -208,7 +262,7 @@ func TestReportCountsRequests(t *testing.T) {
 			{Name: "cache", Ceilings: []float64{0}, Reps: 2},
 		},
 		Equivalence: []equivalence{{Reference: "ref", Arms: []string{"cache"}, Exact: true}}}
-	if got := m.expectedRequests([]string{"cache"}); got != 4 {
+	if got := m.expectedRequests([]string{"cache"}, nil); got != 4 {
 		t.Fatalf("expectedRequests = %d, want 4", got)
 	}
 	ids := []int{1, 2, 3}
@@ -230,6 +284,38 @@ func TestReportCountsRequests(t *testing.T) {
 	out.Reset()
 	if !report(&out, m, []runResult{ref, r1, r2}) {
 		t.Fatalf("all requests equal, yet:\n%s", out.String())
+	}
+}
+
+// A run that fits does not start is a result, not a missing run: the
+// equivalence and the load-failure check expect nothing from it.
+func TestReportSkipsDoesNotFit(t *testing.T) {
+	m := matrix{Cold: "coding", Warm: []string{"coding"},
+		Configs: []config{
+			{Name: "ref", Ceilings: []float64{0}, Reps: 1},
+			{Name: "cache", Args: []string{"--expert-cache", "2"}, Ceilings: []float64{0, 16}, Reps: 1},
+		},
+		Equivalence: []equivalence{{Reference: "ref", Arms: []string{"cache"}, Exact: true}}}
+	ids := []int{1, 2, 3}
+	ref := fakeRun("ref", 0, 1, []float64{50}, []float64{20}, ids)
+	ok := fakeRun("cache", 0, 1, []float64{20}, []float64{50}, ids)
+	ok.Stats = &cacheStats{}
+	nofit := runResult{Config: "cache", CeilingGiB: 16, Rep: 1, Status: statusDoesNotFit}
+	var out strings.Builder
+	if !report(&out, m, []runResult{ref, ok, nofit}) {
+		t.Fatalf("a run that does not fit fails the report:\n%s", out.String())
+	}
+	for _, want := range []string{
+		"PASS equivalence cache against ref: 2 of 2 requests",
+		"PASS expert load failures: 0 in the 1 of 1 cache runs that completed and wrote their stats (1 did not fit)",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("report lacks %q:\n%s", want, out.String())
+		}
+	}
+	nofit.Status = statusLoadFailed
+	if report(io.Discard, m, []runResult{ref, ok, nofit}) {
+		t.Error("a run that failed to load passes")
 	}
 }
 
@@ -388,7 +474,7 @@ func TestE1Matrix(t *testing.T) {
 	for _, c := range e.Configs {
 		for _, ceil := range c.Ceilings {
 			if ceil > 0 && !usesCache(c.Args) {
-				if ok, _ := fits(c, ceil, 35556257600, 48*gib); ok {
+				if ok, _ := fits(c, ceil, weights{Bytes: 35556257600}, 48*gib); ok {
 					t.Errorf("%s fits at %g GiB", c.Name, ceil)
 				}
 			}

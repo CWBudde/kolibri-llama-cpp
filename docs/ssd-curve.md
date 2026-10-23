@@ -30,6 +30,14 @@ wall time; latencies are per op (one chunk, or one expert) in ms.
 - Machine: model Mac17,9; cpu Apple M5 Pro; memory 48 GiB; os 27.0.1; ssd APPLE SSD AP1024Z
 - Power: Now drawing from 'AC Power'; page size 16384; seed 1; evict before each cell: false
 
+## Run 2026-10-22T20:07:14+02:00
+
+- Command: `/Users/christian/models/eval/ssd/kolibri-ssd -expert -gguf /Users/christian/models/Kolibri-1-Q8_0.gguf -modes nocache -json /Users/christian/models/eval/ssd/expert-q8.jsonl`
+- File: `/Users/christian/models/Kolibri-1-Q8_0.gguf` (83,135,393,312 bytes; experts 80,216,064,000 bytes, 50 layers x 384)
+- Expert slices (layer 0): gate Q8_0 1,392,640, up Q8_0 1,392,640, down Q8_0 1,392,640 bytes
+- Machine: model Mac17,9; cpu Apple M5 Pro; memory 48 GiB; os 27.0.1; ssd APPLE SSD AP1024Z
+- Power: Now drawing from 'AC Power'; page size 16384; seed 1; evict before each cell: true
+
 ## raw, nocache, evicted (cold)
 
 MB/s (ops/s), then p50 / p99 / max latency in ms per chunk.
@@ -65,8 +73,9 @@ MB/s (ops/s), then p50 / p99 / max latency in ms per expert.
 | expert | QD 1 | QD 4 | QD 16 |
 |---:|---:|---:|---:|
 | 1,699,840 B | 2776 (1633)<br>0.61 / 0.71 / 0.97 | 9448 (5558)<br>0.68 / 3.06 / 3.23 | 12471 (7337)<br>2.05 / 3.99 / 4.13 |
+| 4,177,920 B | 4420 (1058)<br>0.92 / 1.24 / 1.99 | 12225 (2926)<br>1.34 / 2.05 / 2.25 | 12770 (3057)<br>5.13 / 5.40 / 5.40 |
 
-Resident pages of 2,170,182: at most 0 before a timed pass, 0 after one.
+Resident pages of 5,074,182: at most 0 before a timed pass, 8,448 after one.
 
 ## expert-contiguous, nocache, evicted (cold)
 
@@ -75,8 +84,9 @@ MB/s (ops/s), then p50 / p99 / max latency in ms per expert.
 | expert | QD 1 | QD 4 | QD 16 |
 |---:|---:|---:|---:|
 | 1,699,840 B | 5479 (3223)<br>0.28 / 0.49 / 2.50 | 12911 (7595)<br>0.49 / 2.72 / 2.82 | 13160 (7742)<br>1.95 / 4.08 / 4.26 |
+| 4,177,920 B | 8506 (2036)<br>0.48 / 0.79 / 1.18 | 13763 (3294)<br>1.19 / 1.72 / 1.76 | 13705 (3280)<br>4.48 / 4.87 / 5.00 |
 
-Resident pages of 2,170,182: at most 0 before a timed pass, 2,040 after one.
+Resident pages of 5,074,182: at most 0 before a timed pass, 2,040 after one.
 
 ## expert-three, buffered, evicted (cold)
 
