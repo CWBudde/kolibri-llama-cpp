@@ -37,6 +37,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 import time
@@ -44,7 +45,7 @@ from pathlib import Path
 
 from check_attn import MAX_NMSE_STRICT, kv_caches, rope, rope_cos_sin_cache
 from check_model import MAX_NMSE, Runner, joined, nmse
-from tiny import convert, generate_tiny
+from tiny import arch, convert, generate_tiny
 
 CONTEXT_LENGTH = 262144  # the real max_position_embeddings
 LENGTHS = (8192, 16384, 65536)
@@ -58,8 +59,8 @@ def checked_rows(n: int, rng: random.Random) -> list[int]:
     return sorted(set(range(n - 32, n)) | set(rng.sample(range(n // 2, n - 32), 32)) | {n // 2 - 1, n // 2})
 
 
-def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], rows: list[int], strict: bool,
-          run: dict):
+def check(runner: Runner, gguf: Path, prefix: str, dev, model: Path, tokens: list[int], rows: list[int],
+          strict: bool, run: dict):
     """Decodes tokens on dev as run describes and compares the attention at rows with the reference.
     Returns (ok, message) pairs."""
     import torch
@@ -82,7 +83,7 @@ def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], rows:
     axis = {s: -2 if s.startswith("kqv_out") else -3 for s in want}
     cap = {s: None for s in want}
     t0 = time.monotonic()
-    runner.logits(gguf, dev, tokens, run["n_ubatch"], {"kolibri.context_length": CONTEXT_LENGTH},
+    runner.logits(gguf, dev, tokens, run["n_ubatch"], {f"{prefix}.context_length": CONTEXT_LENGTH},
                   capture=cap, n_ctx=n, chunks=[run["n_ubatch"]] * (n // run["n_ubatch"]), outputs=rows[-1:],
                   rows={s: (axis[s], pos) for s, pos in want.items() if pos is not None}, swa_full=False,
                   **run["ctx"])
@@ -103,6 +104,10 @@ def check(runner: Runner, gguf: Path, dev, model: Path, tokens: list[int], rows:
             f"KV cache layers {layers}, cells {cells} (llama_kv_cache_iswa: {n} cells for the {sum(full)} full "
             f"layers, {n_swa} = window + ubatch, padded, for the {n_layer - sum(full)} sliding layers; "
             f"decoded in {seconds:.0f} s)")]
+    # the override reached the model: an override of a key the GGUF does not have is dropped silently
+    n_ctx_train = re.findall(r"n_ctx_train\s+= (\d+)", "".join(runner.log))
+    res.append((n_ctx_train == [str(CONTEXT_LENGTH)],
+                f"n_ctx_train {n_ctx_train} with {prefix}.context_length overridden to {CONTEXT_LENGTH}"))
 
     pos = torch.tensor(rows)
     cache64 = rope_cos_sin_cache(cfg["rope_theta"], d, n, torch.float64)
@@ -179,11 +184,12 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         model = generate_tiny(Path(tmp), args.seed, "attn")
         gguf = convert(model, args.llama_cpp, "f32")
+        prefix = arch(gguf, args.llama_cpp)  # kolibri1 for upstream's converter
         for name, dev in runner.devices():
             is_cpu = lib.ggml_backend_dev_type(dev) == lib.GGML_BACKEND_DEVICE_TYPE_CPU
             for n, run, label, strict in configs(lib, is_cpu):
                 try:
-                    results = check(runner, gguf, dev, model, tokens[:n], rows[n], strict, run)
+                    results = check(runner, gguf, prefix, dev, model, tokens[:n], rows[n], strict, run)
                 except RuntimeError as e:
                     results = [(False, f"load and decode: {e}")]
                 for ok, what in results:
