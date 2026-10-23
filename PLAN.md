@@ -1013,7 +1013,7 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
 
 ## Phase 11 --- Expert streaming on par with other offloaders (proposed)
 
-**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 and E2 next.
+**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0's rebase done (2026-10-23); E0.2 and E2 next.
 
 ### Where Stage D stands against other work
 
@@ -1054,7 +1054,7 @@ Close these gaps without giving up the lead.
 
 ### Stage E0 --- Rebase onto upstream Kolibri support
 
-- [ ] Rebase the fork onto an upstream commit that contains #30673.
+- [x] Rebase the fork onto an upstream commit that contains #30673.
   - Compare upstream's Kolibri model with ours on the BF16 and IQ3 GGUFs with the existing harnesses: bit identity on the tiny checkpoints, KLD against our BF16 on the real one, and the vLLM capture where it applies.
   - Check in particular the router (bias on the logits, sigmoid without renormalization), the RoPE/NoPE layer split, the window of 513, the pre-tokenizer and the GGUF keys. HF discussion #3 reports that most Hub GGUFs need `--override-kv` for the pre-tokenizer and the gating function.
   - Retire every fork patch that upstream now covers; document the remaining differences in `docs/upstream.md`.
@@ -1066,6 +1066,12 @@ Close these gaps without giving up the lead.
     - Router, RoPE/NoPE, window and pre-tokenizer identical. Hub question: upstream-converted GGUFs need no `--override-kv`.
     - Upstream covers patches 0001–0007. 0008 and 0010 (chat template, server `enable_thinking`) are not upstream. For 0009, `repro.py cpu-moe` must show whether master's `merge_ranges` fixes issue 3.
     - **Remains:** the rebase itself. Retire 0001–0007, move every GGUF and tool here from `kolibri` to `kolibri1`, and rebase 0008–0012 onto master.
+  - (2026-10-23) — Rebased onto master `184f6536` ([docs/upstream.md](docs/upstream.md), "The rebase (Stage E0.1)"): fork branch `feat/kolibri1` with 0008, 0010, 0011 and 0012; the series applied to a clean `184f6536` gives the fork's tree.
+    - **Retired:** 0001–0007, and 0009, since master maps only Metal's ranges ("RUNS cpu-moe: GGUF 79,284 MiB, Metal maps 2,448 MiB of it: exit 0").
+    - **Moved to `kolibri1`:** the local GGUFs (rewritten under their old names; the old files keep a `-kolibri` suffix) and the checks (upstream's keys and node names).
+    - **Checks:** tokenizer golden 85/85; the GGUF, model, MoE and attention checks and `check_chat.py` pass; `compare_real.py --tiny` gives E0's values, with logits byte-identical to unmodified master; ctest 6/6; `check_expert_cache.py` tiny (rc 0) and `--real` IQ3 ("PASS: 0 failures").
+    - **Metal:** master fuses ops differently once the cache's CPU remap splits the graph, so the cache matches a resident run split at the same points bit for bit, not an unsplit one (up to 3.23 in IQ3 logits). As decided on 2026-10-23, `check_expert_cache.py` uses that same-split reference on the GPU and reports the unsplit difference as info.
+    - Controls M44 (an un-rewritten `kolibri` GGUF: "unknown model architecture: 'kolibri'") and M45 (the cache reads the neighbouring expert's down rows: every bit-identity line fails).
 - [ ] Check upstream's two expert-cache paths on this Mac:
   - **#29887** (`--moe-cache-mib`): does it activate on Metal at all (it accepts the IGPU device type)? If it does, run one arm at 0 GiB.
   - **#25294** (`--moe-stream`): build the PR branch and check whether its auto-sizing aborts at `n_expert_used >= 6`. If it runs on Kolibri, add it to the matrix as a reference arm at 0 and 16 GiB.
@@ -1107,6 +1113,7 @@ Only if E1's overhead control shows the overhead.
   - **GPU remap.** The slot table lives in a shared Metal buffer, and a small kernel maps router ids to slots. The CPU is involved only when a layer misses: an `MTLSharedEvent` wait that the I/O side signals once the slot is written (the #23324 PoC's handshake). Hit layers then run without a CPU round trip.
   - **Fewer, larger splits.** Keep the CPU remap, but let the scheduler fuse a layer's attention and the next layer's router into one Metal split.
 - [ ] Gate: lossless as above. Decode tokens/s and p95 at both ceilings must beat Stage D by the Stage D rule. The miss path must still pin, cancel and fall back as `test-expert-cache` requires. Controls from M40, including a wrong slot id in the GPU table.
+- [ ] Without the CPU split, require bit identity to the unsplit resident run on Metal again (`check_expert_cache.py` drops its same-split reference). Until then `kolibri-bench`'s exact equivalence of `iq3-cache128` against `iq3-resident-ub21` compares two differently fused graphs on master (E0.1).
 
 ### Stage E3 --- One read per expert
 

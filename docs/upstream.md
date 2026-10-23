@@ -165,6 +165,23 @@ RUNS cpu-moe: GGUF 79,284 MiB, Metal maps 2,447 MiB of it: exit 0
 Both are closed as not planned. Patch 0009 has not been proposed upstream.
 On the fork it is [CWBudde/llama.cpp#10](https://github.com/CWBudde/llama.cpp/pull/10).
 
+**Master `184f6536` fixes it without 0009 (2026-10-23).** Master now merges
+a context's mapping ranges (`merge_ranges`, `llama-model-loader.cpp:1460`),
+and on unmodified master with the rewritten Q8_0 file Metal maps only its own
+tensors:
+
+```sh
+.venv/bin/python tools/upstream/repro.py cpu-moe --llama-cpp UPSTREAM \
+  --gguf ~/models/Kolibri-1-Q8_0.gguf --expect ok
+```
+
+```text
+RUNS cpu-moe: GGUF 79,284 MiB, Metal maps 2,448 MiB of it: exit 0
+```
+
+0009 is retired with the rebase onto this commit
+([The rebase](#the-rebase-stage-e01)).
+
 ## Negative controls
 
 Each was applied to the upstream worktree, run, and reverted.
@@ -280,7 +297,8 @@ Each fixture runs twice on upstream:
 - **`check_model.py`'s graph-wiring check reads this port's node names, so
   `--no-wiring` skips it.** Upstream names the shared expert output
   `ffn_shexp_out` and leaves the routed-plus-shared sum unnamed.
-  `compare_real.py` reads `ffn_shexp_out` as `ffn_shexp`.
+  `compare_real.py` reads `ffn_shexp_out` as `ffn_shexp`. Since the rebase
+  the wiring check reads upstream's names, and `--no-wiring` is gone.
 - **The RoPE/NoPE split and the window of 513 are covered by the same
   bit-identical runs.** The `pattern` fixture has the real 50-layer pattern,
   and `attn` has the real heads and window; the real model is covered by the
@@ -350,9 +368,9 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0003–0006 converter | yes | identical tensors; the key differences above |
 | 0007 model | yes | bit-identical logits, tiny and real, on the CPU |
 | 0008 chat template | no | upstream has neither the template file and tests nor the `server-common.cpp` line that passes `enable_thinking=false` for `reasoning_effort: none` (master `server-common.cpp:1495`) |
-| 0009 mmap ranges | open | master now merges mapping ranges (`merge_ranges`, `llama-model-loader.cpp:1460`); `repro.py cpu-moe` decides whether issue 3 is fixed |
+| 0009 mmap ranges | yes | master merges mapping ranges (`merge_ranges`, `llama-model-loader.cpp:1460`): "RUNS cpu-moe: GGUF 79,284 MiB, Metal maps 2,448 MiB of it: exit 0" on unmodified master |
 | 0010 continuation tests | no | tests on top of 0008 |
-| 0011, 0012 expert cache | no | the fork's own work; it has to be rebased |
+| 0011, 0012 expert cache | no | the fork's own work, rebased (below) |
 
 ### Controls
 
@@ -360,3 +378,70 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 |---|---|
 | M43a: upstream with `kolibri1.expert_weights_norm=true` for libllama only (`compare_real.py --tiny --override-kv`) | "FAIL tiny, all 8 experts: logits NMSE 5.08e-01", "FAIL tiny, top-2 routing: same experts for 97.0% of (token, layer) pairs", "FAIL 12 problem(s)", rc 1 |
 | M43b: a rekeyed GGUF with `tokenizer.ggml.pre = llama-bpe` (`kolibri-rekey -pre llama-bpe`) | "golden: 82/85 ok", for example "FAIL english/apostrophes", rc 1 |
+
+### The rebase (Stage E0.1)
+
+The fork moved onto master `184f6536`, the commit the comparison above ran
+on, so its verdict still applies. Fork branch `feat/kolibri1` holds 0008,
+0010, 0011 and 0012 as 9 commits; the older `feat/kolibri*` branches stay as
+they were. Patches 0001–0007 and 0009 are retired, and the regenerated series
+applied to a clean `184f6536` gives exactly the fork's tree (`7ade40f0`).
+
+**What moved:**
+- The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's
+  `src/models/kolibri1.cpp` (lazy expert tensors, the cache in the graph).
+  `build_moe_ffn` now also has upstream's MoE cache (#29887); the fork's
+  expert cache maps the router's ids to its slots before it, and the two
+  cannot be on together (an assert).
+- 0008's tests follow master's chat API: prompts are `common_chat_prompt`,
+  and `oaicompat_chat_params_parse` takes a vocab and a session.
+- The local GGUFs were rewritten with `cmd/kolibri-rekey` under their old
+  names; the old-architecture files keep a `-kolibri` suffix and share
+  their data blocks. Nothing records a file's hash, and the expert sizes
+  in `testdata/locality/expert-bytes.json` still verify.
+- The checks expect upstream's GGUF keys and graph: `check_arch.py` and
+  `check_metadata.py` check `kolibri1` (with `tokenizer.ggml.pre = qwen2`,
+  and no `expert_weights_scale` or `rope_pattern`); `check_model.py` and
+  `check_moe.py` read `ffn_shexp_out`, and find the unnamed routed-plus-shared
+  sum and post-FFN norm through `l_out`.
+
+**Checks on the rebased build:**
+
+| Check | Result |
+|---|---|
+| tokenizer `compare.py` | "golden: 85/85 ok", every fuzz and corpus case equal, UTF-8 report 10/14 |
+| `check_arch`, `check_metadata`, `check_tensors`, `check_model`, `check_moe`, `check_attn` | all PASS; `check_model` "graph wiring: 6 layers x 9 node checks", MTL0 vs CPU top-2 99/100 as in E0 |
+| `compare_real.py --tiny`, all four fixtures | PASS with E0's values (logits NMSE 4.75e-13, 3.45e-12, 9.18e-13; router 4.29e-13); the saved logits byte-identical to unmodified master |
+| `check_chat.py` | all PASS |
+| ctest `test-expert-cache`, `test-chat`, `test-chat-template`, `test-chat-peg-parser`, `test-chat-auto-parser`, `test-llama-archs` | 6/6; the Markov fixture "as the Go predictor" |
+| `check_expert_cache.py`, tiny | 164 PASS, rc 0 |
+| `check_expert_cache.py --real` IQ3, 128 and 64 slots | "PASS: 0 failures" |
+| `repro.py cpu-moe --expect ok`, Q8_0 | "RUNS cpu-moe: GGUF 79,284 MiB, Metal maps 2,448 MiB of it: exit 0" |
+
+**The expert cache on Metal: same partition, same bits.** The cache's CPU
+remap splits the Metal graph after each layer's `ffn_moe_topk`. Master's Metal
+backend fuses ops differently with those splits, so against an unsplit
+resident run the cache's logits are no longer bit-identical on Metal: up to
+6e-4 on the tiny F32 fixture, 0.134 on Q8_0, and 3.23 on the real IQ3 file
+(160 positions; a near-tie routed differently compounds over 50 layers). On
+the CPU they still are.
+- `GGML_METAL_FUSION_DISABLE=1` removes the difference, and so does skipping
+  only the `RMS_NORM + MUL + ADD` fusion. Both runs fuse the same number of
+  ops.
+- A resident run that cb_eval splits at the same points is bit-identical to
+  the cache on every fixture, and the cache is deterministic.
+- So `check_expert_cache.py` compares the GPU against a resident run split
+  after each `ffn_moe_topk` (`Runner.logits(split_after=...)`) and reports the
+  difference to the unsplit run as info. The CPU still compares against the
+  plain resident run.
+- E2 removes the CPU split. Its gate can then require bit identity to the
+  unsplit run again. Until then, `kolibri-bench`'s exact equivalence of
+  `iq3-cache128` against `iq3-resident-ub21` compares differently fused
+  graphs on master.
+
+**Controls:**
+
+| Mutation | Result |
+|---|---|
+| M44: the rebased build loads an un-rewritten `kolibri` GGUF | "error loading model: unknown model architecture: 'kolibri'", rc 1 |
+| M45: the cache reads each odd expert's down rows from its neighbour (`e ^ 1`) | every bit-identity line fails, CPU and Metal (the split reference included); rc 1 |

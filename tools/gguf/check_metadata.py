@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "inventory" / "bf16" / "config.json"
 SUMMARY = ROOT / "inventory" / "bf16" / "summary.json"
-ARCH = "kolibri"
+ARCH = "kolibri1"
 
 
 def swa_layers(cfg: dict, summary: dict) -> list[bool]:
@@ -49,6 +49,8 @@ def expected(cfg: dict, summary: dict) -> list[tuple[str, str, object]]:
     period = summary["attention"]["swa_period"]
     return [
         ("architecture", "general.architecture", ARCH),
+        # the Qwen2 pre-tokenizer regex (docs/tokenizer.md)
+        ("pre-tokenizer", "tokenizer.ggml.pre", "qwen2"),
         ("50 blocks", f"{ARCH}.block_count", cfg["num_hidden_layers"]),
         ("embedding size 2,560", f"{ARCH}.embedding_length", cfg["hidden_size"]),
         ("48/4 Q/KV heads", f"{ARCH}.attention.head_count", cfg["num_attention_heads"]),
@@ -68,16 +70,18 @@ def expected(cfg: dict, summary: dict) -> list[tuple[str, str, object]]:
         # (vLLM sigmoid_logit_add_routing). 2 = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID.
         ("router gating", f"{ARCH}.expert_gating_func", 2),
         ("router gating", f"{ARCH}.expert_weights_norm", cfg["norm_topk_prob"]),
-        # vLLM routed_scaling_factor = 1.0; not in config.json.
-        ("router gating", f"{ARCH}.expert_weights_scale", 1.0),
+        # vLLM routed_scaling_factor = 1.0; not in config.json. kolibri1 writes no scale and
+        # passes 1.0 to build_moe_ffn.
+        ("router gating", f"{ARCH}.expert_weights_scale", None),
         # 513 = 512 preceding tokens + the current one: llama.cpp masks when
         # p1 - p0 >= n_swa (LLAMA_SWA_TYPE_STANDARD), vLLM uses window (512, 0).
         ("SWA size 512", f"{ARCH}.attention.sliding_window", summary["attention"]["sliding_window"]),
         (f"repeating SWA/full pattern (period {period}, full last)",
          f"{ARCH}.attention.sliding_window_pattern", is_swa),
         ("RoPE base 10,000 and SWA-only RoPE", f"{ARCH}.rope.freq_base", cfg["rope_theta"]),
-        # Full-attention layers use no positional encoding (vLLM).
-        ("RoPE base 10,000 and SWA-only RoPE", f"{ARCH}.attention.rope_pattern", is_swa),
+        # Full-attention layers use no positional encoding (vLLM). kolibri1 writes no RoPE
+        # pattern: it rotates exactly the sliding layers of the pattern above.
+        ("RoPE base 10,000 and SWA-only RoPE", f"{ARCH}.attention.rope_pattern", None),
     ]
 
 

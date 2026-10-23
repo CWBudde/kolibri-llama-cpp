@@ -94,6 +94,8 @@ The fixture comes from `internal/locality`'s `TestMarkovFixture`: a random conve
   - a model file named with a quote, a backslash and a tab still gives valid stats JSON.
 - **Result:** "PASS: 0 failures", 102 checks; 163 with patch 0012 (buffered reads, decode timing, M42). The logits of all 100 positions are bit-identical in every configuration, and the counters are consistent.
 
+**Since the rebase onto upstream master (2026-10-23, Stage E0.1):** on the GPU the resident reference is split after each layer's `ffn_moe_topk`, where the cache's CPU remap splits the graph. Master's Metal backend fuses ops (`RMS_NORM + MUL + ADD`) across those points in an unsplit graph and rounds differently, so the unsplit resident run differs by up to 0.134 on the tiny Q8_0 fixture and 3.23 on IQ3; the check reports that as info. With the same split the logits are bit-identical; the CPU still compares against the plain resident run. Tiny: 164 checks, rc 0; IQ3: "PASS: 0 failures". Details and control M45 in [upstream.md](upstream.md#the-rebase-stage-e01).
+
 **IQ3, real weights** (`check_expert_cache.py --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`):
 - **Setup:** the first 160 tokens of the coding workload, 128 prefilled and 32 decoded, on Metal.
 - **Result:** with 128 slots (ubatch 21) and with 64 (ubatch 10), with and without prefetch, the logits are bit-identical to resident Metal at the same ubatch. "PASS: 0 failures".

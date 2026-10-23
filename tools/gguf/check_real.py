@@ -35,7 +35,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 SUMMARY = ROOT / "inventory" / "bf16" / "summary.json"
 CONFIG = ROOT / "inventory" / "bf16" / "config.json"
-ARCH = "kolibri"
+ARCH = "kolibri1"
 F32_MATRICES = {"ffn_gate_inp"}
 
 

@@ -19,9 +19,9 @@ mask cuts in, and the fixture has both layer types (SSSSFF).
 - graph wiring (CPU, top-2): the graph nodes, recorded through cb_eval, have
   the inputs of the Kolibri block in every layer. The selection bias is
   added to the raw router logits, the expert weights come from the unbiased
-  probabilities, ffn_out sums the routed and the shared experts, both
-  sandwich norms feed the residual adds, and RoPE nodes exist exactly on the
-  sliding-window layers. This is the graph's structure; its numerics against
+  probabilities, the post-FFN norm reads the sum of the routed and the shared
+  experts, both sandwich norms feed the residual adds, and RoPE nodes exist
+  exactly on the sliding-window layers. This is the graph's structure; its numerics against
   the reference are not checked here.
 
 Why the routing is taken out for the strict comparison: top-k selection is
@@ -111,7 +111,8 @@ class Runner:
                nodes: dict[str, list[str]] | None = None, capture: dict | None = None,
                chunks: list[int] | None = None, n_ctx: int = 256, outputs: list[int] | None = None,
                rows: dict[str, tuple[int, list[int]]] | None = None, cpu_moe: bool = False, no_repack: bool = False,
-               return_logits: bool = True, expert_cache: dict | None = None, n_gpu_layers: int = -1, **ctx_params):
+               return_logits: bool = True, expert_cache: dict | None = None, n_gpu_layers: int = -1,
+               split_after: tuple[str, ...] = (), **ctx_params):
         """Logits [len(tokens), n_vocab] with the model and its computation on dev only.
         overrides maps GGUF keys to int, float or bool values that replace the file's.
         If nodes is given, it receives every graph node's name with the names of its inputs.
@@ -131,7 +132,9 @@ class Runner:
         output positions are still computed (the last layer keeps only their rows) but their logits
         are not kept, and the result is None. expert_cache sets llama_expert_cache_params fields
         (n_slots, prefetch_k, stats_path, ...) and turns the expert cache on. n_gpu_layers offloads
-        only that many layers to dev, the rest stays on the CPU. ctx_params set further
+        only that many layers to dev, the rest stays on the CPU. split_after names node prefixes
+        (ffn_moe_topk) after which the scheduler ends each computation and starts the next, as
+        cb_eval does for a captured node, without reading anything. ctx_params set further
         llama_context_params fields (swa_full, flash_attn_type, type_k, ...)."""
         import numpy as np
 
@@ -179,7 +182,7 @@ class Runner:
         want = None if outputs is None else set(outputs)
         span = [0, 0]  # the positions of the current llama_decode call
         keep = {name: np.asarray(sorted(pos)) for name, (_, pos) in (rows or {}).items()}
-        if nodes is not None or capture is not None:
+        if nodes is not None or capture is not None or split_after:
             computation, seen = [0], {}  # the llama_decode call, and per name the call of its last capture
 
             @self.ffi.callback("bool(struct ggml_tensor *, bool, void *)")
@@ -189,7 +192,9 @@ class Runner:
                     if nodes is not None:
                         srcs = [t.src[i] for i in range(len(t.src))]
                         nodes[name] = [self.ffi.string(x.name).decode() for x in srcs if x != self.ffi.NULL]
-                    return capture is not None and name in capture
+                    return (capture is not None and name in capture) or name.startswith(split_after)
+                if capture is None or name not in capture:  # a split_after node
+                    return True
                 parts = capture[name] or []
                 if seen.get(name) == computation[0]:
                     parts.pop()  # a later node of the same name in the same computation
@@ -240,8 +245,6 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1, help="cmd/kolibri-tiny random seed")
     ap.add_argument("--convert-llama-cpp", type=Path, help="checkout whose converter converts (default --llama-cpp)")
     ap.add_argument("--rekey", action="store_true", help="rewrite the GGUFs into upstream's kolibri1 layout")
-    ap.add_argument("--no-wiring", action="store_true",
-                    help="skip the graph wiring check, which reads this port's node names (for upstream's kolibri1)")
     args = ap.parse_args()
     import numpy as np
 
@@ -293,9 +296,6 @@ def main() -> None:
                            f"f32 {label}, {what}: {N_TOKENS - flips}/{N_TOKENS} positions with NMSE <= {MAX_NMSE:g}, "
                            f"greedy token equal at {same}/{N_TOKENS}")
 
-        if args.no_wiring:
-            print(f"SKIP graph wiring ({prefix})")
-            sys.exit(1 if errs else 0)
         nodes: dict[str, list[str]] = {}
         runner.logits(ggufs["f32"], cpu, tokens, N_TOKENS, nodes=nodes)
         layer_types = json.loads((model / "config.json").read_text())["layer_types"]
@@ -311,20 +311,25 @@ def main() -> None:
             blk = f"blk.{il}"
             want = {
                 # selection on the raw logits plus bias; weights from the unbiased probs
-                f"ffn_moe_probs_biased-{il}": [f"ffn_moe_logits-{il}", f"{blk}.exp_probs_b.bias"],
+                f"ffn_moe_logits_biased-{il}": [f"ffn_moe_logits-{il}", f"{blk}.exp_probs_b.bias"],
                 f"ffn_moe_weights-{il}": [f"ffn_moe_probs-{il} (reshaped)", f"ffn_moe_topk-{il}"],
                 f"ffn_moe_down-{il}": [f"{blk}.ffn_down_exps.weight", f"ffn_moe_swiglu-{il}", f"ffn_moe_topk-{il}"],
-                # routed + shared, then the post-FFN norm into the residual add
-                f"ffn_shexp-{il}": [f"{blk}.ffn_down_shexp.weight", f"ffn_swiglu-{il}"],
-                f"ffn_out-{il}": [f"ffn_moe_out-{il}", f"ffn_shexp-{il}"],
-                f"ffn_post_norm-{il}": [f"norm-{il}", f"{blk}.post_ffw_norm.weight"],
-                f"l_out-{il}": [f"ffn_post_norm-{il}", f"ffn_inp-{il}"],
+                f"ffn_shexp_out-{il}": [f"{blk}.ffn_down_shexp.weight", f"ffn_swiglu-{il}"],
                 # the post-attention norm into the first residual add
                 f"attn_post_norm-{il}": [f"norm-{il}", f"{blk}.post_attention_norm.weight"],
             }
             for node, srcs in want.items():
                 if nodes.get(node) != srcs:
                     bad.append(f"{node} <- {nodes.get(node)}, want {srcs}")
+            # routed + shared, then the post-FFN norm into the residual add. The kolibri1 graph leaves the sum
+            # and the norm's weight multiply unnamed, and the post-FFN norm is the layer's last node named norm-{il}
+            post, *rest = nodes.get(f"l_out-{il}") or [None]
+            if rest != [f"ffn_inp-{il}"] or nodes.get(post) != [f"norm-{il}", f"{blk}.post_ffw_norm.weight"]:
+                bad.append(f"l_out-{il} <- {nodes.get(f'l_out-{il}')}, want the post-FFN norm and ffn_inp-{il}")
+            ffn_out = (nodes.get(f"norm-{il}") or [None])[0]
+            if nodes.get(ffn_out) != [f"ffn_moe_out-{il}", f"ffn_shexp_out-{il}"]:
+                bad.append(f"post-FFN norm-{il} <- {ffn_out} <- {nodes.get(ffn_out)}, "
+                           f"want ffn_moe_out-{il} + ffn_shexp_out-{il}")
             ffn_inp = [origin(n) for n in nodes.get(f"ffn_inp-{il}", [])]
             if not ffn_inp or ffn_inp[0] != f"attn_post_norm-{il}":
                 bad.append(f"ffn_inp-{il} <- {ffn_inp}, want attn_post_norm-{il} first")

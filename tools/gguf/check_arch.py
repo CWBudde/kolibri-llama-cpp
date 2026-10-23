@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Check the kolibri architecture registration in a patched llama.cpp.
+"""Check the kolibri1 architecture registration in llama.cpp.
 
-gguf-py:  MODEL_ARCH.KOLIBRI is named "kolibri", and MODEL_TENSORS[KOLIBRI]
+gguf-py:  MODEL_ARCH.KOLIBRI1 is named "kolibri1", and MODEL_TENSORS[KOLIBRI1]
           lists exactly the tensor kinds of the HF -> GGUF mapping
           (inventory/bf16/summary.json, "classes").
-libllama: a GGUF whose general.architecture is "kolibri" is a known
-          architecture with a model class (llama_model_kolibri).
+libllama: a GGUF whose general.architecture is "kolibri1" is a known
+          architecture with a model class (llama_model_kolibri1).
           A vocab-only load of an otherwise empty GGUF must get past the
           architecture and fail on the missing vocabulary, not with
           "unknown model architecture" or "unsupported model architecture".
@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SUMMARY = ROOT / "inventory" / "bf16" / "summary.json"
-ARCH = "kolibri"
+ARCH = "kolibri1"
 
 sys.path.insert(0, str(ROOT / "tools" / "tokenizer"))
 from common import libllama  # noqa: E402
@@ -31,11 +31,11 @@ from common import libllama  # noqa: E402
 
 def check_tensors(gguf) -> list[str]:
     errs = []
-    if not hasattr(gguf.MODEL_ARCH, "KOLIBRI"):
-        return ["gguf.MODEL_ARCH has no KOLIBRI"]
-    arch = gguf.MODEL_ARCH.KOLIBRI
+    if not hasattr(gguf.MODEL_ARCH, "KOLIBRI1"):
+        return ["gguf.MODEL_ARCH has no KOLIBRI1"]
+    arch = gguf.MODEL_ARCH.KOLIBRI1
     if gguf.MODEL_ARCH_NAMES.get(arch) != ARCH:
-        errs.append(f"MODEL_ARCH_NAMES[KOLIBRI] = {gguf.MODEL_ARCH_NAMES.get(arch)!r}, want {ARCH!r}")
+        errs.append(f"MODEL_ARCH_NAMES[KOLIBRI1] = {gguf.MODEL_ARCH_NAMES.get(arch)!r}, want {ARCH!r}")
 
     # "blk.{L}.attn_q.weight" -> "blk.{bid}.attn_q". Compared by name, because
     # some MODEL_TENSOR kinds are aliases (FFN_PRE_NORM == FFN_NORM).
@@ -43,9 +43,9 @@ def check_tensors(gguf) -> list[str]:
     want = {re.sub(r"\.(weight|bias)$", "", c["gguf"]).replace("{L}", "{bid}") for c in classes if c["role"] == "weight"}
     have = {gguf.TENSOR_NAMES[t] for t in gguf.MODEL_TENSORS.get(arch, [])}
     if missing := sorted(want - have):
-        errs.append(f"MODEL_TENSORS[KOLIBRI] lacks {missing}")
+        errs.append(f"MODEL_TENSORS[KOLIBRI1] lacks {missing}")
     if extra := sorted(have - want):
-        errs.append(f"MODEL_TENSORS[KOLIBRI] has tensors the checkpoint does not: {extra}")
+        errs.append(f"MODEL_TENSORS[KOLIBRI1] has tensors the checkpoint does not: {extra}")
     print(f"gguf-py: {len(have)} tensor names registered, {len(want)} in the HF -> GGUF mapping")
     return errs
 
