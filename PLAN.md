@@ -1059,10 +1059,21 @@ Close these gaps without giving up the lead.
   - Check in particular the router (bias on the logits, sigmoid without renormalization), the RoPE/NoPE layer split, the window of 513, the pre-tokenizer and the GGUF keys. HF discussion #3 reports that most Hub GGUFs need `--override-kv` for the pre-tokenizer and the gating function.
   - Retire every fork patch that upstream now covers; document the remaining differences in `docs/upstream.md`.
   - Rebase patch 0011 on top.
+  - (2026-10-23) — partial: the comparison is done ([docs/upstream.md](docs/upstream.md), "Upstream's Kolibri model"), on master `184f6536` with our GGUFs rewritten by `cmd/kolibri-rekey` (architecture `kolibri1`, pre-tokenizer `qwen2`, an APFS clone with only the header changed).
+    - Tiny checkpoints, with both converters: bit-identical logits to the fork.
+    - Real BF16 on the CPU: the fork's recorded bits at every node of all six e2e cases.
+    - IQ3: the same KLD on the CPU (0.1014 for both); on Metal 0.0998 against the fork's 0.0953, from the newer Metal backend.
+    - Router, RoPE/NoPE, window and pre-tokenizer identical. Hub question: upstream-converted GGUFs need no `--override-kv`.
+    - Upstream covers patches 0001–0007. 0008 and 0010 (chat template, server `enable_thinking`) are not upstream. For 0009, `repro.py cpu-moe` must show whether master's `merge_ranges` fixes issue 3.
+    - **Remains:** the rebase itself. Retire 0001–0007, move every GGUF and tool here from `kolibri` to `kolibri1`, and rebase 0008–0012 onto master.
 - [ ] Check upstream's two expert-cache paths on this Mac:
   - **#29887** (`--moe-cache-mib`): does it activate on Metal at all (it accepts the IGPU device type)? If it does, run one arm at 0 GiB.
   - **#25294** (`--moe-stream`): build the PR branch and check whether its auto-sizing aborts at `n_expert_used >= 6`. If it runs on Kolibri, add it to the matrix as a reference arm at 0 and 16 GiB.
-- [ ] Gate: Phase 11 builds on upstream's Kolibri only if it matches ours within the existing tolerances. Otherwise the differences are documented and the fork stays ahead.
+- [x] Gate: Phase 11 builds on upstream's Kolibri only if it matches ours within the existing tolerances. Otherwise the differences are documented and the fork stays ahead.
+  - (2026-10-23) — **Passed: Phase 11 builds on upstream's Kolibri.**
+    - Upstream passes `compare_real.py --tiny` (NMSE 1e-6 against the torch reference) on the default, `attn`, `pattern` and `router` fixtures, and `check_model.py` (1e-4 across devices and ubatches), with the same values as the fork. The logits are bit-identical to the fork's.
+    - The full model, INFO as agreed: upstream equals the fork on the CPU, BF16 and IQ3.
+    - Control M43: renormalized expert weights fail the gate (logits NMSE 5.08e-01), and the pre-tokenizer `llama-bpe` fails the tokenizer golden (82/85).
 
 ### Stage E1 --- Cheap diagnostics before building anything
 
