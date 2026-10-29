@@ -1287,3 +1287,17 @@ Tracking: [#64](https://github.com/CWBudde/kolibri-llama-cpp/issues/64) (schedul
 5. Test mock delayed completion, completion-before-WAIT, duplicate event, wrong job/request ID, timeout race, cancellation race, and shutdown. No busy-loop or model-side polling.
 
 This preserves synchronous WAIT semantics per request while allowing asynchronous worker completion. Event delivery and model-visible result injection remain distinct steps.
+
+## Future research: Latent-space coprocessor (long-term option)
+
+This is a **research option**, not a committed deliverable or a prerequisite for the scheduler prototype. The first implementation uses explicit typed operations and model-visible results.
+
+Investigate a trainable adapter that maps Kolibri hidden states to structured coprocessor control signals, and a return adapter that exposes compact results to subsequent transformer computation without serializing every interaction as text tokens. Preserve deterministic external job IDs, scheduler, completion events, timeout/cancellation, and sandbox boundaries.
+
+The coprocessor retains large working data in external addressable memory; a latent vector is not a lossless replacement for arbitrary-sized results. Explore explicit handles and targeted reads. Train and evaluate the adapters rather than assuming that arbitrary injected vectors are interpretable by the frozen model.
+
+Potential later experiment: multiple controlled coprocessor interactions within one token's computation, requiring explicit additional compute steps and safe integration points; this is substantially more experimental than once-per-token interaction.
+
+Validation gates: compare against the token-based baseline on correctness, exact-result fidelity, latency, error recovery, and generalization; measure whether latent control actually improves outcomes before adopting it.
+
+Related: #61 hidden-state adapter, #64 event-driven scheduler, #59 execution bridge.
