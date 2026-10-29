@@ -1259,3 +1259,40 @@ The first major milestone remains:
 
 Only after that gate should the project optimize Q4/IQ3 for the 48 GB
 Mac.
+
+
+## Future research track: Generic program execution during inference
+
+This is an **optional, model-agnostic research track**, separate from the Kolibri-1 port and its existing correctness/quantization milestones. It must not block upstream llama.cpp integration. The goal is to allow an LLM to invoke general-purpose deterministic programs, not just a fixed set of acoustic or numerical tools.
+
+### Phase A — Runtime execution bridge ([#59](https://github.com/CWBudde/kolibri-llama-cpp/issues/59))
+
+- [ ] Identify the least invasive integration point in the llama.cpp inference/server loop; preserve existing Kolibri tool-call and chat-template behavior.
+- [ ] Define a versioned structured execution protocol with typed inputs, results, errors, cancellation and correlation IDs. Prefer existing tool-call formatting initially; new special tokens require explicit tokenizer/template compatibility work.
+- [ ] Implement pause → bounded execution → result injection → resume, with streaming and multiple calls tested.
+- [ ] Start with simple deterministic operations; evaluate sandboxed WebAssembly for arbitrary programs, keeping domain libraries as optional extensions.
+- [ ] Enforce resource limits (time, memory, fuel), no network/filesystem by default, and structured tracing.
+- [ ] Benchmark correctness, latency, token overhead and failure recovery against ordinary tool calling.
+
+**Gate:** Unmodified Kolibri executes and interprets a multi-step program safely and reproducibly. This is still explicit runtime tool execution, not neural execution inside weights.
+
+### Phase B — Learn selective execution ([#60](https://github.com/CWBudde/kolibri-llama-cpp/issues/60))
+
+- [ ] Verify training support for Kolibri's architecture, tokenizer and LoRA adapters before committing to a framework.
+- [ ] Build domain-independent SFT examples covering invocation, abstention, chained execution, malformed requests and error recovery.
+- [ ] Establish a prompt-only baseline and train/evaluate a LoRA/SFT variant if feasible.
+- [ ] Measure tool-selection precision, answer accuracy, unnecessary calls, safety regressions, latency and token usage.
+
+**Gate:** Measurable improvement over the Phase A baseline without unacceptable degradation of ordinary model behavior.
+
+### Phase C — Hidden-state coprocessor adapter ([#61](https://github.com/CWBudde/kolibri-llama-cpp/issues/61))
+
+- [ ] Investigate access to intermediate activations in the actual llama.cpp graph and runtime, including Metal support.
+- [ ] Design a bounded latent control interface and explicit program/input/output buffers, including persistent-state lifetime rules.
+- [ ] Prototype an adapter with frozen base weights; train only the adapter initially, then evaluate limited joint tuning.
+- [ ] Treat discrete execution and control-flow training as a separate problem; do not assume end-to-end differentiability.
+- [ ] Compare hidden-state control against the explicit Phase A/B interface for reliability, performance and interpretability.
+
+**Gate:** Working prototype with evidence of benefit, or a documented negative feasibility result. Keep the Phase A interface as fallback.
+
+**Suggested implementation split:** PR A for runtime protocol and sandbox, PR B for training/evaluation infrastructure, PR C for experimental activation adapter. This documentation PR introduces no implementation changes.
