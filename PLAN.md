@@ -1259,3 +1259,45 @@ The first major milestone remains:
 
 Only after that gate should the project optimize Q4/IQ3 for the 48 GB
 Mac.
+
+
+## Research prototype: Deterministic coprocessor scheduler and WAIT
+
+**Decision (2026-10-29):** Kolibri plans program operations and dependencies; a deterministic per-request scheduler owns execution control, waiting, wakeup, and result delivery. Start with synchronous WAIT and an API that can support multiple jobs later. Keep the scheduler independent from training the hidden-state adapter.
+
+- **Controller actions:** CONTINUE, EXECUTE(program, args, dependencies), WAIT(job_id), READ_RESULT(job_id). Begin with scripted actions and mock operations before attempting learned decisions.
+- **Scheduler request states:** READY, GENERATING, BLOCKED. Preserve inference/KV-cache state while blocked and emit no dependent answer tokens.
+- **Coprocessor job states:** IDLE, RUNNING, DONE, ERROR; represent timeout and cancellation explicitly. Each job has a stable ID, bounded resources, and idempotent start semantics.
+- **Result delivery:** resume only for the matching job completion, error, cancellation, or timeout; inject the result into the model's accessible context or a defined result channel. A later hidden-state adapter can replace this delivery mechanism.
+- **Dependencies:** validate job references, prevent cycles, propagate errors, and enforce declared dependencies. The scheduler cannot protect against dependencies that the controller fails to declare.
+- **First end-to-end test:** run a deterministic operation with an artificial one-second delay. Confirm EXECUTE -> WAIT -> completion -> READ_RESULT -> answer, no answer tokens during BLOCKED, and correct timeout/error/duplicate-event behavior.
+- **Next:** multiple independent jobs and dependent jobs; only then consider asynchronous continuation and nonlinguistic result injection.
+
+Tracking: [#64](https://github.com/CWBudde/kolibri-llama-cpp/issues/64) (scheduler prototype), [#59](https://github.com/CWBudde/kolibri-llama-cpp/issues/59) (execution bridge), [#60](https://github.com/CWBudde/kolibri-llama-cpp/issues/60) (training), [#61](https://github.com/CWBudde/kolibri-llama-cpp/issues/61) (adapter), [#63](https://github.com/CWBudde/kolibri-llama-cpp/issues/63) (layer probes), and documentation [PR #62](https://github.com/CWBudde/kolibri-llama-cpp/pull/62).
+
+
+### Event-driven completion decision (interrupt-style, not polling)
+
+**Decision:** use an event-driven completion channel from coprocessor to scheduler, not periodic polling in the model. This is a software-interrupt analogy, not an interruption of an in-flight transformer forward pass.
+
+1. EXECUTE registers a job and starts the mock worker; WAIT(job_id) moves the request to BLOCKED and removes it from active generation.
+2. The worker publishes CompletionEvent { request_id, job_id, generation, status, result_or_error } to a concurrency-safe queue/channel.
+3. The scheduler consumes events, validates ownership and generation, atomically moves the matching blocked request to READY, and resumes only at a safe inference boundary.
+4. Duplicate completions are harmless; stale events after timeout/cancellation/teardown must not resurrect requests. Completion before WAIT must be retained in the job registry (no lost wakeup).
+5. Test mock delayed completion, completion-before-WAIT, duplicate event, wrong job/request ID, timeout race, cancellation race, and shutdown. No busy-loop or model-side polling.
+
+This preserves synchronous WAIT semantics per request while allowing asynchronous worker completion. Event delivery and model-visible result injection remain distinct steps.
+
+## Future research: Latent-space coprocessor (long-term option)
+
+This is a **research option**, not a committed deliverable or a prerequisite for the scheduler prototype. The first implementation uses explicit typed operations and model-visible results.
+
+Investigate a trainable adapter that maps Kolibri hidden states to structured coprocessor control signals, and a return adapter that exposes compact results to subsequent transformer computation without serializing every interaction as text tokens. Preserve deterministic external job IDs, scheduler, completion events, timeout/cancellation, and sandbox boundaries.
+
+The coprocessor retains large working data in external addressable memory; a latent vector is not a lossless replacement for arbitrary-sized results. Explore explicit handles and targeted reads. Train and evaluate the adapters rather than assuming that arbitrary injected vectors are interpretable by the frozen model.
+
+Potential later experiment: multiple controlled coprocessor interactions within one token's computation, requiring explicit additional compute steps and safe integration points; this is substantially more experimental than once-per-token interaction.
+
+Validation gates: compare against the token-based baseline on correctness, exact-result fidelity, latency, error recovery, and generalization; measure whether latent control actually improves outcomes before adopting it.
+
+Related: #61 hidden-state adapter, #64 event-driven scheduler, #59 execution bridge.
