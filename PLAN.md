@@ -1274,3 +1274,16 @@ Mac.
 - **Next:** multiple independent jobs and dependent jobs; only then consider asynchronous continuation and nonlinguistic result injection.
 
 Tracking: [#64](https://github.com/CWBudde/kolibri-llama-cpp/issues/64) (scheduler prototype), [#59](https://github.com/CWBudde/kolibri-llama-cpp/issues/59) (execution bridge), [#60](https://github.com/CWBudde/kolibri-llama-cpp/issues/60) (training), [#61](https://github.com/CWBudde/kolibri-llama-cpp/issues/61) (adapter), [#63](https://github.com/CWBudde/kolibri-llama-cpp/issues/63) (layer probes), and documentation [PR #62](https://github.com/CWBudde/kolibri-llama-cpp/pull/62).
+
+
+### Event-driven completion decision (interrupt-style, not polling)
+
+**Decision:** use an event-driven completion channel from coprocessor to scheduler, not periodic polling in the model. This is a software-interrupt analogy, not an interruption of an in-flight transformer forward pass.
+
+1. EXECUTE registers a job and starts the mock worker; WAIT(job_id) moves the request to BLOCKED and removes it from active generation.
+2. The worker publishes CompletionEvent { request_id, job_id, generation, status, result_or_error } to a concurrency-safe queue/channel.
+3. The scheduler consumes events, validates ownership and generation, atomically moves the matching blocked request to READY, and resumes only at a safe inference boundary.
+4. Duplicate completions are harmless; stale events after timeout/cancellation/teardown must not resurrect requests. Completion before WAIT must be retained in the job registry (no lost wakeup).
+5. Test mock delayed completion, completion-before-WAIT, duplicate event, wrong job/request ID, timeout race, cancellation race, and shutdown. No busy-loop or model-side polling.
+
+This preserves synchronous WAIT semantics per request while allowing asynchronous worker completion. Event delivery and model-visible result injection remain distinct steps.
