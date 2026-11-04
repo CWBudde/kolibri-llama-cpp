@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -298,6 +299,62 @@ func TestGate(t *testing.T) {
 	}
 }
 
+// withPrefill sets a run's warm prompt rate and cold time to first token.
+func withPrefill(r runResult, prompt, ttftMs float64) runResult {
+	for _, q := range r.Requests {
+		q.Summary.Timings.PromptPerSecond = prompt
+		if q.Phase == "cold" {
+			q.Summary.TTFTMs = ttftMs
+		}
+	}
+	return r
+}
+
+func TestGateMetrics(t *testing.T) {
+	m := matrix{Configs: []config{
+		{Name: "waves", Ceilings: []float64{0}, Reps: 2},
+		{Name: "capped", Ceilings: []float64{0}, Reps: 2},
+		{Name: "stream", Ceilings: []float64{0}, Reps: 2},
+	}}
+	runs := []runResult{
+		withPrefill(fakeRun("waves", 0, 1, []float64{17, 17}, []float64{80, 80}, nil), 300, 9000),
+		withPrefill(fakeRun("waves", 0, 2, []float64{18, 18}, []float64{80, 80}, nil), 310, 8800),
+		withPrefill(fakeRun("capped", 0, 1, []float64{18, 18}, []float64{70, 70}, nil), 110, 24000),
+		withPrefill(fakeRun("capped", 0, 2, []float64{19, 19}, []float64{70, 70}, nil), 112, 23000),
+		withPrefill(fakeRun("stream", 0, 1, []float64{20, 20}, []float64{60, 60}, nil), 283, 8600),
+		withPrefill(fakeRun("stream", 0, 2, []float64{21, 21}, []float64{60, 60}, nil), 290, 8700),
+	}
+	for _, tc := range []struct {
+		metric    string
+		baselines []string
+		best      string
+		pass      bool
+	}{
+		// every repetition above the best baseline's fastest: 300 > 290
+		{"prefill", []string{"capped", "stream"}, "stream", true},
+		// the lowest TTFT is the best baseline, and 8,800 is not below its 8,600
+		{"ttft", []string{"capped", "stream"}, "stream", false},
+		{"ttft", []string{"capped"}, "capped", true},
+		// not slower: the candidate's median 17.5 against capped's slowest 18
+		{"decode-not-slower", []string{"capped"}, "capped", false},
+		// the default stays the decode rule: no decode or p95 win over stream
+		{"", []string{"capped", "stream"}, "stream", false},
+	} {
+		v := evalGate(m, gate{CeilingGiB: 0, Candidate: "waves", Baselines: tc.baselines, Metric: tc.metric, Decides: true}, runs)
+		if v.Baseline != tc.best || v.Pass != tc.pass || v.Incomplete != "" {
+			t.Errorf("%q against %v: verdict %+v, want best %s, pass %v", tc.metric, tc.baselines, v, tc.best, tc.pass)
+		}
+	}
+	slower := append(slices.Clone(runs[:2]), withPrefill(fakeRun("capped", 0, 1, []float64{17.2, 17.2}, []float64{70, 70}, nil), 0, 0),
+		withPrefill(fakeRun("capped", 0, 2, []float64{19, 19}, []float64{70, 70}, nil), 0, 0))
+	if v := evalGate(m, gate{Candidate: "waves", Baselines: []string{"capped"}, Metric: "decode-not-slower"}, slower); !v.Pass {
+		t.Errorf("median 17.5 against a slowest repetition of 17.2: verdict %+v, want passed", v)
+	}
+	if err := (matrix{Gates: []gate{{Metric: "latency"}}}).validate(); err == nil {
+		t.Error("an unknown gate metric is accepted")
+	}
+}
+
 func TestReportCountsRequests(t *testing.T) {
 	m := matrix{Cold: "coding", Warm: []string{"coding"},
 		Configs: []config{
@@ -493,7 +550,7 @@ func loadMatrix(t *testing.T, path string) matrix {
 // TestShippedMatrix checks that every config the equivalence checks and gates
 // name exists, at the ceilings they compare.
 func TestShippedMatrix(t *testing.T) {
-	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json"} {
+	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json", "../../testdata/bench/e4.json"} {
 		t.Run(filepath.Base(path), func(t *testing.T) { checkMatrix(t, loadMatrix(t, path)) })
 	}
 }
@@ -554,7 +611,48 @@ func TestE0Matrix(t *testing.T) {
 	}
 }
 
+// TestE4Matrix keeps E4's waves comparable with Stage D's cache and E0.2's
+// #25294 arm (the same workloads, arms and slots), and fixes its gates as in
+// the plan: prefill and TTFT against the best of both, decode against Stage
+// D's cache, at both ceilings.
+func TestE4Matrix(t *testing.T) {
+	z, e := loadMatrix(t, "../../testdata/bench/e0.json"), loadMatrix(t, "../../testdata/bench/e4.json")
+	if !slices.Equal(z.ServerArgs, e.ServerArgs) || z.PromptFirst != e.PromptFirst || z.NPredict != e.NPredict ||
+		z.Cold != e.Cold || !slices.Equal(z.Warm, e.Warm) {
+		t.Errorf("E4's workload settings differ from E0.2's")
+	}
+	for _, name := range []string{"iq3-cpu-moe", "iq3-cache128", "iq3-moestream128"} {
+		a, _ := z.config(name)
+		b, ok := e.config(name)
+		if !ok || !slices.Equal(a.Args, b.Args) || a.Server != b.Server || a.Model != b.Model {
+			t.Errorf("%s differs from E0.2's: %+v against %+v", name, b, a)
+		}
+	}
+	if c, ok := e.config("iq3-cache128-waves"); !ok || !slices.Equal(c.Args, []string{"--expert-cache", "128", "--expert-cache-waves"}) {
+		t.Errorf("iq3-cache128-waves: args %v", c.Args)
+	}
+	var got []string
+	for _, g := range e.Gates {
+		if g.Candidate != "iq3-cache128-waves" {
+			t.Errorf("gate of %s", g.Candidate)
+		}
+		got = append(got, fmt.Sprintf("%s %g %v %s", g.Metric, g.CeilingGiB, g.Decides, strings.Join(g.Baselines, "+")))
+	}
+	want := []string{
+		"prefill 0 true iq3-cache128+iq3-moestream128", "prefill 16 true iq3-cache128+iq3-moestream128",
+		"ttft 0 true iq3-cache128+iq3-moestream128", "ttft 16 true iq3-cache128+iq3-moestream128",
+		"decode-not-slower 0 true iq3-cache128", "decode-not-slower 16 true iq3-cache128",
+		"prefill 0 false iq3-cpu-moe", "prefill 16 false iq3-cpu-moe",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("gates %q, want %q", got, want)
+	}
+}
+
 func checkMatrix(t *testing.T, m matrix) {
+	if err := m.validate(); err != nil {
+		t.Error(err)
+	}
 	if m.PromptFirst <= 0 || m.NPredict <= 0 || m.Cold == "" || len(m.Warm) == 0 || len(m.Configs) == 0 {
 		t.Fatalf("incomplete matrix %+v", m)
 	}
