@@ -371,6 +371,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0009 mmap ranges | yes | master merges mapping ranges (`merge_ranges`, `llama-model-loader.cpp:1460`): "RUNS cpu-moe: GGUF 79,284 MiB, Metal maps 2,448 MiB of it: exit 0" on unmodified master |
 | 0010 continuation tests | no | tests on top of 0008 |
 | 0011, 0012 expert cache | no | the fork's own work, rebased (below) |
+| 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
 
 ### Controls
 
@@ -386,6 +387,13 @@ on, so its verdict still applies. Fork branch `feat/kolibri1` holds 0008,
 0010, 0011 and 0012 as 9 commits; the older `feat/kolibri*` branches stay as
 they were. Patches 0001–0007 and 0009 are retired, and the regenerated series
 applied to a clean `184f6536` gives exactly the fork's tree (`7ade40f0`).
+
+**Patch 0013 is retired (Phase 11, Stage E4, 2026-11-06).** Its gates failed at
+0 GiB, so the number is kept and the code stays on fork branch
+`feat/kolibri1-waves` (`90311e5a2`, fork PR #14, open and not merged). It never
+reached `feat/kolibri1`. The next patch is 0014. The series 0008, 0010, 0011
+and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
+(`7ade40f0`, `git diff --quiet` rc 0).
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's
