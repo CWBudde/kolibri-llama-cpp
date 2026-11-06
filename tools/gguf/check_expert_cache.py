@@ -33,9 +33,12 @@ the CPU its weights are not repacked (the slots are not either).
   --expert-cache-stats without the cache writes the decode timing alone; with a quote, a backslash and a tab in the
   model's file name the stats are still valid JSON and name the file.
 
-Waves (--expert-cache-waves, patch 0013): the prompt runs in one ubatch, uncapped, with 16, 18,
-24, 64 and 384 slots on every device, with and without prefetch and buffered reads; and a prompt of
-4 tokens at 18 slots, whose union does not fit the built waves at their usual size.
+Waves (--expert-cache-waves): only on fork branch feat/kolibri1-waves, not in the patch series
+(patch 0013 is retired, docs/expert-streaming.md, "Stage E4"). Against a checkout without them the
+wave checks are skipped with a note, and --waves-only is an error. The prompt runs in one ubatch,
+uncapped, with 16, 18, 24, 64 and 384 slots on every device, with and without prefetch and buffered
+reads; and a prompt of 4 tokens at 18 slots, whose union does not fit the built waves at their usual
+size.
 
 - logits: bit-identical to the resident run at the same ubatch (the whole prompt), split as above;
 - with at least 3 * 6 slots nothing is capped; below that the ubatch is capped as before and a
@@ -53,7 +56,7 @@ the page cache, since the resident run maps the whole file first.
 
     check_expert_cache.py --llama-cpp third_party/llama.cpp
     check_expert_cache.py --llama-cpp third_party/llama.cpp --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
-    check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only   # the wave checks alone
+    check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only   # the wave checks alone, on a waves build
 """
 
 import argparse
@@ -77,6 +80,20 @@ N_GROWN_REAL = 6  # likewise on a real checkpoint: 36 pairs at 18 slots, 3 waves
 N_BENCH_UBATCH = 512  # testdata/bench/e4.json's arms prefill in ubatches of the server's default
 
 
+def has_waves(r: Runner, llama_cpp: Path) -> bool:
+    """Whether the checkout has --expert-cache-waves. cffi parses the struct from the checkout's
+    llama.h, so the header decides the layout the harness writes. A libllama built from another
+    tree would read those params with a different layout and say nothing, so the two must agree:
+    the library has the stats key waves_built exactly when the header has the field."""
+    header = any(name == "waves" for name, _ in r.ffi.typeof("struct llama_expert_cache_params").fields)
+    path = llama_cpp / "build" / "bin" / ("libllama.dylib" if sys.platform == "darwin" else "libllama.so")
+    library = b"waves_built" in path.read_bytes()
+    if header != library:
+        raise SystemExit(f"{llama_cpp}: include/llama.h {'has' if header else 'has no'} expert cache field waves, "
+                         f"but {path.name} was built {'without' if header else 'with'} it: rebuild the checkout")
+    return header
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llama-cpp", type=Path, required=True, help="llama.cpp checkout with a built libllama")
@@ -89,6 +106,11 @@ def main() -> None:
     import numpy as np
 
     r = Runner(args.llama_cpp)
+    waves_on = has_waves(r, args.llama_cpp)
+    if args.waves_only and not waves_on:
+        ap.error(f"--waves-only: {args.llama_cpp} has no expert cache waves; they need a build of fork branch feat/kolibri1-waves")
+    if not waves_on:
+        print(f"note: {args.llama_cpp} has no expert cache waves (fork branch feat/kolibri1-waves): skipping check_waves", flush=True)
     failed = 0
 
     def report(ok: bool, msg: str) -> None:
@@ -171,6 +193,8 @@ def main() -> None:
 
     def check_waves(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
                     n_layer: int, n_expert: int, k: int, stats: Path, label: str, grown: bool = False) -> None:
+        if not waves_on:
+            return
         chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
         n_dec = len(tokens) - n_prompt
         n_ctx = max(256, len(tokens))
