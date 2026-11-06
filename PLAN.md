@@ -1013,7 +1013,7 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
 
 ## Phase 11 --- Expert streaming on par with other offloaders (proposed)
 
-**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 done (2026-10-23). **Phase 11's stop rule fired at 0 GiB** (E0.2: #25294 matches the fork's decode there and prefills 2.6× faster; the fork still wins decode at 16 GiB). Whether E2 continues on the fork or the work moves onto #25294's design is the user's decision.
+**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 done (2026-10-23). **Phase 11's stop rule fired at 0 GiB** (E0.2: #25294 matches the fork's decode there and prefills 2.6× faster; the fork still wins decode at 16 GiB). Whether E2 continues on the fork or the work moves onto #25294's design is the user's decision. (2026-11-06) — **E4's waves failed their deciding gates at 0 GiB** and passed at 16 GiB; patch 0013 left the series, and the code stays on fork branch `feat/kolibri1-waves`. Layer streaming and prefill admission stay open ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E4: waves for prefill").
 
 ### Where Stage D stands against other work
 
@@ -1130,17 +1130,28 @@ Only if E1's overhead control shows the overhead.
   - A layer's misses are issued concurrently, with the thread count taken from E1's curve.
 - [ ] Gate: the bytes in the slots are identical to the GGUF path (a unit check, plus `check_expert_cache.py` on both paths). Decode and prefill must beat the GGUF path at the same ceiling. Expected upside: about the 14 ms load wait in decode, and more in prefill, where loads waited 51.6 s per run.
 
-### Stage E4 --- Prefill without the ubatch cap
+### Stage E4 --- Prefill without the ubatch cap — ❌ GATE FAILED at 0 GiB (2026-11-06)
+
+**Verdict** ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E4: waves for prefill"): waves lost to #25294 at 0 GiB on warm prefill (301.4 against 351.3 t/s) and cold TTFT (8.91 against 7.44 s). They passed both at 16 GiB (301.8 against 226.7 t/s; 8.93 against 10.95 s) and decode-not-slower at both. The stop rule applies: patch 0013 is retired, number kept, and the code stays on fork branch `feat/kolibri1-waves` (`90311e5a2`, fork PR #14, open and not merged). Buffered waves won at 0 GiB (476.1 t/s, 6.61 s) and lost at 16 GiB (217.2 t/s, 12.31 s); they decide nothing, and the 16 GiB arm was added after the first 27 results. No single waves mode wins at both ceilings. Whether to pre-register a new gate, or a choice per ceiling, is the user's open decision.
 
 - [ ] Lift the cap of 21 tokens with a prefill path that does not go through the decode slots. Compare two variants:
   - **Layer streaming** (AirLLM/FlexGen applied to experts). Per layer and large ubatch, read the stacked `ffn_{gate,up,down}_exps` tensors sequentially into a double-buffered staging area: about 0.6 GiB per layer at IQ3, 1.6 at Q8_0. That is about 29 GB per 2,048-token ubatch against about 81 GB today.
   - **Waves** (as in #25294). Load only the ubatch's union of experts per layer, in waves of at most the slot count. The tokens routed to each wave are computed together.
+  - (2026-11-06) — partial: waves were built and tested, on fork branch `feat/kolibri1-waves` only (`--expert-cache-waves`, former patch 0013). They deviate from the design above: the graph holds `ceil(n_touch/(slots-k))` passes (4 at 128 slots, 7 at 64), and waves stay at `(slots-k)/2` experts unless a union would need more than were built. **Layer streaming was not built, so the two variants were not compared. This item stays open.**
 - [ ] Admission: prefill must not flush the decode working set. Either it bypasses the slots, or it seeds them with the prompt's most-used experts (LFU, which nearly doubles the prefill hit rate in the Stage A replay: 27–41% against 17–21%), as decided by E1's offline replay.
+  - (2026-11-06) — open: E4 did not implement admission. Waves go through the slots, and nothing gates whether prefill flushes the decode working set.
 - [ ] Gate:
   - Lossless against a resident control at the same ubatch size.
   - Warm prefill tokens/s and cold TTFT at both ceilings must beat Stage D and the E0 reference arms.
   - Decode must not get slower.
   - The staging buffers count against the ceiling.
+  - (2026-11-06) — **failed at 0 GiB** (`testdata/bench/e4.json`, 30 runs, all ok; the gates were committed before the first timed run and not moved). This covers waves only, since layer streaming does not exist.
+    - **Lossless: bit identity holds.** Bit-identical to a resident run at the same ubatch and split on tiny (216 checks) and real IQ3 (36 checks, including 128 slots at ubatch 512 in 3 variants), both "PASS: 0 failures". The 30 benchmark runs have no resident arm and do not test it.
+    - **Controls.** M48: the wave mask is always 1, which fails bit identity and the unit test. M49: the next wave's preload may evict the current wave's experts; its plain form fails only the unit test, its strong form both.
+    - **Warm prefill and cold TTFT against the capped cache and #25294:** not passed at 0 GiB (301.4 against 351.3 t/s; 8.91 against 7.44 s), passed at 16 GiB (301.8 against 226.7 t/s; 8.93 against 10.95 s).
+    - **Decode not slower than the capped cache:** passed at both ceilings (18.58 against a slowest of 17.39 t/s; 18.86 against 18.07).
+    - **Staging buffers:** waves have none. The peak footprint stays at the capped cache's 11.0 GiB.
+    - Six consecutive runs (22:03 to 22:48) had others' CPU at or above 100%; recomputing all 12 gates without them flips none.
 
 ### Stage E5 --- Optional lossy miss path
 
@@ -1172,6 +1183,7 @@ Only if E2 and E3 leave the load wait as the largest remaining cost.
   - the Kolibri benchmark matrix.
 
 **Stop condition:** a stage whose gate fails is documented, and its code stays out of the patch set. If E0 shows #25294 matching or beating the fork's cache on Kolibri, move the remaining work onto #25294's design instead of extending patch 0011.
+- (2026-11-06) — Applied to E4: patch 0013 is out of the series, and the next patch is 0014.
 
 ## Phase 9 --- User-facing inference behavior
 
