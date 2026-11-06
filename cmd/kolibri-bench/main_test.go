@@ -651,16 +651,17 @@ func TestE4Matrix(t *testing.T) {
 	if c, ok := e.config("iq3-cache128-waves"); !ok || !slices.Equal(c.Args, []string{"--expert-cache", "128", "--expert-cache-waves"}) {
 		t.Errorf("iq3-cache128-waves: args %v", c.Args)
 	}
-	// at 0 GiB, buffered waves tell a read-mode loss against #25294 (which reads
-	// buffered) from a loss of the design; they decide nothing
+	// buffered waves tell a read-mode loss against #25294 (which reads buffered)
+	// from a loss of the design; they decide nothing. 16 GiB was added after the
+	// first 27 runs, to see whether one mode wins at both ceilings.
 	if c, ok := e.config("iq3-cache128-waves-buffered"); !ok || !slices.Equal(c.Args, []string{"--expert-cache", "128", "--expert-cache-waves", "--expert-cache-buffered"}) ||
-		!slices.Equal(c.Ceilings, []float64{0}) {
+		!slices.Equal(c.Ceilings, []float64{0, 16}) {
 		t.Errorf("iq3-cache128-waves-buffered: %+v", c)
 	}
 	var got []string
 	for _, g := range e.Gates {
 		if g.Candidate == "iq3-cache128-waves-buffered" {
-			if g.Decides || g.CeilingGiB != 0 || !slices.Equal(g.Baselines, []string{"iq3-cache128", "iq3-moestream128"}) {
+			if g.Decides || !slices.Equal(g.Baselines, []string{"iq3-cache128", "iq3-moestream128"}) {
 				t.Errorf("buffered waves gate %+v", g)
 			}
 			continue
