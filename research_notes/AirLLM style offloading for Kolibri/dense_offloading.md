@@ -70,7 +70,7 @@ These systems stream *all* (or most) weights per forward pass, layer by layer, a
 ### Inferences
 - Bytes per token at batch 1 for a dense layer-streaming design (AirLLM) equal the whole off-RAM model. For an 83 GB Q8_0 Kolibri at about 6 GiB/s, that is ≥13 s/token. Expert-granular caching (about 0.1 GB/token) is two orders of magnitude better. AirLLM-style whole-layer streaming is the wrong granularity for Kolibri.
 - The useful borrowable idea is FlexGen's block schedule, *if* Kolibri prefill or multi-request batching is a goal. During prefill of N tokens, a non-resident expert can be loaded once and applied to every token routed to it. This mirrors FlexGen's reuse of a loaded layer across a batch block.
-- On Apple Silicon unified memory, "CPU offload" (vLLM/Accelerate) collapses to nothing: there is no PCIe hop. Only the SSD tier matters.
+- On Apple Silicon unified memory, the copy behind "CPU offload" (vLLM/Accelerate) disappears: there is no PCIe hop. Of the weight traffic, only the SSD tier remains. CPU placement still changes which kernels run and can be much slower than Metal: this repo's IQ3 runs measured 17 tok/s cold decode with `--cpu-moe` against 60 tok/s resident on Metal (docs/expert-streaming.md).
 
 ### Gaps
 - No 2025-2026 head-to-head of vLLM vs. SGLang CPU offload was found.

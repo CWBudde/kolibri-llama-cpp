@@ -142,7 +142,7 @@ As of 2026-10-22 nothing is merged upstream in llama.cpp or mlx-lm for SSD exper
 ## 5. Theoretical throughput: bytes per token vs SSD GB/s, and reported hit rates
 
 ### Takeaway
-Decode tok/s is bounded by roughly SSD_GBps / ((1 − hit_rate) × expert_bytes_per_token) plus compute time. Reported hit rates for per-layer LRU at about 20-35% resident are ~70-95%, which is why measured speeds land 2-5x above a zero-hit SSD ceiling.
+Decode time per token is roughly (1 − hit_rate) × expert_bytes_per_token / SSD_GBps + compute time, and decode tok/s is at most the reciprocal of that. Reported hit rates for per-layer LRU at about 20-35% resident are ~70-95%, which is why measured speeds land 2-5x above a zero-hit SSD ceiling.
 
 ### Cited Findings
 - flash-moe states its own ceiling: 2-bit needs 943 MB/token, and 943 MB ÷ 17.5 GB/s ≈ 18.6 tok/s. The 4-bit build exceeded that at 20.34 and 21.48 tok/s. With perfect prediction ("oracle") the ceiling is 29.3 tok/s. Expert I/O per token is 1.62 GB for 4-bit and 1.30 GB for Q3, and on the M5 Max it takes 44.7 ms (47% of decode) and 26.7 ms (35%) respectively — [gorroai/flash-moe](https://github.com/gorroai/flash-moe)
