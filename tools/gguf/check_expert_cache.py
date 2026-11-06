@@ -47,9 +47,9 @@ Waves (--expert-cache-waves, patch 0013): the prompt runs in one ubatch, uncappe
 With --real GGUF it checks a real checkpoint on the GPU instead: the first 160 tokens of a
 locality workload (128 prefilled, 32 decoded), resident against the cache with 128 and 64 slots per
 layer, with and without prefetch, again bit-identical, with the same counter checks; with waves the
-128 prompt tokens run in one ubatch (4 and 7 waves per layer built), and 6 tokens at 18 slots grow
-their waves. Its reads may
-come from the page cache, since the resident run maps the whole file first.
+128 prompt tokens run in one ubatch (4 and 7 waves per layer built), 6 tokens at 18 slots grow
+their waves, and 512 tokens at 128 slots check the benchmark's own ubatch. Its reads may come from
+the page cache, since the resident run maps the whole file first.
 
     check_expert_cache.py --llama-cpp third_party/llama.cpp
     check_expert_cache.py --llama-cpp third_party/llama.cpp --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
@@ -74,6 +74,7 @@ VARIANTS = [(0, False), (12, False), (0, True)]  # (prefetch, buffered reads)
 WAVE_SLOTS = [16, 18, 24, 64, 384]
 N_GROWN = 4  # 4 tokens' 24 pairs at 18 slots: 2 waves built, and a union above 2 * 6 grows them
 N_GROWN_REAL = 6  # likewise on a real checkpoint: 36 pairs at 18 slots, 3 waves built
+N_BENCH_UBATCH = 512  # testdata/bench/e4.json's arms prefill in ubatches of the server's default
 
 
 def main() -> None:
@@ -172,17 +173,18 @@ def main() -> None:
                     n_layer: int, n_expert: int, k: int, stats: Path, label: str, grown: bool = False) -> None:
         chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
         n_dec = len(tokens) - n_prompt
+        n_ctx = max(256, len(tokens))
         for slots in slots_list:
             waves = slots >= 3 * k
             ub = n_prompt if waves else min(n_prompt, max(1, slots // k))
             n_pre = -(-n_prompt // ub)
             touch = min(n_expert, ub * k)
             built = -(-touch // (slots - k)) if waves and touch > slots else 1  # waves per layer the graph holds
-            ref = resident(gguf, dev, tokens, ub, chunks=chunks)
+            ref = resident(gguf, dev, tokens, ub, chunks=chunks, n_ctx=n_ctx)
             for pf, buffered in VARIANTS:
                 what = f"{label} {dev_name}, waves, {slots} slots, ubatch {ub}, prefetch {pf}" + (", buffered" if buffered else "")
                 stats.unlink(missing_ok=True)
-                got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True,
+                got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, n_ctx=n_ctx,
                                expert_cache={"n_slots": slots, "prefetch_k": pf, "stats_path": str(stats), "buffered": buffered, "waves": True})
                 log = "".join(r.log)
                 same = np.array_equal(got, ref)
@@ -212,12 +214,15 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         stats = Path(tmp) / "stats.json"
         if args.real:
-            tokens = [int(t) for t in np.load(args.tokens)[:160]]
+            workload = [int(t) for t in np.load(args.tokens)]
+            tokens = workload[:160]
             gpu = [(n, d) for n, d in r.devices() if r.lib.ggml_backend_dev_type(d) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU]
             if not args.waves_only:
                 check(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
             check_waves(args.real, *gpu[0], tokens, 128, [128, 64], 50, 384, 6, stats, args.real.stem)
             check_waves(args.real, *gpu[0], tokens[:40], N_GROWN_REAL, [18], 50, 384, 6, stats, f"{args.real.stem} grown waves", grown=True)
+            # the benchmark's ubatch: on a real workload about a third of the layers' unions outgrow 4 waves of 61
+            check_waves(args.real, *gpu[0], workload[:N_BENCH_UBATCH + 32], N_BENCH_UBATCH, [128], 50, 384, 6, stats, f"{args.real.stem} benchmark ubatch")
         elif args.waves_only:
             model = generate_tiny(Path(tmp), args.seed, "router")
             cfg = json.loads((model / "config.json").read_text())
