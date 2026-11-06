@@ -187,6 +187,29 @@ func (r runResult) cold() *streamSummary {
 
 func decodeRate(s *streamSummary) float64 { return s.DecodeTokensPerSecond }
 func p95(s *streamSummary) float64        { return s.LatencyMs.P95 }
+func promptRate(s *streamSummary) float64 { return s.Timings.PromptPerSecond }
+
+// gateValues is a gate metric per repetition of a config at a ceiling, for
+// the runs that completed: the median warm prompt tokens/s (prefill), the
+// cold time to first token in ms (ttft), or else the median warm decode
+// tokens/s.
+func gateValues(runs []runResult, cfg string, ceiling float64, metric string) []float64 {
+	switch metric {
+	case "prefill":
+		return perRep(runs, cfg, ceiling, promptRate)
+	case "ttft":
+		var out []float64
+		for _, r := range runs {
+			if r.Config == cfg && r.CeilingGiB == ceiling && r.Status == statusOK {
+				if s := r.cold(); s != nil {
+					out = append(out, s.TTFTMs)
+				}
+			}
+		}
+		return out
+	}
+	return perRep(runs, cfg, ceiling, decodeRate)
+}
 
 // perRep is a metric per repetition of a config at a ceiling: the median over
 // its warm requests, for the runs that completed.
@@ -207,7 +230,7 @@ type verdict struct {
 	Incomplete string // the configs with some but not all repetitions completed; no verdict then
 	Baseline   string // the best baseline that runs at this ceiling; "" if none does
 	Candidate  []float64
-	Best       []float64 // the baseline's decode tokens/s per repetition
+	Best       []float64 // the baseline's per repetition, in the gate's metric
 	CandP95    []float64
 	BestP95    []float64
 	DecodeWin  bool
@@ -253,26 +276,35 @@ func completed(m matrix, runs []runResult, cfg string, ceiling float64) (ok, wan
 	return ok, want
 }
 
-// evalGate applies the performance gate fixed in the plan: the candidate wins
-// against the baseline with the highest median warm decode tokens/s that runs
-// at the same ceiling if every repetition of the candidate is faster than
-// that baseline's fastest one, or if every one of its warm p95 latencies is
-// below the baseline's lowest one. A config runs at a ceiling if all its
-// repetitions completed and does not if all were recorded and none
-// completed; anything in between, missing runs included, withholds the
-// verdict.
+// evalGate applies the performance gate fixed in the plan, against the best
+// baseline that runs at the same ceiling (the highest median of the gate's
+// metric, the lowest for ttft). By metric, the candidate wins:
+//   - decode (the default): if every repetition of the candidate is faster
+//     than that baseline's fastest one, or if every one of its warm p95
+//     latencies is below the baseline's lowest one;
+//   - prefill: if every repetition's warm prompt tokens/s is above the
+//     baseline's fastest one;
+//   - ttft: if every repetition's cold time to first token is below the
+//     baseline's lowest one;
+//   - decode-not-slower: if the candidate's median warm decode tokens/s is at
+//     least the baseline's slowest repetition.
+//
+// A config runs at a ceiling if all its repetitions completed and does not if
+// all were recorded as not fitting; anything else, missing or failed runs
+// included, withholds the verdict: a config that failed says nothing about
+// the gate, and a baseline dropped for it would let the rest decide alone.
 func evalGate(m matrix, g gate, runs []runResult) verdict {
 	v := verdict{Gate: g}
 	var partial []string
 	for _, name := range append([]string{g.Candidate}, g.Baselines...) {
 		ok, want := completed(m, runs, name, g.CeilingGiB)
-		recorded := 0
+		noFit := 0
 		for _, r := range runs {
-			if r.Config == name && r.CeilingGiB == g.CeilingGiB {
-				recorded++
+			if r.Config == name && r.CeilingGiB == g.CeilingGiB && r.Status == statusDoesNotFit {
+				noFit++
 			}
 		}
-		if ok != want && !(ok == 0 && recorded == want) {
+		if ok != want && !(ok == 0 && noFit == want) {
 			partial = append(partial, fmt.Sprintf("%s %d of %d", name, ok, want))
 		}
 	}
@@ -280,23 +312,36 @@ func evalGate(m matrix, g gate, runs []runResult) verdict {
 		v.Incomplete = strings.Join(partial, ", ")
 		return v
 	}
-	v.Candidate = perRep(runs, g.Candidate, g.CeilingGiB, decodeRate)
-	v.CandP95 = perRep(runs, g.Candidate, g.CeilingGiB, p95)
+	lower := g.Metric == "ttft"
+	v.Candidate = gateValues(runs, g.Candidate, g.CeilingGiB, g.Metric)
 	best := math.Inf(-1)
+	if lower {
+		best = math.Inf(1)
+	}
 	for _, b := range g.Baselines {
-		reps := perRep(runs, b, g.CeilingGiB, decodeRate)
-		if len(reps) > 0 && median(reps) > best {
+		reps := gateValues(runs, b, g.CeilingGiB, g.Metric)
+		if len(reps) > 0 && (median(reps) > best && !lower || median(reps) < best && lower) {
 			best, v.Baseline, v.Best = median(reps), b, reps
-			v.BestP95 = perRep(runs, b, g.CeilingGiB, p95)
 		}
 	}
 	if v.Baseline == "" || len(v.Candidate) == 0 {
 		v.Baseline = ""
 		return v
 	}
-	v.DecodeWin = slices.Min(v.Candidate) > slices.Max(v.Best)
-	v.TailWin = len(v.CandP95) > 0 && len(v.BestP95) > 0 && slices.Max(v.CandP95) < slices.Min(v.BestP95)
-	v.Pass = v.DecodeWin || v.TailWin
+	switch g.Metric {
+	case "prefill":
+		v.Pass = slices.Min(v.Candidate) > slices.Max(v.Best)
+	case "ttft":
+		v.Pass = slices.Max(v.Candidate) < slices.Min(v.Best)
+	case "decode-not-slower":
+		v.Pass = median(v.Candidate) >= slices.Min(v.Best)
+	default:
+		v.CandP95 = perRep(runs, g.Candidate, g.CeilingGiB, p95)
+		v.BestP95 = perRep(runs, v.Baseline, g.CeilingGiB, p95)
+		v.DecodeWin = slices.Min(v.Candidate) > slices.Max(v.Best)
+		v.TailWin = len(v.CandP95) > 0 && len(v.BestP95) > 0 && slices.Max(v.CandP95) < slices.Min(v.BestP95)
+		v.Pass = v.DecodeWin || v.TailWin
+	}
 	return v
 }
 
@@ -333,6 +378,15 @@ func checkEquivalence(e equivalence, runs []runResult) []comparison {
 			}
 			out = append(out, comparison{r.key(), q.Phase, q.Workload, firstDiff(q.Summary.TokenIDs, want)})
 		}
+	}
+	return out
+}
+
+// scale returns v times f.
+func scale(v []float64, f float64) []float64 {
+	out := make([]float64, len(v))
+	for i, x := range v {
+		out[i] = x * f
 	}
 	return out
 }
@@ -476,10 +530,23 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 			if v.Pass {
 				result = "passed"
 			}
-			result = fmt.Sprintf("%s: decode %s against %s's %s t/s (win %v), p95 %s against %s ms (win %v)", result,
-				fmtRange(v.Candidate, 2), v.Baseline, fmtRange(v.Best, 2), v.DecodeWin, fmtRange(v.CandP95, 1), fmtRange(v.BestP95, 1), v.TailWin)
+			switch g.Metric {
+			case "prefill":
+				result = fmt.Sprintf("%s: warm prompt %s against %s's %s t/s", result, fmtRange(v.Candidate, 1), v.Baseline, fmtRange(v.Best, 1))
+			case "ttft":
+				result = fmt.Sprintf("%s: cold TTFT %s against %s's %s s", result, fmtRange(scale(v.Candidate, 1e-3), 2), v.Baseline, fmtRange(scale(v.Best, 1e-3), 2))
+			case "decode-not-slower":
+				result = fmt.Sprintf("%s: decode median %.2f against %s's slowest of %s t/s", result, median(v.Candidate), v.Baseline, fmtRange(v.Best, 2))
+			default:
+				result = fmt.Sprintf("%s: decode %s against %s's %s t/s (win %v), p95 %s against %s ms (win %v)", result,
+					fmtRange(v.Candidate, 2), v.Baseline, fmtRange(v.Best, 2), v.DecodeWin, fmtRange(v.CandP95, 1), fmtRange(v.BestP95, 1), v.TailWin)
+			}
 		}
-		fmt.Fprintf(w, "- %s %s at %g GiB against the best of %s: %s\n", kind, g.Candidate, g.CeilingGiB, strings.Join(g.Baselines, ", "), result)
+		what := ""
+		if g.Metric != "" && g.Metric != "decode" {
+			what = " (" + g.Metric + ")"
+		}
+		fmt.Fprintf(w, "- %s%s %s at %g GiB against the best of %s: %s\n", kind, what, g.Candidate, g.CeilingGiB, strings.Join(g.Baselines, ", "), result)
 	}
 	return allEqual
 }
