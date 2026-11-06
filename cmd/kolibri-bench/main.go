@@ -84,7 +84,21 @@ type gate struct {
 	CeilingGiB float64  `json:"ceiling_gib"`
 	Candidate  string   `json:"candidate"`
 	Baselines  []string `json:"baselines"`
+	Metric     string   `json:"metric,omitempty"` // one of gateMetrics; "" is decode
 	Decides    bool     `json:"decides"`
+}
+
+// gateMetrics are what a gate compares (evalGate has the rules).
+var gateMetrics = []string{"", "decode", "prefill", "ttft", "decode-not-slower"}
+
+// validate rejects what the report could not evaluate.
+func (m matrix) validate() error {
+	for _, g := range m.Gates {
+		if !slices.Contains(gateMetrics, g.Metric) {
+			return fmt.Errorf("gate %s at %g GiB: metric %q, want one of %q", g.Candidate, g.CeilingGiB, g.Metric, gateMetrics[1:])
+		}
+	}
+	return nil
 }
 
 type matrix struct {
@@ -731,6 +745,9 @@ func main() {
 	}
 	var m matrix
 	if err := json.Unmarshal(data, &m); err != nil {
+		log.Fatalf("%s: %v", *matrixPath, err)
+	}
+	if err := m.validate(); err != nil {
 		log.Fatalf("%s: %v", *matrixPath, err)
 	}
 	for i := range m.Configs {

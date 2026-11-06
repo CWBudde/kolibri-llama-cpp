@@ -33,13 +33,30 @@ the CPU its weights are not repacked (the slots are not either).
   --expert-cache-stats without the cache writes the decode timing alone; with a quote, a backslash and a tab in the
   model's file name the stats are still valid JSON and name the file.
 
+Waves (--expert-cache-waves): only on fork branch feat/kolibri1-waves, not in the patch series
+(patch 0013 is retired, docs/expert-streaming.md, "Stage E4"). Against a checkout without them the
+wave checks are skipped with a note, and --waves-only is an error. The prompt runs in one ubatch,
+uncapped, with 16, 18, 24, 64 and 384 slots on every device, with and without prefetch and buffered
+reads; and a prompt of 4 tokens at 18 slots, whose union does not fit the built waves at their usual
+size.
+
+- logits: bit-identical to the resident run at the same ubatch (the whole prompt), split as above;
+- with at least 3 * 6 slots nothing is capped; below that the ubatch is capped as before and a
+  warning says why; with 384 slots every expert fits, so there are no waves;
+- counters: one plan per layer and prefill ubatch, waves only in prefill and only where the
+  prompt's experts can exceed the slots, the graph's passes as built (as few as waves of up to
+  slots - 6 experts take), the decode counts as without waves.
+
 With --real GGUF it checks a real checkpoint on the GPU instead: the first 160 tokens of a
 locality workload (128 prefilled, 32 decoded), resident against the cache with 128 and 64 slots per
-layer, with and without prefetch, again bit-identical, with the same counter checks. Its reads may
-come from the page cache, since the resident run maps the whole file first.
+layer, with and without prefetch, again bit-identical, with the same counter checks; with waves the
+128 prompt tokens run in one ubatch (4 and 7 waves per layer built), 6 tokens at 18 slots grow
+their waves, and 512 tokens at 128 slots check the benchmark's own ubatch. Its reads may come from
+the page cache, since the resident run maps the whole file first.
 
     check_expert_cache.py --llama-cpp third_party/llama.cpp
     check_expert_cache.py --llama-cpp third_party/llama.cpp --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
+    check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only   # the wave checks alone, on a waves build
 """
 
 import argparse
@@ -57,6 +74,25 @@ from tiny import convert, generate_tiny
 N_PROMPT, N_DECODE = 40, 60
 SLOTS = [6, 16, 64, 384]
 VARIANTS = [(0, False), (12, False), (0, True)]  # (prefetch, buffered reads)
+WAVE_SLOTS = [16, 18, 24, 64, 384]
+N_GROWN = 4  # 4 tokens' 24 pairs at 18 slots: 2 waves built, and a union above 2 * 6 grows them
+N_GROWN_REAL = 6  # likewise on a real checkpoint: 36 pairs at 18 slots, 3 waves built
+N_BENCH_UBATCH = 512  # testdata/bench/e4.json's arms prefill in ubatches of the server's default
+
+
+def has_waves(r: Runner, llama_cpp: Path) -> bool:
+    """Whether the checkout has --expert-cache-waves. cffi parses the struct from the checkout's
+    llama.h, so the header decides what the harness writes. A libllama built from another tree has
+    the same size and offsets, with waves in what is padding there, so it would ignore waves=true
+    and silently stay capped; the two must agree: the library has the stats key waves_built exactly
+    when the header has the field."""
+    header = any(name == "waves" for name, _ in r.ffi.typeof("struct llama_expert_cache_params").fields)
+    path = llama_cpp / "build" / "bin" / ("libllama.dylib" if sys.platform == "darwin" else "libllama.so")
+    library = b"waves_built" in path.read_bytes()
+    if header != library:
+        raise SystemExit(f"{llama_cpp}: include/llama.h {'has' if header else 'has no'} expert cache field waves, "
+                         f"but {path.name} was built {'without' if header else 'with'} it: rebuild the checkout")
+    return header
 
 
 def main() -> None:
@@ -66,10 +102,16 @@ def main() -> None:
     ap.add_argument("--real", type=Path, help="a real Kolibri GGUF, checked on the GPU instead of the tiny checkpoint")
     ap.add_argument("--tokens", type=Path, default=Path.home() / "models/eval/locality/coding.tokens.npy",
                     help="the token IDs of a locality workload, for --real")
+    ap.add_argument("--waves-only", action="store_true", help="only the wave checks")
     args = ap.parse_args()
     import numpy as np
 
     r = Runner(args.llama_cpp)
+    waves_on = has_waves(r, args.llama_cpp)
+    if args.waves_only and not waves_on:
+        ap.error(f"--waves-only: {args.llama_cpp} has no expert cache waves; they need a build of fork branch feat/kolibri1-waves")
+    if not waves_on:
+        print(f"note: {args.llama_cpp} has no expert cache waves (fork branch feat/kolibri1-waves): skipping check_waves", flush=True)
     failed = 0
 
     def report(ok: bool, msg: str) -> None:
@@ -150,12 +192,74 @@ def main() -> None:
                            f"{(dec['metal_commits'] or 0) / max(dec['tokens'], 1):.2f} Metal commits; "
                            f"{s['process']['disk_bytes_read']} bytes read from disk)")
 
+    def check_waves(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
+                    n_layer: int, n_expert: int, k: int, stats: Path, label: str, grown: bool = False) -> None:
+        if not waves_on:
+            return
+        chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
+        n_dec = len(tokens) - n_prompt
+        n_ctx = max(256, len(tokens))
+        for slots in slots_list:
+            waves = slots >= 3 * k
+            ub = n_prompt if waves else min(n_prompt, max(1, slots // k))
+            n_pre = -(-n_prompt // ub)
+            touch = min(n_expert, ub * k)
+            built = -(-touch // (slots - k)) if waves and touch > slots else 1  # waves per layer the graph holds
+            ref = resident(gguf, dev, tokens, ub, chunks=chunks, n_ctx=n_ctx)
+            for pf, buffered in VARIANTS:
+                what = f"{label} {dev_name}, waves, {slots} slots, ubatch {ub}, prefetch {pf}" + (", buffered" if buffered else "")
+                stats.unlink(missing_ok=True)
+                got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, n_ctx=n_ctx,
+                               expert_cache={"n_slots": slots, "prefetch_k": pf, "stats_path": str(stats), "buffered": buffered, "waves": True})
+                log = "".join(r.log)
+                same = np.array_equal(got, ref)
+                diff = "" if same else f", max |diff| {float(np.abs(got - ref).max()):.3g}"
+                report(same, f"{what}: logits of {len(tokens)} positions bit-identical to the resident run at ubatch {ub}{diff}")
+                capped = f"n_ubatch {n_prompt} capped to {ub}" in log
+                report(capped == (ub < n_prompt) and (waves or "the ubatch stays capped" in log),
+                       f"{what}: " + ("not capped" if waves else f"capped at {ub}, with the warning"))
+
+                s = json.loads(stats.read_text())
+                eb = s["expert_cache"]["expert_bytes"]
+                pre, dec = s["prefill"], s["decode"]
+                ok = s["expert_cache"]["waves"] == waves
+                ok = ok and all(c["hits"] + c["hits_loading"] + c["misses"] == c["needed"] and c["demand_bytes"] == c["misses"] * eb
+                                for c in (pre, dec))
+                ok = ok and pre["steps"] == n_pre * n_layer and dec["steps"] == n_dec * n_layer and dec["waves"] == 0
+                ok = ok and ((pre["waves"] > 0) == (built > 1)) and pre["waves"] <= n_pre * n_layer * built
+                ok = ok and pre["waves_built"] == (n_pre * n_layer * built if built > 1 else 0) and dec["waves_built"] == 0
+                ok = ok and (pre["wave_parked"] > 0) == (built > 1) and pre["load_failures"] + dec["load_failures"] == 0
+                ok = ok and pre["prefetch_issued"] + pre["prefetch_skipped"] == 0
+                # some layer's union did not fit its built waves at (slots - k) // 2 experts each
+                ok = ok and (not grown or pre["needed"] > n_layer * built * ((slots - k) // 2))
+                report(ok, f"{what}: counters consistent ({built} waves per layer built, {pre['waves']} of {pre['waves_built']} passes used over {n_layer} layers, "
+                           f"{pre['wave_parked']} pairs parked; prefill {pre['needed']} needed, {pre['misses']} misses, "
+                           f"{pre['hits']} hits, {pre['wait_seconds']:.3f} s wait; decode {dec['steps']} remaps, {dec['misses']} misses)")
+
     with tempfile.TemporaryDirectory() as tmp:
         stats = Path(tmp) / "stats.json"
         if args.real:
-            tokens = [int(t) for t in np.load(args.tokens)[:160]]
+            workload = [int(t) for t in np.load(args.tokens)]
+            tokens = workload[:160]
             gpu = [(n, d) for n, d in r.devices() if r.lib.ggml_backend_dev_type(d) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU]
-            check(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
+            if not args.waves_only:
+                check(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
+            check_waves(args.real, *gpu[0], tokens, 128, [128, 64], 50, 384, 6, stats, args.real.stem)
+            check_waves(args.real, *gpu[0], tokens[:40], N_GROWN_REAL, [18], 50, 384, 6, stats, f"{args.real.stem} grown waves", grown=True)
+            # the benchmark's ubatch: on a real workload about a third of the layers' unions outgrow 4 waves of 61
+            check_waves(args.real, *gpu[0], workload[:N_BENCH_UBATCH + 32], N_BENCH_UBATCH, [128], 50, 384, 6, stats, f"{args.real.stem} benchmark ubatch")
+        elif args.waves_only:
+            model = generate_tiny(Path(tmp), args.seed, "router")
+            cfg = json.loads((model / "config.json").read_text())
+            rng = random.Random(args.seed)
+            tokens = [rng.randrange(1000, 100000) for _ in range(N_PROMPT + N_DECODE)]
+            for outtype in ["f32", "q8_0"]:
+                gguf = convert(model, args.llama_cpp, outtype)
+                for dev_name, dev in r.devices():
+                    check_waves(gguf, dev_name, dev, tokens, N_PROMPT, WAVE_SLOTS, cfg["num_hidden_layers"],
+                                cfg["num_experts"], cfg["num_experts_per_tok"], stats, outtype)
+                    check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], cfg["num_hidden_layers"],
+                                cfg["num_experts"], cfg["num_experts_per_tok"], stats, f"{outtype} grown waves", grown=True)
         else:
             model = generate_tiny(Path(tmp), args.seed, "router")
             cfg = json.loads((model / "config.json").read_text())
@@ -166,6 +270,8 @@ def main() -> None:
                 gguf = convert(model, args.llama_cpp, outtype)
                 for dev_name, dev in r.devices():
                     check(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
+                    check_waves(gguf, dev_name, dev, tokens, N_PROMPT, WAVE_SLOTS, n_layer, cfg["num_experts"], k, stats, outtype)
+                    check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], n_layer, cfg["num_experts"], k, stats, f"{outtype} grown waves", grown=True)
 
                 # fewer slots than one token's experts cannot work
                 try:
