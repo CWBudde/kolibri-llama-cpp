@@ -82,9 +82,10 @@ N_BENCH_UBATCH = 512  # testdata/bench/e4.json's arms prefill in ubatches of the
 
 def has_waves(r: Runner, llama_cpp: Path) -> bool:
     """Whether the checkout has --expert-cache-waves. cffi parses the struct from the checkout's
-    llama.h, so the header decides the layout the harness writes. A libllama built from another
-    tree would read those params with a different layout and say nothing, so the two must agree:
-    the library has the stats key waves_built exactly when the header has the field."""
+    llama.h, so the header decides what the harness writes. A libllama built from another tree has
+    the same size and offsets, with waves in what is padding there, so it would ignore waves=true
+    and silently stay capped; the two must agree: the library has the stats key waves_built exactly
+    when the header has the field."""
     header = any(name == "waves" for name, _ in r.ffi.typeof("struct llama_expert_cache_params").fields)
     path = llama_cpp / "build" / "bin" / ("libllama.dylib" if sys.platform == "darwin" else "libllama.so")
     library = b"waves_built" in path.read_bytes()

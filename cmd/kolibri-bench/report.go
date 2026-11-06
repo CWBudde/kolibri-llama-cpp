@@ -536,7 +536,8 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 			case "ttft":
 				result = fmt.Sprintf("%s: cold TTFT %s against %s's %s s", result, fmtRange(scale(v.Candidate, 1e-3), 2), v.Baseline, fmtRange(scale(v.Best, 1e-3), 2))
 			case "decode-not-slower":
-				result = fmt.Sprintf("%s: decode median %.2f against %s's slowest of %s t/s", result, median(v.Candidate), v.Baseline, fmtRange(v.Best, 2))
+				result = fmt.Sprintf("%s: decode median %.2f against %s's slowest of %.2f (median %.2f, %.2f–%.2f) t/s", result, median(v.Candidate), v.Baseline,
+					slices.Min(v.Best), median(v.Best), slices.Min(v.Best), slices.Max(v.Best))
 			default:
 				result = fmt.Sprintf("%s: decode %s against %s's %s t/s (win %v), p95 %s against %s ms (win %v)", result,
 					fmtRange(v.Candidate, 2), v.Baseline, fmtRange(v.Best, 2), v.DecodeWin, fmtRange(v.CandP95, 1), fmtRange(v.BestP95, 1), v.TailWin)

@@ -237,14 +237,16 @@ Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefi
 
 `iq3-moestream128` writes no `stats.json`, so its disk read and load failures are unknown.
 
+Peak footprint here is the sampled column, which moves in 1 GiB steps at this size. `max_phys_footprint` from `stats.json` is 10.90 GiB for the capped cache and 10.98 GiB for waves, about 90 MiB more.
+
 **Gates, as the report prints them:**
 
 - GATE (prefill) iq3-cache128-waves at 0 GiB against the best of iq3-cache128, iq3-moestream128: not passed: warm prompt 301.4 (246.6–302.0) against iq3-moestream128's 351.3 (321.8–351.4) t/s
 - GATE (prefill) iq3-cache128-waves at 16 GiB against the best of iq3-cache128, iq3-moestream128: passed: warm prompt 301.8 (301.0–301.9) against iq3-moestream128's 226.7 (136.1–232.9) t/s
 - GATE (ttft) iq3-cache128-waves at 0 GiB against the best of iq3-cache128, iq3-moestream128: not passed: cold TTFT 8.91 (8.90–12.51) against iq3-moestream128's 7.44 (6.89–7.72) s
 - GATE (ttft) iq3-cache128-waves at 16 GiB against the best of iq3-cache128, iq3-moestream128: passed: cold TTFT 8.93 (8.86–9.01) against iq3-moestream128's 10.95 (10.57–11.19) s
-- GATE (decode-not-slower) iq3-cache128-waves at 0 GiB against the best of iq3-cache128: passed: decode median 18.58 against iq3-cache128's slowest of 17.39 (15.16–18.38) t/s
-- GATE (decode-not-slower) iq3-cache128-waves at 16 GiB against the best of iq3-cache128: passed: decode median 18.86 against iq3-cache128's slowest of 18.07 (16.90–18.93) t/s
+- GATE (decode-not-slower) iq3-cache128-waves at 0 GiB against the best of iq3-cache128: passed: decode median 18.58 against iq3-cache128's slowest of 15.16 (median 17.39, 15.16–18.38) t/s
+- GATE (decode-not-slower) iq3-cache128-waves at 16 GiB against the best of iq3-cache128: passed: decode median 18.86 against iq3-cache128's slowest of 16.90 (median 18.07, 16.90–18.93) t/s
 - INFO (prefill) iq3-cache128-waves at 0 GiB against the best of iq3-cpu-moe: not passed: warm prompt 301.4 (246.6–302.0) against iq3-cpu-moe's 281.2 (166.3–311.9) t/s
 - INFO (prefill) iq3-cache128-waves at 16 GiB against the best of iq3-cpu-moe: passed: warm prompt 301.8 (301.0–301.9) against iq3-cpu-moe's 26.6 (15.3–55.5) t/s
 - INFO (prefill) iq3-cache128-waves-buffered at 0 GiB against the best of iq3-cache128, iq3-moestream128: passed: warm prompt 476.1 (400.4–483.8) against iq3-moestream128's 351.3 (321.8–351.4) t/s
@@ -258,6 +260,8 @@ The report's equivalence line is INFO (`exact: false`): 0 of 120 requests of the
 The rules (`evalGate`, fixed before the runs): prefill passes if every repetition's warm prompt rate is above the best baseline's fastest repetition; TTFT if every repetition's cold TTFT is below the best baseline's lowest; decode-not-slower if the candidate's median warm decode is at least the baseline's slowest repetition. The prefill and TTFT baselines are Stage D's cache and #25294, rerun in the same session.
 
 An independent recomputation from `run.json`, using the gate rule as `report.go`'s comment states it, reproduced all 220 table cells of `report.md`, all 12 GATE and INFO lines, the equivalence line and the PASS line.
+
+The two decode lines were relabelled after the runs, because they printed the median as "slowest". This is display only. `kolibri-bench -report` regenerated `report.md` from the same `run.json`, and only those two lines changed; the first report is kept as `~/models/eval/expert-bench-e4.runner/report.out`.
 
 ### How waves work
 
@@ -279,7 +283,7 @@ Bit identity with `np.array_equal` against a resident run at the same ubatch and
   - 128 and 64 slots at ubatch 128;
   - grown waves, 18 slots at ubatch 6;
   - 128 slots at ubatch 512, the benchmark's own, in 3 variants (no prefetch, prefetch 12, buffered): logits of 544 positions, 11,566 experts needed, 195 of 200 passes used, 460,800 pairs parked.
-- **Full tiny check on the waves build:** 379 checks, 0 failures, on 5 of 6 runs. In the sixth a pre-existing flake stopped the script after 377 checks with no failure: its odd-filename `llama-completion` call has no fixed seed and can crash with `UnicodeDecodeError` on random output.
+- **Full tiny check on the waves build:** 379 checks, 0 failures, on 5 of 6 runs. In the sixth a pre-existing flake stopped the script after 377 checks with no failure: its odd-filename `llama-completion` call has no fixed seed and can crash with `UnicodeDecodeError` on random output. The logs of 4 clean runs are kept in `~/models/eval/expert-bench-e4.runner/checks/`. The other clean run's and the stopped run's logs were overwritten; `flake.txt` there holds what the session's tool output preserved of them, the traceback included.
 
 The 30 benchmark runs do not test lossless. E4 has no resident arm, and its equivalence entry is `exact: false`. What they do show: waves, buffered waves and #25294 generate identical tokens to each other, 128 of 128 on all 5 request kinds, across all repetitions and ceilings (90 requests).
 
@@ -291,18 +295,18 @@ Both mutate only `src/llama-expert-slots.cpp` and were reverted (`cmp` identical
 
 | Control | `test-expert-cache` | Bit identity (tiny `--waves-only`) |
 |---|---|---|
-| **M48:** `wave_mask` always writes 1, so parked pairs are kept | fails: "FAIL mask[i] == (in ? 1.0f : 0.0f)", 17910 checks failed | fails: "FAIL: 60 failures", max \|diff\| 1.88 |
+| **M48:** `wave_mask` always writes 1, so parked pairs are kept | fails: "FAIL mask[i] == (in ? 1.0f : 0.0f)", 17910 checks failed | fails: "FAIL: 60 failures", max \|diff\| up to 1.96 |
 | **M49, plain:** the current wave's pins are cleared before the preload, so the next wave's preload may evict its experts | fails: 2 checks failed (`hits + hits_loading + misses == needed`, no load failure) | **passes**, "PASS: 0 failures": the wait loop reloads an evicted expert before the wave's slot ids are written |
-| **M49, strong:** after the wave's ids are written, the next wave's load overwrites a slot of this wave | fails: 12530 checks failed | fails: "FAIL: 45 failures", max \|diff\| 0.996 |
+| **M49, strong:** after the wave's ids are written, the next wave's load overwrites a slot of this wave | fails: 12530 checks failed | fails: "FAIL: 45 failures", max \|diff\| up to 1.11 |
 
-M49's plain form fails only the unit test. Its strong form was added because the plain form did not reach bit identity.
+M49's plain form fails only the unit test. Its strong form was added because the plain form did not reach bit identity. Logs: `m48.log`, `m49.log` and `m49b.log` in `~/models/eval/expert-bench-e4.runner/checks/`.
 
 ### Validity
 
 - **Sleep and power.** No run overlaps a true system sleep. `pmset -g log` has its last Sleep and Wake on Nov 5 (22:11:47, 22:17:13) and none on Nov 6, and `kern.sleeptime` and `kern.waketime` agree. It has no "Using Batt" line on Nov 6. The display was off from 21:52:20 to 23:29:49, which is not sleep.
 - **A disturbed block, no verdict depends on it.** Six consecutive runs from 22:03:40 to 22:48:01 have others' CPU at or above 100% on average (mean/max): moestream128/16g/r1 527/1010, cpu-moe/0g/r2 140/909, cpu-moe/16g/r2 213/1109, cache128/0g/r2 384/1223, cache128/16g/r2 155/675, waves/0g/r2 417/967. Their warm prompt is 0.58 to 0.85 of the arm's median. The process responsible is not identified. Recomputing all 12 gates without those 6 runs flips none: waves at 0 GiB still fails prefill (301.4, 302.0 against 351.4) and TTFT (8.90, 8.91 against 6.89).
 - **Swap.** At run start it went 1792 MiB (through 22:03), 2665, 9046 (22:32), about 7000 (through 23:27), then 4718 to 4414 (23:31 onward). Inside runs `samples.txt` reaches 21491 MiB in cpu-moe/16g/r2 and 24343 MiB in cache128/0g/r2.
-- **Memory pressure** reached level 4 from 22:22 to 22:24 (cpu-moe/16g/r2) and from 22:32 to 22:33 (cache128/0g/r2), and level 2 in moestream128/16g/r1 and cpu-moe/16g/r2. In cache128/0g/r2 there is no hog and the server's RSS is at most 13.8 GiB, yet swap reached 24 GiB, so something else held the memory; what is not recorded.
+- **Memory pressure** reached level 4 in single samples: cpu-moe/16g/r2 at 22:23:20, and cache128/0g/r2 at 22:32:17 and 22:33:48. Level 2 ran 22:21:29 to 22:22:13, 22:22:43 to 22:23:58 and 22:26:51 to 22:28:39 in cpu-moe/16g/r2, 22:32:19 to 22:33:52 in cache128/0g/r2, and 22:04:54 to 22:06:33 in moestream128/16g/r1. In cache128/0g/r2 there is no hog and the server's RSS is at most 13.5 GiB, yet swap reached 23.8 GiB, so something else held the memory; what is not recorded.
 - **`--cpu-moe` at 16 GiB varies widely** also below 100% others' CPU: r1 26.6 t/s and 129.87 s (others 56%), r3 55.5 t/s and 59.14 s (others 39%), with page cache peaks of 18.7 and 23.3 GiB. Only INFO lines use this arm.
 - **Page-cache arms have a lower r1 at 0 GiB** with no others' CPU signal: moestream128 321.8 against about 351, buffered waves 400.4 against 476 to 484, with a lower page cache peak in r1 for both. Buffered r1 also read 72.88 GB against about 33.6. Repetition order and swap level are confounded here.
 - **Disk GB read does not measure `--cpu-moe`'s load at 0 GiB.** r3 reports 0.00 GB and 27985 process page-ins, although `kolibri-evict` emptied the file and page cache was 33.1 GiB by the first sample.
@@ -323,18 +327,20 @@ These are observations on open questions. None of them changes a gate.
 - [ssd-curve.md](ssd-curve.md) gives 9.45 GB/s (three reads) or 12.9 GB/s (one read) at the arm's QD 4 and 1,699,840 B, and 13 to 14 GB/s at saturation for larger reads or QD 16.
 - The I/O threads are busy about 70% of prefill time (`io_seconds` 106.0 to 106.8 over 4 threads), which is 10.0 GB/s while busy and 0.677 ms per expert, close to the curve's three-read QD 4 p50 of 0.68 ms. The graph waits 16.1 to 16.3 s, 43% of prefill wall time.
 - So the data shows neither saturation nor a full queue.
-- Clean `F_NOCACHE` prefill reads did not drift from 21:55 to 23:20. The run data records no free-disk figure, so no correlation with free disk can be computed. The pre-flight showed 477 GiB free and the end status 439 GiB, and the 20 MiB of results do not account for that; the cause is not established.
+- Clean `F_NOCACHE` prefill reads did not drift from 21:55 to 23:20. The run data records no free-disk figure, so no correlation with free disk can be computed. The pre-flight's `df -h` at 21:27:37 showed 477 GiB free and the end status (`df -g`) 439 GiB, and the 20 MiB of results do not account for that; the cause is not established. Both outputs, with the status snapshots in between, are saved in `~/models/eval/expert-bench-e4.runner/checks/preflight.txt`.
 
 **The low ends of two ranges.**
-- `--cpu-moe` at 0 GiB, 166.3 t/s, is r2. It is not a first repetition, and all three repetitions reach about 33 GiB of page cache by the first sample. The change happens inside r2: page cache falls from 31.8 to 24.4 GiB during warm coding, and process page-ins are 14.3 GiB against about 0.45 GiB in r1 and r3. It follows moestream128/16g/r1 after 240.2 s of quiet wait, and its own others' CPU is 140/909.
+- `--cpu-moe` at 0 GiB, 166.3 t/s, is r2. It is not a first repetition, and all three repetitions reach about 33 GiB of page cache by the first sample. The change happens inside r2: page cache falls from 31.0 to 23.8 GiB during warm coding, and process page-ins are 14.3 GiB against about 0.45 GiB in r1 and r3. It follows moestream128/16g/r1 after 240.2 s of quiet wait, and its own others' CPU is 140/909.
 - Waves at 0 GiB, 246.6 t/s, is r2 at 22:46, inside the disturbed block (others' CPU 417/967, 180 s of quiet wait before it, 300 s after). Page cache is flat at 2.7 GiB in all three repetitions. The next run, waves/16g/r2, is clean at 301.8. Contention fits, but the data does not say whether it was CPU, disk or memory.
 
 **Others' CPU correlates with the results, swap level does not.** Spearman over the 30 runs, each normalised to its arm's median: others' CPU against prefill −0.70, decode −0.49, TTFT +0.57; swap at start against prefill +0.18, decode −0.19, TTFT +0.05. `F_NOCACHE` arms are unaffected by swap level once settled (waves/16g: 301.0 at 1792 MiB, 301.9 at 6990 MiB). Among the 24 runs below 100% others' CPU, swap against prefill is +0.48, but there the page-cache arms are higher in r2 and r3, confounded with repetition order.
 
 **Tokens against `--cpu-moe`.**
 - E4's `--cpu-moe`, capped-cache and #25294 tokens equal E0's exactly. As in E0, #25294 first differs from `--cpu-moe` at tokens 15, 13, 14 and 15, and the capped cache at 72, 12, 27 and 15. Waves agree with `--cpu-moe` at 126, 127, 32 and 15 of 128 positions for coding, research, hr and medtech.
-- Ubatch and split do not explain waves or #25294 against `--cpu-moe`: neither sets `-ub`, and `--cpu-moe` and waves both have 102 splits and 103 commits per token. What remains is E0's stated difference, GPU against CPU expert matmuls. The tokens fit it (waves also equal E0's #29887 arm and Stage D's resident run at the default ubatch), but no run isolates it.
-- Ubatch does fit the capped cache against waves: the same split counts, ubatch 21 against uncapped, first differences 15, 15, 12, 14 and 22, exactly those of Stage D's resident against resident `-ub 21`. The capped cache against `--cpu-moe` differs in both ubatch and device, so those two cannot be separated.
+- Ubatch does not explain waves or #25294 against `--cpu-moe`, since neither sets `-ub`.
+- Whether the split contributes stays open. `--cpu-moe` and waves have the same decode split count (102 splits, 103 commits per token), but #25294 records no splits, prefill splits are not recorded, and equal counts do not show equal split points.
+- The other known difference is E0's, GPU against CPU expert matmuls. The tokens fit it (waves also equal E0's #29887 arm and Stage D's resident run at the default ubatch), but no run isolates it.
+- Ubatch does fit the capped cache against waves: the same decode split counts, ubatch 21 against uncapped, first differences 15, 15, 12, 14 and 22, exactly those of Stage D's resident against resident `-ub 21`. The capped cache against `--cpu-moe` differs in both ubatch and device, so those two cannot be separated.
 
 ### Deviations and known limits
 

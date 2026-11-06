@@ -1149,8 +1149,8 @@ Only if E1's overhead control shows the overhead.
     - **Lossless: bit identity holds.** Bit-identical to a resident run at the same ubatch and split on tiny (216 checks) and real IQ3 (36 checks, including 128 slots at ubatch 512 in 3 variants), both "PASS: 0 failures". The 30 benchmark runs have no resident arm and do not test it.
     - **Controls.** M48: the wave mask is always 1, which fails bit identity and the unit test. M49: the next wave's preload may evict the current wave's experts; its plain form fails only the unit test, its strong form both.
     - **Warm prefill and cold TTFT against the capped cache and #25294:** not passed at 0 GiB (301.4 against 351.3 t/s; 8.91 against 7.44 s), passed at 16 GiB (301.8 against 226.7 t/s; 8.93 against 10.95 s).
-    - **Decode not slower than the capped cache:** passed at both ceilings (18.58 against a slowest of 17.39 t/s; 18.86 against 18.07).
-    - **Staging buffers:** waves have none. The peak footprint stays at the capped cache's 11.0 GiB.
+    - **Decode not slower than the capped cache:** passed at both ceilings (18.58 against a slowest of 15.16 t/s; 18.86 against 16.90). Both slowest repetitions are among the six disturbed runs below; without those runs the slowest are 17.39 and 18.07, and the gate still passes.
+    - **Staging buffers:** waves have none. `max_phys_footprint` is 10.98 GiB against the capped cache's 10.90 GiB, about 90 MiB more (the sampled column reads 11.0 for both, because it moves in 1 GiB steps).
     - Six consecutive runs (22:03 to 22:48) had others' CPU at or above 100%; recomputing all 12 gates without them flips none.
 
 ### Stage E5 --- Optional lossy miss path

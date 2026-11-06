@@ -375,6 +375,29 @@ func TestGateMetrics(t *testing.T) {
 	}
 }
 
+// The decode-not-slower line names its threshold, the slowest repetition, not
+// the baseline's median.
+func TestReportDecodeNotSlowerThreshold(t *testing.T) {
+	m := matrix{Cold: "coding", Warm: []string{"coding", "research"},
+		Configs: []config{
+			{Name: "waves", Ceilings: []float64{0}, Reps: 1},
+			{Name: "capped", Ceilings: []float64{0}, Reps: 3},
+		},
+		Gates: []gate{{CeilingGiB: 0, Candidate: "waves", Baselines: []string{"capped"}, Metric: "decode-not-slower", Decides: true}}}
+	runs := []runResult{
+		fakeRun("waves", 0, 1, []float64{18, 18}, []float64{80, 80}, nil),
+		fakeRun("capped", 0, 1, []float64{19, 19}, []float64{70, 70}, nil),
+		fakeRun("capped", 0, 2, []float64{15, 15}, []float64{70, 70}, nil),
+		fakeRun("capped", 0, 3, []float64{17, 17}, []float64{70, 70}, nil),
+	}
+	var out strings.Builder
+	report(&out, m, runs)
+	want := "passed: decode median 18.00 against capped's slowest of 15.00 (median 17.00, 15.00–19.00) t/s"
+	if !strings.Contains(out.String(), want) {
+		t.Errorf("want %q in the report:\n%s", want, out.String())
+	}
+}
+
 func TestReportCountsRequests(t *testing.T) {
 	m := matrix{Cold: "coding", Warm: []string{"coding"},
 		Configs: []config{
