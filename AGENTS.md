@@ -8,16 +8,18 @@ Where things live, and the rules for the model weights. The project itself is in
 - **Code is local.** Checkouts and worktrees are real directories on the internal drive, never
   symlinks to another volume. `third_party/llama.cpp` is a gitignored checkout of the fork with its
   own branches and uncommitted work, which the outer `git status` does not show.
-- **`~/models` is a real local directory, and every `~/models/<file>` path stays valid.** Code and
-  docs hard-code these paths. Each weight is on one of two tiers:
+- **`~/models` is a real local directory, and a weight keeps its `~/models/<file>` name on either
+  tier.** Code and docs hard-code these paths. A cold entry cannot be read while the cold volume is
+  absent (see below). Each weight is on one of two tiers:
   - **hot:** a real file on the internal drive;
   - **cold:** a symlink to its master on the cold volume, an external drive.
-- **The cold volume holds the master of every weight.** A hot weight is a verified copy of its
-  master, so offloading it loses nothing.
+- **The cold volume holds the master of every weight that has been copied there.** `offload` compares
+  a hot file with its master before replacing it, so it loses nothing. A file that `status` marks
+  `LOCAL ONLY` has no master and may be the only copy.
 - **`~/models/eval/` is a local working directory, not a tier.** Benchmarks read their workloads
   from it and write their results to it. Those results may exist nowhere else: never delete, offload
   or link it. Copy it to the cold volume when a stage ends, under a dated name:
-  `ditto ~/models/eval "$KOLIBRI_COLD_ROOT/eval.backup-<date>"`.
+  `ditto ~/models/eval "${KOLIBRI_COLD_ROOT:?set it to the cold root}/eval.backup-<date>"`.
 
 ## Hot or cold
 
