@@ -3,7 +3,9 @@
 // pages were in memory before and after. It needs no root, unlike purge:
 // msync(MS_INVALIDATE) on a shared mapping of each file (internal/memctl).
 // Pages another process maps or has wired may stay, so evict before the
-// server starts.
+// server starts. Each file also gets a line saying where it resolves, so a
+// benchmark run's record (run.json, "evict") tells whether its weight was on
+// the home volume (internal/tier).
 //
 //	kolibri-evict ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
 //	kolibri-evict -check ~/models/Kolibri-1-Q8_0.gguf
@@ -16,6 +18,7 @@ import (
 	"os"
 
 	"kolibri-llm/internal/memctl"
+	"kolibri-llm/internal/tier"
 )
 
 func main() {
@@ -31,6 +34,11 @@ func main() {
 	}
 	mib := float64(memctl.PageSize()) / (1 << 20)
 	for _, path := range flag.Args() {
+		loc, err := tier.Locate(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("%s: location %s\n", path, loc)
 		before, err := memctl.Resident(path)
 		if err != nil {
 			log.Fatal(err)
