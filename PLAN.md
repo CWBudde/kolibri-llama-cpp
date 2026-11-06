@@ -1301,8 +1301,8 @@ This is an **optional, model-agnostic research track**, separate from the Kolibr
 
 **Decision (2026-10-29):** Kolibri plans program operations and dependencies; a deterministic per-request scheduler owns execution control, waiting, wakeup, and result delivery. Start with synchronous WAIT and an API that can support multiple jobs later. Keep the scheduler independent from training the hidden-state adapter.
 
-- **Controller actions:** CONTINUE, EXECUTE(program, args, dependencies), WAIT(job_id), READ_RESULT(job_id). Begin with scripted actions and mock operations before attempting learned decisions.
-- **Scheduler request states:** READY, GENERATING, BLOCKED. Preserve inference/KV-cache state while blocked and emit no dependent answer tokens.
+- **Controller actions:** CONTINUE, EXECUTE(idempotency_key, program, args, dependencies), WAIT(job_id), READ_RESULT(job_id). EXECUTE returns a job_id; a retry with the same idempotency_key in the same request returns the existing job_id and starts nothing. Begin with scripted actions and mock operations before attempting learned decisions.
+- **Scheduler request states:** READY, GENERATING, BLOCKED. Preserve inference/KV-cache state while blocked and emit no user-visible answer tokens.
 - **Coprocessor job states:** IDLE, RUNNING, DONE, ERROR; represent timeout and cancellation explicitly. Each job has a stable ID, bounded resources, and idempotent start semantics.
 - **Result delivery:** resume only for the matching job completion, error, cancellation, or timeout; inject the result into the model's accessible context or a defined result channel. A later hidden-state adapter can replace this delivery mechanism.
 - **Dependencies:** validate job references, prevent cycles, propagate errors, and enforce declared dependencies. The scheduler cannot protect against dependencies that the controller fails to declare.
@@ -1316,7 +1316,7 @@ Tracking: [#64](https://github.com/CWBudde/kolibri-llama-cpp/issues/64) (schedul
 
 **Decision:** use an event-driven completion channel from coprocessor to scheduler, not periodic polling in the model. This is a software-interrupt analogy, not an interruption of an in-flight transformer forward pass.
 
-1. EXECUTE registers a job and starts the mock worker; WAIT(job_id) moves the request to BLOCKED and removes it from active generation.
+1. EXECUTE registers a job and starts the mock worker. WAIT(job_id) checks the job registry first: if the job is already terminal, the request does not block and can read the result at once. Otherwise WAIT moves the request to BLOCKED and removes it from active generation, atomically with that check, so a completion cannot slip in between.
 2. The worker publishes CompletionEvent { request_id, job_id, generation, status, result_or_error } to a concurrency-safe queue/channel.
 3. The scheduler consumes events, validates ownership and generation, atomically moves the matching blocked request to READY, and resumes only at a safe inference boundary.
 4. Duplicate completions are harmless; stale events after timeout/cancellation/teardown must not resurrect requests. Completion before WAIT must be retained in the job registry (no lost wakeup).
