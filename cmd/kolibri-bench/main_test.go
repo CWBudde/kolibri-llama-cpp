@@ -518,6 +518,17 @@ func TestDecodeSplit(t *testing.T) {
 	if !ok || res.ExpertCache != nil || !near(d.Wall, 16.5) || !near(d.Other, 16.5) || d.Splits != 2 || !math.IsNaN(d.Commits) {
 		t.Fatalf("resident split = %+v, %v", d, ok)
 	}
+	// the stats of a build with waves have more keys (fork branch feat/kolibri1-waves): the same split
+	var waves cacheStats
+	if err := json.Unmarshal([]byte(`{"expert_cache": {"buffered": true, "waves": true}, "decode": {"needed": 10, "wait_seconds": 9.2,
+		"remap_seconds": 1.6, "tokens": 640, "wall_seconds": 34.56, "splits": 65280, "metal_commits": 66560,
+		"waves": 0, "waves_built": 0, "wave_parked": 0},
+		"prefill": {"waves": 195, "waves_built": 200, "wave_parked": 460800}, "process": {}}`), &waves); err != nil {
+		t.Fatal(err)
+	}
+	if w, ok := waves.split(); !ok || !near(w.Wall, 54) || !near(w.Other, 37.125) || w.Splits != 102 {
+		t.Fatalf("split with waves = %+v, %v", w, ok)
+	}
 	// Stage D's stats have no timing
 	var old cacheStats
 	if err := json.Unmarshal([]byte(`{"expert_cache": {}, "decode": {"wait_seconds": 9.2}}`), &old); err != nil {
