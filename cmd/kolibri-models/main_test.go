@@ -219,6 +219,119 @@ func TestOffloadAddsAMissingLink(t *testing.T) {
 	}
 }
 
+// raceFixture is a hot w.gguf with the file infos that offload took before
+// hashing it and its master.
+func raceFixture(t *testing.T) (s store, entry, master, aside string, hashed, masterHashed os.FileInfo) {
+	t.Helper()
+	s, _, data := fixture(t)
+	entry = filepath.Join(s.root, "w.gguf")
+	master = filepath.Join(s.cold, "w.gguf")
+	aside = filepath.Join(s.root, ".w.gguf.offload")
+	write(t, entry, data)
+	var err error
+	if hashed, err = os.Lstat(entry); err != nil {
+		t.Fatal(err)
+	}
+	if masterHashed, err = os.Stat(master); err != nil {
+		t.Fatal(err)
+	}
+	return s, entry, master, aside, hashed, masterHashed
+}
+
+// A file that changes after its hash must survive, whichever way it changed.
+func TestReplaceWithLinkKeepsAFileThatChanged(t *testing.T) {
+	unique := []byte("output of a converter, stored nowhere else")
+	later := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	for name, change := range map[string]func(t *testing.T, entry string){
+		"written in place": func(t *testing.T, entry string) {
+			f, err := os.OpenFile(entry, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteAt(unique, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(entry, later, later); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"replaced by a new file": func(t *testing.T, entry string) {
+			next := entry + ".new"
+			write(t, next, unique)
+			if err := os.Rename(next, entry); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, entry, master, aside, hashed, masterHashed := raceFixture(t)
+			change(t, entry)
+			before, err := os.ReadFile(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := replaceWithLink(entry, master, aside, hashed, masterHashed); err == nil {
+				t.Error("no error")
+			}
+			got, err := os.ReadFile(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !isRegular(t, entry) || !bytes.Equal(got, before) {
+				t.Error("the changed file was not kept")
+			}
+			if _, err := os.Lstat(aside); !os.IsNotExist(err) {
+				t.Errorf("aside left behind: %v", err)
+			}
+		})
+	}
+}
+
+// The hash said nothing about a master that has moved since.
+func TestReplaceWithLinkRefusesAChangedMaster(t *testing.T) {
+	_, entry, master, aside, hashed, masterHashed := raceFixture(t)
+	later := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Chtimes(master, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceWithLink(entry, master, aside, hashed, masterHashed); err == nil {
+		t.Error("no error")
+	}
+	if !isRegular(t, entry) {
+		t.Error("entry replaced")
+	}
+}
+
+// A file that appears where there was no entry must not be overwritten.
+func TestReplaceWithLinkKeepsAnEntryThatAppeared(t *testing.T) {
+	_, entry, master, aside, _, masterHashed := raceFixture(t)
+	write(t, entry, []byte("appeared"))
+	if err := replaceWithLink(entry, master, aside, nil, masterHashed); err == nil {
+		t.Error("no error")
+	}
+	if got, _ := os.ReadFile(entry); !isRegular(t, entry) || string(got) != "appeared" {
+		t.Errorf("entry %q", got)
+	}
+}
+
+// A leftover from an interrupted offload may be the only copy.
+func TestOffloadKeepsALeftoverAside(t *testing.T) {
+	s, entry, _, aside, _, _ := raceFixture(t)
+	write(t, aside, []byte("only copy"))
+	if err := s.offload("w.gguf"); err == nil {
+		t.Error("no error")
+	}
+	if got, _ := os.ReadFile(aside); string(got) != "only copy" {
+		t.Errorf("aside %q", got)
+	}
+	if !isRegular(t, entry) {
+		t.Error("entry replaced")
+	}
+}
+
 func TestPullClonesFromAHotPartner(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("APFS clones")

@@ -19,7 +19,9 @@
 // offload replaces a hot file with a symlink to its master, and only if the
 // master exists and has the same SHA-256. Anything else is refused and left
 // alone, so a file written locally and never copied to the cold volume cannot
-// be lost. Both are single files of the root: directories are not moved.
+// be lost. A file that changes while it is being compared is refused as well
+// (replaceWithLink). Both are single files of the root: directories are not
+// moved.
 package main
 
 import (
@@ -424,10 +426,17 @@ func (s store) offload(name string) error {
 	if !mi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", master)
 	}
+	aside := filepath.Join(s.root, "."+name+".offload")
+	if _, err := os.Lstat(aside); err == nil {
+		return fmt.Errorf("%s exists, perhaps from an interrupted offload, and may be the only copy of %s: move it back or delete it first", aside, name)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	li, err := os.Lstat(entry)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		// A master without an entry: nothing to verify, only the link to add.
+		li = nil
 	case err != nil:
 		return err
 	case li.Mode()&os.ModeSymlink != 0:
@@ -452,15 +461,7 @@ func (s store) offload(name string) error {
 		}
 	}
 
-	tmp := filepath.Join(s.root, "."+name+".offload")
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	if err := os.Symlink(master, tmp); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, entry); err != nil {
-		os.Remove(tmp)
+	if err := replaceWithLink(entry, master, aside, li, mi); err != nil {
 		return err
 	}
 	fmt.Fprintf(s.out, "%s is cold -> %s\n", name, master)
@@ -470,6 +471,61 @@ func (s store) offload(name string) error {
 		}
 	}
 	return nil
+}
+
+// replaceWithLink makes entry a symlink to master, given the file infos taken
+// before the two were hashed. A nil hashed means that entry did not exist.
+//
+// Hashing a large weight takes minutes, and another process may replace or
+// modify the entry meanwhile. So entry is first renamed to aside, which pins
+// the exact file that would be deleted, and that file must still be the one
+// that was hashed. The link is created without overwriting anything, and a
+// file that fails either step goes back to entry. Entry is missing for the
+// moment in between, so a reader opening it then gets ENOENT.
+//
+// A writer that keeps a descriptor open past the check is not detected: nothing
+// here can see it without locks that other tools do not take.
+func replaceWithLink(entry, master, aside string, hashed, masterHashed fs.FileInfo) error {
+	mi, err := os.Stat(master)
+	if err != nil {
+		return err
+	}
+	if !sameVersion(masterHashed, mi) {
+		return fmt.Errorf("%s changed while it was being compared: left alone", master)
+	}
+	if hashed == nil {
+		if err := os.Symlink(master, entry); err != nil {
+			return fmt.Errorf("%w: left alone", err)
+		}
+		return nil
+	}
+	if err := os.Rename(entry, aside); err != nil {
+		return err
+	}
+	ai, err := os.Lstat(aside)
+	if err == nil && !sameVersion(hashed, ai) {
+		err = fmt.Errorf("%s changed while it was being compared", entry)
+	}
+	if err == nil {
+		err = os.Symlink(master, entry)
+	}
+	if err != nil {
+		// Link, not rename: a file that has appeared at entry stays.
+		if lerr := os.Link(aside, entry); lerr != nil {
+			return fmt.Errorf("%w; the file is now at %s, since it could not go back: %v", err, aside, lerr)
+		}
+		if rerr := os.Remove(aside); rerr != nil {
+			return fmt.Errorf("%w; %s is a leftover link to the same file: %v", err, aside, rerr)
+		}
+		return fmt.Errorf("%w: left alone", err)
+	}
+	return os.Remove(aside)
+}
+
+// sameVersion says whether b is still the file that a described: the same
+// inode, and neither its size nor its modification time has moved.
+func sameVersion(a, b fs.FileInfo) bool {
+	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
 
 // sameContent compares the SHA-256 of two files.
