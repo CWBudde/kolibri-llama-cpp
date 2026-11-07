@@ -369,7 +369,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4.json -out ~/models/eval/exp
 
 ## Stage E2: GPU remap
 
-Phase 11, Stage E2. `--expert-cache-gpu-remap` removes the scheduler split and CPU sync at every expert layer that hits. **The option exists only on fork branch `feat/kolibri1-gpu-remap` (fork PR [#16](https://github.com/CWBudde/llama.cpp/pull/16), draft, patch 0015, not on `feat/kolibri1`).** The checks below ran on tiny checkpoints only. **Nothing here says it is faster: the real-weight checks and the benchmark have not run**, and no gate is met.
+Phase 11, Stage E2. `--expert-cache-gpu-remap` removes the scheduler split and CPU sync at every expert layer that hits. **The option exists only on fork branch `feat/kolibri1-gpu-remap` (fork PR [#16](https://github.com/CWBudde/llama.cpp/pull/16), draft, not on `feat/kolibri1`). Its patch waits in `patches/llama.cpp/pending/`, which the series' glob does not match.** The checks below ran on tiny checkpoints only. **Nothing here says it is faster: the real-weight checks and the benchmark have not run**, and no gate is met.
 
 ### The problem
 
@@ -408,7 +408,7 @@ Pin, cancel and fall back: `remap` is unchanged, so `test-expert-cache`'s checks
 
 ### No silent fallback
 
-The model fails to load, and says why, when the option is asked for with `--expert-prefetch`, with an expert layer not on Metal (the CPU, `-ngl 0`, part of the layers), or without a Metal backend. After each ubatch, every layer must have been through its gate, or the process aborts. `expert_cache.gpu_remap` in the stats records the mode, and `prefill` and `decode` gain `gpu_runs` and `gpu_stops`. Off by default; the default path builds the same graph as before and its stats differ by that one key.
+The model fails to load, and says why, when the option is asked for without a cache (no `--expert-cache` or `--expert-cache-layers`, where it would otherwise load fully resident, the hazardous memory case on this machine), with `--expert-prefetch`, with an expert layer not on Metal (the CPU, `-ngl 0`, part of the layers), or without a Metal backend. The process aborts, and says why, on a `cb_eval` that stops between a layer's matmuls and on the wider ids of `llama_set_warmup` (Known limits). After each ubatch, every layer must have been through its gate, or the process aborts. `expert_cache.gpu_remap` in the stats records the mode, and `prefill` and `decode` gain `gpu_runs` and `gpu_stops`. Off by default; the default path builds the same graph as before and its stats differ by that one key.
 
 ### Counts
 
@@ -437,9 +437,9 @@ Evidence this estimate lacks, which only a quiet machine gives: what one indirec
 | Check | Result |
 |---|---|
 | `test-expert-cache` | "all expert cache tests passed"; new: the table holds exactly the `READY` slots, and the gate's deferred bookkeeping gives the same counters as a remap per layer over 400 tokens, with no load while the "GPU" runs |
-| fork `ctest` | 63 of 64. `test-tokenizers-ggml-vocabs` fails: the `.gguf` files of the vocabulary repo it clones are git-lfs pointers here. It fails on the E3 build as well (reason not read there) |
-| `check_expert_cache.py`, tiny, all | "PASS: 0 failures", 248 checks |
-| `check_expert_cache.py --gpu-remap-only`, tiny | "PASS: 0 failures", 81 checks, plus 96 under `GGML_METAL_FUSION_DISABLE=1` |
+| fork `ctest` | 63 of 64, before the refusals below; not rerun since. `test-tokenizers-ggml-vocabs` fails: the `.gguf` files of the vocabulary repo it clones are git-lfs pointers here. It fails on the E3 build as well (reason not read there) |
+| `check_expert_cache.py`, tiny, all | "PASS: 0 failures", 270 checks |
+| `check_expert_cache.py --gpu-remap-only`, tiny | "PASS: 0 failures", 103 checks, plus 118 under `GGML_METAL_FUSION_DISABLE=1` |
 | `go test ./cmd/... ./internal/...` | 21 packages ok, with `/bin` first in `PATH` for `kolibri-rekey` |
 
 - **Bit identity is against the UNSPLIT resident run,** `np.array_equal`, F32 and Q8_0, 6, 16, 64 and 384 slots, `F_NOCACHE` and buffered, as PLAN requires. It passed on the first build. On the CPU the option fails to load, by design, so the CPU has no second arm to compare.
@@ -468,6 +468,18 @@ Two more controls change what a run costs or counts, not what it computes, so bi
 | **M66:** command buffers never grow past two gates | passes | fails: "FAIL: 3 failures", the all-hits cost (and its run under fusion off); bit identity holds |
 | **M68:** a layer that hits skips its bookkeeping | passes | fails: "FAIL: 17 failures", `steps` and the other counters; bit identity holds |
 
+Five more guard the refusals. M69 was rerun after them and still fails as above, "FAIL: 33 failures": a `cb_eval` that stops outside the matmuls runs and changes the logits, and it is not refused.
+
+| Control | `test-expert-cache` | Tiny `--gpu-remap-only` |
+|---|---|---|
+| **M70:** the model does not refuse the option without a cache | passes | fails: "FAIL: 9 failures": it loads on the CPU and on Metal, and `llama-completion` exits 0 |
+| **M71:** `common` builds no params for the option alone | passes | fails: "FAIL: 3 failures": `llama-completion --expert-cache-gpu-remap` exits 0. With `--expert-cache-stats` the model still refuses |
+| **M72:** a layer's second gate is not refused | passes | fails: "FAIL: 5 failures": a `cb_eval` after `ffn_moe_up` or `ffn_moe_gate` exits -6 without saying why. The old message was "11 of 6 expert layers went through the Metal gate" |
+| **M73:** the slot ids' width is not checked | passes | fails: "FAIL: 5 failures": at 384 slots `llama_set_warmup` exits 0, with the gate writing past the tensor; at 64 it exits -6 without the width message |
+| **M74:** the gate state is not reset after a graph that did not complete | passes | **passes:** "PASS: 0 failures" |
+
+M74 shows a gap, not a guard: **the reset after an aborted graph has no check.** The check ends a decode at each call of the abort callback, and each next decode still works without the reset. `llama_set_abort_callback` reaches only backends that register `ggml_backend_set_abort_callback`, and Metal does not, so the callback runs in the CPU backend. The 4 calls and M74's result fit a CPU split before the gates; the split order was not read directly. The reset stays because a graph that ends past a gate would otherwise refuse the next one.
+
 M67 is more than a control. Dropping that one boundary moves tiny Q8_0's logits by the same maximum, 0.134, that the CPU remap's splits do, so a resident run's own numbers depend on where its encoder boundary falls. The GPU remap computes the boundary by the same formula, on the same node count. Why the two maxima agree was not investigated.
 
 ### Reproduce
@@ -478,18 +490,30 @@ The real-weight phase, on a quiet machine, nothing else holding the weights. The
 go run ./cmd/kolibri-models check testdata/bench/e2.json
 .venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp-e2 \
   --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf --gpu-remap-only
-go run ./cmd/kolibri-bench -matrix testdata/bench/e2.json -out ~/models/eval/expert-bench-e2 \
+# from a checkout of feat/phase11-e3-sidefile, with -matrix naming this branch's file
+go run ./cmd/kolibri-bench -matrix /path/to/this/branch/testdata/bench/e2.json -out ~/models/eval/expert-bench-e2 \
   -server third_party/llama.cpp-e2/build/bin/llama-server
 ```
 
-The check must say "PASS: 0 failures". `e2.json` is 12 runs: 2 arms × 2 ceilings × 3 repetitions. Its gates are decode by the Stage D rule at 0 and 16 GiB. The report's decode table must show 2 splits per token for `iq3-cache128-gpuremap` and 102 for `iq3-cache128`; otherwise the arms did not compare what they claim to. A server without the option exits with "error: invalid argument: --expert-cache-gpu-remap", and the gates then give no verdict.
+The benchmark uses the driver of E3's branch (`feat/phase11-e3-sidefile`), not this branch's: it has the eviction limit and the server digest. Its validation accepts this matrix, as a test against that branch's package showed; the matrix has no side-file arm, so the side-file guards do nothing here. The refusal checks run on tiny only, so `--real` does not repeat them.
+
+The check must say "PASS: 0 failures". `e2.json` is 19 runs: 3 arms × 2 ceilings × 3 repetitions, and one resident reference.
+
+- **Gates:** decode by the Stage D rule at 0 and 16 GiB, against the best of `iq3-cache128` and `iq3-cache128-prefetch12`, since that rule names the best other arm at that ceiling. Resident at 0 GiB is the token reference, not a baseline: Stage D's deciding gate was at 16 GiB, where resident does not fit, and E2's bar is beating Stage D's cache.
+- **Token IDs:** `iq3-cache128-gpuremap` must generate exactly those of `iq3-resident-ub21`, the same ubatches, or the driver exits 1. The comparison with `iq3-cache128` stays INFO: the CPU remap's splits round differently from the unsplit graph (E0.1).
+- **Splits:** the report's decode table must show 2 per token for `iq3-cache128-gpuremap` and 102 for the two CPU remap arms; otherwise the arms did not compare what they claim to.
+
+A server without the option exits with "error: invalid argument: --expert-cache-gpu-remap", and the gates then give no verdict.
 
 ### Known limits
 
 - No prefetch in this mode. Same-token prefetch would need its own policy, since a hit layer no longer reaches the CPU in time to predict the layers after it. Stage D's prefetch did not earn its reads either.
 - Metal only.
-- `kolibri-bench`'s equivalence between the arms is not exact, since the CPU remap's rounding differs from the unsplit graph (E0.1); bit identity is `check_expert_cache.py`'s job.
-- Merging with E3 (`feat/phase11-e3-sidefile`, fork `feat/kolibri1-sidefile`): patch order depends on E3's result, and the fork commit is based on `feat/kolibri1`, not on the side-file. Both touch `llama_expert_cache_params`, `stats_json` and `check_expert_cache.py` beside each other; no logic overlaps.
+- A `cb_eval` may stop outside a layer's matmuls, as M69 does after `ffn_moe_topk`, and that changes the logits like any split. It may not stop between them: each graph compute finds its own gates, so the layer would get two, and the process aborts ("reached its Metal gate again"). So capturing `ffn_moe_up` or `ffn_moe_gate` needs the CPU remap or a resident run.
+- `llama_set_warmup` makes the router's ids `n_expert` wide, and the slot ids tensor is `n_expert_used` wide, so the gate asserts. `common`'s warmup decode does not call it.
+- `kolibri-bench`'s equivalence with the CPU remap arm is not exact, since its rounding differs from the unsplit graph (E0.1).
+- Merging with E3 (`feat/phase11-e3-sidefile`, fork `feat/kolibri1-sidefile`): 0014 stays in the series on PR #72, not yet merged, and 0015 was generated without it, against `feat/kolibri1`, so it conflicts. `git merge-tree` of the fork branches reports conflicts in `common/arg.cpp`, `common/common.cpp`, `common/common.h`, `include/llama.h`, `src/llama-expert-cache.cpp`, `src/llama-expert-cache.h`, `src/llama-model.cpp` and `tests/test-expert-cache.cpp`; in the main repo in `check_expert_cache.py`, `main_test.go` and the docs. They include `llama_expert_cache_params` and `stats_json`. They were not resolved or read one by one, so this does not say whether any logic overlaps. 0015's final place and its order after 0014 are decided after the benchmark and #72's merge.
+- The patch is the plain diff of the fork branch against `feat/kolibri1` at `634e34bb4`, and applied to that tree it gives the branch's tree. The branch merged `feat/kolibri1` for that: it had gained the refusal of a LoRA on the cache's experts, which the diff would otherwise have taken out.
 
 ## Limits
 

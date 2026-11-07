@@ -372,7 +372,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0010 continuation tests | no | tests on top of 0008 |
 | 0011, 0012 expert cache | no | the fork's own work, rebased (below) |
 | 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
-| 0015 expert cache GPU remap | no | the fork's own work, on branch `feat/kolibri1-gpu-remap`, not on `feat/kolibri1`: Stage E2's benchmark has not run ([expert-streaming.md](expert-streaming.md#stage-e2-gpu-remap)); its place in the series depends on E3's result |
+| 0015 expert cache GPU remap | no | the fork's own work, on branch `feat/kolibri1-gpu-remap`, not on `feat/kolibri1`, and in `patches/llama.cpp/pending/`, outside the series: Stage E2's benchmark has not run ([expert-streaming.md](expert-streaming.md#stage-e2-gpu-remap)); its place and its order after 0014 are decided after the benchmark and #72's merge |
 
 ### Controls
 
@@ -444,8 +444,10 @@ the CPU they still are.
   difference to the unsplit run as info. The CPU still compares against the
   plain resident run.
 - E2 removes the CPU split, behind `--expert-cache-gpu-remap`, and then requires
-  bit identity to the unsplit run (`check_expert_cache.py`, tiny, so far). Without
-  the option, `kolibri-bench`'s exact equivalence of
+  bit identity to the unsplit run (`check_expert_cache.py`, tiny, so far), and
+  the same token IDs as `iq3-resident-ub21` on the real workload (exact in
+  `testdata/bench/e2.json`; not run yet). Without the option, `kolibri-bench`'s
+  exact equivalence of
   `iq3-cache128` against `iq3-resident-ub21` compares differently fused
   graphs on master.
 
