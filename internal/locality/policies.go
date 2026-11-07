@@ -413,6 +413,12 @@ type Oracle struct {
 	h       []keyHeap // per group, resident keys, furthest next use first
 	evict   []int
 	err     error
+	// pinned (NewPinnedOracle): the keys the running step has used are out of h, pins, and never
+	// evicted; pinBytes are their bytes per group and step the running step, plus one.
+	pinned   bool
+	pins     []int
+	pinBytes []int64
+	step     int
 }
 
 // NewOracle returns an Oracle of budget bytes shared by all layers, for Replay(sel, spans, ...).
@@ -422,11 +428,38 @@ func NewOracle(sel Selections, spans []Span, nExpert int, bytes []int64, budget 
 
 // NewLayerOracle returns an Oracle of capacity experts in every layer.
 func NewLayerOracle(sel Selections, spans []Span, nExpert int, bytes []int64, capacity int) *Oracle {
+	return newOracle(sel, spans, nExpert, bytes, layerBudgets(bytes, capacity), true)
+}
+
+func layerBudgets(bytes []int64, capacity int) []int64 {
 	budget := make([]int64, len(bytes))
 	for l, b := range bytes {
 		budget[l] = int64(capacity) * b
 	}
-	return newOracle(sel, spans, nExpert, bytes, budget, true)
+	return budget
+}
+
+// NewPinnedOracle is NewOracle that holds a step's experts together, as a server does (eviction.go):
+// it never evicts an expert the running step has used, and it keeps an expert it loads even when
+// that expert's next use is the furthest, as long as the step's experts fit. A step whose union does
+// not fit has no such schedule, and what does not fit is used once, as in the pinned LFU.
+//
+// So where every step fits this is a valid event-atomic schedule, and its bytes bound the
+// event-atomic optimum from above, as NewOracle's bound it from below. With experts of equal size
+// TestPinnedOracleOptimal holds it to that optimum; with a shared budget over layers of unequal
+// sizes it is only a bound.
+func NewPinnedOracle(sel Selections, spans []Span, nExpert int, bytes []int64, budget int64) *Oracle {
+	return pinnedOracle(newOracle(sel, spans, nExpert, bytes, []int64{budget}, false))
+}
+
+// NewPinnedLayerOracle is NewLayerOracle with NewPinnedOracle's pins.
+func NewPinnedLayerOracle(sel Selections, spans []Span, nExpert int, bytes []int64, capacity int) *Oracle {
+	return pinnedOracle(newOracle(sel, spans, nExpert, bytes, layerBudgets(bytes, capacity), true))
+}
+
+func pinnedOracle(o *Oracle) *Oracle {
+	o.pinned, o.pinBytes = true, make([]int64, len(o.budget))
+	return o
 }
 
 func newOracle(sel Selections, spans []Span, nExpert int, bytes []int64, budget []int64, perL bool) *Oracle {
@@ -480,11 +513,36 @@ func (o *Oracle) group(k int) int {
 
 func (o *Oracle) size(k int) int64 { return o.bytes[k/o.nExpert] }
 
-func (o *Oracle) Prefetch(StepInfo) []int { return nil }
+// Prefetch releases the last step's pins; it prefetches nothing.
+func (o *Oracle) Prefetch(s StepInfo) []int {
+	if o.pinned && s.Index+1 != o.step {
+		o.step = s.Index + 1
+		for _, k := range o.pins {
+			heap.Push(&o.h[o.group(k)], k)
+		}
+		o.pins = o.pins[:0]
+		clear(o.pinBytes)
+	}
+	return nil
+}
 
 func (o *Oracle) Load(k int) []int {
 	o.evict = o.evict[:0]
 	g := o.group(k)
+	if o.pinned {
+		if o.pinBytes[g]+o.size(k) > o.budget[g] {
+			return append(o.evict, k) // the step's union does not fit: no atomic schedule exists
+		}
+		h := &o.h[g]
+		for o.cur[g]+o.size(k) > o.budget[g] {
+			v := heap.Pop(h).(int)
+			o.cur[g] -= o.size(v)
+			o.evict = append(o.evict, v)
+		}
+		heap.Push(h, k)
+		o.cur[g] += o.size(k)
+		return o.evict
+	}
 	after := math.MaxInt // k's next access after the one it is loaded for
 	if o.ptr[k]+1 < len(o.uses[k]) {
 		after = int(o.uses[k][o.ptr[k]+1])
@@ -507,9 +565,17 @@ func (o *Oracle) Use(_ StepInfo, k int) {
 	if o.next(k) != o.access && o.err == nil {
 		o.err = fmt.Errorf("oracle: access %d is key %d, not the one the trace it was built from has there", o.access, k)
 	}
+	g := o.group(k)
+	if o.pinned {
+		if p := o.h[g].pos[k]; p >= 0 {
+			heap.Remove(&o.h[g], p)
+			o.pins = append(o.pins, k)
+			o.pinBytes[g] += o.size(k)
+		}
+	}
 	o.access++
 	o.ptr[k]++
-	if p := o.h[o.group(k)].pos[k]; p >= 0 {
-		heap.Fix(&o.h[o.group(k)], p)
+	if p := o.h[g].pos[k]; p >= 0 {
+		heap.Fix(&o.h[g], p)
 	}
 }

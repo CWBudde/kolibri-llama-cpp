@@ -331,6 +331,34 @@ func ReplaySegments(sel Selections, spans []Span, cuts []int, nExpert int, bytes
 	return rs, nil
 }
 
+// StepUnions returns the size of every step's union in phase p, per span and layer in replay order:
+// the number of distinct experts the step needs, what a cache must hold at once to run it. A decoded
+// step's is K; a prefill step's depends on its ubatch.
+func StepUnions(sel Selections, spans []Span, nExpert int, p Phase) []int {
+	var out []int
+	seen := make([]int, nExpert) // the last step that had the expert, plus one
+	step := 0
+	for _, s := range spans {
+		if s.Phase != p {
+			continue
+		}
+		for l := range sel.Layers {
+			step++
+			n := 0
+			for t := s.First; t < s.End; t++ {
+				for _, e := range sel.IDs[(l*sel.Tokens+t)*sel.K : (l*sel.Tokens+t+1)*sel.K] {
+					if seen[e] != step {
+						seen[e] = step
+						n++
+					}
+				}
+			}
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // Merge adds the segments of a replay up: their counts and link times, and the largest peak. It
 // is the unsegmented replay unless a prefetch made before a cut is used after it.
 func Merge(rs ...Result) Result {
