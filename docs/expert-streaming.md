@@ -207,7 +207,7 @@ The `-ub 21` control differs from resident IQ3 at the default ubatch (512) from 
 
 ## Stage E3: one read per expert
 
-Phase 11, Stage E3. A side-file next to the GGUF holds each expert's gate, up and down rows in one aligned extent, and a miss reads it with one `pread`. **The code and the checks exist. The benchmark has not run, so nothing here says whether it is faster.** Patch 0014 is on fork branch `feat/kolibri1-sidefile`, not yet on `feat/kolibri1`. By the plan's stop rule it stays in the series only if the gates pass. E3 is not built on waves.
+Phase 11, Stage E3. A side-file next to the GGUF holds each expert's gate, up and down rows in one aligned extent, and a miss reads it with one `pread`. **The code and the checks exist. The benchmark has not run, so nothing here says whether it is faster.** Patch 0014 is on fork branch `feat/kolibri1-sidefile` (fork PR #15, open), not yet on `feat/kolibri1`. By the plan's stop rule it stays in the series only if the gates pass. E3 is not built on waves.
 
 ### The side-file
 
