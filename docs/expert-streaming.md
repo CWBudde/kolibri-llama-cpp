@@ -1,6 +1,6 @@
 # Expert streaming: the runtime expert cache
 
-Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill".
+Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill". The GPU remap of Stage E2, not benchmarked yet, is in "Stage E2: GPU remap".
 
 ## How it works
 
@@ -366,6 +366,129 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4.json -out ~/models/eval/exp
   -servers pr25294=third_party/llama.cpp-pr25294/build/bin/llama-server
 .venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only
 ```
+
+## Stage E2: GPU remap
+
+Phase 11, Stage E2. `--expert-cache-gpu-remap` removes the scheduler split and CPU sync at every expert layer that hits. **The option exists only on fork branch `feat/kolibri1-gpu-remap` (fork PR [#16](https://github.com/CWBudde/llama.cpp/pull/16), draft, patch 0015, not on `feat/kolibri1`).** The checks below ran on tiny checkpoints only. **Nothing here says it is faster: the real-weight checks and the benchmark have not run**, and no gate is met.
+
+### The problem
+
+E1 measured it: with all 384 experts cached, decode takes 35.6 ms/token against 16.8 resident, with 102 splits per token against 2; 17.6 ms of the gap comes with those splits ([expert-diagnostics.md](expert-diagnostics.md)).
+
+### The decision
+
+PLAN names two candidates and says a measured prototype decides. Measuring needs a quiet machine, so this choice rests on split and commit counts on tiny checkpoints and on reasoning.
+
+- **Fewer, larger splits is out, by count.** The scheduler already puts a layer's attention and the next layer's router in one Metal split: 2 + 2 per layer is what one CPU op per layer costs at least, so the candidate has nothing left to fuse. It also keeps the split the requirement forbids: the logits would still differ from the unsplit resident run (0.134 on tiny Q8_0, 3.23 on IQ3).
+- **GPU remap, but not with an `MTLSharedEvent` wait per layer.** A shader cannot signal or skip an encoded wait, so a wait at every layer is a CPU round trip at every layer, hit or miss. That is a lighter form of what E2 is meant to remove.
+- **Chosen: a gate per layer that stops the command buffer on a miss.** A hit takes no CPU at all.
+
+### How it works
+
+- **The graph is the resident run's, node for node.** No CPU op, no extra node: the three `MUL_MAT_ID` get two extra sources, the layer's slot ids and its table. They reorder and fuse as in the unsplit run, which is why the logits are bit-identical to it.
+- **Fusion stays intact.** The fusion table has no pattern with a `MUL_MAT_ID`, so a command buffer may end before a gate without cutting a fused group. The plain path's own encoder boundary (`n_nodes_0`) stays too, because a pattern across it does not fuse there.
+- **The table.** Per layer, one `int32` per expert: its slot, or -1. It lives in the same shared host memory as the slots.
+- **The gate.** Before a layer's first matmul, `kernel_expert_gate` maps the router's ids through the table into the slot ids, which the three matmuls read, and logs the router's ids for the CPU.
+- **A stop.** On an id without a slot, the gate sets a flag and zeroes the threadgroup counts of every later dispatch of the command buffer: after a command buffer's first gate, all its dispatches are indirect. So nothing after the gate runs, including that layer's matmuls.
+- **The miss path is the old one.** The backend waits for the buffer and calls the same `llama_expert_slots::remap` the CPU op uses: pins, LRU, loads, waits, the abort on a failed read. It then copies the layer's table and resumes at that gate.
+- **Hits' bookkeeping is deferred, not dropped.** When a buffer has completed (or stopped), `remap` runs for each layer that passed, in layer order. LRU is per layer, so the order within a layer is what it was.
+- **Command buffers.** Two gates per buffer after a stop, doubling while no gate stops, so a stop wastes little encoding and a run of hits costs few commits.
+
+### What replaces the sync guarantee
+
+Before, the scheduler's sync before each CPU split guaranteed that the previous layer's matmuls were done when the next remap ran, and a layer was in flight from its remap to the next one, so no prefetch replaced its slots. Now:
+
+1. **The table and the slots' bytes change only while the GPU is idle:** in the remap of a stopped layer, after `waitUntilCompleted` of the only command buffer running for the graph.
+2. **A stopped gate has run nothing after it.** That layer's matmuls did not start, and no later node has overwritten a tensor the resumed run reads. (M62 shows what happens otherwise: NaN.)
+3. **The layers before it are complete:** their matmuls precede the gate in a completed buffer.
+4. **There is no asynchronous writer.** The cache refuses `--expert-prefetch` in this mode, so all loads are demand loads, and the remap returns only when its layer's loads are done. The table holds only `READY` slots (`copy_table`), so a gate cannot pass an unread expert.
+5. **Resuming must make progress:** a gate that stops again after its loads aborts (`stopped again after its loads`) rather than loop.
+
+Pin, cancel and fall back: `remap` is unchanged, so `test-expert-cache`'s checks still hold it to them. Cancelling and the prefetch fallback have nothing to do in this mode, since it has no prefetch.
+
+### No silent fallback
+
+The model fails to load, and says why, when the option is asked for with `--expert-prefetch`, with an expert layer not on Metal (the CPU, `-ngl 0`, part of the layers), or without a Metal backend. After each ubatch, every layer must have been through its gate, or the process aborts. `expert_cache.gpu_remap` in the stats records the mode, and `prefill` and `decode` gain `gpu_runs` and `gpu_stops`. Off by default; the default path builds the same graph as before and its stats differ by that one key.
+
+### Counts
+
+On the tiny router checkpoint (6 layers, top 6), Metal, per decoded token, 40 prompt and 60 decoded tokens:
+
+| Slots | Mode | Scheduler splits | Metal commits | Stops |
+|--:|---|--:|--:|--:|
+| any | resident | 2 | 3 | |
+| any | CPU remap | 14 | 15 | |
+| 6 | GPU remap | 2 | 8.99 | 5.99 |
+| 16 | GPU remap | 2 | 7.43 | 3.90 |
+| 64 | GPU remap | 2 | 4.73 | 1.15 |
+| 384 | GPU remap | 2 | 4.73 | 1.15 |
+| all hits (M61) | GPU remap | 2 | 3 | 0 |
+
+The figures are F32; Q8_0 is within 0.07. The last row repeats a pass after clearing the KV cache, so the routing repeats and every expert has a slot: exactly 2 splits, 2 command buffers and 3 commits per token, as resident. **The expected decode split count is 2 per token for every model, whatever its layers,** and M61 is the control for it, as M42 is for the CPU remap's 2 + 2 per layer. At 64 and 384 slots tiny's stops are first uses: its 100 tokens do not fill the slots, so nothing is evicted, and both rows are the same.
+
+### Estimate, not a result
+
+For IQ3 at 128 slots, Stage D's hit rate (8634 of 9600) means about 30 misses per token, so at most about 23.5 of 50 layers stop (independent misses: 1 - 0.9^6 = 47%). Tiny's pattern (6 stops, 8 command buffers) gives about 25 command buffers, or about 26 commits against 103. If E1's 17.6 ms scale with commits alone, that saves about 13.5 ms of 57.8: about 44 ms/token, or 23 tokens/s against 17.6. If all of it goes with 384 slots, about 18 ms/token against 35.6.
+
+Evidence this estimate lacks, which only a quiet machine gives: what one indirect dispatch costs on the GPU, since most dispatches of a token become indirect; how much of E1's 0.18 ms per split is the scheduler and how much is commit and wait; the encoding a stop wastes (one layer per stop); and whether the 7.5 ms that E1 could attribute only to misses stays. If the estimate fails, an event wait per layer is the untested alternative: no re-encoding, but a CPU round trip at every layer.
+
+### Checks
+
+| Check | Result |
+|---|---|
+| `test-expert-cache` | "all expert cache tests passed"; new: the table holds exactly the `READY` slots, and the gate's deferred bookkeeping gives the same counters as a remap per layer over 400 tokens, with no load while the "GPU" runs |
+| fork `ctest` | 63 of 64. `test-tokenizers-ggml-vocabs` fails: the `.gguf` files of the vocabulary repo it clones are git-lfs pointers here. It fails on the E3 build as well (reason not read there) |
+| `check_expert_cache.py`, tiny, all | "PASS: 0 failures", 248 checks |
+| `check_expert_cache.py --gpu-remap-only`, tiny | "PASS: 0 failures", 81 checks, plus 96 under `GGML_METAL_FUSION_DISABLE=1` |
+| `go test ./cmd/... ./internal/...` | 21 packages ok, with `/bin` first in `PATH` for `kolibri-rekey` |
+
+- **Bit identity is against the UNSPLIT resident run,** `np.array_equal`, F32 and Q8_0, 6, 16, 64 and 384 slots, `F_NOCACHE` and buffered, as PLAN requires. It passed on the first build. On the CPU the option fails to load, by design, so the CPU has no second arm to compare.
+- **A server's shape of decode found a bug.** The last layer keeps only the output rows, so a prefill ubatch with no output has no matmuls there and no gate; the first version aborted on it. The check now also runs with only the last positions as outputs, and `llama-completion` with its warmup decode. `llama-server` on tiny, three requests with `cache_prompt`, gave the same text as resident `-ub 10`, with 2 splits per decoded token. That run is by hand, not in the check.
+- **Counters.** With fusion on, the CPU remap can route an expert differently, because its splits round differently: on tiny Q8_0 one hit in 1,762 at 6 slots. So the check holds it to the GPU remap's counters exactly only where its logits equal the unsplit run's, and runs again under `GGML_METAL_FUSION_DISABLE=1`, where they do: hits, misses, evictions and bytes are then equal in every configuration.
+
+### Negative controls
+
+Each was applied, recorded and reverted; then a forced rebuild and a rerun of the checks. Logs: `~/models/eval/expert-bench-e2.runner/checks/`.
+
+| Control | `test-expert-cache` | Tiny `--gpu-remap-only` |
+|---|---|---|
+| **M60:** `copy_table` swaps the slot of every odd expert: a wrong slot id in the GPU table | fails: 4667 checks failed | fails: "FAIL: 37 failures", max \|diff\| 1.11 |
+| **M61:** cb_eval splits the GPU arm after each `ffn_moe_topk`, as the CPU remap's splits do | passes | fails: "FAIL: 33 failures": 14 splits per token instead of 2, and bit identity, max \|diff\| 0.134 |
+| **M62:** the gate stops but leaves the later dispatches on: the invariant's second point | passes | fails: logits NaN on the first configurations, then the guard aborts ("gate 3 stopped again after its loads") |
+| **M63:** `copy_table` never writes -1, so an evicted expert stays in the table | fails: 7891 checks failed | fails: "FAIL: 17 failures", max \|diff\| 1.11 |
+| **M64:** the run resumes one node after the stopped gate | passes | fails: "FAIL: 37 failures", max \|diff\| 2.23 |
+| **M65:** the remap does not wait for loads, the table lists loading slots, and a load takes 2 ms longer: the invariant's fourth point | fails: 5680 checks failed | fails: "FAIL: 34 failures", max \|diff\| 1.26 |
+| **M67:** the plain path's `n_nodes_0` encoder boundary is dropped | passes | fails: "FAIL: 27 failures", max \|diff\| 0.134 |
+
+Two more controls change what a run costs or counts, not what it computes, so bit identity holds under them by design. They do not meet the rule that a control fails bit identity; they guard the counts:
+
+| Control | `test-expert-cache` | Tiny `--gpu-remap-only` |
+|---|---|---|
+| **M66:** command buffers never grow past two gates | passes | fails: "FAIL: 3 failures", the all-hits cost (and its run under fusion off); bit identity holds |
+| **M68:** a layer that hits skips its bookkeeping | passes | fails: "FAIL: 17 failures", `steps` and the other counters; bit identity holds |
+
+M67 is more than a control. Dropping that one boundary moves tiny Q8_0's logits by the same maximum, 0.134, that the CPU remap's splits do, so a resident run's own numbers depend on where its encoder boundary falls. The GPU remap computes the boundary by the same formula, on the same node count. Why the two maxima agree was not investigated.
+
+### Reproduce
+
+The real-weight phase, on a quiet machine, nothing else holding the weights. The server is `third_party/llama.cpp-e2/build/bin/llama-server`, which serves both arms:
+
+```sh
+go run ./cmd/kolibri-models check testdata/bench/e2.json
+.venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp-e2 \
+  --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf --gpu-remap-only
+go run ./cmd/kolibri-bench -matrix testdata/bench/e2.json -out ~/models/eval/expert-bench-e2 \
+  -server third_party/llama.cpp-e2/build/bin/llama-server
+```
+
+The check must say "PASS: 0 failures". `e2.json` is 12 runs: 2 arms × 2 ceilings × 3 repetitions. Its gates are decode by the Stage D rule at 0 and 16 GiB. The report's decode table must show 2 splits per token for `iq3-cache128-gpuremap` and 102 for `iq3-cache128`; otherwise the arms did not compare what they claim to. A server without the option exits with "error: invalid argument: --expert-cache-gpu-remap", and the gates then give no verdict.
+
+### Known limits
+
+- No prefetch in this mode. Same-token prefetch would need its own policy, since a hit layer no longer reaches the CPU in time to predict the layers after it. Stage D's prefetch did not earn its reads either.
+- Metal only.
+- `kolibri-bench`'s equivalence between the arms is not exact, since the CPU remap's rounding differs from the unsplit graph (E0.1); bit identity is `check_expert_cache.py`'s job.
+- Merging with E3 (`feat/phase11-e3-sidefile`, fork `feat/kolibri1-sidefile`): patch order depends on E3's result, and the fork commit is based on `feat/kolibri1`, not on the side-file. Both touch `llama_expert_cache_params`, `stats_json` and `check_expert_cache.py` beside each other; no logic overlaps.
 
 ## Limits
 
