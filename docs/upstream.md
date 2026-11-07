@@ -398,10 +398,10 @@ reached `feat/kolibri1`. At that date the next patch was 0014, and the series
 is in the next paragraph.
 
 **Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on fork branch
-`feat/kolibri1-sidefile` (`1f6ce476c`), not on `feat/kolibri1` yet. The patch is
+`feat/kolibri1-sidefile` (`ca32334bb`), not on `feat/kolibri1` yet. The patch is
 the plain diff of that branch against `feat/kolibri1`. The series 0008, 0010,
 0011, 0012 and 0014 applied to a clean `184f6536` equals that branch's tree
-(`d8ee53b6`), and without 0014 it equals `feat/kolibri1`'s (`e4937d7a`, both by
+(`153d82bd`), and without 0014 it equals `feat/kolibri1`'s (`5b35743d`, both by
 `git write-tree`). Its gates passed, so the number stays in the series. The
 benchmark ran on `dd2040eaf`, whose tree (`53739515`) is what the same series
 gave at `0b19754`, before the review fixes below.
@@ -438,6 +438,35 @@ error.
 
 Commit `da2f581`'s message calls these two M70 and M71. PR #77 uses those numbers
 for the loop baseline, so they moved to M80 and M81.
+
+**Second review (fork PRs #13 to #16, 2026-11-07).** Four findings on `feat/kolibri1`
+were real, all in 0011: `4a4661220`, merged into the side-file branch as `fcd9271a5`.
+- **A draft model inherited the target's cache.** It would fail the architecture
+  check at load. `common_base_params_to_speculative` now clears the cache's params.
+- **`--expert-cache` with `--moe-cache-mib` aborted.** The graph's `GGML_ASSERT` fired
+  on the tiny checkpoint. The context now refuses the pair by name.
+- **A reopened model could be another file.** macOS reopens by path, and the offsets
+  would read wrong weights without an error. A dup would share `F_NOCACHE` with the
+  loader, so the cache compares device and inode and refuses a replaced file. Nothing
+  tests the race itself.
+- **A remap could evict a slot the last graph still read.** `graph_compute` is
+  async. Metal waits for the last graph at its next split, which comes first when
+  layer 0 is on the GPU, but a prefetch on a layer before that split could still
+  evict. `process_ubatch` now synchronizes first when a cache is present. Nothing
+  tests the race itself, and no benchmark ran with this: a decode is already
+  synchronized before its next call, a prefill's wait moves ahead of its first split.
+
+`ca32334bb` adds a test that an alignment of zero is refused. A review read the
+division as coming before the check, and the check comes first. The other findings
+were declined, with the reasons on the PRs: `llama.h` and the CLI options (upstream's
+rules), `gguf_head`'s lower bound ("Limits" in
+[expert-streaming.md](expert-streaming.md)), and everything on the waves and GPU remap
+branches, which do not merge.
+
+| Mutation | Result |
+|---|---|
+| M89: the MoE cache refusal off (`if (false && params.moe_cache_size > 0)`) | `check_expert_cache.py`: "FAIL llama-completion with --expert-cache and --moe-cache-mib exits -6", "FAIL: 1 failures", rc 1 |
+| M90: the draft's cache params not cleared | `test-expert-cache`: "FAIL draft.expert_cache == 0", the same for the layers and the stats, "3 checks failed" |
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's

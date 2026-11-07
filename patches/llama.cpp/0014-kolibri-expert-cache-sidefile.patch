@@ -75,10 +75,10 @@ index 03b4efa10..bf6d6c35f 100644
      llama-grammar.cpp
      llama-graph.cpp
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index ca8af2414..5559df2f9 100644
+index 52acfbcd5..d7bd82490 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
-@@ -105,14 +105,14 @@ std::string counts_json(const llama_expert_cache_counts & c, const std::string &
+@@ -107,14 +107,14 @@ std::string counts_json(const llama_expert_cache_counts & c, const std::string &
          "\"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
          "\"prefetch_used\": %llu, \"prefetch_wasted\": %llu, \"prefetch_cancelled\": %llu, "
          "\"prefetch_skipped\": %llu, \"load_failures\": %llu, \"wait_seconds\": %.6f, \"io_seconds\": %.6f, "
@@ -95,7 +95,7 @@ index ca8af2414..5559df2f9 100644
  }
  
  std::string process_json(const process_counts & pc, uint64_t disk_read0, uint64_t pageins0, uint64_t faults0) {
-@@ -168,7 +168,7 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int
+@@ -170,7 +170,7 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int
      : n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used),
        n_threads(std::max(p.n_threads, 1)), prefetch_k(std::max(p.prefetch_k, 0)),
        prefetch_half_life(std::max(p.prefetch_half_life, 1)), prefetch_mix(p.prefetch_mix),
@@ -104,8 +104,8 @@ index ca8af2414..5559df2f9 100644
      if (p.n_slots_layer && p.n_layer_slots > 0) {
          if (p.n_layer_slots != n_layer) {
              throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
-@@ -363,12 +363,23 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
-     throw std::runtime_error("expert cache: not supported on this platform");
+@@ -377,12 +377,23 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+     }
  #endif
  
 +    rows.resize(n_layer);
@@ -129,7 +129,7 @@ index ca8af2414..5559df2f9 100644
      if (prefetch_k > 0) {
          markov = std::make_unique<llama_expert_markov>(n_layer, n_expert, prefetch_half_life, prefetch_mix);
      }
-@@ -387,7 +398,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -401,7 +412,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      }
      LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s%s\n",
          __func__, *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
@@ -138,7 +138,7 @@ index ca8af2414..5559df2f9 100644
  }
  
  uint32_t llama_expert_cache::max_ubatch() const {
-@@ -428,7 +439,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -442,7 +453,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
          int l = -1;
          int e = -1;
          if (slots->failure(l, e)) {
@@ -147,7 +147,7 @@ index ca8af2414..5559df2f9 100644
          }
          GGML_ABORT("expert cache: layer %d needs more distinct experts in one ubatch of %d tokens than its %d slots",
              il, n_tokens, n_slots[il]);
-@@ -445,34 +456,16 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -459,34 +470,16 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
      op_seconds[decode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
  }
  
@@ -189,7 +189,7 @@ index ca8af2414..5559df2f9 100644
  }
  
  std::string llama_expert_cache::stats_json() const {
-@@ -487,10 +480,11 @@ std::string llama_expert_cache::stats_json() const {
+@@ -501,10 +494,11 @@ std::string llama_expert_cache::stats_json() const {
      const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + (diag ? ", " + diag->json_fields() : std::string());
      return format(
          "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
@@ -874,10 +874,10 @@ index 746dd66cb..3952741b4 100644
  
      return result;
 diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
-index 157750c17..1f0cc3080 100644
+index aaba048a9..2900fb100 100644
 --- a/tests/test-expert-cache.cpp
 +++ b/tests/test-expert-cache.cpp
-@@ -1,19 +1,32 @@
+@@ -1,21 +1,34 @@
 -// Tests of the expert cache's bookkeeping (src/llama-expert-slots.*) with a fake loader, and of its
 -// Markov predictor against the predictions of the Go original:
 +// Tests of the expert cache's bookkeeping (src/llama-expert-slots.*) with a fake loader, of its
@@ -897,6 +897,8 @@ index 157750c17..1f0cc3080 100644
  
 +#include "../src/llama-expert-sidefile.h"
  #include "../src/llama-expert-slots.h"
+ #include "common.h"
+ #include "speculative.h"
  
 +#include "ggml.h"
 +#include "gguf.h"
@@ -912,7 +914,7 @@ index 157750c17..1f0cc3080 100644
  #include <memory>
  #include <mutex>
  #include <random>
-@@ -22,6 +35,12 @@
+@@ -24,6 +37,12 @@
  #include <utility>
  #include <vector>
  
@@ -925,7 +927,7 @@ index 157750c17..1f0cc3080 100644
  static int n_failed = 0;
  
  #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "%s:%d: FAIL %s\n", __FILE__, __LINE__, #cond); n_failed++; } } while (0)
-@@ -86,7 +105,7 @@ struct fake {
+@@ -88,7 +107,7 @@ struct fake {
  
  static std::unique_ptr<llama_expert_slots> make(fake & f, int n_expert, int n_threads, size_t bytes = 100) {
      return std::make_unique<llama_expert_slots>(std::vector<int>(f.n_layer, f.n_slots), n_expert,
@@ -934,7 +936,7 @@ index 157750c17..1f0cc3080 100644
  }
  
  // every id maps to a slot that holds it
-@@ -295,6 +314,520 @@ static void test_stress() {
+@@ -297,6 +316,522 @@ static void test_stress() {
      CHECK(d.prefetch_issued > 0 && d.prefetch_used > 0);
  }
  
@@ -1302,6 +1304,8 @@ index 157750c17..1f0cc3080 100644
 +    expect("a table of another length", "table of");
 +    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, 32, x.file_size() + F::align); });
 +    expect("a larger file size in the table", "file size");
++    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 12, 0); });
++    expect("an alignment of zero, which the extents divide by", "alignment");
 +    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 12, 512); });
 +    expect("an alignment below the device's", "alignment");
 +    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 12, 20000); });
@@ -1455,7 +1459,7 @@ index 157750c17..1f0cc3080 100644
  static void test_top_k() {
      std::vector<int> out;
      llama_expert_top_k({0.5, 2.0, 1.0, 2.0, 0.0}, 3, out);
-@@ -346,6 +879,11 @@ static void test_markov_fixture(const char * path) {
+@@ -361,6 +896,11 @@ static void test_draft_params() {
  }
  
  int main(int argc, char ** argv) {
@@ -1467,7 +1471,7 @@ index 157750c17..1f0cc3080 100644
      test_lru();
      test_pinned();
      test_pinned_loading();
-@@ -355,7 +893,16 @@ int main(int argc, char ** argv) {
+@@ -370,7 +910,16 @@ int main(int argc, char ** argv) {
      test_in_flight();
      test_failures();
      test_stress();
@@ -1481,6 +1485,6 @@ index 157750c17..1f0cc3080 100644
 +    test_sha256_file();
 +    test_sidefile_refusals();
 +#endif
+     test_draft_params();
      if (argc > 1) {
          test_markov_fixture(argv[1]);
-     } else {

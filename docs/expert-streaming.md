@@ -223,7 +223,7 @@ Phase 11, Stage E3. A side-file next to the GGUF holds each expert's gate, up an
 
 **Merging is the owner's call. The order is fork PR #15 into `feat/kolibri1` first, then PR #72.** Fork PR #15 is not merged, so `feat/kolibri1` does not have 0014 until it is. Until then the README's option A (the patches by glob, with this branch's patches) and option B (the fork branch) differ by 0014.
 
-**The runs did not use the series' current code.** They ran on `dd2040eaf` (tree `53739515`, build digest `e5dcda2e6e56`). The series now gives `1f6ce476c` (tree `d8ee53b6`), which adds two review fixes after the runs: a refused LoRA on the routed experts, and a bound on the GGUF header length that the table claims. Both act at load, and the diff does not change the path that reads a miss. They were not timed: see "Limits".
+**The runs did not use the series' current code.** They ran on `dd2040eaf` (tree `53739515`, build digest `e5dcda2e6e56`). The series now gives `ca32334bb` (tree `153d82bd`), which adds review fixes after the runs: at load, a refused LoRA on the routed experts, a bound on the GGUF header length that the table claims, a draft model without the cache, a refused MoE cache and a check that the reopened file is the loader's; and a synchronize before each ubatch ([upstream.md](upstream.md)). The diff does not change the path that reads a miss. They were not timed: see "Limits".
 
 ### Results
 
@@ -322,8 +322,8 @@ E3's fastest warm prompt at 0 GiB (88.77) is above E4's (86.7) by 2.4%. The exce
 
 ### Limits
 
-- **The review fixes were not timed.** The 12 runs ran on `dd2040eaf`. `1f6ce476c` and `634e34bb4` came after them. In `git diff dd2040eaf 1f6ce476c`, `llama_expert_read_rows` and the remap's reads do not change, but no run measures that.
-- **The fork branch is not squashed.** The force-push that would have squashed `dbac35709` and `dd2040eaf` into one commit was denied, so both stayed. Merge `26a059be8` and `1f6ce476c` followed them, so the branch now has four commits over `feat/kolibri1`. The patch is the branch's plain diff, so the series is unaffected.
+- **The review fixes were not timed.** The 12 runs ran on `dd2040eaf`. `1f6ce476c`, `634e34bb4` and `4a4661220` came after them. In `git diff dd2040eaf ca32334bb`, `llama_expert_read_rows` and the remap's reads do not change, but no run measures that. The synchronize before each ubatch is a no-op for a decode, which is already synchronized before its next call. A prefill's wait moves ahead of its first split, and no run measures that either.
+- **The fork branch is not squashed.** The force-push that would have squashed `dbac35709` and `dd2040eaf` into one commit was denied, so both stayed. Merges `26a059be8` and `fcd9271a5`, `1f6ce476c` and `ca32334bb` followed them, so the branch now has six commits over `feat/kolibri1`. The patch is the branch's plain diff, so the series is unaffected.
 - **The alignment rationale for `F_NOCACHE` is unmeasured.** What XNU's cluster layer wants comes from its source as remembered. No arm isolates alignment: the benchmark measures one aligned read against three unaligned ones as a whole.
 - **Reads take the padded extent.** That is 4,096 bytes per expert more than the rows hold, on every miss.
 - **The load's identity check is no security boundary.** The reviewer's finding on `gguf_head`, that a table with a valid checksum could claim the whole model and force an allocation of tens of GB, was fixed in `1f6ce476c` after the runs (control M81, [upstream.md](upstream.md)). The table's checksum has no key, and `gguf_head` has no lower bound, so a crafted table can still pass the identity check. That stays as it is, because the side-file is a local file the user wrote.
@@ -578,12 +578,12 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4.json -out ~/models/eval/exp
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
 - The expert layers must be on the CPU or on a device that can use host memory in place (Metal); CUDA and the like are rejected.
-- Kolibri only. A LoRA on the routed experts is refused at load, since the matmuls read the slots and its delta would be left out; a LoRA on anything else, the router's input weight among them, works as without the cache. The experts must be in one file; the load refuses them otherwise.
+- Kolibri only. A LoRA on the routed experts is refused at load, since the matmuls read the slots and its delta would be left out; a LoRA on anything else, the router's input weight among them, works as without the cache. `--moe-cache-mib` with the cache is refused when the context is created. A draft model runs without the cache. The experts must be in one file; the load refuses them otherwise.
 - A ubatch of one token counts as decode, also in a prompt. In a prefill ubatch the last layer sees only the output rows, so the predictor's counts of that layer cover fewer tokens than the trace replays of Stage B.
 - LRU only. Layer budgets can be set with `--expert-cache-layers`, but nothing writes the Stage A allocation to such a file yet.
 - `-fit` does not know about the slot buffer.
 - libllama's INFO lines, including the cache's setup line, appear only with `-v`; the counters go to `--expert-cache-stats`.
 - Platforms:
-  - macOS opens the file again through `F_GETPATH` and reads it with `F_NOCACHE`;
+  - macOS opens the file again through `F_GETPATH`, refuses it if device and inode are not the loader's, and reads it with `F_NOCACHE`;
   - Linux reopens `/proc/self/fd/N`, without bypassing the page cache, and measures only the major faults;
   - other systems compile the cache but reject it at load time.

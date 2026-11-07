@@ -540,6 +540,10 @@ def main() -> None:
                 rs, rok = str(e), False
             report(resident.returncode == 0 and rok and resident.stdout == plain.stdout,
                    f"llama-completion --expert-cache-stats without the cache: decode timing only, same text ({rs if not rok else rs['decode']})")
+            # the MoE cache would take over the same matmuls, and the graph has one slot map for them
+            both = subprocess.run(base + ["--expert-cache", "16", "--moe-cache-mib", "8"], capture_output=True, text=True, errors="replace")
+            report(both.returncode != 0 and both.stdout.strip() == "" and "cannot serve one model" in both.stderr,
+                   f"llama-completion with --expert-cache and --moe-cache-mib exits {both.returncode} without generating, refused by name, no abort ({both.stderr[-200:] if both.returncode < 0 else 'no signal'})")
             # a LoRA on the experts the cache holds is refused; without the cache, or on what it does not hold, it applies
             for kind in ("gate", "up", "down"):
                 lora = Path(tmp) / f"lora-{kind}.gguf"
