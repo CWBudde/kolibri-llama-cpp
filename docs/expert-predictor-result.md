@@ -2,7 +2,7 @@
 
 No predictor built from recorded expert IDs passed the gate. Last-N reuse, a decayed-count Markov predictor and a trained linear predictor were replayed causally on held-out decode, over two horizons and three declared links, for IQ3 and Q8_0. None loaded fewer bytes or ran faster than the best simple cache policy at any of 10 budgets. Without its CPU cost, no Markov or linear variant is faster either; the gate's best case is equal, at 384 experts per layer. At runtime, prefetch passed one of three comparisons, at 16 GiB on p95 alone, by about 5%, with hardly fewer misses.
 
-The gap to the offline optimum is still large: on held-out decode at 128 experts per layer the best causal policy loads 2.20 to 2.54 times the bytes of Belady's MIN. Holding a step's experts together, as a server must, hardly changes that: 2.20 to 2.56 times. These predictors do not attack that gap. They prefetch into an LRU and leave its victim choice alone, and no predictor was tried as an eviction rule.
+The gap to the offline optimum is still large: on held-out decode at 128 experts per layer the best causal policy loads at least 2.71 to 3.09 times the bytes of a bound on that decode, which is Belady's MIN with the training prefix and every prefill free. Holding a step's experts together, as a server must, hardly changes that: 2.70 to 3.07 times. Against the schedule MIN picks for the whole trace, which pays for those too, it is 2.20 to 2.54 times. These predictors do not attack that gap. They prefetch into an LRU and leave its victim choice alone, and no predictor was tried as an eviction rule.
 
 This writes up Phases 10 and 11 with Zhang's reporting checklist ([arXiv 2608.07911](https://arxiv.org/pdf/2608.07911)). Every number comes from a file in this repo, named beside it. Stage E7 filled the checklist's gaps with one new replay of the same selection files, with the same rules, so the earlier tables keep their values; its tables are in [expert-policy.md](expert-policy.md), "Stage E7". A value marked "derived" is arithmetic on recorded values. Where this document says a number is not measured, the repo does not hold it. Those places are collected in [Not measured](#not-measured).
 
@@ -80,7 +80,7 @@ Baseline: last-N with n 1 covers 34.4% (0.4%) with 6.3 candidates, and with n 8 
 | Per-event replay | Done for every cache policy, the predictors and a step-pinned oracle, with step evictions counted, and the Stage B gate rerun with pinned references | Nothing on this list |
 | Decode-only hit rate | Reported apart from prefill for every cache policy and predictor, with a lifetime rate beside it | Nothing on this list |
 | Per-step union against capacity | Exact for decode, since a token needs six experts per layer, and measured as a distribution for prefill | Nothing on this list |
-| Belady gap | Per workload and pooled, held out, at every budget, against both oracles | The pooled oracle is a sum of per-workload oracles, not one over joined traces |
+| Belady gap | Per workload and pooled, held out, at every budget, against a bound on held-out decode and its step-pinned twin | The pooled oracle is a sum of per-workload oracles, not one over joined traces. The bound pays for no prefill, so at large budgets it says little about a schedule that does |
 
 ### Per-event replay
 
@@ -111,10 +111,10 @@ Q8_0's table in the same section shows the same pattern.
 |---|--:|--:|
 | Whole traces, IQ3 | 0.47% to 1.53% | 0.04% to 2.31% |
 | Whole traces, Q8_0 | 0.33% to 1.58% | 0.02% to 2.31% |
-| Held-out test suffixes, IQ3 | -0.10% to 0.78% | |
-| Held-out test suffixes, Q8_0 | -0.08% to 0.83% | |
+| Held-out test suffixes, IQ3, pinned against the held-out bound | 0.00% to 3.30% | |
+| Held-out test suffixes, Q8_0, pinned against the held-out bound | 0.00% to 3.05% | |
 
-At 384 they are equal. A held-out value can be negative because each oracle is built for its whole trace, not for the suffix. So the recorded gap does not overstate the gap to an event-atomic optimum by more than these margins.
+At 384 they are equal. The held-out rows are per workload, for 8 to 256 experts per layer, and compare the two oracles built for held-out decode alone ([Belady gap](#belady-gap)); pooled they are 0.00% to 2.59% and 0.00% to 2.33%. So the gap to the bound does not overstate the gap to an event-atomic optimum by more than these margins. An earlier version of this table compared slices of the whole-trace oracles, got -0.10% to 0.83%, and put the negative values down to those oracles being built for the whole trace. That was the sign the slices are no bound, and it is what the section below corrects.
 
 **A per-layer budget is different.** The pinned per-layer oracle loads 7.02% to 29.36% more decode bytes than the plain one on whole traces, for 8 to 256 per layer. That is not an atomic schedule below the unions in the next section: what does not fit is used once. The cause of the margin was not isolated. Candidates are the lost use-once at small budgets and a prefill that overflows the layer.
 
@@ -210,7 +210,9 @@ So a decoded step's union never exceeds a layer's capacity at any budget tested.
 
 ### Belady gap
 
-Decode on each workload's held-out suffix at 128 experts per layer. Best causal is the lowest MB/token among the causal rows of that table (ties on printed MB broken by hit rate). The ratio is derived from the printed, rounded MB/token.
+**A slice of the oracle is not a bound.** MIN minimizes the bytes of the whole replay. What one schedule loads in a phase or a test suffix bounds nothing, since a schedule can load more elsewhere to load less there. With room for one expert and A, B, A | B, whole-trace MIN misses B in the suffix, while a schedule with the same 3 misses overall misses nothing there (`TestHeldOutOracleWholeTraceSliceIsNoBound`). The review of this result raised the suffix; the phase is the same fault. So the tables in this section that compare with "Oracle, shared" compare with one hindsight schedule that pays for everything, and the bound on held-out decode is in the last table.
+
+Decode on each workload's held-out suffix at 128 experts per layer, against that schedule. Best causal is the lowest MB/token among the causal rows of that table (ties on printed MB broken by hit rate). The ratio is derived from the printed, rounded MB/token.
 
 | Model | Workload | Best causal | MB/token | Hit | Whole Top-6 sets | Oracle, shared †: MB/token | Hit | Whole Top-6 sets | Ratio | ssd ms/token, best causal against oracle |
 |---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
@@ -238,25 +240,33 @@ Source: [expert-policy.md](expert-policy.md), the "Held-out test suffix at 128 e
 | 128 | 49 (90.4%) / 22 (95.8%) | 32 (93.8%) / 13 (97.5%) | 31 (93.9%) / 13 (97.5%) | 30 (94.0%) / 12 (97.7%) | 2.23–2.50 | 2.28–2.59 |
 | 192 | 20 (96.0%) / 8 (98.5%) | 11 (97.8%) / 4 (99.1%) | 13 (97.5%) / 6 (98.8%) | 10 (98.0%) / 4 (99.3%) | 2.17–2.75 | 2.13–2.80 |
 
-Source: "Decode, MB/token (hit rate)" of each workload section. The oracle's bound is only on bytes: no cache of the budget, prefetching or not, loads fewer ([expert-policy.md](expert-policy.md), head).
+Source: "Decode, MB/token (hit rate)" of each workload section. The oracle's bound is on the bytes of the whole replay, both phases: no cache of the budget, prefetching or not, loads fewer ([expert-policy.md](expert-policy.md), head). Its decode column is one schedule's share of those.
 
-**Prefetch cannot close this gap in bytes.** It loads no fewer bytes than the misses it replaces, and can only hide their time ("Stage B: the decayed-count Markov predictor"). In the notes, 84.3–96.6% of Zhang's gap comes from knowing which resident expert is used furthest ahead, and a causal next-use predictor used as the eviction rule recovers −11.4% of it. He scopes that to residency and next-use prediction, not next-expert prefetch. Stage B is next-expert prefetch, so the two results are complementary rather than one confirming the other. **This repo has no causal next-use eviction predictor, so it has no result on victim prediction.**
+**Prefetch cannot close this gap in bytes over a whole replay.** It loads no fewer bytes than the misses it replaces, and can only hide their time ("Stage B: the decayed-count Markov predictor"). In the notes, 84.3–96.6% of Zhang's gap comes from knowing which resident expert is used furthest ahead, and a causal next-use predictor used as the eviction rule recovers −11.4% of it. He scopes that to residency and next-use prediction, not next-expert prefetch. Stage B is next-expert prefetch, so the two results are complementary rather than one confirming the other. **This repo has no causal next-use eviction predictor, so it has no result on victim prediction.**
 
-**Held out, at every budget, against both oracles.** All test suffixes together, decode, MB/token (hit rate) ([expert-policy.md](expert-policy.md), "The Belady gap on held-out decode, at every budget", which also has each workload and the per-layer oracles). Each oracle is built per workload, so this sums per-workload oracles and is not one oracle over joined traces. Best causal is one policy over all workloads, picked among unpinned and pinned ones alike, so LFU at 192 can evict within a step. The ratios are from unrounded bytes. At 384 both ratios are 1.00:
+**Held out, at every budget, against the bound.** All test suffixes together, decode, MB/token (hit rate) ([expert-policy.md](expert-policy.md), "The Belady gap on held-out decode, at every budget", which also has each workload and the per-layer oracles).
 
-| Experts per layer | IQ3 best causal | Oracle, shared † | Pinned † | Best / oracle | Best / pinned | Q8_0 best / oracle | Best / pinned |
-|--:|---|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer: 317 (37.9%) | 206 (59.6%) | 207 (59.4%) | 1.54 | 1.53 | 1.54 | 1.53 |
-| 16 | hotness, per layer: 234 (54.0%) | 143 (71.9%) | 144 (71.8%) | 1.63 | 1.63 | 1.63 | 1.63 |
-| 32 | SLRU, shared: 161 (68.3%) | 89 (82.6%) | 89 (82.5%) | 1.81 | 1.81 | 1.81 | 1.80 |
-| 48 | SLRU, shared: 121 (76.2%) | 61 (88.0%) | 61 (88.0%) | 1.99 | 1.98 | 1.98 | 1.98 |
-| 64 | SLRU, shared: 93 (81.7%) | 44 (91.4%) | 44 (91.3%) | 2.12 | 2.11 | 2.12 | 2.11 |
-| 96 | SLRU, shared: 57 (88.8%) | 25 (95.2%) | 25 (95.2%) | 2.34 | 2.32 | 2.34 | 2.32 |
-| 128 | SLRU, shared: 35 (93.1%) | 15 (97.1%) | 15 (97.1%) | 2.35 | 2.35 | 2.35 | 2.35 |
-| 192 | LFU: 13 (97.4%) | 5 (99.0%) | 5 (99.0%) | 2.59 | 2.57 | 2.64 | 2.62 |
-| 256 | SLRU, shared: 4 (99.3%) | 1 (99.8%) | 1 (99.8%) | 3.06 | 3.04 | 3.02 | 3.01 |
+- **Bound:** MIN with one objective, the decoded misses after the cut. The training prefix and every prefill cost nothing, so they only fill the cache, and an expert whose next use is free can be dropped for nothing. With one expert size, which both models have, no demand cache of the budget misses less in that decode, by `TestHeldOutOracleOptimal` against exhaustive search on small random traces: a test, not a proof. The replay also checks it against every cache policy and the whole-trace oracle, at every size and workload. A cache that prefetches in a prefill is not bound by it, since that costs decode nothing.
+- **Pinned:** the bound's objective, holding a step's experts together. Where every step fits it is an event-atomic schedule, so it bounds that optimum from above. It never loads more than the pinned whole-trace oracle's slice at any size (replay's PASS lines).
+- **Slice:** the whole-trace shared oracle's bytes in this decode, as in the tables above. It pays for its prefix and prefills, so Best / slice is the gap to a schedule that pays for everything, though not necessarily the one with the least decode.
 
-**From unrounded bytes, per workload at 128:** best causal against the plain oracle 2.25 (coding), 2.20 (research), 2.45 (hr) and 2.54 (medtech) on IQ3, and 2.25, 2.21, 2.43 and 2.54 on Q8_0. Against the pinned oracle 2.25, 2.20, 2.46, 2.55 and 2.25, 2.21, 2.43, 2.56. The per-workload table above derives its 2.1 to 2.6 from rounded MB/token.
+Each oracle is built per workload, so this sums per-workload oracles and is not one oracle over joined traces. Best causal is one policy over all workloads, picked among unpinned and pinned ones alike, so LFU at 192 can evict within a step. The ratios are from unrounded bytes. At 384 all ratios are 1.00:
+
+| Experts per layer | IQ3 best causal | Bound, shared † | Pinned † | Slice † | Best / bound | Best / pinned | Best / slice | Q8_0 best / bound | Best / pinned | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer: 317 (37.9%) | 206 (59.6%) | 207 (59.4%) | 206 (59.6%) | 1.54 | 1.53 | 1.54 | 1.54 | 1.53 | 1.54 |
+| 16 | hotness, per layer: 234 (54.0%) | 143 (71.9%) | 144 (71.8%) | 143 (71.9%) | 1.63 | 1.63 | 1.63 | 1.63 | 1.63 | 1.63 |
+| 32 | SLRU, shared: 161 (68.3%) | 89 (82.6%) | 89 (82.5%) | 89 (82.6%) | 1.82 | 1.81 | 1.81 | 1.82 | 1.81 | 1.81 |
+| 48 | SLRU, shared: 121 (76.2%) | 61 (88.1%) | 61 (88.1%) | 61 (88.0%) | 2.01 | 2.00 | 1.99 | 2.00 | 2.00 | 1.98 |
+| 64 | SLRU, shared: 93 (81.7%) | 43 (91.5%) | 43 (91.5%) | 44 (91.4%) | 2.16 | 2.15 | 2.12 | 2.16 | 2.15 | 2.12 |
+| 96 | SLRU, shared: 57 (88.8%) | 23 (95.5%) | 23 (95.5%) | 25 (95.2%) | 2.50 | 2.49 | 2.34 | 2.50 | 2.49 | 2.34 |
+| 128 | SLRU, shared: 35 (93.1%) | 12 (97.6%) | 12 (97.6%) | 15 (97.1%) | 2.85 | 2.83 | 2.35 | 2.85 | 2.83 | 2.35 |
+| 192 | LFU: 13 (97.4%) | 1 (99.7%) | 1 (99.7%) | 5 (99.0%) | 10.00 | 9.75 | 2.59 | 9.93 | 9.71 | 2.64 |
+| 256 | SLRU, shared: 4 (99.3%) | 0 (100.0%) | 0 (100.0%) | 1 (99.8%) | 20.48 | 20.48 | 3.06 | 20.32 | 20.32 | 3.02 |
+
+**What the correction moves.** Up to 32 per layer the slice is within 0.3% of the bound, pooled. Then the two part: 7% at 96, 21% at 128, 276 to 286% at 192 and about 570% at 256. The likely reason, which was not isolated: a cache this large holds nearly all of a decode's experts, so what remains is mostly what free prefills and a free state at the cut can supply. The ratios at 192 and 256 also rest on few bytes: 13 and 4 MB/token against 510 uncached, IQ3. **They do not say that an attainable schedule is 10 to 20 times better.** No cheapest schedule that pays for everything was computed, so the true gap lies between Best / slice and Best / bound. Since the bound is never above the slice, the earlier ratios understated the gap to the optimum on this decode, wherever they were read as that, and did not overstate it.
+
+**From unrounded bytes, per workload at 128:** best causal against the bound 2.74 (coding), 2.94 (research), 3.09 (hr) and 2.71 (medtech) on IQ3, and 2.75, 2.95, 3.09 and 2.71 on Q8_0. Against the pinned one 2.72, 2.91, 3.07, 2.70 and 2.72, 2.92, 3.07, 2.70. Against the slice 2.26, 2.20, 2.45, 2.54 and 2.25, 2.21, 2.43, 2.54. The per-workload table above derives its 2.1 to 2.6 from rounded MB/token.
 
 The notes do not define the denominator of Zhang's "44.2–45.9% gap", so it is not compared with these ratios.
 
@@ -294,19 +304,25 @@ Each of these is absent from the repo, and no estimate is given in its place. No
 3. Template diversity, which the notes list beside the four items PLAN names. The workloads have no within-class expert Jaccard or check for identical generated prefixes.
 4. Replays at the measured 13–14 GB/s, or with the cache's real step time.
 5. One oracle over the joined traces, as a pooled bound.
+6. The cheapest decode of a schedule that also pays for its prefix and prefills, which would close the bracket between Best / slice and Best / bound.
 
-Items 1, 3, 4 and 5 can be computed from the selection files under `~/models/eval/locality/`, which `cmd/kolibri-policy` reads, without loading a weight. They need new replay code or a new report. Item 2 needs a new predictor.
+Items 1, 3, 4, 5 and 6 can be computed from the selection files under `~/models/eval/locality/`, which `cmd/kolibri-policy` reads, without loading a weight. They need new replay code or a new report. Item 2 needs a new predictor.
 
 ## Reproduce
 
 ```sh
-go run ./cmd/kolibri-policy -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx,Kolibri-1-Q8_0 -out ~/models/eval/locality-e7 -md docs/expert-policy.md
+go run ./cmd/kolibri-policy -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx,Kolibri-1-Q8_0 -out ~/models/eval/locality-e7-heldout -md docs/expert-policy.md
 ```
 
-`-out` keeps a rerun from overwriting `policy-<model>.json` under `~/models/eval/locality/`. The Stage E7 run took about 12 minutes on the M5 Pro, with 88 PASS lines and `CHECK` lines reporting 0 of 12 retained per model on both gates. It changed `docs/expert-policy.md` by additions only, and rerunning it reproduced the report. Selection files are verified with `tools/locality/experts.py --verify`. Recording them needs the weights; replaying them does not. Tests are in `internal/locality` and `cmd/kolibri-policy`, for example `TestReplayCausal`, `TestTuneNoLeak`, `TestMarkovNoLeak`, `TestLinearNoLeak`, `TestStageBGate`, `TestPolicyOracleOptimal`, `TestPinnedOracleOptimal`, `TestStepUnionsMatchReplay` and `TestCheckPinnedRefs`.
+`-out` keeps a rerun from overwriting `policy-<model>.json` under `~/models/eval/locality/`. The Stage E7 run took about 12 minutes on the M5 Pro, with 96 PASS lines and `CHECK` lines reporting 0 of 12 retained per model on both gates. The first Stage E7 run, with 88 PASS lines and no held-out oracles, changed `docs/expert-policy.md` by additions only, and rerunning it reproduced the report. The run with them changes only "The Belady gap on held-out decode, at every budget" and adds to two lines of the head, what a row of the oracle means. Its results are under `~/models/eval/locality-e7-heldout/`, beside the earlier `locality-e7/`. Selection files are verified with `tools/locality/experts.py --verify`. Recording them needs the weights; replaying them does not. Tests are in `internal/locality` and `cmd/kolibri-policy`, for example `TestReplayCausal`, `TestTuneNoLeak`, `TestMarkovNoLeak`, `TestLinearNoLeak`, `TestStageBGate`, `TestPolicyOracleOptimal`, `TestPinnedOracleOptimal`, `TestHeldOutOracleOptimal`, `TestStepUnionsMatchReplay` and `TestCheckPinnedRefs`.
 
 **Controls.** Each makes its tests fail, and each was reverted:
 - M92: the pinned oracles ignore the pins (`TestPinnedOracleOptimal`: "trial 0, 1 experts: 8 step evictions").
 - M93: a union counts every selection instead of distinct experts (`TestStepUnions`: "prefill unions [4 4], want [3 2]").
 - M94: a pinned reference swapped back to the unpinned LFU (`TestCheckPinnedRefs`: "reference \"LFU\" has 7 step evictions").
 - M95: the pinned oracle keeps its use-once of an expert with no later use (`TestPinnedOracleOptimal`: "trial 0, 3 experts: the pinned oracle misses 9, the event-atomic optimum 12").
+- M99: every access costs the held-out oracle something, which is whole-trace MIN (`TestHeldOutOracleWholeTraceSliceIsNoBound`: "the held-out oracle misses 1 in the suffix, want 0").
+- M100: a test suffix's prefill costs it something (`TestHeldOutOracleOptimal`: "trial 3, 2 experts: the held-out oracle misses 2, the optimum 1").
+- M101: an expert whose next use is free ranks by that use (`TestHeldOutOracleWholeTraceSliceIsNoBound`: "the held-out oracle misses 1 in the suffix, want 0").
+- M102: the pinned held-out oracle does not pin a step when it starts (`TestPinnedHeldOutHoldsTheStep`: "evicted 1 of the running step to load 2").
+- M103: the replay's check leaves the cache policies out (`TestCheckHeldOut`: "a cache below the shared bound passes").

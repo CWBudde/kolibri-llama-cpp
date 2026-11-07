@@ -15,13 +15,13 @@ Every policy holds at most the same budget: the bytes of the given number of exp
 - **step-pinned LFU, ARC and layer LRU:** the policy, except that it never evicts an expert the running step has used. LFU loads an expert with its count before the step's use, so a later miss of the same step can evict it again; ARC's REPLACE may take a list's least recent expert while that list holds only the running step's; a layer LRU evicts them when a ubatch needs more experts than a layer holds. The step-pinned layer LRU is the per-layer SLRU below without a protected segment (Stage E1);
 - **SLRU:** the segmented LRU of llama.cpp's `--moe-cache-mib` (PR #29887): a loaded expert enters probation, a hit there promotes it to protected, which holds at most 0.5 of the budget and demotes its least recent expert to probation when full; victims come from probation's least recent end, from protected's only when probation has none. Per layer, of that many experts in every layer, and shared, of the whole budget for all layers, as upstream shares one per device (Stage E1);
 - **hotness:** the decayed hotness of llama.cpp's `--moe-stream` (PR #25294): every expert scores 1 per step that uses it, resident or not, halved every 512 tokens (a declared default, also tuned below); a load evicts the layer's resident expert of the lowest score, the least recent of equal ones. Per layer, as upstream keeps a slot pool per layer (Stage E1);
-- **oracle †:** Belady's MIN, per layer and shared: it knows every future step and drops the expert needed furthest ahead, the incoming one included. **It uses future knowledge and is an unattainable upper bound, not a policy a server can run.** With equal expert sizes no cache of the budget, prefetching or not, loads fewer bytes.
+- **oracle †:** Belady's MIN, per layer and shared: it knows every future step and drops the expert needed furthest ahead, the incoming one included. **It uses future knowledge and is an unattainable upper bound, not a policy a server can run.** With equal expert sizes no cache of the budget, prefetching or not, loads fewer bytes over the whole replay. A row for one phase or one test suffix is what that one schedule loads there and bounds nothing: "Stage E7" has the bound on held-out decode.
 
 Stage E1's policies never evict an expert the running step has used, as a server that runs a ubatch's or a token's experts of a layer together cannot; an expert that does not fit beside them is used once and not kept. **Step evictions** count the evictions of experts the running step has already used: a replay that counts them treats a step's experts as separate accesses (Zhang, arXiv 2608.07911).
 
 **Estimated time (an assumption, not a measurement).** Each load, missed or prefetched, goes over one link at a constant bandwidth, one after another: ssd 5 GB/s, pcie 25 GB/s, ram 100 GB/s, each estimated on its own. A step computes once all its experts have arrived, for the time the fully resident model takes on this Mac (`llama-bench` on Metal, [real-checkpoint.md](real-checkpoint.md)): 63.7 tokens/s decode, 1347/s prefill, 15.7 ms per decoded token. Until its experts arrive, it stalls. None of the baselines prefetches, so all their loads stall.
 
-**Held-out splits.** Each workload is split chronologically after one of its answers (`testdata/locality/splits.json`): chronological, per workload: train on the first floor(n/2) of its n answers, up to the last one's decoded tokens; test from the next request's prefill on. Tuning sees training prefixes only, leave-one-workload-out the other workloads' training prefixes. A test suffix is replayed warm, after its prefix, with whatever state the prefix's causal replay left behind, and only its own steps are counted. A policy at test time knows only the steps before it; the answers fix only the order of the spans. The oracle † is still built from the whole trace.
+**Held-out splits.** Each workload is split chronologically after one of its answers (`testdata/locality/splits.json`): chronological, per workload: train on the first floor(n/2) of its n answers, up to the last one's decoded tokens; test from the next request's prefill on. Tuning sees training prefixes only, leave-one-workload-out the other workloads' training prefixes. A test suffix is replayed warm, after its prefix, with whatever state the prefix's causal replay left behind, and only its own steps are counted. A policy at test time knows only the steps before it; the answers fix only the order of the spans. The oracle † is still built from the whole trace, so its test-suffix rows are a slice of a schedule chosen for the whole trace.
 
 | Workload | Answers | Training answers | First test token | Training decode tokens | Test decode tokens | Test prefill tokens |
 |---|--:|--:|--:|--:|--:|--:|
@@ -1625,157 +1625,157 @@ Q8_0:
 
 ### The Belady gap on held-out decode, at every budget
 
-The gap to both oracles on the test suffixes, warm from the training prefix. An oracle is built per workload from its whole trace, so the pooled table sums per-workload oracles: it is not one oracle over the joined traces. Best causal is the cache policy with the fewest bytes among those of this report, and in the pooled table it is one policy over all workloads. Ratios are from unrounded bytes.
+The gap to the oracles of the test suffixes' decode, warm from the training prefix. A held-out oracle counts a decoded token's misses after the cut and nothing else, so its training prefix and every prefill only fill the cache, and it drops an expert whose next use is free. With one expert size no demand cache of the budget misses less in that decode, the bound of these tables, by `TestHeldOutOracleOptimal` on small random traces: a test, not a proof. It is unattainable twice over: it knows the future, and it pays nothing for the rest of the trace, as no server does, which makes it loosest at large budgets, where free prefills fill the cache. A cache that prefetches in a prefill is not bound by it. The pinned one holds a step's experts together, and where every step fits it is a schedule a server could run if the rest were free, so it bounds the event-atomic optimum from above, as the bound does from below. Whole-trace oracle's slice is what the oracle of the sections above, which minimizes the bytes of the whole trace, loads in this decode: one schedule's bytes and no bound, but it pays for its prefix and prefills, so Best / slice is the gap to a schedule that pays for everything, though not necessarily the one with the least decode. An oracle is built per workload, so the pooled table sums per-workload oracles: it is not one oracle over the joined traces. Best causal is the cache policy with the fewest bytes among those of this report, and in the pooled table it is one policy over all workloads. Ratios are from unrounded bytes.
 
 IQ3_XXS-IQ4_XS-down-imx, all test suffixes together:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 317 (37.9%) | 206 (59.6%) | 207 (59.4%) | 1.54 | 1.53 | 220 (56.9%) | 264 (48.3%) |
-| 16 | hotness, per layer | 234 (54.0%) | 143 (71.9%) | 144 (71.8%) | 1.63 | 1.63 | 151 (70.3%) | 165 (67.7%) |
-| 32 | SLRU, shared | 161 (68.3%) | 89 (82.6%) | 89 (82.5%) | 1.81 | 1.81 | 94 (81.5%) | 101 (80.2%) |
-| 48 | SLRU, shared | 121 (76.2%) | 61 (88.0%) | 61 (88.0%) | 1.99 | 1.98 | 66 (87.1%) | 71 (86.0%) |
-| 64 | SLRU, shared | 93 (81.7%) | 44 (91.4%) | 44 (91.3%) | 2.12 | 2.11 | 48 (90.5%) | 53 (89.5%) |
-| 96 | SLRU, shared | 57 (88.8%) | 25 (95.2%) | 25 (95.2%) | 2.34 | 2.32 | 28 (94.5%) | 33 (93.6%) |
-| 128 | SLRU, shared | 35 (93.1%) | 15 (97.1%) | 15 (97.1%) | 2.35 | 2.35 | 17 (96.6%) | 21 (95.9%) |
-| 192 | LFU | 13 (97.4%) | 5 (99.0%) | 5 (99.0%) | 2.59 | 2.57 | 7 (98.7%) | 9 (98.3%) |
-| 256 | SLRU, shared | 4 (99.3%) | 1 (99.8%) | 1 (99.8%) | 3.06 | 3.04 | 2 (99.6%) | 3 (99.5%) |
-| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 317 (37.9%) | 206 (59.6%) | 207 (59.4%) | 1.54 | 1.53 | 220 (56.9%) | 264 (48.3%) | 206 (59.6%) | 1.54 |
+| 16 | hotness, per layer | 234 (54.0%) | 143 (71.9%) | 144 (71.8%) | 1.63 | 1.63 | 151 (70.4%) | 165 (67.7%) | 143 (71.9%) | 1.63 |
+| 32 | SLRU, shared | 161 (68.3%) | 89 (82.6%) | 89 (82.5%) | 1.82 | 1.81 | 94 (81.6%) | 101 (80.2%) | 89 (82.6%) | 1.81 |
+| 48 | SLRU, shared | 121 (76.2%) | 61 (88.1%) | 61 (88.1%) | 2.01 | 2.00 | 65 (87.3%) | 71 (86.1%) | 61 (88.0%) | 1.99 |
+| 64 | SLRU, shared | 93 (81.7%) | 43 (91.5%) | 43 (91.5%) | 2.16 | 2.15 | 47 (90.8%) | 53 (89.6%) | 44 (91.4%) | 2.12 |
+| 96 | SLRU, shared | 57 (88.8%) | 23 (95.5%) | 23 (95.5%) | 2.50 | 2.49 | 26 (94.9%) | 32 (93.7%) | 25 (95.2%) | 2.34 |
+| 128 | SLRU, shared | 35 (93.1%) | 12 (97.6%) | 12 (97.6%) | 2.85 | 2.83 | 15 (97.1%) | 20 (96.0%) | 15 (97.1%) | 2.35 |
+| 192 | LFU | 13 (97.4%) | 1 (99.7%) | 1 (99.7%) | 10.00 | 9.75 | 3 (99.4%) | 8 (98.4%) | 5 (99.0%) | 2.59 |
+| 256 | SLRU, shared | 4 (99.3%) | 0 (100.0%) | 0 (100.0%) | 20.48 | 20.48 | 0 (99.9%) | 1 (99.7%) | 1 (99.8%) | 3.06 |
+| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 |
 
 IQ3_XXS-IQ4_XS-down-imx, coding:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 333 (34.6%) | 222 (56.5%) | 223 (56.2%) | 1.50 | 1.49 | 235 (53.9%) | 279 (45.4%) |
-| 16 | SLRU, per layer | 257 (49.5%) | 159 (68.8%) | 160 (68.6%) | 1.62 | 1.61 | 167 (67.2%) | 182 (64.3%) |
-| 32 | SLRU, shared | 184 (63.9%) | 103 (79.8%) | 103 (79.7%) | 1.79 | 1.78 | 109 (78.7%) | 116 (77.3%) |
-| 48 | SLRU, shared | 142 (72.1%) | 74 (85.6%) | 74 (85.5%) | 1.94 | 1.93 | 78 (84.6%) | 85 (83.4%) |
-| 64 | SLRU, shared | 113 (77.7%) | 55 (89.2%) | 55 (89.1%) | 2.06 | 2.05 | 59 (88.4%) | 65 (87.3%) |
-| 96 | SLRU, shared | 73 (85.7%) | 32 (93.7%) | 32 (93.7%) | 2.26 | 2.25 | 36 (93.0%) | 41 (92.0%) |
-| 128 | SLRU, shared | 47 (90.7%) | 21 (95.9%) | 21 (95.9%) | 2.26 | 2.25 | 23 (95.5%) | 27 (94.7%) |
-| 192 | LFU | 19 (96.2%) | 7 (98.7%) | 7 (98.6%) | 2.83 | 2.77 | 9 (98.3%) | 12 (97.7%) |
-| 256 | SLRU, shared | 6 (98.9%) | 2 (99.5%) | 2 (99.5%) | 2.44 | 2.41 | 3 (99.4%) | 4 (99.2%) |
-| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 333 (34.6%) | 222 (56.5%) | 223 (56.3%) | 1.50 | 1.50 | 235 (53.9%) | 279 (45.4%) | 222 (56.5%) | 1.50 |
+| 16 | SLRU, per layer | 257 (49.5%) | 159 (68.8%) | 160 (68.6%) | 1.62 | 1.61 | 167 (67.2%) | 182 (64.2%) | 159 (68.8%) | 1.62 |
+| 32 | SLRU, shared | 184 (63.9%) | 103 (79.9%) | 103 (79.8%) | 1.80 | 1.79 | 108 (78.8%) | 116 (77.3%) | 103 (79.8%) | 1.79 |
+| 48 | SLRU, shared | 142 (72.1%) | 73 (85.7%) | 73 (85.6%) | 1.96 | 1.95 | 77 (84.8%) | 85 (83.4%) | 74 (85.6%) | 1.94 |
+| 64 | SLRU, shared | 113 (77.7%) | 54 (89.4%) | 54 (89.3%) | 2.10 | 2.09 | 58 (88.7%) | 64 (87.4%) | 55 (89.2%) | 2.06 |
+| 96 | SLRU, shared | 73 (85.7%) | 30 (94.1%) | 30 (94.0%) | 2.41 | 2.39 | 34 (93.4%) | 40 (92.2%) | 32 (93.7%) | 2.26 |
+| 128 | SLRU, shared | 47 (90.7%) | 17 (96.6%) | 17 (96.6%) | 2.74 | 2.72 | 20 (96.1%) | 26 (94.9%) | 21 (95.9%) | 2.26 |
+| 192 | LFU | 19 (96.2%) | 3 (99.4%) | 3 (99.4%) | 6.66 | 6.45 | 5 (99.0%) | 11 (97.8%) | 7 (98.7%) | 2.83 |
+| 256 | SLRU, shared | 6 (98.9%) | 0 (100.0%) | 0 (100.0%) | 57.66 | 57.66 | 0 (99.9%) | 3 (99.5%) | 2 (99.5%) | 2.44 |
+| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 |
 
 IQ3_XXS-IQ4_XS-down-imx, research:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 305 (40.1%) | 197 (61.4%) | 198 (61.2%) | 1.55 | 1.54 | 211 (58.7%) | 251 (50.7%) |
-| 16 | hotness, per layer | 221 (56.6%) | 135 (73.6%) | 135 (73.4%) | 1.64 | 1.63 | 142 (72.1%) | 155 (69.6%) |
-| 32 | SLRU, shared | 150 (70.5%) | 81 (84.1%) | 82 (84.0%) | 1.85 | 1.84 | 87 (83.0%) | 93 (81.8%) |
-| 48 | SLRU, shared | 111 (78.2%) | 56 (89.0%) | 56 (89.0%) | 1.99 | 1.98 | 61 (88.1%) | 66 (87.1%) |
-| 64 | SLRU, shared | 86 (83.2%) | 40 (92.1%) | 40 (92.1%) | 2.13 | 2.12 | 45 (91.2%) | 50 (90.2%) |
-| 96 | SLRU, shared | 53 (89.6%) | 24 (95.4%) | 24 (95.4%) | 2.25 | 2.25 | 27 (94.7%) | 31 (93.9%) |
-| 128 | SLRU, shared | 32 (93.7%) | 15 (97.1%) | 15 (97.1%) | 2.20 | 2.20 | 17 (96.7%) | 20 (96.0%) |
-| 192 | SLRU, shared | 12 (97.7%) | 4 (99.2%) | 4 (99.1%) | 2.68 | 2.67 | 6 (98.8%) | 8 (98.5%) |
-| 256 | SLRU, shared | 3 (99.5%) | 0 (99.9%) | 0 (99.9%) | 6.03 | 6.03 | 1 (99.8%) | 2 (99.6%) |
-| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 305 (40.1%) | 197 (61.4%) | 198 (61.2%) | 1.55 | 1.54 | 211 (58.7%) | 251 (50.7%) | 197 (61.4%) | 1.55 |
+| 16 | hotness, per layer | 221 (56.6%) | 135 (73.6%) | 135 (73.5%) | 1.64 | 1.64 | 142 (72.1%) | 155 (69.6%) | 135 (73.6%) | 1.64 |
+| 32 | SLRU, shared | 150 (70.5%) | 81 (84.1%) | 82 (84.0%) | 1.85 | 1.85 | 86 (83.1%) | 93 (81.8%) | 81 (84.1%) | 1.85 |
+| 48 | SLRU, shared | 111 (78.2%) | 55 (89.2%) | 56 (89.1%) | 2.01 | 2.00 | 60 (88.3%) | 65 (87.2%) | 56 (89.0%) | 1.99 |
+| 64 | SLRU, shared | 86 (83.2%) | 39 (92.3%) | 39 (92.3%) | 2.19 | 2.18 | 43 (91.5%) | 49 (90.4%) | 40 (92.1%) | 2.13 |
+| 96 | SLRU, shared | 53 (89.6%) | 20 (96.0%) | 21 (96.0%) | 2.59 | 2.57 | 24 (95.4%) | 31 (94.0%) | 24 (95.4%) | 2.25 |
+| 128 | SLRU, shared | 32 (93.7%) | 11 (97.9%) | 11 (97.8%) | 2.94 | 2.91 | 13 (97.4%) | 20 (96.1%) | 15 (97.1%) | 2.20 |
+| 192 | SLRU, shared | 12 (97.7%) | 0 (100.0%) | 0 (100.0%) | 113.78 | 113.78 | 2 (99.6%) | 7 (98.6%) | 4 (99.2%) | 2.68 |
+| 256 | SLRU, shared | 3 (99.5%) | 0 (100.0%) | 0 (100.0%) | 26.91 | 26.91 | 0 (100.0%) | 1 (99.8%) | 0 (99.9%) | 6.03 |
+| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 |
 
 IQ3_XXS-IQ4_XS-down-imx, hr:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 313 (38.6%) | 201 (60.6%) | 202 (60.3%) | 1.56 | 1.55 | 216 (57.7%) | 261 (48.9%) |
-| 16 | hotness, per layer | 227 (55.5%) | 137 (73.1%) | 138 (72.9%) | 1.65 | 1.64 | 146 (71.4%) | 159 (68.8%) |
-| 32 | hotness, per layer | 150 (70.5%) | 81 (84.1%) | 81 (84.1%) | 1.86 | 1.85 | 86 (83.1%) | 93 (81.8%) |
-| 48 | ARC, step-pinned | 107 (79.0%) | 52 (89.9%) | 52 (89.8%) | 2.07 | 2.05 | 57 (88.9%) | 61 (88.0%) |
-| 64 | SLRU, shared | 75 (85.2%) | 35 (93.0%) | 36 (93.0%) | 2.12 | 2.11 | 39 (92.3%) | 44 (91.4%) |
-| 96 | SLRU, shared | 45 (91.3%) | 19 (96.2%) | 20 (96.1%) | 2.31 | 2.25 | 22 (95.7%) | 27 (94.8%) |
-| 128 | SLRU, shared | 29 (94.4%) | 12 (97.7%) | 12 (97.7%) | 2.45 | 2.46 | 14 (97.2%) | 17 (96.6%) |
-| 192 | LFU | 12 (97.7%) | 5 (99.0%) | 5 (99.0%) | 2.25 | 2.24 | 7 (98.7%) | 8 (98.5%) |
-| 256 | SLRU, shared | 4 (99.2%) | 1 (99.7%) | 1 (99.7%) | 2.77 | 2.75 | 2 (99.5%) | 3 (99.5%) |
-| 384 | layer LRU | 0 (99.9%) | 0 (99.9%) | 0 (99.9%) | 1.00 | 1.00 | 0 (99.9%) | 0 (99.9%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 313 (38.6%) | 201 (60.6%) | 202 (60.4%) | 1.56 | 1.55 | 215 (57.8%) | 261 (48.9%) | 201 (60.6%) | 1.56 |
+| 16 | hotness, per layer | 227 (55.5%) | 137 (73.1%) | 138 (73.0%) | 1.65 | 1.65 | 145 (71.5%) | 159 (68.8%) | 137 (73.1%) | 1.65 |
+| 32 | hotness, per layer | 150 (70.5%) | 80 (84.3%) | 80 (84.3%) | 1.88 | 1.87 | 85 (83.3%) | 92 (81.9%) | 81 (84.1%) | 1.86 |
+| 48 | ARC, step-pinned | 107 (79.0%) | 51 (90.1%) | 51 (90.0%) | 2.11 | 2.11 | 55 (89.2%) | 61 (88.0%) | 52 (89.9%) | 2.07 |
+| 64 | SLRU, shared | 75 (85.2%) | 34 (93.3%) | 34 (93.3%) | 2.20 | 2.19 | 38 (92.6%) | 44 (91.4%) | 35 (93.0%) | 2.12 |
+| 96 | SLRU, shared | 45 (91.3%) | 18 (96.4%) | 18 (96.4%) | 2.45 | 2.45 | 21 (96.0%) | 26 (94.9%) | 19 (96.2%) | 2.31 |
+| 128 | SLRU, shared | 29 (94.4%) | 9 (98.2%) | 9 (98.2%) | 3.09 | 3.07 | 11 (97.8%) | 17 (96.7%) | 12 (97.7%) | 2.45 |
+| 192 | LFU | 12 (97.7%) | 1 (99.8%) | 1 (99.8%) | 9.81 | 9.68 | 3 (99.5%) | 7 (98.6%) | 5 (99.0%) | 2.25 |
+| 256 | SLRU, shared | 4 (99.2%) | 0 (99.9%) | 0 (99.9%) | 8.35 | 8.35 | 1 (99.9%) | 1 (99.8%) | 1 (99.7%) | 2.77 |
+| 384 | layer LRU | 0 (99.9%) | 0 (99.9%) | 0 (99.9%) | 1.00 | 1.00 | 0 (99.9%) | 0 (99.9%) | 0 (99.9%) | 1.00 |
 
 IQ3_XXS-IQ4_XS-down-imx, medtech:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 314 (38.5%) | 203 (60.2%) | 204 (60.1%) | 1.55 | 1.54 | 217 (57.4%) | 263 (48.4%) |
-| 16 | hotness, per layer | 225 (55.9%) | 141 (72.3%) | 142 (72.2%) | 1.59 | 1.59 | 149 (70.8%) | 162 (68.2%) |
-| 32 | hotness, per layer | 155 (69.7%) | 90 (82.4%) | 90 (82.4%) | 1.72 | 1.72 | 94 (81.5%) | 101 (80.2%) |
-| 48 | hotness, per layer | 116 (77.2%) | 62 (87.8%) | 62 (87.8%) | 1.87 | 1.87 | 66 (87.0%) | 72 (85.9%) |
-| 64 | hotness, per layer | 91 (82.2%) | 44 (91.4%) | 44 (91.3%) | 2.06 | 2.06 | 48 (90.5%) | 53 (89.5%) |
-| 96 | LFU | 55 (89.1%) | 22 (95.6%) | 23 (95.6%) | 2.48 | 2.45 | 27 (94.8%) | 31 (93.9%) |
-| 128 | LFU | 31 (93.9%) | 12 (97.6%) | 12 (97.6%) | 2.54 | 2.55 | 15 (97.0%) | 19 (96.3%) |
-| 192 | LFU | 9 (98.1%) | 4 (99.2%) | 4 (99.2%) | 2.35 | 2.37 | 5 (98.9%) | 7 (98.6%) |
-| 256 | SLRU, shared | 3 (99.5%) | 1 (99.9%) | 1 (99.9%) | 3.93 | 3.95 | 2 (99.7%) | 2 (99.6%) |
-| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 314 (38.5%) | 203 (60.2%) | 204 (60.1%) | 1.55 | 1.54 | 217 (57.4%) | 263 (48.4%) | 203 (60.2%) | 1.55 |
+| 16 | hotness, per layer | 225 (55.9%) | 141 (72.3%) | 142 (72.2%) | 1.59 | 1.59 | 149 (70.8%) | 162 (68.3%) | 141 (72.3%) | 1.59 |
+| 32 | hotness, per layer | 155 (69.7%) | 90 (82.4%) | 90 (82.4%) | 1.73 | 1.72 | 94 (81.5%) | 101 (80.3%) | 90 (82.4%) | 1.72 |
+| 48 | hotness, per layer | 116 (77.2%) | 62 (87.8%) | 62 (87.8%) | 1.87 | 1.87 | 66 (87.0%) | 71 (86.0%) | 62 (87.8%) | 1.87 |
+| 64 | hotness, per layer | 91 (82.2%) | 44 (91.4%) | 44 (91.4%) | 2.07 | 2.07 | 48 (90.6%) | 53 (89.6%) | 44 (91.4%) | 2.06 |
+| 96 | LFU | 55 (89.1%) | 22 (95.7%) | 22 (95.6%) | 2.50 | 2.49 | 26 (94.9%) | 31 (94.0%) | 22 (95.6%) | 2.48 |
+| 128 | LFU | 31 (93.9%) | 11 (97.8%) | 12 (97.7%) | 2.71 | 2.70 | 14 (97.3%) | 18 (96.4%) | 12 (97.6%) | 2.54 |
+| 192 | LFU | 9 (98.1%) | 1 (99.8%) | 1 (99.8%) | 9.36 | 9.17 | 3 (99.4%) | 7 (98.7%) | 4 (99.2%) | 2.35 |
+| 256 | SLRU, shared | 3 (99.5%) | 0 (100.0%) | 0 (100.0%) | 31.74 | 31.74 | 0 (99.9%) | 1 (99.8%) | 1 (99.9%) | 3.93 |
+| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 |
 
 Q8_0, all test suffixes together:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 779 (37.9%) | 506 (59.6%) | 509 (59.4%) | 1.54 | 1.53 | 541 (56.9%) | 648 (48.3%) |
-| 16 | hotness, per layer | 576 (54.0%) | 353 (71.8%) | 355 (71.7%) | 1.63 | 1.63 | 373 (70.3%) | 406 (67.6%) |
-| 32 | SLRU, shared | 397 (68.3%) | 219 (82.5%) | 220 (82.4%) | 1.81 | 1.80 | 232 (81.5%) | 249 (80.2%) |
-| 48 | SLRU, shared | 299 (76.1%) | 151 (88.0%) | 151 (87.9%) | 1.98 | 1.98 | 162 (87.1%) | 176 (86.0%) |
-| 64 | SLRU, shared | 230 (81.7%) | 108 (91.3%) | 109 (91.3%) | 2.12 | 2.11 | 119 (90.5%) | 131 (89.5%) |
-| 96 | SLRU, shared | 141 (88.7%) | 60 (95.2%) | 61 (95.1%) | 2.34 | 2.32 | 69 (94.5%) | 80 (93.6%) |
-| 128 | SLRU, shared | 86 (93.1%) | 37 (97.1%) | 37 (97.1%) | 2.35 | 2.35 | 43 (96.6%) | 51 (95.9%) |
-| 192 | LFU | 33 (97.4%) | 12 (99.0%) | 13 (99.0%) | 2.64 | 2.62 | 16 (98.7%) | 21 (98.3%) |
-| 256 | SLRU, shared | 9 (99.3%) | 3 (99.8%) | 3 (99.8%) | 3.02 | 3.01 | 5 (99.6%) | 6 (99.5%) |
-| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 779 (37.9%) | 506 (59.6%) | 509 (59.4%) | 1.54 | 1.53 | 541 (56.9%) | 648 (48.3%) | 506 (59.6%) | 1.54 |
+| 16 | hotness, per layer | 576 (54.0%) | 353 (71.8%) | 354 (71.7%) | 1.63 | 1.63 | 372 (70.3%) | 406 (67.6%) | 353 (71.8%) | 1.63 |
+| 32 | SLRU, shared | 397 (68.3%) | 219 (82.6%) | 219 (82.5%) | 1.82 | 1.81 | 231 (81.6%) | 248 (80.2%) | 219 (82.5%) | 1.81 |
+| 48 | SLRU, shared | 299 (76.1%) | 149 (88.1%) | 150 (88.0%) | 2.00 | 2.00 | 160 (87.2%) | 175 (86.0%) | 151 (88.0%) | 1.98 |
+| 64 | SLRU, shared | 230 (81.7%) | 106 (91.5%) | 107 (91.5%) | 2.16 | 2.15 | 116 (90.8%) | 130 (89.6%) | 108 (91.3%) | 2.12 |
+| 96 | SLRU, shared | 141 (88.7%) | 56 (95.5%) | 57 (95.5%) | 2.50 | 2.49 | 64 (94.9%) | 79 (93.7%) | 60 (95.2%) | 2.34 |
+| 128 | SLRU, shared | 86 (93.1%) | 30 (97.6%) | 31 (97.6%) | 2.85 | 2.83 | 36 (97.1%) | 50 (96.0%) | 37 (97.1%) | 2.35 |
+| 192 | LFU | 33 (97.4%) | 3 (99.7%) | 3 (99.7%) | 9.93 | 9.71 | 8 (99.4%) | 20 (98.4%) | 12 (99.0%) | 2.64 |
+| 256 | SLRU, shared | 9 (99.3%) | 0 (100.0%) | 0 (100.0%) | 20.32 | 20.32 | 1 (99.9%) | 3 (99.7%) | 3 (99.8%) | 3.02 |
+| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 |
 
 Q8_0, coding:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 820 (34.6%) | 545 (56.5%) | 549 (56.2%) | 1.50 | 1.49 | 579 (53.8%) | 685 (45.3%) |
-| 16 | SLRU, per layer | 633 (49.5%) | 392 (68.7%) | 394 (68.6%) | 1.62 | 1.61 | 412 (67.1%) | 449 (64.2%) |
-| 32 | SLRU, shared | 454 (63.8%) | 253 (79.8%) | 254 (79.7%) | 1.79 | 1.78 | 267 (78.7%) | 285 (77.2%) |
-| 48 | SLRU, shared | 351 (72.0%) | 181 (85.5%) | 182 (85.5%) | 1.94 | 1.93 | 193 (84.6%) | 209 (83.3%) |
-| 64 | SLRU, shared | 280 (77.6%) | 136 (89.2%) | 136 (89.1%) | 2.06 | 2.06 | 146 (88.4%) | 160 (87.3%) |
-| 96 | SLRU, shared | 179 (85.7%) | 79 (93.7%) | 80 (93.6%) | 2.26 | 2.25 | 88 (93.0%) | 100 (92.0%) |
-| 128 | SLRU, shared | 117 (90.7%) | 52 (95.9%) | 52 (95.9%) | 2.25 | 2.25 | 57 (95.5%) | 66 (94.7%) |
-| 192 | LFU | 48 (96.2%) | 17 (98.7%) | 17 (98.6%) | 2.89 | 2.83 | 21 (98.3%) | 29 (97.7%) |
-| 256 | SLRU, shared | 14 (98.9%) | 6 (99.5%) | 6 (99.5%) | 2.41 | 2.39 | 7 (99.4%) | 10 (99.2%) |
-| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 820 (34.6%) | 545 (56.5%) | 548 (56.3%) | 1.50 | 1.50 | 578 (53.9%) | 685 (45.3%) | 545 (56.5%) | 1.50 |
+| 16 | SLRU, per layer | 633 (49.5%) | 392 (68.7%) | 394 (68.6%) | 1.62 | 1.61 | 412 (67.1%) | 449 (64.2%) | 392 (68.7%) | 1.62 |
+| 32 | SLRU, shared | 454 (63.8%) | 253 (79.8%) | 254 (79.7%) | 1.79 | 1.78 | 266 (78.8%) | 286 (77.2%) | 253 (79.8%) | 1.79 |
+| 48 | SLRU, shared | 351 (72.0%) | 180 (85.7%) | 181 (85.6%) | 1.96 | 1.94 | 190 (84.8%) | 209 (83.4%) | 181 (85.5%) | 1.94 |
+| 64 | SLRU, shared | 280 (77.6%) | 133 (89.4%) | 134 (89.3%) | 2.10 | 2.10 | 142 (88.7%) | 159 (87.3%) | 136 (89.2%) | 2.06 |
+| 96 | SLRU, shared | 179 (85.7%) | 75 (94.1%) | 75 (94.0%) | 2.40 | 2.39 | 83 (93.4%) | 98 (92.2%) | 79 (93.7%) | 2.26 |
+| 128 | SLRU, shared | 117 (90.7%) | 42 (96.6%) | 43 (96.6%) | 2.75 | 2.72 | 49 (96.1%) | 64 (94.9%) | 52 (95.9%) | 2.25 |
+| 192 | LFU | 48 (96.2%) | 7 (99.4%) | 7 (99.4%) | 6.60 | 6.40 | 13 (99.0%) | 28 (97.7%) | 17 (98.7%) | 2.89 |
+| 256 | SLRU, shared | 14 (98.9%) | 0 (100.0%) | 0 (100.0%) | 57.32 | 57.32 | 1 (99.9%) | 7 (99.5%) | 6 (99.5%) | 2.41 |
+| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 |
 
 Q8_0, research:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 751 (40.1%) | 484 (61.4%) | 486 (61.2%) | 1.55 | 1.54 | 518 (58.7%) | 619 (50.7%) |
-| 16 | hotness, per layer | 545 (56.6%) | 332 (73.5%) | 333 (73.4%) | 1.64 | 1.63 | 351 (72.0%) | 382 (69.6%) |
-| 32 | SLRU, shared | 370 (70.5%) | 200 (84.0%) | 202 (83.9%) | 1.85 | 1.83 | 214 (83.0%) | 229 (81.7%) |
-| 48 | SLRU, shared | 274 (78.1%) | 138 (89.0%) | 138 (89.0%) | 1.99 | 1.98 | 149 (88.1%) | 162 (87.0%) |
-| 64 | SLRU, shared | 212 (83.1%) | 100 (92.1%) | 100 (92.0%) | 2.13 | 2.11 | 111 (91.2%) | 123 (90.2%) |
-| 96 | SLRU, shared | 131 (89.6%) | 58 (95.4%) | 58 (95.4%) | 2.25 | 2.26 | 67 (94.6%) | 77 (93.9%) |
-| 128 | SLRU, shared | 79 (93.7%) | 36 (97.1%) | 36 (97.1%) | 2.21 | 2.21 | 42 (96.7%) | 50 (96.0%) |
-| 192 | SLRU, shared | 28 (97.7%) | 10 (99.2%) | 10 (99.2%) | 2.74 | 2.71 | 14 (98.9%) | 19 (98.5%) |
-| 256 | SLRU, shared | 7 (99.5%) | 1 (99.9%) | 1 (99.9%) | 5.55 | 5.48 | 3 (99.7%) | 5 (99.6%) |
-| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 751 (40.1%) | 484 (61.4%) | 486 (61.2%) | 1.55 | 1.54 | 518 (58.7%) | 618 (50.7%) | 484 (61.4%) | 1.55 |
+| 16 | hotness, per layer | 545 (56.6%) | 332 (73.5%) | 333 (73.4%) | 1.64 | 1.63 | 350 (72.0%) | 381 (69.6%) | 332 (73.5%) | 1.64 |
+| 32 | SLRU, shared | 370 (70.5%) | 200 (84.0%) | 201 (84.0%) | 1.85 | 1.84 | 213 (83.0%) | 228 (81.8%) | 200 (84.0%) | 1.85 |
+| 48 | SLRU, shared | 274 (78.1%) | 136 (89.1%) | 137 (89.1%) | 2.01 | 2.00 | 147 (88.2%) | 161 (87.1%) | 138 (89.0%) | 1.99 |
+| 64 | SLRU, shared | 212 (83.1%) | 97 (92.3%) | 97 (92.3%) | 2.19 | 2.18 | 107 (91.5%) | 121 (90.3%) | 100 (92.1%) | 2.13 |
+| 96 | SLRU, shared | 131 (89.6%) | 51 (96.0%) | 51 (95.9%) | 2.59 | 2.57 | 58 (95.3%) | 75 (94.0%) | 58 (95.4%) | 2.25 |
+| 128 | SLRU, shared | 79 (93.7%) | 27 (97.9%) | 27 (97.8%) | 2.95 | 2.92 | 32 (97.4%) | 49 (96.1%) | 36 (97.1%) | 2.21 |
+| 192 | SLRU, shared | 28 (97.7%) | 0 (100.0%) | 0 (100.0%) | 103.72 | 103.72 | 5 (99.6%) | 18 (98.6%) | 10 (99.2%) | 2.74 |
+| 256 | SLRU, shared | 7 (99.5%) | 0 (100.0%) | 0 (100.0%) | 23.92 | 23.92 | 1 (100.0%) | 2 (99.8%) | 1 (99.9%) | 5.55 |
+| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 |
 
 Q8_0, hr:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 770 (38.6%) | 495 (60.5%) | 497 (60.3%) | 1.56 | 1.55 | 530 (57.7%) | 640 (48.9%) |
-| 16 | hotness, per layer | 558 (55.5%) | 338 (73.0%) | 339 (72.9%) | 1.65 | 1.64 | 358 (71.4%) | 392 (68.7%) |
-| 32 | hotness, per layer | 370 (70.5%) | 199 (84.1%) | 200 (84.0%) | 1.86 | 1.85 | 212 (83.1%) | 228 (81.8%) |
-| 48 | ARC, step-pinned | 264 (79.0%) | 128 (89.8%) | 128 (89.8%) | 2.06 | 2.05 | 140 (88.9%) | 151 (87.9%) |
-| 64 | SLRU, shared | 186 (85.2%) | 87 (93.0%) | 88 (93.0%) | 2.13 | 2.12 | 97 (92.2%) | 108 (91.4%) |
-| 96 | SLRU, shared | 109 (91.3%) | 47 (96.2%) | 49 (96.1%) | 2.30 | 2.24 | 54 (95.7%) | 65 (94.8%) |
-| 128 | SLRU, shared | 70 (94.4%) | 29 (97.7%) | 29 (97.7%) | 2.43 | 2.43 | 35 (97.2%) | 43 (96.6%) |
-| 192 | LFU | 29 (97.7%) | 13 (99.0%) | 13 (99.0%) | 2.27 | 2.26 | 16 (98.7%) | 19 (98.5%) |
-| 256 | SLRU, shared | 10 (99.2%) | 4 (99.7%) | 4 (99.7%) | 2.77 | 2.75 | 6 (99.5%) | 6 (99.5%) |
-| 384 | layer LRU | 1 (99.9%) | 1 (99.9%) | 1 (99.9%) | 1.00 | 1.00 | 1 (99.9%) | 1 (99.9%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 770 (38.6%) | 495 (60.5%) | 497 (60.4%) | 1.56 | 1.55 | 529 (57.8%) | 640 (48.9%) | 495 (60.5%) | 1.56 |
+| 16 | hotness, per layer | 558 (55.5%) | 338 (73.1%) | 339 (73.0%) | 1.65 | 1.65 | 358 (71.5%) | 391 (68.8%) | 338 (73.0%) | 1.65 |
+| 32 | hotness, per layer | 370 (70.5%) | 197 (84.3%) | 198 (84.2%) | 1.88 | 1.87 | 210 (83.3%) | 228 (81.8%) | 199 (84.1%) | 1.86 |
+| 48 | ARC, step-pinned | 264 (79.0%) | 125 (90.0%) | 125 (90.0%) | 2.11 | 2.10 | 136 (89.2%) | 151 (87.9%) | 128 (89.8%) | 2.06 |
+| 64 | SLRU, shared | 186 (85.2%) | 84 (93.3%) | 85 (93.3%) | 2.21 | 2.20 | 94 (92.5%) | 108 (91.4%) | 87 (93.0%) | 2.13 |
+| 96 | SLRU, shared | 109 (91.3%) | 45 (96.4%) | 45 (96.4%) | 2.45 | 2.44 | 51 (96.0%) | 64 (94.9%) | 47 (96.2%) | 2.30 |
+| 128 | SLRU, shared | 70 (94.4%) | 23 (98.2%) | 23 (98.2%) | 3.09 | 3.07 | 28 (97.8%) | 41 (96.7%) | 29 (97.7%) | 2.43 |
+| 192 | LFU | 29 (97.7%) | 3 (99.8%) | 3 (99.8%) | 9.88 | 9.75 | 6 (99.5%) | 17 (98.6%) | 13 (99.0%) | 2.27 |
+| 256 | SLRU, shared | 10 (99.2%) | 1 (99.9%) | 1 (99.9%) | 8.46 | 8.46 | 2 (99.9%) | 3 (99.8%) | 4 (99.7%) | 2.77 |
+| 384 | layer LRU | 1 (99.9%) | 1 (99.9%) | 1 (99.9%) | 1.00 | 1.00 | 1 (99.9%) | 1 (99.9%) | 1 (99.9%) | 1.00 |
 
 Q8_0, medtech:
 
-| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |
-|--:|---|--:|--:|--:|--:|--:|--:|--:|
-| 8 | hotness, per layer | 771 (38.5%) | 499 (60.2%) | 501 (60.0%) | 1.55 | 1.54 | 534 (57.4%) | 647 (48.4%) |
-| 16 | hotness, per layer | 552 (55.9%) | 347 (72.3%) | 348 (72.2%) | 1.59 | 1.59 | 366 (70.8%) | 399 (68.2%) |
-| 32 | hotness, per layer | 380 (69.7%) | 221 (82.4%) | 221 (82.3%) | 1.72 | 1.72 | 232 (81.5%) | 248 (80.2%) |
-| 48 | hotness, per layer | 287 (77.1%) | 153 (87.8%) | 153 (87.8%) | 1.87 | 1.87 | 163 (87.0%) | 177 (85.9%) |
-| 64 | hotness, per layer | 223 (82.2%) | 108 (91.3%) | 109 (91.3%) | 2.06 | 2.05 | 119 (90.5%) | 131 (89.5%) |
-| 96 | LFU | 136 (89.1%) | 55 (95.6%) | 56 (95.5%) | 2.47 | 2.44 | 65 (94.8%) | 77 (93.9%) |
-| 128 | LFU | 77 (93.9%) | 30 (97.6%) | 30 (97.6%) | 2.54 | 2.56 | 37 (97.0%) | 46 (96.3%) |
-| 192 | LFU | 23 (98.1%) | 10 (99.2%) | 10 (99.2%) | 2.39 | 2.43 | 13 (98.9%) | 17 (98.6%) |
-| 256 | SLRU, shared | 6 (99.5%) | 1 (99.9%) | 1 (99.9%) | 4.09 | 4.14 | 4 (99.7%) | 5 (99.6%) |
-| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) |
+| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | Best / slice |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 8 | hotness, per layer | 771 (38.5%) | 499 (60.2%) | 501 (60.0%) | 1.55 | 1.54 | 534 (57.4%) | 647 (48.4%) | 499 (60.2%) | 1.55 |
+| 16 | hotness, per layer | 552 (55.9%) | 347 (72.3%) | 348 (72.2%) | 1.59 | 1.59 | 366 (70.8%) | 398 (68.2%) | 347 (72.3%) | 1.59 |
+| 32 | hotness, per layer | 380 (69.7%) | 221 (82.4%) | 221 (82.4%) | 1.72 | 1.72 | 232 (81.5%) | 248 (80.2%) | 221 (82.4%) | 1.72 |
+| 48 | hotness, per layer | 287 (77.1%) | 153 (87.8%) | 153 (87.8%) | 1.87 | 1.87 | 163 (87.0%) | 176 (86.0%) | 153 (87.8%) | 1.87 |
+| 64 | hotness, per layer | 223 (82.2%) | 108 (91.4%) | 108 (91.4%) | 2.07 | 2.06 | 118 (90.6%) | 130 (89.6%) | 108 (91.3%) | 2.06 |
+| 96 | LFU | 136 (89.1%) | 55 (95.6%) | 55 (95.6%) | 2.49 | 2.48 | 64 (94.9%) | 75 (94.0%) | 55 (95.6%) | 2.47 |
+| 128 | LFU | 77 (93.9%) | 28 (97.7%) | 28 (97.7%) | 2.71 | 2.70 | 34 (97.3%) | 45 (96.4%) | 30 (97.6%) | 2.54 |
+| 192 | LFU | 23 (98.1%) | 2 (99.8%) | 3 (99.8%) | 9.41 | 9.27 | 7 (99.4%) | 16 (98.7%) | 10 (99.2%) | 2.39 |
+| 256 | SLRU, shared | 6 (99.5%) | 0 (100.0%) | 0 (100.0%) | 32.71 | 32.71 | 1 (99.9%) | 2 (99.9%) | 1 (99.9%) | 4.09 |
+| 384 | layer LRU | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 | 1.00 | 0 (100.0%) | 0 (100.0%) | 0 (100.0%) | 1.00 |
 
 ### The predictors' hit rates, bytes and step evictions
 
