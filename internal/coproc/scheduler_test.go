@@ -718,30 +718,39 @@ func TestQueueDropsSettledJobs(t *testing.T) {
 	})
 }
 
-// A closed request must be collectable while the scheduler lives on. The queue's backing array is
-// the one place that could keep it: a job taken off the head stays in the slot behind the slice.
+// A closed request must be collectable while the scheduler lives on. The queue could keep it in two
+// ways: as an entry, or in the slot a job was taken from, which stays behind the slice for as long
+// as later entries keep the backing array in use.
 func TestClosedRequestIsNotRetained(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, _ := setup(t, func(c *Config) { c.MaxRunning = 2 })
-		holder := open(t, s, "holder", &MockGenerator{})
-		must(t, holder, Execute{Job: "hold", Program: "manual"})
+		s, _ := setup(t, func(c *Config) { c.MaxRunning = 1 })
+		other := open(t, s, "other", &MockGenerator{})
+		must(t, other, Execute{Job: "hold", Program: "manual"})
 		synctest.Wait()
 
 		ref := func() weak.Pointer[Request] {
 			r := open(t, s, "r", &MockGenerator{})
 			must(t, r, Execute{Job: "dispatched", Program: "manual"})
-			synctest.Wait()
-			// The second slot is taken, so these two stay queued until Close.
+			must(t, other, Execute{Job: "next", Program: "manual"})
+			must(t, other, Execute{Job: "last", Program: "manual"})
+			publish(t, s, synctest.Wait, done(t, other, "hold", "x")) // takes "dispatched" off the head
+			wantJob(t, r, "dispatched", JobRunning)
 			must(t, r, Execute{Job: "queued", Program: "manual"})
-			must(t, r, Execute{Job: "queued too", Program: "manual"})
-			r.Close()
+			r.Close() // frees the slot for "next"
 			return weak.Make(r)
 		}()
+		synctest.Wait()
+		wantJob(t, other, "next", JobRunning)
+		s.mu.Lock()
+		left := len(s.queue)
+		s.mu.Unlock()
+		if left != 1 {
+			t.Fatalf("%d jobs queued, want \"last\" alone, which keeps the backing array in use", left)
+		}
 		runtime.GC()
 		if ref.Value() != nil {
 			t.Fatal("the scheduler still holds a closed request")
 		}
-		wantState(t, holder, Ready) // keeps the scheduler's other request in use up to here
 	})
 }
 
