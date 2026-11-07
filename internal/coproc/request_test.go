@@ -304,3 +304,29 @@ func TestRunStopsWhenTheRequestCloses(t *testing.T) {
 		wantErr(t, r.Apply(context.Background(), Continue{}).Err, ErrRequestClosed)
 	})
 }
+
+// Close can land between an action's gate and its critical section, where only applyWait can see
+// it. A waiter must then hear of the close: a retryable ErrNotReady makes Run report success for a
+// job that never finished.
+func TestWaitReportsAClosedRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		g := &blockingGen{release: make(chan struct{}), entered: make(chan struct{})}
+		r := open(t, s, "r", g)
+		must(t, r, Execute{Job: "a", Program: "manual"})
+		synctest.Wait()
+		ctx := context.Background()
+
+		// Any other state stays retryable.
+		token := make(chan Observation, 1)
+		go func() { token <- r.Apply(ctx, Continue{}) }()
+		<-g.entered
+		wantErr(t, r.applyWait(ctx, Wait{Job: "a"}).Err, ErrNotReady)
+		close(g.release)
+		<-token
+
+		r.Close()
+		wantErr(t, r.applyWait(ctx, Wait{Job: "a"}).Err, ErrRequestClosed)
+		wantErr(t, r.applyWait(ctx, Wait{Job: "nope"}).Err, ErrRequestClosed)
+	})
+}
