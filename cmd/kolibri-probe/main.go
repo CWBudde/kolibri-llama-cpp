@@ -6,7 +6,9 @@
 //	kolibri-probe report   -capture DIR [-dataset ...] [-folds 5] [-l2 0.01] [-shuffles 20] [-out DIR]
 //
 // tools/probe/capture.py writes the capture directory. report refuses a capture whose dataset,
-// activations or shape do not match its capture.json.
+// activations or shape do not match its capture.json, or that was not checked: see ReadCapture. It
+// never replaces a report. Flags that move a committed definition write report-deviation-*, which
+// says so at its top; only the committed definitions write report.md.
 package main
 
 import (
@@ -104,6 +106,6 @@ func verify(args []string) error {
 	if err := check(items); err != nil {
 		return err
 	}
-	fmt.Printf("PASS %d prompts: the oracle computes every expected answer from the prompt, and no template, seed or near-identical prompt spans two groups\n", len(items))
+	fmt.Printf("PASS %d prompts: the oracle reads every operation and computes every answer from the prompt, each refusal carries its partner's numbers, and no template, seed or sentence frame spans two groups\n", len(items))
 	return nil
 }

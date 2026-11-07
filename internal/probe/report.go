@@ -15,6 +15,7 @@ type Task struct {
 	Classes []string
 	Label   func(Item) int
 	Rule    func(Item) int // the fixed keyword rule's prediction
+	Surface func(Item) int // the surface rule's prediction
 }
 
 // TaskExecute is the binary gate: execute or not.
@@ -32,13 +33,20 @@ var TaskExecute = Task{
 		}
 		return 0
 	},
+	Surface: func(it Item) int {
+		if surfaceExecute(it.Prompt) {
+			return 1
+		}
+		return 0
+	},
 }
 
 // TaskFamily is the multiclass controller: which class of operation is needed.
 var TaskFamily = Task{
 	Name: "operation_family", Classes: Families,
-	Label: func(it Item) int { return slices.Index(Families, it.OperationFamily) },
-	Rule:  func(it Item) int { return slices.Index(Families, keywordFamily(it.Prompt)) },
+	Label:   func(it Item) int { return slices.Index(Families, it.OperationFamily) },
+	Rule:    func(it Item) int { return slices.Index(Families, keywordFamily(it.Prompt)) },
+	Surface: func(it Item) int { return slices.Index(Families, surfaceFamily(it.Prompt)) },
 }
 
 // foldKernels are one fold's precomputed inner products.
@@ -260,6 +268,34 @@ type Options struct {
 // DefaultOptions are the definitions of the smoke readout.
 var DefaultOptions = Options{Folds: 5, L2: 0.01, Shuffles: 20, Seed: Seed}
 
+// Deviations says how these options differ from the committed definitions; empty if they do not.
+func (o Options) Deviations() []string {
+	var out []string
+	d := DefaultOptions
+	if o.Folds != d.Folds {
+		out = append(out, fmt.Sprintf("folds %d (committed %d)", o.Folds, d.Folds))
+	}
+	if o.L2 != d.L2 {
+		out = append(out, fmt.Sprintf("L2 %g (committed %g)", o.L2, d.L2))
+	}
+	if o.Shuffles != d.Shuffles {
+		out = append(out, fmt.Sprintf("shuffles %d (committed %d)", o.Shuffles, d.Shuffles))
+	}
+	if o.Seed != d.Seed {
+		out = append(out, fmt.Sprintf("seed %d (committed %d)", o.Seed, d.Seed))
+	}
+	return out
+}
+
+// ReportName is the report's file name without its extension. Only the committed definitions give
+// plain "report", so that a report under that name is the committed one.
+func (o Options) ReportName() string {
+	if len(o.Deviations()) == 0 {
+		return "report"
+	}
+	return fmt.Sprintf("report-deviation-folds%d-l2%g-shuffles%d-seed%d", o.Folds, o.L2, o.Shuffles, o.Seed)
+}
+
 // Row is one line of a task's table.
 type Row struct {
 	Name     string    `json:"name"`
@@ -290,7 +326,11 @@ type Report struct {
 	Results []Row      `json:"results"`
 	Pilot   []PilotRow `json:"pilot"`
 	Caveats []string   `json:"caveats"`
-	Capture any        `json:"capture,omitempty"`
+	// Deviations are the options that differ from the committed definitions.
+	Deviations []string `json:"deviations,omitempty"`
+	// CaptureFacts are what the capture was checked against, for reading; Capture is all of it.
+	CaptureFacts []string `json:"capture_facts,omitempty"`
+	Capture      any      `json:"capture,omitempty"`
 }
 
 // Caveats every report carries. They are part of the result: nothing here supports a layer choice.
@@ -300,6 +340,7 @@ func caveatSmallSample(rows, groups int) string {
 
 var (
 	CaveatDecodable = "Decodability is not causal usefulness: a linear probe that reads a label from an activation shows that the information is there at that layer, not that the model uses it there, nor that injecting a result at that layer would change its behavior correctly. Only an intervention can show that, and this report runs none."
+	CaveatSurface   = "Surface cues: on these rows a digit and the absence of the refusal words (aber, ohne, but, without) give the execute label on 39 of 40 smoke rows, and a refusal is longer than its partner. The surface rule and the prompt length are in the tables, and a probe that does not beat them has shown nothing the text's surface does not show. Beating the bag of words is not enough, and the rule was written after seeing the rows. These rows cannot separate a probe that reads what a prompt asks from one that reads those cues."
 	CaveatPolicy    = "The labels are a policy (" + LabelPolicy + "): execute_expected says execution is helpful, not that it is strictly necessary; execution_need keeps the two apart."
 )
 
@@ -358,15 +399,16 @@ func evaluateFolds(rows []Item, layers []NamedMatrix, folds Folds, opt Options) 
 	for _, it := range rows {
 		groups[it.ParaphraseGroup] = true
 	}
-	rep := &Report{NRows: len(rows), NGroups: len(groups), Options: opt, Folds: folds,
-		Caveats: []string{caveatSmallSample(len(rows), len(groups)), CaveatDecodable, CaveatPolicy}}
+	rep := &Report{NRows: len(rows), NGroups: len(groups), Options: opt, Folds: folds, Deviations: opt.Deviations(),
+		Caveats: []string{caveatSmallSample(len(rows), len(groups)), CaveatDecodable, CaveatSurface, CaveatPolicy}}
+	length := kernelsOf(lengthFeature(rows), folds, len(rows))
 	bow := kernelsOf(BagOfWords{rows}, folds, len(rows))
 	for _, task := range []Task{TaskExecute, TaskFamily} {
 		k := len(task.Classes)
 		labels := make([]int, len(rows))
-		rule := make([]int, len(rows))
+		rule, surface := make([]int, len(rows)), make([]int, len(rows))
 		for i, it := range rows {
-			labels[i], rule[i] = task.Label(it), task.Rule(it)
+			labels[i], rule[i], surface[i] = task.Label(it), task.Rule(it), task.Surface(it)
 		}
 		maj := make([]int, len(rows))
 		for _, test := range folds {
@@ -386,7 +428,14 @@ func evaluateFolds(rows []Item, layers []NamedMatrix, folds Folds, opt Options) 
 		}
 		rep.Results = append(rep.Results,
 			Row{Name: "majority", Kind: "baseline", Task: task.Name, Metrics: scores(rows, labels, maj, nil, task)},
-			Row{Name: "keyword rule", Kind: "baseline", Task: task.Name, Metrics: scores(rows, labels, rule, nil, task)})
+			Row{Name: "keyword rule", Kind: "baseline", Task: task.Name, Metrics: scores(rows, labels, rule, nil, task)},
+			Row{Name: "surface rule", Kind: "baseline", Task: task.Name, Metrics: scores(rows, labels, surface, nil, task)})
+		byLength, err := crossValidate(length, labels, k, opt.L2)
+		if err != nil {
+			return nil, fmt.Errorf("prompt length, %s: %w", task.Name, err)
+		}
+		rep.Results = append(rep.Results, Row{Name: "prompt length", Kind: "baseline", Task: task.Name,
+			Metrics: scores(rows, labels, byLength.pred, byLength.prob, task), Unconverged: byLength.unconverge})
 		oof, err := crossValidate(bow, labels, k, opt.L2)
 		if err != nil {
 			return nil, fmt.Errorf("bag of words, %s: %w", task.Name, err)
@@ -447,6 +496,9 @@ func opt3(p *float64) string {
 func (r *Report) Markdown() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Layer probe readout\n\n**Result: pipeline validation on %d rows in %d paraphrase groups, %d grouped folds. It selects no layer.**\n\n", r.NRows, r.NGroups, r.Options.Folds)
+	if len(r.Deviations) > 0 {
+		fmt.Fprintf(&b, "**These are not the committed definitions: %s.**\n\n", strings.Join(r.Deviations, ", "))
+	}
 	for _, c := range r.Caveats {
 		fmt.Fprintf(&b, "- %s\n", c)
 	}
@@ -470,6 +522,12 @@ func (r *Report) Markdown() string {
 			if row.Unconverged > 0 {
 				fmt.Fprintf(&b, "| %s: %d folds did not converge | | | | | | | | | | | |\n", row.Name, row.Unconverged)
 			}
+		}
+	}
+	if len(r.CaptureFacts) > 0 {
+		b.WriteString("\n## Capture\n\n")
+		for _, f := range r.CaptureFacts {
+			fmt.Fprintf(&b, "- %s\n", f)
 		}
 	}
 	if len(r.Pilot) > 0 {

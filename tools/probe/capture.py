@@ -42,6 +42,9 @@ DEFAULT_DATASET = ROOT / "testdata" / "probe" / "smoke.jsonl"
 # token is where the answer starts: the point of the execute decision. A definition: see the doc.
 DEFAULT_REASONING = "none"
 PILOT_REPEATS = 4
+# build_norm of the post-FFN norm, as the graph holds it, from the l_out add down
+POST_FFN_OPS = ["MUL", "RMS_NORM", "ADD"]
+POST_FFN_WEIGHT = "post_ffw_norm.weight"
 
 
 def sha256_file(path: Path) -> str:
@@ -118,6 +121,7 @@ class Capture:
         self.want: set[str] = set()
         self.parts: dict[str, list] = {}
         self.nodes: dict[str, list[list[str]]] = {}
+        self.post_ffn: dict[str, dict] = {}
         self.record_nodes = False
 
         @self.ffi.callback("bool(struct ggml_tensor *, bool, void *)")
@@ -127,6 +131,8 @@ class Capture:
                 if self.record_nodes:
                     srcs = [self.ffi.string(s.name).decode() for s in t.src if s != self.ffi.NULL]
                     self.nodes.setdefault(name, []).append(srcs)
+                    if name in self.want:
+                        self.post_ffn[name] = self._post_ffn(t)
                 return name in self.want
             if name in self.want:
                 self._on_read(t, name)
@@ -161,6 +167,26 @@ class Capture:
         if part.shape[0] != 1 or part.shape[1] != 1 or part.shape[3] != self.n_embd:
             raise RuntimeError(f"{name}: shape {part.shape}, want [1, 1, n_rows, {self.n_embd}]")
         self.parts[name].append(part[0, 0])
+
+    def _post_ffn(self, l_out) -> dict:
+        """The residual sum's first source, walked by pointer, since those nodes have no names of their
+        own: the weight's multiply, the RMS norm under it and the sum of the experts under that."""
+        names = lambda t: [self.ffi.string(s.name).decode() for s in t.src if s != self.ffi.NULL]
+        ops, weight, norm, experts = [], None, None, None
+        t = l_out.src[0]
+        for depth in range(3):
+            if t == self.ffi.NULL:
+                break
+            ops.append(self.ffi.string(self.lib.ggml_op_name(t.op)).decode())
+            srcs = names(t)
+            if depth == 0:
+                weight = srcs[1] if len(srcs) > 1 else None
+            elif depth == 1:
+                norm = self.ffi.string(t.name).decode()
+            else:
+                experts = srcs
+            t = t.src[0]
+        return {"ops": ops, "weight": weight, "norm": norm, "experts": experts}
 
     def tokenize(self, text: str) -> list[int]:
         raw = text.encode()
@@ -239,31 +265,41 @@ class Capture:
         return logits, {n: r[-1] for n, r in rows.items()}
 
     def check_graph(self, tokens: list[int], layers: list[int]) -> dict:
-        """What the numbering rests on, read from this model's graph: a layer's l_out is the residual
-        add of ffn_inp and the post-FFN norm, feeds the next block's first norm, and the last one
-        feeds output_norm. Any other wiring refuses the capture."""
+        """Reads this model's graph during one decode and checks it with check_wiring."""
         self.record_nodes = True
-        self.nodes = {}
+        self.nodes, self.post_ffn = {}, {}
         try:
             self.capture(tokens, layers)
         finally:
             self.record_nodes = False
-        out = {}
-        for n in layers:
-            il, name = n - 1, node_for_layer(n)
-            srcs = self.nodes.get(name)
-            if not srcs or len(srcs[-1]) != 2 or srcs[-1][1] != f"ffn_inp-{il}":
-                raise SystemExit(f"layer {n}: {name} <- {srcs}, want the post-FFN norm and ffn_inp-{il}")
-            following = f"norm-{il + 1}" if il + 1 < self.n_layer else "norm"
-            if [name] not in self.nodes.get(following, []):
-                raise SystemExit(f"layer {n}: {following} <- {self.nodes.get(following)}, does not read {name}")
-            out[name] = {"sources": srcs[-1], "read_by": following}
-        return out
+        return check_wiring(self.nodes, self.post_ffn, layers, self.n_layer)
 
     def close(self) -> None:
         self.lib.llama_free(self.ctx)
         self.lib.llama_batch_free(self.batch)
         self.lib.llama_model_free(self.model)
+
+
+def check_wiring(nodes: dict, post_ffn: dict, layers: list[int], n_layer: int) -> dict:
+    """What the numbering and the normalization rest on: a layer's l_out is the residual add of
+    ffn_inp and post_ffw_norm(routed + shared experts), feeds the next block's first norm, and the
+    last one feeds output_norm. Any other wiring refuses the capture."""
+    out = {}
+    for n in layers:
+        il, name = n - 1, node_for_layer(n)
+        srcs = nodes.get(name)
+        if not srcs or len(srcs[-1]) != 2 or srcs[-1][1] != f"ffn_inp-{il}":
+            raise SystemExit(f"layer {n}: {name} <- {srcs}, want the post-FFN norm and ffn_inp-{il}")
+        norm = post_ffn.get(name)
+        want = {"ops": POST_FFN_OPS, "weight": f"blk.{il}.{POST_FFN_WEIGHT}", "norm": f"norm-{il}",
+                "experts": [f"ffn_moe_out-{il}", f"ffn_shexp_out-{il}"]}
+        if norm != want:
+            raise SystemExit(f"layer {n}: {name}'s first source is {norm}, want the post-FFN norm {want}")
+        following = f"norm-{il + 1}" if il + 1 < n_layer else "norm"
+        if [name] not in nodes.get(following, []):
+            raise SystemExit(f"layer {n}: {following} <- {nodes.get(following)}, does not read {name}")
+        out[name] = {"sources": srcs[-1], "post_ffn": norm, "read_by": following}
+    return out
 
 
 def git_head(path: Path) -> str | None:
@@ -404,8 +440,9 @@ def run(args, mutate_node: str | None = None) -> int:
     if repeatable is False:
         print("FAIL a repeated decode differs")
         return 1
-    print(f"PASS captured {len(rows)} prompts at layers {layers}; logits {manifest['logits_check']} against a context "
-          f"without a callback; repeat {repeatable}; {args.out}")
+    checked = manifest["logits_check"] == "equal" and repeatable is True
+    print(f"{'PASS' if checked else 'UNCHECKED, kolibri-probe report refuses it:'} captured {len(rows)} prompts at layers {layers}; "
+          f"logits {manifest['logits_check']} against a context without a callback; repeat {repeatable}; {args.out}")
     return 0
 
 
@@ -422,8 +459,8 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=10)
     ap.add_argument("--expert-cache", type=int, default=0, help="expert cache slots per layer, 0 for resident experts")
     ap.add_argument("--reasoning", default=DEFAULT_REASONING, help="reasoning_effort for the template, or 'default' to leave it unset")
-    ap.add_argument("--repeat", action=argparse.BooleanOptionalAction, default=True, help="decode the first prompts again and compare")
-    ap.add_argument("--skip-logits-check", action="store_true", help="no decode without a callback; capture.json says skipped")
+    ap.add_argument("--repeat", action=argparse.BooleanOptionalAction, default=True, help="decode the first prompts again and compare; without it, kolibri-probe report refuses the capture")
+    ap.add_argument("--skip-logits-check", action="store_true", help="no decode without a callback; capture.json says skipped, and kolibri-probe report refuses it")
     args = ap.parse_args()
     args.model = args.model.expanduser()
     return run(args)

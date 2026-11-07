@@ -19,8 +19,11 @@ reads 10,25,40,50, and the 50-layer -pattern model reads the real ones.
 
 Controls: M77, a capture that writes into a node, changes the logits, and the check and kolibri-probe
 report catch it. M79, zero-based numbering for the issue's layers, is refused by the graph check, and
-by the missing node at the last layer. M75, M76 and M78 are Go tests in internal/probe. The capture
-prints its own FAIL line for M77, which is the control working; the check's result is its last line.
+by the missing node at the last layer. M87, a graph whose residual add lacks the post-FFN norm, is
+refused by the check, and by the report from capture.json. M88, a capture that was not checked, gets
+no report, also if it wrote into a node. M75, M76 and M78 are Go tests in internal/probe. The capture
+prints its own FAIL line for M77 and an UNCHECKED line for M88, which is the controls working; the
+check's result is its last line.
 
     check_capture.py --llama-cpp third_party/llama.cpp
 """
@@ -98,8 +101,9 @@ def main() -> int:
                 plain.close()
                 c = session(gguf, device)
                 graph = c.check_graph(prompts[0], layers)
-                report(set(graph) == {"l_out-1", "l_out-2", "l_out-4", "l_out-5"} and graph["l_out-5"]["read_by"] == "norm",
-                       f"{what}: the graph reads as documented: l_out-(N-1) is the residual add; the last one feeds output_norm")
+                report(set(graph) == {"l_out-1", "l_out-2", "l_out-4", "l_out-5"} and graph["l_out-5"]["read_by"] == "norm"
+                       and graph["l_out-5"]["post_ffn"]["norm"] == "norm-5",
+                       f"{what}: the graph reads as documented: l_out-(N-1) is the residual add with the post-FFN norm; the last one feeds output_norm")
                 got = [c.capture(p, layers) for p in prompts]
                 report(all(np.array_equal(b, g[0]) for b, g in zip(base, got)),
                        f"{what}: capture at {layers}, {len(prompts)} prompts: logits exactly those without a callback")
@@ -175,6 +179,21 @@ def main() -> int:
                 report(True, f"M79: zero-based numbering of {label} is refused: {e}")
         c.close()
         cap.node_for_layer = right
+
+        # control M87: the wiring as a rebase could leave it, on what the real graph recorded
+        c = session(tiny, "CPU")
+        c.check_graph(prompts[0], layers)
+        real_nodes, real_norm = c.nodes, c.post_ffn
+        c.close()
+        wrong = {"no post-FFN norm": {"ops": ["ADD", "MUL", "RMS_NORM"], "weight": "ffn_shexp_out-1", "norm": None, "experts": ["ffn_moe_out-1", "node_9"]},
+                 "another block's norm": real_norm["l_out-1"] | {"weight": "blk.4.post_ffw_norm.weight"},
+                 "only the routed experts": real_norm["l_out-1"] | {"experts": ["ffn_moe_out-1", "node_9"]}}
+        for label, norm in wrong.items():
+            try:
+                cap.check_wiring(real_nodes, real_norm | {"l_out-1": norm}, layers, 6)
+                report(False, f"M87: {label} passed the graph check")
+            except SystemExit as e:
+                report("post-FFN norm" in str(e), f"M87: {label} is refused by the graph check")
         try:
             cap.parse_layers("0,6", 6)
             report(False, "M79: layer 0 passed")
@@ -222,6 +241,29 @@ def main() -> int:
         report(m["n_ubatch_effective"] == 3 and m["expert_cache_slots"] == SLOTS and m["logits_check"] == "equal" and m["repeatable"] is True,
                "capture.json records the capped ubatch, the slots, the logits check and the repeat")
         report(probe_report(cached).returncode == 0, "kolibri-probe report reads that capture")
+
+        # control M87, the report's side: it reads what the graph check found
+        no_norm = tmpdir / "no-norm"
+        shutil.copytree(out, no_norm)
+        (no_norm / "report.md").unlink()
+        (no_norm / "report.json").unlink()
+        m = json.loads((no_norm / "capture.json").read_text())
+        m["graph_check"]["l_out-5"]["post_ffn"]["ops"] = ["ADD", "MUL", "RMS_NORM"]
+        (no_norm / "capture.json").write_text(json.dumps(m))
+        p = probe_report(no_norm)
+        report(p.returncode != 0 and "post-FFN norm" in p.stderr, "M87: kolibri-probe report refuses a capture whose graph lacks the post-FFN norm")
+        shutil.rmtree(no_norm)
+
+        # control M88: a capture that was not checked gets no report, also if it wrote into a node
+        unchecked = tmpdir / "unchecked"
+        report(cap.run(namespace(unchecked, skip_logits_check=True), mutate_node="l_out-2") == 0,
+               "M88: --skip-logits-check lets a capture that writes into a node through the capture")
+        p = probe_report(unchecked)
+        report(p.returncode != 0 and "logits_check skipped" in p.stderr, "M88: kolibri-probe report refuses that capture")
+        norepeat = tmpdir / "norepeat"
+        report(cap.run(namespace(norepeat, repeat=False)) == 0, "M88: --no-repeat captures")
+        p = probe_report(norepeat)
+        report(p.returncode != 0 and "no repeated decode ran" in p.stderr, "M88: kolibri-probe report refuses a capture without a repeat")
 
         # control M77: a capture that writes into the graph
         mutated = tmpdir / "mutated"

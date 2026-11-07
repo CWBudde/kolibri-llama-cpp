@@ -2,6 +2,7 @@ package probe
 
 import (
 	"math"
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -155,4 +156,34 @@ func keywordFamily(prompt string) string {
 		return FamilyAlgorithm
 	}
 	return FamilyNone
+}
+
+// The surface rule, the bar a probe must clear on this dataset: a digit, and none of the words the
+// refusals turn on. Written after seeing the rows, and it gets 39 of the 40 smoke rows, so most of
+// the execute label can be read off two cues that have nothing to do with what a prompt means.
+var (
+	surfaceDigitRe   = regexp.MustCompile(`\d`)
+	surfaceRefusalRe = regexp.MustCompile(`(?i)\b(?:aber|ohne|but|without)\b`)
+)
+
+func surfaceExecute(prompt string) bool {
+	return surfaceDigitRe.MatchString(prompt) && !surfaceRefusalRe.MatchString(prompt)
+}
+
+// surfaceFamily is the fixed keyword rule behind the surface rule's gate.
+func surfaceFamily(prompt string) string {
+	if !surfaceExecute(prompt) {
+		return FamilyNone
+	}
+	return keywordFamily(prompt)
+}
+
+// lengthFeature is each row's prompt length, the other surface cue: a refusal says more than the
+// computation it pairs with. The same classifier reads it, as one feature.
+func lengthFeature(items []Item) Matrix {
+	m := Matrix{Rows: len(items), Dim: 1, Data: make([]float32, len(items))}
+	for i, it := range items {
+		m.Data[i] = float32(len([]rune(it.Prompt)))
+	}
+	return m
 }

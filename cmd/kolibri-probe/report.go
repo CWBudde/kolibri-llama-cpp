@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"kolibri-llm/internal/probe"
 )
@@ -16,7 +17,7 @@ func report(args []string) error {
 	folds := fs.Int("folds", probe.DefaultOptions.Folds, "grouped cross-validation folds")
 	l2 := fs.Float64("l2", probe.DefaultOptions.L2, "L2 strength")
 	shuffles := fs.Int("shuffles", probe.DefaultOptions.Shuffles, "shuffled-label runs per probe")
-	out := fs.String("out", "", "write report.md and report.json here (default: the capture directory)")
+	out := fs.String("out", "", "write the report here (default: the capture directory)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -44,27 +45,53 @@ func report(args []string) error {
 		named = append(named, probe.NamedMatrix{Name: fmt.Sprintf("layer-%d", l.Layer.OneBased), Matrix: l.Matrix})
 	}
 	opt := probe.Options{Folds: *folds, L2: *l2, Shuffles: *shuffles, Seed: probe.Seed}
+	dir := *out
+	if dir == "" {
+		dir = *capture
+	}
+	base := filepath.Join(dir, opt.ReportName())
+	for _, ext := range []string{".md", ".json"} {
+		if _, err := os.Stat(base + ext); err == nil {
+			return fmt.Errorf("%s already exists, and a report must not replace another: move it away to report again", base+ext)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
 	rep, err := probe.Evaluate(items, named, opt)
 	if err != nil {
 		return err
 	}
 	rep.Capture = c.Raw
-	dir := *out
-	if dir == "" {
-		dir = *capture
-	}
+	rep.CaptureFacts = c.Facts()
 	js, err := rep.JSON()
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "report.json"), js, 0o644); err != nil {
+	if err := writeNew(base+".json", js); err != nil {
 		return err
 	}
 	md := rep.Markdown()
-	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte(md), 0o644); err != nil {
+	if err := writeNew(base+".md", []byte(md)); err != nil {
 		return err
 	}
 	fmt.Print(md)
-	fmt.Printf("\nPASS report on %d rows in %d groups: %s\n", rep.NRows, rep.NGroups, filepath.Join(dir, "report.md"))
+	if len(rep.Deviations) > 0 {
+		fmt.Printf("\nDEVIATION report on %d rows in %d groups, not the committed definitions (%s): %s.md\n", rep.NRows, rep.NGroups, strings.Join(rep.Deviations, ", "), base)
+		return nil
+	}
+	fmt.Printf("\nPASS report on %d rows in %d groups: %s.md\n", rep.NRows, rep.NGroups, base)
 	return nil
+}
+
+// writeNew writes a file that must not exist yet.
+func writeNew(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

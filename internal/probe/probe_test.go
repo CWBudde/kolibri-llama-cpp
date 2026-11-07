@@ -302,14 +302,83 @@ func TestBaselines(t *testing.T) {
 	}
 	// the learned words have only the training groups to learn from, so all this asks is that they
 	// see something; how they compare with the rule is a result, not a property
-	if bow := get("execute", "bag of words").Metrics; bow.BalancedAccuracy <= 0.5 {
+	bow := get("execute", "bag of words").Metrics
+	if bow.BalancedAccuracy <= 0.5 {
 		t.Errorf("bag of words: balanced accuracy %.3f", bow.BalancedAccuracy)
+	}
+	// two surface cues give nearly the whole execute label, so they are the bar, above the words
+	if surface := get("execute", "surface rule").Metrics; surface.Accuracy != 39.0/40 || surface.Accuracy <= bow.Accuracy {
+		t.Errorf("surface rule: accuracy %.3f, bag of words %.3f; docs/layer-probe.md says 39 of 40", surface.Accuracy, bow.Accuracy)
+	}
+	for _, task := range []string{"execute", "operation_family"} {
+		if m := get(task, "prompt length").Metrics; m.Brier == nil || m.BalancedAccuracy == 0 {
+			t.Errorf("%s: prompt length row: %+v", task, m)
+		}
+	}
+}
+
+// The cue itself: the refusal words are on every refusal and on no other row, and the rule's one
+// error is the digit that needs no execution.
+func TestSurfaceCues(t *testing.T) {
+	for _, it := range smokeRows() {
+		if got, want := surfaceRefusalRe.MatchString(it.Prompt), it.Category == CategoryNonExecution; got != want {
+			t.Errorf("%s: refusal word %v, want %v: %q", it.ID, got, want, it.Prompt)
+		}
+		if surfaceExecute(it.Prompt) != it.ExecuteExpected && it.ID != "A-011" {
+			t.Errorf("%s: the surface rule errs on %q", it.ID, it.Prompt)
+		}
+	}
+	// a refusal is longer than every computation it pairs with
+	rows := smokeRows()
+	for _, d := range rows {
+		if d.Category != CategoryNonExecution {
+			continue
+		}
+		for _, c := range rows {
+			if c.ParaphraseGroup == d.ParaphraseGroup && c.ExecuteExpected && c.PromptLength >= d.PromptLength {
+				t.Errorf("%s (%d characters) is not longer than %s (%d)", d.ID, d.PromptLength, c.ID, c.PromptLength)
+			}
+		}
+	}
+}
+
+func TestDeviationsAndReportName(t *testing.T) {
+	if d := DefaultOptions.Deviations(); len(d) != 0 || DefaultOptions.ReportName() != "report" {
+		t.Errorf("the committed options: %v, %s", d, DefaultOptions.ReportName())
+	}
+	o := DefaultOptions
+	o.L2 = 0.1
+	if d := o.Deviations(); len(d) != 1 || !strings.Contains(d[0], "L2 0.1 (committed 0.01)") {
+		t.Errorf("L2 moved: %v", d)
+	}
+	if o.ReportName() == "report" {
+		t.Error("a moved option gets the committed report's name")
+	}
+	for _, edit := range []func(*Options){func(o *Options) { o.Folds = 4 }, func(o *Options) { o.Shuffles = 1 }, func(o *Options) { o.Seed = 1 }} {
+		o := DefaultOptions
+		edit(&o)
+		if len(o.Deviations()) != 1 || o.ReportName() == "report" {
+			t.Errorf("%+v passes as committed", o)
+		}
+	}
+	rows := smokeRows()
+	folds, _ := GroupFolds(rows, 5, Seed)
+	m := signalActivations(rows, 8, TaskExecute.Label, 2, 0, 1)
+	o = DefaultOptions
+	o.L2, o.Shuffles = 0.1, 1
+	rep, err := evaluateFolds(rows, []NamedMatrix{{"x", m}}, folds, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rep.Markdown(), "These are not the committed definitions: L2 0.1 (committed 0.01), shuffles 1 (committed 20).") {
+		t.Errorf("the report does not say it deviates:\n%s", rep.Markdown())
 	}
 }
 
 func writeCapture(t *testing.T, dir string, items []Item, dataset []byte, layers []int, dim int) {
 	t.Helper()
-	var ls []string
+	const nLayer = 50
+	var ls, gs []string
 	for _, n := range layers {
 		m := signalActivations(items, dim, TaskExecute.Label, 2, 0.5, uint64(n))
 		var b bytes.Buffer
@@ -322,13 +391,21 @@ func writeCapture(t *testing.T, dir string, items []Item, dataset []byte, layers
 		}
 		ls = append(ls, `{"one_based":`+strconv.Itoa(n)+`,"zero_based":`+strconv.Itoa(n-1)+`,"node":"l_out-`+strconv.Itoa(n-1)+
 			`","file":"`+file+`","sha256":"`+sha256Hex(b.Bytes())+`","dtype":"float32","shape":[`+strconv.Itoa(len(items))+`,`+strconv.Itoa(dim)+`]}`)
+		il := strconv.Itoa(n - 1)
+		readBy := "norm-" + strconv.Itoa(n)
+		if n == nLayer {
+			readBy = "norm"
+		}
+		gs = append(gs, `"l_out-`+il+`":{"sources":["node_9","ffn_inp-`+il+`"],"post_ffn":{"ops":["MUL","RMS_NORM","ADD"],"weight":"blk.`+il+
+			`.post_ffw_norm.weight","norm":"norm-`+il+`","experts":["ffn_moe_out-`+il+`","ffn_shexp_out-`+il+`"]},"read_by":"`+readBy+`"}`)
 	}
 	var rows []string
 	for _, it := range items {
-		rows = append(rows, `{"id":"`+it.ID+`","n_tokens":10}`)
+		rows = append(rows, `{"id":"`+it.ID+`","n_tokens":10,"last_token":108}`)
 	}
-	js := `{"schema":"` + CaptureSchema + `","dataset_sha256":"` + sha256Hex(dataset) + `","logits_check":"equal","repeatable":true,"model_sha256":"abc","rows":[` +
-		strings.Join(rows, ",") + `],"layers":[` + strings.Join(ls, ",") + `]}`
+	js := `{"schema":"` + CaptureSchema + `","dataset_sha256":"` + sha256Hex(dataset) + `","logits_check":"equal","repeatable":true,"model_sha256":"abc",` +
+		`"n_layer":` + strconv.Itoa(nLayer) + `,"last_tokens":[108],"template_is_released":true,"reasoning":"none","device":"CPU","n_ubatch_effective":21,"expert_cache_slots":128,` +
+		`"graph_check":{` + strings.Join(gs, ",") + `},"rows":[` + strings.Join(rows, ",") + `],"layers":[` + strings.Join(ls, ",") + `]}`
 	if err := os.WriteFile(filepath.Join(dir, "capture.json"), []byte(js), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -354,8 +431,10 @@ func TestCaptureRoundTripAndReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rep.CaptureFacts = c.Facts()
 	md := rep.Markdown()
-	for _, want := range []string{"Small sample", "Decodability is not causal usefulness", "no confidence interval", "It selects no layer", "| layer-10 | probe |", "| keyword rule | baseline |", "| majority | baseline |", "| bag of words | baseline |", "Pilot prompts", "| layer-50 | D-001 | execute | no |"} {
+	for _, want := range []string{"Small sample", "Decodability is not causal usefulness", "Surface cues", "no confidence interval", "It selects no layer", "| layer-10 | probe |", "| keyword rule | baseline |", "| surface rule | baseline |", "| prompt length | baseline |", "| majority | baseline |", "| bag of words | baseline |", "Pilot prompts", "| layer-50 | D-001 | execute | no |",
+		"Logits against a context without a callback: equal.", "Repeated decode: equal.", "l_out-9, l_out-24, l_out-39, l_out-49 are each the residual add", "Last prompt token, the same for every prompt: 108.", "Chat template is the released one: yes.", "expert cache slots 128"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("the report lacks %q:\n%s", want, md)
 		}
@@ -365,9 +444,30 @@ func TestCaptureRoundTripAndReport(t *testing.T) {
 	}
 }
 
+// The report tells a template that is not the released one, or that it could not compare.
+func TestCaptureFactsTemplate(t *testing.T) {
+	no := false
+	for released, want := range map[*bool]string{&no: "released one: **no**.", nil: "released one: not known"} {
+		c := Capture{LastTokens: []int{1}, TemplateIsReleased: released}
+		if got := strings.Join(c.Facts(), "\n"); !strings.Contains(got, want) {
+			t.Errorf("%v: %q lacks %q", released, got, want)
+		}
+	}
+}
+
 func TestReadCaptureRefuses(t *testing.T) {
 	items := Generate(Seed)
 	dataset, _ := MarshalJSONL(items)
+	replace := func(old, new string) func(string) {
+		return func(dir string) {
+			p := filepath.Join(dir, "capture.json")
+			b, _ := os.ReadFile(p)
+			if !bytes.Contains(b, []byte(old)) {
+				t.Errorf("capture.json lacks %s", old)
+			}
+			os.WriteFile(p, bytes.ReplaceAll(b, []byte(old), []byte(new)), 0o644)
+		}
+	}
 	for name, c := range map[string]struct {
 		edit    func(dir string)
 		dataset []byte
@@ -389,6 +489,18 @@ func TestReadCaptureRefuses(t *testing.T) {
 			b, _ := os.ReadFile(p)
 			os.WriteFile(p, bytes.Replace(b, []byte(`"repeatable":true`), []byte(`"repeatable":false`), 1), 0o644)
 		}, dataset},
+		// control M88: a capture that was not checked gets no report, whatever it did to the graph
+		"logits not checked": {replace(`"logits_check":"equal"`, `"logits_check":"skipped"`), dataset},
+		"no repeat":          {replace(`"repeatable":true`, `"repeatable":null`), dataset},
+		// control M87: what the graph check found is read again, and a norm that is not there refuses
+		"no graph check":      {replace(`"graph_check":{`, `"graph_check_gone":{`), dataset},
+		"no post-FFN norm":    {replace(`"ops":["MUL","RMS_NORM","ADD"]`, `"ops":["ADD","ADD","MUL"]`), dataset},
+		"other weight":        {replace(`"weight":"blk.9.post_ffw_norm.weight"`, `"weight":"blk.9.ffn_norm.weight"`), dataset},
+		"other experts":       {replace(`"experts":["ffn_moe_out-9","ffn_shexp_out-9"]`, `"experts":["ffn_moe_out-9"]`), dataset},
+		"other reader":        {replace(`"read_by":"norm-10"`, `"read_by":"norm"`), dataset},
+		"several last tokens": {replace(`"last_tokens":[108]`, `"last_tokens":[108,109]`), dataset},
+		"no last tokens":      {replace(`"last_tokens":[108]`, `"last_tokens":[]`), dataset},
+		"a row's last token":  {replace(`"id":"A-001","n_tokens":10,"last_token":108`, `"id":"A-001","n_tokens":10,"last_token":109`), dataset},
 		"numbering": {func(dir string) {
 			p := filepath.Join(dir, "capture.json")
 			b, _ := os.ReadFile(p)
