@@ -373,7 +373,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0010 continuation tests | no | tests on top of 0008 |
 | 0011, 0012 expert cache | no | the fork's own work, rebased (below) |
 | 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
-| 0014 expert cache side-file | no | the fork's own work, Stage E3; its four deciding gates passed on 2026-11-07, and fork PR #15 is not merged ([expert-streaming.md](expert-streaming.md#stage-e3-one-read-per-expert)) |
+| 0014 expert cache side-file | no | the fork's own work, Stage E3; its four deciding gates passed on 2026-11-07, merged by fork PR #15 ([expert-streaming.md](expert-streaming.md#stage-e3-one-read-per-expert)) |
 
 ### Controls
 
@@ -398,19 +398,16 @@ reached `feat/kolibri1`. At that date the next patch was 0014, and the series
 `feat/kolibri1`'s tree (`7ade40f0`, `git diff --quiet` rc 0). The current tree
 is in the next paragraph.
 
-**Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on fork branch
-`feat/kolibri1-sidefile` (`bf7bf16b6`), not on `feat/kolibri1` yet. The patch is
-the plain diff of that branch against `feat/kolibri1`. The series 0008, 0010,
-0011, 0012 and 0014 applied to a clean `184f6536` equals that branch's tree
-(`6bc64819`), and without 0014 it equals `feat/kolibri1`'s (`7e901295`, both by
-`git write-tree`). Its gates passed, so the number stays in the series. The
+**Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on `feat/kolibri1` as
+`c0b2de9be`, the squash of fork PR #15. The patch is that commit's plain diff. The
+series 0008, 0010, 0011, 0012 and 0014 applied to a clean `184f6536` equals its
+tree (`db0c6d55`), and without 0014 it equals its parent's, `ba4bd5bbc` (`7e901295`,
+both by `git write-tree`). Its gates passed, so the number stays in the series. The
 benchmark ran on `dd2040eaf`, whose tree (`53739515`) is what the same series
 gave at `0b19754`, before the review fixes below.
 
-**Merge order: fork PR #15 into `feat/kolibri1` first, then PR #72.** Fork PR #15
-is not merged, so the README's option A (the patches by glob) and option B (the
-fork branch) only match once it is merged too. Number 0015 is taken by Stage E2's
-draft PR #76.
+**Merge order: fork PR #15 into `feat/kolibri1`, then PR #72.** The README's option
+A (the patches by glob) and option B (the fork branch) give the same tree.
 
 **Review fixes (fork PRs #13 and #15, 2026-11-07).** Two findings were real; the
 fixes are `634e34bb4` on `feat/kolibri1`, merged into the side-file branch, and
@@ -456,6 +453,13 @@ were real, all in 0011: `4a4661220`, merged into the side-file branch as `fcd927
   evict. `process_ubatch` now synchronizes first when a cache is present. Nothing
   tests the race itself, and no benchmark ran with this: a decode is already
   synchronized before its next call, a prefill's wait moves ahead of its first split.
+
+**Third review (PR #72, 2026-11-07).** `19001f2e0` on the side-file branch, in 0014.
+A draft model inherited the target's side-file, and it would fail to load.
+`common_base_params_to_speculative` now clears that option too, and `test-arg-parser`
+checks all four cache options on the draft params. The test failed before the fix.
+It acts only when params are derived for a draft, so nothing in the timed path
+changes.
 
 `ca32334bb` adds a test that an alignment of zero is refused. A review read the
 division as coming before the check, and the check comes first. The other findings
