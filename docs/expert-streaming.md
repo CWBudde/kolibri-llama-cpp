@@ -243,21 +243,28 @@ Bit identity with `np.array_equal` against a resident run at the same ubatch and
 - **M52, the load without its checksum test:** `test-expert-cache` fails 3 checks, and the tiny check fails 2 ("FAIL: 2 failures").
 - **M53, `kolibri-bench` without the side-file's eviction:** `TestEvictSidefile` fails.
 - **M54, eviction works on the real file:** `shasum` left 1,820,300 of 1,996,810 pages resident (28,442 MiB), and `kolibri-evict` took them to 0. `shasum`'s read is the hazard the next section guards against.
+- **M55, `kolibri-bench` without the GGUF's residency limit:** `TestEvictSidefile` fails on a resident GGUF in both arms.
+- **M56, `readsCheck` accepting runs with no loads:** `TestReadsCheck` fails, with "0 preads for 0 experts" printed as PASS.
+- **M57, one build's runs not compared:** with `buildCheck` accepting two digests, `TestBuildCheck` fails. With `serverBuild` hashing only the binary, `TestServerBuild` fails on a rebuilt library.
+- **M58, `kolibri-bench` not reading the server's `--help`:** `TestCheckServer` fails.
+- **M59, the refusal of a side-file without the cache moved back behind the load:** the tiny check fails 1 check ("FAIL: 1 failures"), the one that wants no `load_tensors:` line in the refused run's verbose log. On the tiny router model, the fix took the refused run's peak RSS from 520 MB to 129 MB.
 
 ### Benchmark validity
 
 The page cache serves resident pages even with `F_NOCACHE`, and reading the file for a hash leaves it resident (M54), so an arm could read from memory and look fast. So:
 
-- **Every run of every arm evicts the GGUF and every side-file of the matrix**, and `run.json` records it (`evict`, `evict_sidefiles`, and `sidefile` for the arm's own file). The driver stops, with no result, if a side-file is missing or stays more than 1% resident.
+- **Every run of every arm evicts the GGUF and every side-file of the matrix**, and `run.json` records it (`evict`, `evict_sidefiles`, and `sidefile` for the arm's own file). The driver stops, with no result, if a file is missing, or if the GGUF or a side-file stays more than 1% resident. `kolibri-evict` exits 0 whatever stays, and an idle Metal server left on the file keeps pages resident with no `--mlock`: a real `-ngl 99` llama-server on the tiny router GGUF kept 244 MiB of it, and the driver stopped. All 30 E4 runs show 0 pages after eviction, so the limit would not have stopped any of them. The driver does not look for stray servers that hold other files.
 - **The hidden tier counts for the arm as for any other.** `peak_page_cache_mib` and `end_page_cache_mib` sum the GGUF and the side-file, with the side-file's part beside them. All arms sample the same files, so the sampling costs them the same.
 - **A missing side-file is loud:** the driver stops before its first run, and a later loss fails the server's load, which fails the report. Nothing falls back to the GGUF.
-- **The report proves the path:** with a side-file arm in the matrix it fails unless each run's stats name the file its flags gave and show 1 pread per expert (3 on the GGUF path) in both phases.
+- **The report proves the path:** with a side-file arm in the matrix it fails unless each run's stats name the file its flags gave and show 1 pread per expert (3 on the GGUF path) in both phases, with experts loaded in both. A build without patch 0014 writes no such counters, and 0 preads for 0 loads does not pass: E4's `iq3-cache128/0g` runs, reported against this matrix, fail.
+- **The report proves one build:** every run records `server` and `server_sha256`, and the report fails if the completed runs of one build differ, or, with a side-file arm, if a run has no digest. The digest covers the binary and the libraries beside it, because the expert cache lives in `libllama` and a rebuild can leave the binary unchanged. So a resume after a rebuild or with another `-server` fails the report.
+- **The driver refuses a server without the flag:** with a side-file arm in the matrix it stops before the first run if the server's `--help` does not list `--expert-cache-sidefile`, as the default `-server` does not. This holds with `-only` too, so no baseline runs on the wrong build.
 - **`fits` and the quiet rule do not special-case the arm.** Its `--expert-cache 128` counts as the GGUF arm's does (a test holds them equal).
 - **No timing yet.** A smoke run of the exact flags with 8 generated tokens gave 5,117 and 219 preads for 5,117 and 219 experts on the side-file, 15,351 and 657 on the GGUF path, the same token IDs, and at most the table's 10 pages of the side-file in the page cache. Its speed was not read.
 
 ### Reproduce
 
-The matrix `testdata/bench/e3.json` holds 12 runs: `iq3-cache128` and `iq3-cache128-sidefile`, with every other flag the same, at 0 and 16 GiB, 3 repetitions each. Decode and prefill of the side-file against the GGUF path decide at both ceilings, by `kolibri-bench`'s existing rule. TTFT is info only. Token IDs must be exactly equal.
+The matrix `testdata/bench/e3.json` holds 12 runs: `iq3-cache128` and `iq3-cache128-sidefile`, with every other flag the same, at 0 and 16 GiB, 3 repetitions each. Decode and prefill of the side-file against the GGUF path decide at both ceilings, by `kolibri-bench`'s existing rule. The decode gate is the Stage D rule, so a warm p95 win alone passes it, even with a lower median decode rate, and the report's "(win true)" and "(win false)" show which one it was. TTFT is info only. Token IDs must be exactly equal.
 
 ```sh
 go run ./cmd/kolibri-sidefile verify -gguf ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf

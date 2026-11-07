@@ -397,9 +397,10 @@ and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
 (`7ade40f0`, `git diff --quiet` rc 0).
 
 **Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on fork branch
-`feat/kolibri1-sidefile` (`dbac35709`), not on `feat/kolibri1` yet. The series
+`feat/kolibri1-sidefile` (`dd2040eaf`), not on `feat/kolibri1` yet. The patch is
+the plain diff of that branch's two commits against `feat/kolibri1`. The series
 0008, 0010, 0011, 0012 and 0014 applied to a clean `184f6536` equals that
-branch's tree (`132a5020`, `git diff --quiet` rc 0). If its gates fail, the
+branch's tree (`53739515`, `git diff --quiet` rc 0). If its gates fail, the
 number is retired as 0013's was.
 
 **What moved:**
