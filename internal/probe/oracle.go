@@ -10,9 +10,10 @@ import (
 	"unicode"
 )
 
-// The oracle checks every expected answer without the generator: it reads a row's numbers from the
-// prompt's text and computes the answer with other algorithms (math/big's Mul, Exp, MulRange, GCD
-// and ProbablyPrime, fast doubling, an insertion sort). It shares no code with generate.go.
+// The oracle checks every expected answer without the generator: it reads a row's operation and
+// numbers from the prompt's text and computes the answer with other algorithms (math/big's Mul, Exp,
+// MulRange, GCD and ProbablyPrime, fast doubling, an insertion sort). It shares no code with
+// generate.go.
 
 var (
 	groupedNumRe = regexp.MustCompile(`\d{1,3}(?:[., ]\d{3})+|\d+`)
@@ -26,7 +27,7 @@ var (
 // facts are the oracle's own answers for the factual prompts, by prompt.
 var facts = map[string]string{
 	"Was ist die Hauptstadt von Frankreich?":     "Paris",
-	"Was ist die Hauptstadt von Spanien?":        "Madrid",
+	"Wie heißt die Hauptstadt von Spanien?":      "Madrid",
 	"What is the capital of Spain?":              "Madrid",
 	"In welchem Jahr fiel die Berliner Mauer?":   "1989",
 	"Wie viele Planeten hat unser Sonnensystem?": "8",
@@ -97,6 +98,71 @@ func fibFastDoubling(n int) *big.Int {
 		}
 	}
 	return a
+}
+
+// operationWords tell a compute prompt's operation from its text, in lower case.
+var operationWords = map[string]*regexp.Regexp{
+	"multiplication":    regexp.MustCompile(`\bmal\b|×|multipliziere`),
+	"exponentiation":    regexp.MustCompile(`\bhoch\b|\^`),
+	"factorial":         regexp.MustCompile(`\d!|factorial`),
+	"gcd":               regexp.MustCompile(`\bggt\b|greatest common divisor`),
+	"primality":         regexp.MustCompile(`primzahl|\bprime\b`),
+	"fibonacci":         regexp.MustCompile(`fibonacci`),
+	"sorting":           regexp.MustCompile(`sortiere|\bsort\b|reihenfolge`),
+	"filtering_even":    regexp.MustCompile(`\bgerade`),
+	"filtering_greater": regexp.MustCompile(`greater than|größer als`),
+}
+
+// PromptOperation reads the operation a compute prompt asks for from its text alone, and refuses a
+// prompt that names none or several.
+func PromptOperation(prompt string) (string, error) {
+	lower := strings.ToLower(prompt)
+	var found []string
+	for op, re := range operationWords {
+		if re.MatchString(lower) {
+			found = append(found, op)
+		}
+	}
+	if len(found) != 1 {
+		slices.Sort(found)
+		return "", fmt.Errorf("%q names the operations %v, want exactly one", prompt, found)
+	}
+	return found[0], nil
+}
+
+// numbersIn are a prompt's numbers in order, without their thousands separators.
+func numbersIn(prompt string) ([]string, error) {
+	var out []string
+	for _, s := range groupedNumRe.FindAllString(prompt, -1) {
+		n, err := bigFrom(s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, n.String())
+	}
+	return out, nil
+}
+
+// necessaryAt is the oracle's own copy of the documented size from which an exact result counts as
+// necessary: a number of the prompt or of the answer reaches it.
+const necessaryAt = 100000
+
+// needOf is the execution_need of a compute prompt with this answer.
+func needOf(prompt, answer string) (string, error) {
+	nums, err := numbersIn(prompt)
+	if err != nil {
+		return "", err
+	}
+	at := big.NewInt(necessaryAt)
+	if a, ok := new(big.Int).SetString(answer, 10); ok && a.Cmp(at) >= 0 {
+		return NeedNecessary, nil
+	}
+	for _, s := range nums {
+		if n, ok := new(big.Int).SetString(s, 10); ok && n.Cmp(at) >= 0 {
+			return NeedNecessary, nil
+		}
+	}
+	return NeedHelpful, nil
 }
 
 // Oracle computes a compute prompt's answer from its text and operation alone.
@@ -185,8 +251,9 @@ func Oracle(operation, prompt string) (string, error) {
 	return "", fmt.Errorf("oracle: operation %q", operation)
 }
 
-// VerifyAnswers checks every row against the oracle and the facts: an exact answer must be what
-// the oracle computes from the prompt, and a row without one must have no answer to compute.
+// VerifyAnswers checks every row against the oracle and the facts: a compute row's operation, answer
+// and execution_need must be what the oracle reads and computes from the prompt, and a row without
+// an answer must have none to compute.
 func VerifyAnswers(items []Item) []error {
 	var errs []error
 	fail := func(it Item, format string, a ...any) {
@@ -195,11 +262,26 @@ func VerifyAnswers(items []Item) []error {
 	for _, it := range items {
 		switch it.Category {
 		case CategoryArithmetic, CategoryAlgorithm:
-			want, err := Oracle(it.Operation, it.Prompt)
+			op, err := PromptOperation(it.Prompt)
 			if err != nil {
 				fail(it, "%v", err)
-			} else if it.ExpectedAnswerOrOracle != want {
+				continue
+			}
+			if it.Operation != op {
+				fail(it, "operation %q, the prompt asks for %q", it.Operation, op)
+			}
+			want, err := Oracle(op, it.Prompt)
+			if err != nil {
+				fail(it, "%v", err)
+				continue
+			}
+			if it.ExpectedAnswerOrOracle != want {
 				fail(it, "expected answer %q, the oracle computes %q", it.ExpectedAnswerOrOracle, want)
+			}
+			if need, err := needOf(it.Prompt, want); err != nil {
+				fail(it, "%v", err)
+			} else if it.ExecutionNeed != need {
+				fail(it, "execution_need %s, the numbers make it %s", it.ExecutionNeed, need)
 			}
 		case CategoryNoExecution:
 			if want, ok := facts[it.Prompt]; ok {
@@ -223,8 +305,10 @@ func VerifyAnswers(items []Item) []error {
 	return errs
 }
 
-// nearDuplicateAt is the masked word overlap at which prompts of two groups count as near-identical.
-const nearDuplicateAt = 0.8
+// nearDuplicateAt is the masked word overlap at which prompts of two groups count as sharing a
+// sentence frame. Pairs that differ in one word reach 0.67 to 0.75, and the highest pair the
+// committed rows hold is 0.50, between short questions that share "what is the".
+const nearDuplicateAt = 0.6
 
 // maskedWords are a prompt's lowercased words with every number masked, so that two prompts from
 // one number template look the same whatever their numbers.
@@ -249,8 +333,9 @@ func overlap(a, b map[string]bool) float64 {
 }
 
 // VerifyStructure checks what the dataset promises beyond its answers: the counts, balance and
-// labels, unique prompts, and that nothing shared between two groups can leak across a fold: no
-// template, no numeric seed and no near-identical prompt.
+// labels, unique prompts, that a refusal carries its partner's numbers and operation, and that
+// nothing shared between two groups can leak across a fold: no template, no numeric seed and no
+// shared sentence frame. Folds keep groups whole, so a pair within a group cannot cross one.
 func VerifyStructure(items []Item) []error {
 	var errs []error
 	failf := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
@@ -299,10 +384,10 @@ func VerifyStructure(items []Item) []error {
 		if it.ExecuteExpected != execute || it.OperationFamily != family {
 			failf("%s: execute %v family %s in category %s", it.ID, it.ExecuteExpected, it.OperationFamily, it.Category)
 		}
-		if execute {
-			need = NeedHelpful
-			if it.ExecutionNeed == NeedNecessary {
-				need = NeedNecessary
+		if execute { // which of the two: VerifyAnswers works it out from the numbers
+			need = it.ExecutionNeed
+			if need != NeedHelpful && need != NeedNecessary {
+				failf("%s: execution_need %s on a row that executes", it.ID, need)
 			}
 		}
 		if it.ExecutionNeed != need {
@@ -356,6 +441,7 @@ func VerifyStructure(items []Item) []error {
 	if paired != 10 {
 		failf("%d groups pair a computation with its refusal, want 10", paired)
 	}
+	errs = append(errs, verifyPairs(items)...)
 	for i, a := range items {
 		wa := maskedWords(a.Prompt)
 		for _, b := range items[i+1:] {
@@ -363,8 +449,44 @@ func VerifyStructure(items []Item) []error {
 				continue
 			}
 			if v := overlap(wa, maskedWords(b.Prompt)); v >= nearDuplicateAt {
-				failf("%s and %s are near-identical across groups (%.2f): %q, %q", a.ID, b.ID, v, a.Prompt, b.Prompt)
+				failf("%s and %s share a sentence frame across groups (%.2f): %q, %q", a.ID, b.ID, v, a.Prompt, b.Prompt)
 			}
+		}
+	}
+	return errs
+}
+
+// verifyPairs checks every refusal against the computations of its group: the same operation, and
+// the same numbers in the same order. A refusal of the pilot stands alone, as the issue words it.
+func verifyPairs(items []Item) []error {
+	var errs []error
+	for _, d := range items {
+		if d.Category != CategoryNonExecution {
+			continue
+		}
+		partners := 0
+		dn, err := numbersIn(d.Prompt)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", d.ID, err))
+			continue
+		}
+		for _, c := range items {
+			if c.ParaphraseGroup != d.ParaphraseGroup || !c.ExecuteExpected {
+				continue
+			}
+			partners++
+			if c.Operation != d.Operation {
+				errs = append(errs, fmt.Errorf("%s has operation %q, its partner %s %q", d.ID, d.Operation, c.ID, c.Operation))
+			}
+			cn, err := numbersIn(c.Prompt)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", c.ID, err))
+			} else if !slices.Equal(dn, cn) {
+				errs = append(errs, fmt.Errorf("%s has the numbers %v, its partner %s %v", d.ID, dn, c.ID, cn))
+			}
+		}
+		if partners == 0 && d.Split != SplitPilot {
+			errs = append(errs, fmt.Errorf("%s: no computation in group %s", d.ID, d.ParaphraseGroup))
 		}
 	}
 	return errs

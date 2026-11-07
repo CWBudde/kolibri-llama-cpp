@@ -216,7 +216,7 @@ var groups = []group{
 
 	// Category A. Hard negatives ask about a number or mention an operation, and need no execution.
 	{name: "capital-02", split: SplitSmoke, rows: []row{
-		noExec("capital-de", "de", "base", "Was ist die Hauptstadt von Spanien?", "Madrid", false),
+		noExec("capital-de", "de", "base", "Wie heißt die Hauptstadt von Spanien?", "Madrid", false),
 		noExec("capital-en", "en", "language", "What is the capital of Spain?", "Madrid", false)}},
 	{name: "history-01", split: SplitSmoke, rows: []row{
 		noExec("history-year", "de", "base", "In welchem Jahr fiel die Berliner Mauer?", "1989", true)}},
@@ -245,11 +245,11 @@ var groups = []group{
 	{name: "multiplication-03", op: "multiplication", split: SplitSmoke, draw: pair(between(1000000, 9999999), between(1000, 9999)), rows: []row{
 		compute(CategoryArithmetic, "mul-large-dot-de", "de", "base", ConstraintDemand,
 			func(v values) string {
-				return fmt.Sprintf("Berechne %s × %s exakt.", grouped(v.A, "."), grouped(v.B, "."))
+				return fmt.Sprintf("Berechne das exakte Produkt %s × %s.", grouped(v.A, "."), grouped(v.B, "."))
 			}),
 		compute(CategoryArithmetic, "mul-large-comma-en", "en", "language", ConstraintDemand,
 			func(v values) string {
-				return fmt.Sprintf("Compute %s × %s exactly.", grouped(v.A, ","), grouped(v.B, ","))
+				return fmt.Sprintf("Compute the exact product %s × %s.", grouped(v.A, ","), grouped(v.B, ","))
 			})}},
 	{name: "multiplication-04", op: "multiplication", split: SplitSmoke, draw: pair(between(10000, 99999), between(10000, 99999)), rows: []row{
 		compute(CategoryArithmetic, "mul-space-de", "de", "base", ConstraintNone,
@@ -296,7 +296,7 @@ var groups = []group{
 	// Category C, likewise. Input length, order and phrasing vary.
 	{name: "sorting-02", op: "sorting", split: SplitSmoke, draw: listOf(4, 2, 99), rows: []row{
 		compute(CategoryAlgorithm, "sort-short-de", "de", "base", ConstraintNone,
-			func(v values) string { return "Sortiere die Zahlen " + listText(v.List) + " absteigend." }),
+			func(v values) string { return "Sortiere absteigend: " + listText(v.List) + "." }),
 		abstain("sort-explain-de", "de",
 			func(v values) string {
 				return "Erkläre Bubblesort an den Zahlen " + listText(v.List) + ", aber sortiere sie nicht."
@@ -342,7 +342,7 @@ var groups = []group{
 			})}},
 	{name: "filtering-01", op: "filtering_even", split: SplitSmoke, draw: listOf(6, 2, 99), rows: []row{
 		compute(CategoryAlgorithm, "filter-even-de", "de", "base", ConstraintNone,
-			func(v values) string { return "Behalte aus der Liste " + listText(v.List) + " nur die geraden Zahlen." }),
+			func(v values) string { return "Welche Zahlen der Liste " + listText(v.List) + " sind gerade?" }),
 		abstain("filter-explain-de", "de",
 			func(v values) string {
 				return "Beschreibe, wie man aus der Liste " + listText(v.List) + " die geraden Zahlen herausfiltert, ohne das Ergebnis zu nennen."

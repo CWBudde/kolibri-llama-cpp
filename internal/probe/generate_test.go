@@ -162,15 +162,113 @@ func TestM78OracleCatchesCorruption(t *testing.T) {
 	}
 }
 
+// The oracle reads the operation from the prompt, so a row's operation field cannot choose what it
+// computes: an answer that follows a wrong operation fails too.
+func TestOracleReadsTheOperation(t *testing.T) {
+	for prompt, want := range map[string]string{
+		"Was ist 36 mal 49?":                          "multiplication",
+		"Berechne das exakte Produkt 1 × 2.":          "multiplication",
+		"Berechne 6 hoch 21.":                         "exponentiation",
+		"Wie lautet der exakte Wert von 2^3?":         "exponentiation",
+		"Wie groß ist 15! genau?":                     "factorial",
+		"What is the factorial of 12?":                "factorial",
+		"Bestimme den ggT von 12 und 18.":             "gcd",
+		"Is 1001 a prime number?":                     "primality",
+		"Berechne die Fibonacci-Zahl F(5).":           "fibonacci",
+		"Sortiere absteigend: 1, 2.":                  "sorting",
+		"Welche Zahlen der Liste 1 sind gerade?":      "filtering_even",
+		"From the list 1, keep those greater than 0.": "filtering_greater",
+	} {
+		if got, err := PromptOperation(prompt); err != nil || got != want {
+			t.Errorf("%q: %q, %v, want %q", prompt, got, err, want)
+		}
+	}
+	for _, prompt := range []string{"Was ist die Hauptstadt von Spanien?", "Berechne 3 mal 4 hoch 5."} {
+		if got, err := PromptOperation(prompt); err == nil {
+			t.Errorf("%q: %q, want a refusal", prompt, got)
+		}
+	}
+	for _, it := range Generate(Seed) {
+		if !it.ExecuteExpected {
+			continue
+		}
+		other := "gcd"
+		if it.Operation == other {
+			other = "multiplication"
+		}
+		wrong := it
+		wrong.Operation = other
+		if len(VerifyAnswers([]Item{wrong})) == 0 {
+			t.Errorf("%s: operation %s passed", it.ID, other)
+		}
+		if it.ID == "B-002" {
+			wrong.ExpectedAnswerOrOracle = "1" // what gcd(36, 49) gives
+			if len(VerifyAnswers([]Item{wrong})) == 0 {
+				t.Errorf("%s: an answer that follows a wrong operation passed", it.ID)
+			}
+		}
+	}
+}
+
+func byID(items []Item, id string) *Item {
+	for i := range items {
+		if items[i].ID == id {
+			return &items[i]
+		}
+	}
+	panic("no item " + id)
+}
+
+// A refusal carries its partner's numbers and operation, and execution_need follows the numbers.
+func TestPairsAndNeed(t *testing.T) {
+	for name, edit := range map[string]func([]Item){
+		"other numbers": func(s []Item) {
+			byID(s, "D-002").Prompt = "Erkläre das schriftliche Multiplizieren am Beispiel 11 mal 13, aber rechne das Ergebnis nicht aus."
+		},
+		"other order": func(s []Item) {
+			byID(s, "D-005").Prompt = "Erkläre, wie der euklidische Algorithmus den ggT von 1680 und 1020 findet, aber rechne nichts aus."
+		},
+		"no numbers":      func(s []Item) { byID(s, "D-007").Prompt = "Erkläre Bubblesort, aber sortiere nicht." },
+		"other operation": func(s []Item) { byID(s, "D-002").Operation = "gcd" },
+		"no partner":      func(s []Item) { byID(s, "D-002").ParaphraseGroup = "alone-01" },
+	} {
+		items := Generate(Seed)
+		edit(items)
+		if len(verifyPairs(items)) == 0 {
+			t.Errorf("%s: verifyPairs passed", name)
+		}
+		if len(VerifyStructure(items)) == 0 {
+			t.Errorf("%s: VerifyStructure passed", name)
+		}
+	}
+	for id, need := range map[string]string{"C-002": NeedNecessary, "B-002": NeedNecessary, "B-003": NeedHelpful, "C-006": NeedHelpful} {
+		items := Generate(Seed)
+		bad := byID(items, id)
+		bad.ExecutionNeed = need
+		if len(VerifyAnswers([]Item{*bad})) == 0 {
+			t.Errorf("%s: execution_need %s passed", id, need)
+		}
+	}
+}
+
 func TestStructureRefuses(t *testing.T) {
 	for name, edit := range map[string]func([]Item){
-		"duplicate prompt":   func(s []Item) { s[5].Prompt = s[6].Prompt },
-		"template shared":    func(s []Item) { s[5].TemplateID = s[20].TemplateID },
-		"seed shared":        func(s []Item) { s[20].NumericSeed = s[30].NumericSeed },
-		"label flipped":      func(s []Item) { s[20].ExecuteExpected = !s[20].ExecuteExpected },
-		"near-identical":     func(s []Item) { s[7].Prompt = s[4].Prompt + " Kurz." },
-		"pilot group reused": func(s []Item) { s[4].ParaphraseGroup = s[0].ParaphraseGroup },
-		"count":              func(s []Item) { s[4].Split = SplitPilot },
+		"duplicate prompt": func(s []Item) { s[5].Prompt = s[6].Prompt },
+		"template shared":  func(s []Item) { s[5].TemplateID = s[20].TemplateID },
+		"seed shared":      func(s []Item) { s[20].NumericSeed = s[30].NumericSeed },
+		"label flipped":    func(s []Item) { s[20].ExecuteExpected = !s[20].ExecuteExpected },
+		"near-identical":   func(s []Item) { s[7].Prompt = s[4].Prompt + " Kurz." },
+		// frames of two groups: one word, or a few, apart; each was once in the dataset
+		"frame, smoke": func(s []Item) {
+			byID(s, "C-009").Prompt = "Behalte aus der Liste 81, 92, 7, 90, 74, 55 nur die geraden Zahlen."
+		},
+		"frame, pilot and smoke": func(s []Item) { byID(s, "A-002").Prompt = "Was ist die Hauptstadt von Spanien?" },
+		"frame, pilot's sort": func(s []Item) {
+			byID(s, "C-002").Prompt = "Sortiere die Zahlen 53, 97, 40, 51 absteigend."
+		},
+		"frame, pilot's product": func(s []Item) { byID(s, "B-003").Prompt = "Berechne 9.694.976 × 5.310 exakt." },
+		"pilot group reused":     func(s []Item) { s[4].ParaphraseGroup = s[0].ParaphraseGroup },
+		"count":                  func(s []Item) { s[4].Split = SplitPilot },
 	} {
 		items := Generate(Seed)
 		edit(items)
