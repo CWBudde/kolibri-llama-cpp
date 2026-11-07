@@ -408,3 +408,31 @@ func TestRunEmitsATokenGeneratedBeforeCtxEnded(t *testing.T) {
 		}
 	})
 }
+
+// A context that has ended starts nothing: not through Run, and not through Apply.
+func TestDeadContextStartsNoJob(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, m := setup(t, nil)
+		r, _ := openChecked(t, s, "r")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		sc := &Script{Actions: []Action{Execute{Job: "run", Program: "slow"}}}
+		wantErr(t, r.Run(ctx, sc, nil), context.Canceled)
+		wantErr(t, r.Apply(ctx, Execute{Job: "apply", Program: "slow"}).Err, context.Canceled)
+		synctest.Wait()
+
+		for _, id := range []JobID{"run", "apply"} {
+			if _, ok := r.Job(id); ok {
+				t.Errorf("job %s registered under a dead context", id)
+			}
+			if n := m.StartCount(string(id)); n != 0 {
+				t.Errorf("job %s started %d times", id, n)
+			}
+		}
+		wantState(t, r, Ready)
+		if sc.next != 0 {
+			t.Errorf("controller asked %d times under a dead context", sc.next)
+		}
+	})
+}
