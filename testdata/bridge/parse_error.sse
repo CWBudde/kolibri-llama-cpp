@@ -1,0 +1,4 @@
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1794012043,"id":"chatcmpl-J7BPctR6ZdVgBjomre2qPSjw4fWRVHh0","model":"kolibri-tiny-f32.gguf","system_fingerprint":"b11839-90311e5a2","object":"chat.completion.chunk"}
+
+data: {"error":{"code":500,"message":"The model produced output that does not match the expected peg-native format","type":"server_error"}}
+
