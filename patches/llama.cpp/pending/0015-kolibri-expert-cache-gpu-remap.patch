@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index d58070b4e..e956e006b 100644
+index d58070b4e..a4ef4d87c 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2843,6 +2843,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -8,8 +8,8 @@ index d58070b4e..e956e006b 100644
      ).set_env("LLAMA_ARG_EXPERT_CACHE_BUFFERED"));
 +    add_opt(common_arg(
 +        {"--expert-cache-gpu-remap"},
-+        "[EXPERIMENTAL] map the router's ids to slots on the GPU, with no CPU split per layer: every expert layer on Metal, "
-+        "no --expert-prefetch; otherwise the model fails to load (default: off)",
++        "[EXPERIMENTAL] map the router's ids to slots on the GPU, with no CPU split per layer: needs --expert-cache or "
++        "--expert-cache-layers and every expert layer on Metal, and no --expert-prefetch; otherwise the model fails to load (default: off)",
 +        [](common_params & params) {
 +            params.expert_cache_gpu_remap = true;
 +        }
@@ -18,10 +18,22 @@ index d58070b4e..e956e006b 100644
          {"-ncmoe", "--n-cpu-moe"}, "N",
          "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
 diff --git a/common/common.cpp b/common/common.cpp
-index fd6bc67b5..fc7fd975a 100644
+index fd6bc67b5..28c82a533 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1722,6 +1722,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1709,8 +1709,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.no_alloc                    = params.no_alloc;
+     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+ 
+-    // without the cache, --expert-cache-stats still asks for the decode timing of the resident model
+-    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty()) {
++    // without the cache, --expert-cache-stats still asks for the decode timing of the resident model,
++    // and --expert-cache-gpu-remap reaches the model's refusal
++    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty() || params.expert_cache_gpu_remap) {
+         auto & ec = params.expert_cache_lp;
+         ec = llama_expert_cache_default_params();
+         ec.n_slots            = params.expert_cache;
+@@ -1722,6 +1723,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
          ec.prefetch_mix       = params.expert_prefetch_mix;
          ec.stats_path         = params.expert_cache_stats.empty() ? nullptr : params.expert_cache_stats.c_str();
          ec.buffered           = params.expert_cache_buffered;
@@ -498,7 +510,7 @@ index 46b56c9d9..f6fc60c7c 100644
      int32_t  ne00;
      int32_t  ne01;
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index fc856b5b2..f06b8ac8c 100644
+index fc856b5b2..797b845ec 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -122,8 +122,21 @@ private:
@@ -523,7 +535,7 @@ index fc856b5b2..f06b8ac8c 100644
  ggml_metal_op_t ggml_metal_op_init(
          ggml_metal_device_t dev,
          ggml_metal_cmd_buf_t cmd_buf,
-@@ -2821,9 +2834,62 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
+@@ -2821,9 +2834,65 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
      return 8 + N_MM_NPART_AMAX*sizeof(float);
  }
  
@@ -541,6 +553,9 @@ index fc856b5b2..f06b8ac8c 100644
 +
 +    // the log holds a ubatch's ids; the context caps the ubatch to fit
 +    GGML_ASSERT(ids->ne[1] <= ggml_get_op_params_i32(slots, 1));
++    // the tensor is n_expert_used wide; llama_set_warmup makes the router's ids n_expert wide, and the
++    // gate would write its slot ids and its log past the tensor
++    GGML_ASSERT(ids->ne[0] <= slots->ne[0] && "the router's ids are wider than the expert gate's slot ids (llama_set_warmup?)");
 +
 +    const uint32_t next = ggml_metal_encoder_gate_next(enc);
 +
@@ -586,7 +601,7 @@ index fc856b5b2..f06b8ac8c 100644
      ggml_metal_library_t lib = ctx->lib;
      ggml_metal_encoder_t enc = ctx->enc;
  
-@@ -2849,9 +2915,12 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+@@ -2849,9 +2918,12 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
  
      ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
      ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
@@ -600,7 +615,7 @@ index fc856b5b2..f06b8ac8c 100644
      const uint32_t r2 = 1;
      const uint32_t r3 = 1;
  
-@@ -2913,7 +2982,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+@@ -2913,7 +2985,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                  nb12,
                  ne21, // n_tokens
                  ne20, // n_expert_used
@@ -609,7 +624,7 @@ index fc856b5b2..f06b8ac8c 100644
              };
  
              auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
-@@ -3001,7 +3070,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+@@ -3001,7 +3073,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
          ggml_metal_kargs_mul_mv_id args = {
              /*.nei0 =*/ ne20,
              /*.nei1 =*/ ne21,
@@ -717,20 +732,21 @@ index c313cb8e2..aa3b8ad4d 100644
 +    }
 +}
 diff --git a/include/llama.h b/include/llama.h
-index 2435d5ebd..964ef2b63 100644
+index 2435d5ebd..d524c0924 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -331,6 +331,8 @@ extern "C" {
+@@ -331,6 +331,9 @@ extern "C" {
          const char *    stats_path;    // optional: write the cache counters as JSON when the model is freed;
                                         // with n_slots 0 and no n_slots_layer, the decode timing of the resident model
          bool            buffered;      // read misses through the page cache (macOS: no F_NOCACHE)
 +        bool            gpu_remap;     // map the router's ids to slots on the GPU, without a CPU split per layer
-+                                       // (every expert layer on Metal; no prefetch; else the model fails to load)
++                                       // (a cache, with n_slots or n_slots_layer; every expert layer on Metal;
++                                       // no prefetch; else the model fails to load)
      };
  
      struct llama_model_params {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0ade59d05..5b3b81d21 100644
+index 0ade59d05..cdb12af51 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,8 @@
@@ -778,21 +794,25 @@ index 0ade59d05..5b3b81d21 100644
      // [EXPERIMENTAL] the expert cache serves one context; taken last, so that a constructor that
      // throws before never holds it (its destructor would not run to give it back)
      if (model.expert_cache) {
-@@ -1619,6 +1650,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1619,6 +1650,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      }
  
      const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 +
 +    // [EXPERIMENTAL] the gates ran synchronously, each layer once, or a layer left the GPU; the last
 +    // layer keeps only the output rows, so with no output in this ubatch it has no matmuls
-+    if (status == GGML_STATUS_SUCCESS && model.expert_cache && model.expert_cache->gpu_remap()) {
-+        model.expert_cache->gate_check_graph(n_outputs > 0);
++    if (model.expert_cache && model.expert_cache->gpu_remap()) {
++        if (status == GGML_STATUS_SUCCESS) {
++            model.expert_cache->gate_check_graph(n_outputs > 0);
++        } else {
++            model.expert_cache->gate_abandon_graph();
++        }
 +    }
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
          ret = status;
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 12eca257f..e878aa7c0 100644
+index ca8af2414..5c54eeea9 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -168,7 +168,11 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int
@@ -808,7 +828,7 @@ index 12eca257f..e878aa7c0 100644
      if (p.n_slots_layer && p.n_layer_slots > 0) {
          if (p.n_layer_slots != n_layer) {
              throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
-@@ -237,6 +241,16 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -248,6 +252,16 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      GGML_ASSERT((int) stacked_in.size() == n_layer && (int) devs.size() == n_layer);
      stacked = stacked_in;
  
@@ -825,7 +845,7 @@ index 12eca257f..e878aa7c0 100644
      // one group of slot tensors per device: the stacked tensors' first two dimensions, n_slots experts
      std::vector<int> group_of(n_layer);
      for (int il = 0; il < n_layer; ++il) {
-@@ -252,7 +266,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -263,7 +277,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      }
      for (auto & gr : groups) {
          ggml_init_params ip = {
@@ -834,7 +854,7 @@ index 12eca257f..e878aa7c0 100644
              /*.mem_buffer =*/ nullptr,
              /*.no_alloc   =*/ true,
          };
-@@ -280,6 +294,22 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -291,6 +305,22 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
          expert_bytes[il] = bytes;
      }
  
@@ -857,7 +877,7 @@ index 12eca257f..e878aa7c0 100644
      for (auto & gr : groups) {
          const char * dev_name = ggml_backend_dev_name(gr.dev);
          if (ggml_backend_dev_type(gr.dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-@@ -356,6 +386,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -367,6 +397,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      for (int il = 0; il < n_layer; ++il) {
          ud[il] = { this, il };
      }
@@ -867,7 +887,7 @@ index 12eca257f..e878aa7c0 100644
      slots = std::make_unique<llama_expert_slots>(n_slots, n_expert, expert_bytes, n_threads,
          [this](int il, int e, int s) { return load(il, e, s); });
      if (prefetch_k > 0) {
-@@ -374,8 +407,8 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -385,8 +418,8 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      for (const auto & gr : groups) {
          where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
      }
@@ -878,7 +898,7 @@ index 12eca257f..e878aa7c0 100644
          n_expert, where.c_str(), n_threads, pf.c_str(), path.c_str(), buffered ? " (buffered)" : "");
  }
  
-@@ -402,8 +435,46 @@ ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor *
+@@ -413,8 +446,55 @@ ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor *
  
  void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * dst) {
      GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
@@ -894,9 +914,13 @@ index 12eca257f..e878aa7c0 100644
 +}
 +
 +void llama_expert_cache::gate_remap(int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped) {
-+    if (il == 0) {
-+        gate_seen = 0;
++    // A graph compute finds its own gates, so a layer cut in two gets two, and a second remap of the
++    // same layer would count and pin it twice. Hence no cut inside a layer, before that remap.
++    if (il <= gate_il) {
++        GGML_ABORT("expert cache: --expert-cache-gpu-remap: layer %d reached its Metal gate again in the same graph, after layer %d: "
++                   "a cb_eval that stops between a layer's matmuls cuts it in two, and this mode cannot run that", il, gate_il);
 +    }
++    gate_il = il;
 +    gate_seen++;
 +    gate_scratch.resize(n_ids);
 +    remap_ids(il, ids, n_ids, n_tokens, gate_scratch.data());
@@ -917,7 +941,12 @@ index 12eca257f..e878aa7c0 100644
 +    if (gate_seen != want) {
 +        GGML_ABORT("expert cache: --expert-cache-gpu-remap: %d of %d expert layers went through the Metal gate; the others left the GPU", gate_seen, want);
 +    }
++    gate_abandon_graph();
++}
++
++void llama_expert_cache::gate_abandon_graph() {
 +    gate_seen = 0;
++    gate_il   = -1;
 +}
 +
 +void llama_expert_cache::remap_ids(int il, const int32_t * ids, int n_ids, int n_tokens, int32_t * out) {
@@ -926,7 +955,7 @@ index 12eca257f..e878aa7c0 100644
  
      // a graph runs its layers in order; layer 0 starts the next ubatch (the last layer may see
      // fewer tokens, only the outputs)
-@@ -413,7 +484,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -424,7 +504,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
          decode    = n_tokens == 1;
      }
  
@@ -935,7 +964,7 @@ index 12eca257f..e878aa7c0 100644
          int l = -1;
          int e = -1;
          if (slots->failure(l, e)) {
-@@ -472,14 +543,18 @@ std::string llama_expert_cache::stats_json() const {
+@@ -483,14 +563,18 @@ std::string llama_expert_cache::stats_json() const {
      const auto c_dec = slots->counts(true);
      // the remap op's own time: all of it but the wait on loads
      const auto remap = [](double op, double wait) { return format(", \"remap_seconds\": %.6f", std::max(op - wait, 0.0)); };
@@ -959,10 +988,10 @@ index 12eca257f..e878aa7c0 100644
          process_json(pc, disk_read0, pageins0, faults0).c_str());
  }
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
-index 9370af36f..7a7ec9a2e 100644
+index e5b40fea4..93596fadc 100644
 --- a/src/llama-expert-cache.h
 +++ b/src/llama-expert-cache.h
-@@ -86,12 +86,26 @@ struct llama_expert_cache {
+@@ -89,12 +89,29 @@ struct llama_expert_cache {
      // the slot ids of the router's selected experts [n_expert_used, n_tokens], from a CPU op
      ggml_tensor * build_remap(ggml_context * ctx, ggml_tensor * selected_experts, int il);
  
@@ -979,6 +1008,9 @@ index 9370af36f..7a7ec9a2e 100644
 +    // has_outputs false: the last layer has no rows, hence no gate
 +    void gate_check_graph(bool has_outputs);
 +
++    // after a graph that did not complete: the next one starts at layer 0 again
++    void gate_abandon_graph();
++
      ggml_tensor * gate(int il) const { return slot_t[il].t[0]; }
      ggml_tensor * up  (int il) const { return slot_t[il].t[1]; }
      ggml_tensor * down(int il) const { return slot_t[il].t[2]; }
@@ -989,7 +1021,7 @@ index 9370af36f..7a7ec9a2e 100644
  
      // the decode timing to add to the stats; the model owns it
      void set_decode_diag(const llama_decode_diag * d) { diag = d; }
-@@ -109,12 +123,22 @@ private:
+@@ -112,12 +129,23 @@ private:
      double prefetch_mix;
      std::string stats_path;
      bool buffered; // misses read through the page cache
@@ -1006,6 +1038,7 @@ index 9370af36f..7a7ec9a2e 100644
 +    std::vector<ggml_tensor *> gate_slots;
 +    std::vector<int32_t>       gate_scratch;
 +    int      gate_seen = 0;           // layers through their gate in this graph
++    int      gate_il   = -1;          // the last of them
 +    uint64_t gate_runs[2]  = {0, 0};  // command buffers per phase
 +    uint64_t gate_stops[2] = {0, 0};  // those a gate stopped
 +
@@ -1097,10 +1130,23 @@ index 69508d4a9..08c175f58 100644
          cb(experts, "ffn_moe_down", il);
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 746dd66cb..0c2efef4e 100644
+index 746dd66cb..4c7684afe 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3457,6 +3457,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
+@@ -1728,6 +1728,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+         layers.resize(n_layer_all);
+ 
++        // the option changes how the cache runs, and with no cache the model would load fully
++        // resident, which is what the cache is there to avoid
++        if (params.expert_cache && params.expert_cache->gpu_remap && !expert_cache_requested()) {
++            throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs --expert-cache or --expert-cache-layers");
++        }
++
+         if (expert_cache_requested()) {
+             if (arch != LLM_ARCH_KOLIBRI1) {
+                 throw std::runtime_error(format("the expert cache supports the kolibri1 architecture only, not %s", llm_arch_name(arch)));
+@@ -3457,6 +3463,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
          /*.prefetch_mix       =*/ 0.75f,
          /*.stats_path         =*/ nullptr,
          /*.buffered           =*/ false,
