@@ -472,13 +472,15 @@ Five more guard the refusals. M69 was rerun after them and still fails as above,
 
 | Control | `test-expert-cache` | Tiny `--gpu-remap-only` |
 |---|---|---|
-| **M70:** the model does not refuse the option without a cache | passes | fails: "FAIL: 9 failures": it loads on the CPU and on Metal, and `llama-completion` exits 0 |
-| **M71:** `common` builds no params for the option alone | passes | fails: "FAIL: 3 failures": `llama-completion --expert-cache-gpu-remap` exits 0. With `--expert-cache-stats` the model still refuses |
-| **M72:** a layer's second gate is not refused | passes | fails: "FAIL: 5 failures": a `cb_eval` after `ffn_moe_up` or `ffn_moe_gate` exits -6 without saying why. The old message was "11 of 6 expert layers went through the Metal gate" |
-| **M73:** the slot ids' width is not checked | passes | fails: "FAIL: 5 failures": at 384 slots `llama_set_warmup` exits 0, with the gate writing past the tensor; at 64 it exits -6 without the width message |
-| **M74:** the gate state is not reset after a graph that did not complete | passes | **passes:** "PASS: 0 failures" |
+| **M82:** the model does not refuse the option without a cache | passes | fails: "FAIL: 9 failures": it loads on the CPU and on Metal, and `llama-completion` exits 0 |
+| **M83:** `common` builds no params for the option alone | passes | fails: "FAIL: 3 failures": `llama-completion --expert-cache-gpu-remap` exits 0. With `--expert-cache-stats` the model still refuses |
+| **M84:** a layer's second gate is not refused | passes | fails: "FAIL: 5 failures": a `cb_eval` after `ffn_moe_up` or `ffn_moe_gate` exits -6 without saying why. The old message was "11 of 6 expert layers went through the Metal gate" |
+| **M85:** the slot ids' width is not checked | passes | fails: "FAIL: 5 failures": at 384 slots `llama_set_warmup` exits 0, with the gate writing past the tensor; at 64 it exits -6 without the width message |
+| **M86:** the gate state is not reset after a graph that did not complete | passes | **passes:** "PASS: 0 failures" |
 
-M74 shows a gap, not a guard: **the reset after an aborted graph has no check.** The check ends a decode at each call of the abort callback, and each next decode still works without the reset. `llama_set_abort_callback` reaches only backends that register `ggml_backend_set_abort_callback`, and Metal does not, so the callback runs in the CPU backend. The 4 calls and M74's result fit a CPU split before the gates; the split order was not read directly. The reset stays because a graph that ends past a gate would otherwise refuse the next one.
+M86 shows a gap, not a guard: **the reset after an aborted graph has no check.** The check ends a decode at each call of the abort callback, and each next decode still works without the reset. `llama_set_abort_callback` reaches only backends that register `ggml_backend_set_abort_callback`, and Metal does not, so the callback runs in the CPU backend. The 4 calls and M86's result fit a CPU split before the gates; the split order was not read directly. The reset stays because a graph that ends past a gate would otherwise refuse the next one.
+
+Commit `4397b54`'s subject calls these five M70 to M74, and their logs keep those names (`m70.log` to `m74.log` and `m74-rerun.log`, in `~/models/eval/expert-bench-e2.runner/checks/`). They moved to M82 to M86 because PR #77 uses M72 to M74e, and PR #72's `docs/upstream.md` gives M70 and M71 as the old numbers of its M80 and M81.
 
 M67 is more than a control. Dropping that one boundary moves tiny Q8_0's logits by the same maximum, 0.134, that the CPU remap's splits do, so a resident run's own numbers depend on where its encoder boundary falls. The GPU remap computes the boundary by the same formula, on the same node count. Why the two maxima agree was not investigated.
 
