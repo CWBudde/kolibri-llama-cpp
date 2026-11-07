@@ -1,6 +1,6 @@
 # Expert-ID prediction does not beat a plain expert cache on Kolibri-1
 
-No predictor built from recorded expert IDs passed the gate. Last-N reuse, a decayed-count Markov predictor and a trained linear predictor were replayed causally on held-out decode, over two horizons and three declared links, for IQ3 and Q8_0. None loaded fewer bytes or ran faster than the best simple cache policy at any of 10 budgets. Without its CPU cost, no Markov or linear variant is faster either; the gate's best case is equal, at 384 experts per layer. At runtime, prefetch passed one of three comparisons, at 16 GiB on p95 alone, by about 5%, with no fewer misses.
+No predictor built from recorded expert IDs passed the gate. Last-N reuse, a decayed-count Markov predictor and a trained linear predictor were replayed causally on held-out decode, over two horizons and three declared links, for IQ3 and Q8_0. None loaded fewer bytes or ran faster than the best simple cache policy at any of 10 budgets. Without its CPU cost, no Markov or linear variant is faster either; the gate's best case is equal, at 384 experts per layer. At runtime, prefetch passed one of three comparisons, at 16 GiB on p95 alone, by about 5%, with hardly fewer misses.
 
 The gap to the offline optimum is still large: on held-out decode at 128 experts per layer the best causal policy loads about 2.1 to 2.6 times the bytes of Belady's MIN. These predictors do not attack that gap. They prefetch into an LRU and leave its victim choice alone, and no predictor was tried as an eviction rule.
 
@@ -200,7 +200,7 @@ Source: "Decode, MB/token (hit rate)" of each workload section. The oracle's bou
 
 ## The runtime prefetch
 
-Stage D ported the Markov predictor's same-token horizon to C++ as `--expert-prefetch`, because the user chose on 2026-10-14 to build the prototype although no predictor had passed. Its benchmark is `testdata/bench/expert-cache.json`, with 3 repetitions per arm and ceiling ([expert-streaming.md](expert-streaming.md), "Gates").
+Stage D ported the Markov predictor's same-token horizon to C++ as `--expert-prefetch`, because the user chose on 2026-10-14 to build the prototype although no predictor had passed. Its benchmark is `testdata/bench/expert-cache.json`, with 3 repetitions per arm and ceiling ([expert-streaming.md](expert-streaming.md), "Method", "Results" and "Gates").
 
 | Comparison, `--expert-prefetch 12` against the demand cache | Decode t/s | p95 ms | Verdict |
 |---|--:|--:|---|
@@ -208,9 +208,9 @@ Stage D ported the Markov predictor's same-token horizon to C++ as `--expert-pre
 | IQ3, 0 GiB (INFO) | 18.43 (18.22–18.52) against 18.51 (18.25–18.77) | 78.9 (75.5–83.6) against 78.9 (77.8–80.7) | not passed |
 | Q8_0, 0 GiB (INFO) | 12.73 (12.02–12.81) against 13.00 (12.59–13.09) | 116.1 (115.2–118.1) against 111.9 (110.3–117.3) | not passed |
 
-At 12 per layer it issues 4,252 prefetches per IQ3 run. 1,541 are used, 2,027 are evicted unused, and it reads 6.8 GB more. Decode misses hardly move (17,315 against 17,424 of 190,800 needed), nor does the wait on loads (9.5 against 9.2 s). A loaded-machine Q8_0 smoke run gave 7.67 against 11.25 tokens/s (INFO, not a benchmark).
+At 12 per layer it issues 4,252 prefetches per IQ3 run. 1,541 are used, 2,027 are evicted unused, and it reads 6.8 GB more. Decode misses hardly move (17,315 against 17,424 of 190,800 needed), nor does the wait on loads (9.5 against 9.2 s). A loaded-machine Q8_0 smoke run gave 7.67 against 11.25 tokens/s ("Checks", same document; INFO, not a benchmark).
 
-So the runtime's one pass, about 5% at the p95 under one ceiling, comes with no fewer misses. It is not evidence that prediction beats the cache. The offline gate does not contradict it either, since the offline replay models neither ceilings nor tail latency. The cause of the p95 change is not established. The third repetition at 16 GiB ran four days after the demand cache's. Stage D left keeping the option to the user, and PLAN records no decision.
+So the runtime's one pass, about 5% at the p95 under one ceiling, comes with hardly fewer misses. It is not evidence that prediction beats the cache. The offline gate does not contradict it either, since the offline replay models neither ceilings nor tail latency. The cause of the p95 change is not established. The third repetition at 16 GiB ran four days after the demand cache's. Stage D left keeping the option to the user, and PLAN records no decision.
 
 **Not recorded:** any prefetch arm on the rebased fork (the matrices of E0, E1 and E4 have none), and Q8_0 prefetch at 16 GiB, where 128 slots do not fit ([expert-diagnostics.md](expert-diagnostics.md), "Page-cache A/B").
 

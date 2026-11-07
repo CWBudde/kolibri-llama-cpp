@@ -609,13 +609,13 @@ Collected 2026-11-07 from what is recorded on `main`, for the user to write from
 
 **In short:**
 - **#25294:** its auto-sizing aborts on Top-6, confirmed with a threshold. It runs on Kolibri once sized by hand. At 0 GiB it beat the fork's `F_NOCACHE` arms in both benchmarks; only the fork's buffered waves passed it, in E4, in a non-deciding arm.
-- **#29887:** on Metal it needs `--cpu-moe` and loses to plain `--cpu-moe`.
+- **#29887:** on Metal it needs `--cpu-moe`, and in its only arm (E0, 0 GiB) it loses to plain `--cpu-moe`.
 - **Both:** a Metal slot path, a ceiling and equivalence method, and a benchmark matrix they could run.
 
 **State of the evidence:**
 - **E0 and E1:** recorded.
 - **E4 (waves):** recorded. Its gates failed at 0 GiB, so its code is not in the patch series.
-- **E3 (one read per expert) and E2 (no per-layer CPU sync):** pending. PLAN has both unchecked and `main` holds no result, so neither can be cited yet. Add their results here once they are recorded, since both change the slot path's numbers.
+- **E3 (one read per expert) and E2 (no per-layer CPU sync):** pending. PLAN has both unchecked and `main` holds no result, so neither can be cited yet. Add their results here once they are recorded, since both aim at the slot path's cost and may change its numbers.
 - **Upstream's side:** the PR states are as of this repo's checks of 2026-10-22 and 2026-10-23. They were not rechecked for this section. Check them, and both threads, before filing.
 
 ### Machine and builds
@@ -625,7 +625,7 @@ Collected 2026-11-07 from what is recorded on `main`, for the user to write from
 | Machine | M5 Pro, 48 GiB, APPLE SSD AP1024Z, internal drive ([expert-diagnostics.md](expert-diagnostics.md)) |
 | macOS | changed between E0 and E4 (27.2 installed on 2026-10-29, [expert-streaming.md](expert-streaming.md#observations)) |
 | Master used | `184f6536` (2026-10-23) |
-| #25294 | PR head `1248fd8fa` does not merge on current master. All numbers come from the port on `184f6536`, fork branch `ref/pr25294-on-184f6536` (`8a8ddf827`), with the PR's logic unchanged and only API changes, listed in its merge commit. **No number here comes from the PR head itself.** |
+| #25294 | PR head `1248fd8fa` did not merge on master as of 2026-10-23. All numbers come from the port on `184f6536`, fork branch `ref/pr25294-on-184f6536` (`8a8ddf827`), with the PR's logic unchanged and only API changes, listed in its merge commit. **No number here comes from the PR head itself.** |
 | #29887 | as merged in `184f6536` |
 | Fork | `feat/kolibri1`: series 0008, 0010, 0011, 0012 (`patches/llama.cpp/`) |
 | Waves | `feat/kolibri1-waves` (`90311e5a2`), fork PR #14, open, not in the series |
@@ -648,12 +648,13 @@ Confirmed by E0.2 ("#25294: `--moe-stream` on Kolibri" above).
 | Trigger | a ubatch that touches more experts than the slots |
 | Line number | from the port, not the PR head |
 | Workaround used | `--moe-stream-cache 128s` |
+| Reported before | The research notes list it among the PR's known issues: "Auto-sizing aborts when `n_expert_used >= 6` (suggested floor: 3×n_expert_used)" (`research_notes/AirLLM style offloading for Kolibri/apple_ssd_streaming.md`). The repo does not link that report, so find it in the thread first. What this repo adds is the run on Kolibri, the message and M46 |
 
 **Missing:** the repo records no command line for the abort or for M46, and `tools/upstream/repro.py` has no check for it. The file the runs used is not named beside them either; E0.2's matrix uses the IQ3 GGUF. Whether the tiny router fixture (`cmd/kolibri-tiny -router`, 384 experts, top 6) reproduces it was not tried. That would matter, since it would need no real weight.
 
 ### #25294 and #29887: the benchmark numbers
 
-Warm rates are medians over repetitions, each repetition being the median of 4 warm requests. Cold TTFT is the single cold request, including a 2,048-token prefill from an evicted page cache. Every cache holds 128 IQ3 experts per layer. E0 ran 2 repetitions and E4 ran 3. Sources, with ranges: "The benchmark" above and [E4's table](expert-streaming.md#results-1).
+Warm rates are medians over repetitions, each repetition being the median of 4 warm requests. Cold TTFT is the median over repetitions of the one cold request, including a 2,048-token prefill from an evicted page cache. Every cache holds 128 IQ3 experts per layer. E0 ran 2 repetitions and E4 ran 3. Sources, with ranges: "The benchmark" above and [E4's table](expert-streaming.md#results-1).
 
 | Arm | Ceiling GiB | Stage | Warm prompt t/s | Cold TTFT s | Warm decode t/s | Footprint GiB |
 |---|--:|---|--:|--:|--:|--:|
@@ -680,7 +681,7 @@ Warm rates are medians over repetitions, each repetition being the median of 4 w
 **Do not read more into this than it holds:**
 - **E0's "F_NOCACHE beats #25294's decode at 16 GiB" does not repeat in E4.** E0: 17.96 against 12.69 t/s, a passed gate. E4: 18.07 (16.90–18.93) against 18.52 (8.14–19.39), overlapping ranges, and E4 had no gate on it. Its 16 GiB r1 is in E4's disturbed block, which may be the 8.14; the recorded text does not tie that value to the run. So buffered reads losing decode under memory pressure is an E0 result that E4 does not confirm. In prefill the fall remains: #25294 runs 351.3 t/s at 0 GiB and 226.7 at 16, while `F_NOCACHE` waves hold 301.4 and 301.8.
 - **Sessions differ.** Across E0 and E4, #25294's warm prompt went from 283.2 to 351.3 t/s and `--cpu-moe`'s from 218.7 to 281.2. E4's Observations section shows #25294's repetitions rising with the page cache peak, n = 5, cause not established. Compare only within one stage.
-- **Waves are not an upstream candidate from this data.** They lost to #25294 at 0 GiB, and no single mode won at both ceilings. They show that the design ports onto a zero-copy slot pool, not that it is faster.
+- **Waves are not an upstream candidate from this data.** `F_NOCACHE` waves lost to #25294 at 0 GiB and buffered waves at 16 GiB, so no single mode won at both ceilings. They show that the design ports onto a zero-copy slot pool, not that it is faster.
 - **The machine was shared.** Six consecutive E4 runs had others' CPU at or above 100%. Recomputing the gates without them flips none. See [Validity](expert-streaming.md#validity).
 
 ### #25294: further facts
@@ -688,7 +689,7 @@ Warm rates are medians over repetitions, each repetition being the median of 4 w
 | Fact | Value | Source |
 |---|---|---|
 | Port is sound on the CPU | tiny 384-expert top-6 fixture: logits bit-identical to plain master, with waves (64 slots, 32-token ubatch) and in one wave (200 slots) | "#25294: `--moe-stream` on Kolibri" above |
-| Metal is not bit-identical to the unsplit run | on the same fixture it differs by 4.2e-4 | same |
+| Metal is not bit-identical to the unsplit run | on the same fixture it differs by 4.2e-4. The research notes record that the PR's byte-identical-output claim was retracted on 2026-09-06 | same; `apple_ssd_streaming.md` |
 | Likely reason on Metal | not isolated for #25294. For the fork: the CPU remap splits the graph and master's fusion (`RMS_NORM + MUL + ADD`) then rounds differently; `GGML_METAL_FUSION_DISABLE=1` removes the difference, and a resident run split at the same points is bit-identical | "The rebase" above |
 | Tokens on real weights | #25294, waves and buffered waves generate identical tokens, 128 of 128 on all 5 request kinds (90 requests) | [expert-streaming.md](expert-streaming.md#lossless) |
 | Tokens against `--cpu-moe` | first differ at tokens 15, 13, 14 and 15. No run isolates the cause; GPU against CPU matmuls is the known candidate | [expert-streaming.md](expert-streaming.md#observations) |
@@ -701,7 +702,7 @@ Warm rates are medians over repetitions, each repetition being the median of 4 w
 - its decode split, hit rate, disk bytes and load failures: it writes no `--expert-cache-stats`;
 - any arm on Q8_0;
 - bit identity on real weights: tokens only;
-- whether its miss path copies on Metal. The repo records only that its slots are Metal buffers, which `cmd/kolibri-bench` treats as wired (`fits`, `cmd/kolibri-bench/main.go`).
+- what its miss path's copy costs on Metal. From the port's source, not measured: `src/llama-moe-stream.cpp` at `8a8ddf827` reads an expert into a staging buffer and then calls `ggml_backend_tensor_set` on the slot, so a load copies once after the read. Its slots are Metal buffers, which `cmd/kolibri-bench` treats as wired (`fits`, `cmd/kolibri-bench/main.go`).
 
 ### #29887: facts on Metal
 
@@ -726,7 +727,7 @@ Code: `patches/llama.cpp/0011-kolibri-expert-cache.patch`, mainly `src/llama-exp
 
 | Part | Fact |
 |---|---|
-| Slots | an anonymous host mapping per layer that Metal uses in place (`ggml_backend_dev_buffer_from_host_ptr`); slots never written cost no memory |
+| Slots | slot tensors per layer, in one anonymous host mapping per device that Metal uses in place (`ggml_backend_dev_buffer_from_host_ptr`); slots never written cost no memory |
 | Miss | `pread` writes straight into the slot, with no host-to-device copy; three ranges per expert (gate, up, down), from a second descriptor with `F_NOCACHE` |
 | Remap | a CPU custom op maps the router's ids to slots before the three `mul_mat_id`; the expert weights keep the router's ids |
 | Safety | a remap pins its ubatch's experts; a loading slot is never a victim; the scheduler's sync before each CPU split guards the slots of the previous layer |
@@ -746,7 +747,7 @@ So 17.6 ms/token of the slot path is neither waiting nor remapping and comes wit
 
 **Limits** ([expert-streaming.md](expert-streaming.md#limits)): Kolibri only, no LoRA on the routed experts, experts in one file, one context per model, devices without `buffer_from_host_ptr` rejected at load, `-fit` does not know the slot buffer, and the ubatch is capped at slots / 6 without waves. On macOS, cached pages are served from the page cache despite `F_NOCACHE`. On Linux, reads go through the page cache.
 
-**Not measured:** zero-copy against a copying slot pool in isolation. No arm has the same cache with a copy, so the saving is not a number here. The comparison with #29887 mixes it with a different problem (experts in host RAM, not on SSD).
+**Not measured:** zero-copy against a copying slot pool in isolation. No arm has the same cache with a copy, so the saving is not a number here. The comparison with #29887 mixes it with a different problem (experts in host RAM, not on SSD). #25294 copies once on a load, but it differs in ubatch, eviction and waves, so it does not isolate zero-copy either.
 
 ### The equivalence and ceiling method
 
@@ -755,16 +756,16 @@ Code: `cmd/kolibri-bench`, `cmd/kolibri-evict`, `cmd/kolibri-memhog`, `internal/
 | Part | What it does | Why, or what went wrong without it |
 |---|---|---|
 | Ceiling | `kolibri-memhog` wires 0 or 16 GiB with `mlock` before the server starts | compression and swap cannot undo it |
-| Fit check | `fits` counts wired weights or slots, the hog and 8 GiB for the system against `hw.memsize`, and records "does not fit" | resident IQ3 beside the hog wired 49.1 GiB of 48 and hung the Mac until a watchdog panic (2026-10-15). Q8_0 at 128 slots paged out and gave no token in 20 minutes |
+| Fit check | `fits` checks against `hw.memsize` and records "does not fit". Resident: all weights and the hog. Cache: the non-expert weights, the slots, the hog and 8 GiB for the system. `--cpu-moe` always fits | resident IQ3 beside the hog wired 49.1 GiB of 48 and hung the Mac until a watchdog panic (2026-10-15). Q8_0 at 128 slots paged out and gave no token in 20 minutes |
 | Cold start | `kolibri-evict` drops the GGUF with `msync(MS_INVALIDATE)`, no root | 576,976 resident pages to 0; M41 and M35 check it |
 | Quiet machine | 1-minute load below 3, swap growth below 100 MiB per minute, AC power, `caffeinate` | runs on battery slept and were repeated. It holds only at a run's start, so others' CPU is recorded per run |
 | Order | repetitions outermost | spreads drift over the arms |
-| Gates | in the matrix, committed before the first timed run; every repetition must beat the best repetition of the best baseline; no hit rate counts | E4's failed gates stayed failed. A later added arm is labelled |
+| Gates | in the matrix, fixed before the first timed run; every repetition must beat the best repetition of the best baseline (E4's decode-not-slower: the median must reach the baseline's slowest repetition); no hit rate counts | E4's failed gates stayed failed. A later added arm is labelled. The order is what each stage's text records: on `main`, the matrices of D, E0 and E4 first appear in the commit that holds their results |
 | Equivalence, exact | same token IDs, every request of every run of an arm | M37: one changed ID fails with the first difference |
 | Bit identity | `np.array_equal` on logits against a resident run at the same ubatch, on Metal also the same split | master's fusion differs across CPU splits, up to 3.23 in IQ3 logits against an unsplit run |
 | Reference choice | at a different ubatch or device, token equivalence is INFO only | the ubatch changes the order of the sums: first differences at tokens 12 to 22 |
 | Footprint | `phys_footprint` beside the GGUF's page-cache residency from `mincore` | buffered reads hold up to 20.8 GiB that a 10.9 GiB footprint does not show |
-| Negative controls | each check is shown failing on a mutation (global M-numbers) | M49's plain form failed only the unit test, which is why a strong form was added |
+| Negative controls | checks are shown failing on a mutation (global M-numbers) | M49's plain form failed only the unit test, which is why a strong form was added |
 | Trace replay | causal, phases apart, a step as one event, a Belady bound labelled unattainable | [expert-predictor-result.md](expert-predictor-result.md) |
 
 ### The Kolibri benchmark matrix
@@ -773,7 +774,7 @@ All matrices run `llama-server -ngl 99 -t 10 -c 4096 -np 1 --fit off`, one cold 
 
 | Matrix | Stage | Reps | Arms | Ceilings GiB | Fork build | Results in the repo |
 |---|---|--:|---|---|---|---|
-| `testdata/bench/expert-cache.json` | D | 3 | IQ3 resident, `--cpu-moe`, cache 128, cache with prefetch 12, resident `-ub 21`; Q8_0 cache, cache with prefetch, `--cpu-moe --no-repack` | 0, 16 (Q8_0 and the control at 0) | `2da6ec661` | [expert-streaming.md](expert-streaming.md#results) |
+| `testdata/bench/expert-cache.json` | D | 3 (the control 1) | IQ3 resident, `--cpu-moe`, cache 128, cache with prefetch 12, resident `-ub 21`; Q8_0 cache, cache with prefetch, `--cpu-moe --no-repack` | 0, 16 (Q8_0 and the control at 0) | `2da6ec661` | [expert-streaming.md](expert-streaming.md#results) |
 | `testdata/bench/e1.json` | E1 | 2 | IQ3 resident `-ub 21`, cache 384 `-ub 21`, cache 128, cache 128 buffered; Q8_0 cache 128, buffered | 0, 16 (the two `-ub 21` controls at 0) | `746be1eae` | [expert-diagnostics.md](expert-diagnostics.md) |
 | `testdata/bench/e0.json` | E0.2 | 2 | IQ3 `--cpu-moe`, cache 128, buffered, #29887, #25294 | 0, 16 (#29887 at 0) | rebased fork | "The benchmark" above |
 | `testdata/bench/e4.json` | E4 | 3 | IQ3 `--cpu-moe`, cache 128, waves, waves buffered, #25294 | 0, 16 | `90311e5a2` | [expert-streaming.md](expert-streaming.md#results-1) |
