@@ -2,7 +2,7 @@
 
 The reproducible baseline of Kolibri-1's repetition loops, step 1 of issue #66. It is a measurement: no weight is edited, and nothing here suggests a fix. Steps 2 to 5 of the issue (activation patching, weight edits) are not started.
 
-**Status: the corpus, the tool and the definitions are committed. Results are pending; see [Results](#results-pending).**
+**Status: the corpus, the tool and the definitions are committed, and one run on the quantized IQ3 weight is reported under [Results](#results). BF16 and reference logits remain open.**
 
 | Issue metric | State |
 |---|---|
@@ -221,7 +221,7 @@ The numbers start at M72 because M70 and M71 are taken by PR #72's controls in [
   - `--expert-cache 128`, `--fit off` and `-ngl 99` on the router fixture ran 3 prompts, with the server's log showing the ubatch capped to 21.
 
   This shows the tool works, and nothing about loops: random weights say nothing about Kolibri-1.
-- **Not checked:** the real weight. No run on it has happened yet.
+- **The real weight:** one run; see [Results](#results). A second run on it, and so its repeatability there, has not been checked.
 
 ## Not done
 
@@ -231,6 +231,91 @@ The numbers start at M72 because M70 and M71 are taken by PR #72's controls in [
 
 Each report lists these three too, so they stay with a `report.json` read without this page.
 
-## Results (pending)
+## Results
 
-**No result exists yet.** This section gets its tables from `kolibri-loops report` once the real run has happened, with the run's pins. The definitions above do not change for it.
+One run on 2026-11-07, 112 of 112 records in a single pass, with no resume. It used [the command above](#the-real-run), with a binary built from commit `65d1be4` in place of `go run`. The tables are the output of `kolibri-loops report`, unedited; the notes under them were checked against `report.json` and the records. Records, `report.json` and `server.log` are in `~/models/eval/loop-baseline/iq3-cache128`, on this machine only.
+
+**What this run is, and is not:**
+- **One quantized weight.** It does not replace BF16, and [the BF16 run remains a follow-up](#what-a-run-on-this-weight-does-not-replace).
+- **`--expert-cache 128` at ubatch 21.** `server.log` shows "n_ubatch 512 capped to 21". The documented runs used the default ubatch, and tokens from the two settings differ, so the control table informs and does not gate.
+- **The waves build.** `b11839-90311e5a2` is fork branch `feat/kolibri1-waves`, without passing `--expert-cache-waves`. Whether a build without that code gives the same tokens has not been measured.
+- **No reference logits.** "p(first)" and "p(in loop)" are this run's own probabilities.
+- **Run once.** Repeatability was checked on tiny random weights only, not on this weight.
+- **No timing.** The run took no timing, and none is published.
+- **Not done:** reference logits, BF16 and tool use; see [Not done](#not-done).
+- **A baseline only.** It says nothing about any intervention.
+
+**Pins:**
+- **Weight:** `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, a real local file, 35556257600 bytes, SHA-256 `93720b94a5a383f5bad07677ca05014bf0681a662e646ea3b1b196cda33c88bc`.
+- **Server:** `llama-server` SHA-256 `a3e31e656f5f540b4dc9b7583d9d06399632901cdaeffe0726edbcb400a8b798`, 16 libraries next to it with digest `822af4fc6b434ce96e82ae6b025bdf30dcbf97730f12206608e52aca8df3427c`, flags `-ngl 99 -t 10 -c 4096 -np 1 --fit off --jinja --expert-cache 128`, no `LLAMA_` or `GGML_` variables.
+- **Inputs:** chat template SHA-256 `9ba35d4bd6baa26b66aa75d03a922dfee98b16bb1fa37481b195d247267b0f97`, corpus SHA-256 `722992046f85c1ac63394e954dd776239d08ad7a283b4117cdd1140bf36b2ddc`, vocabulary 128000.
+- **Decoding:** greedy, seed 42, `n_predict` 256 (768 with thinking on), `n_probs` 10.
+- **Counts:** 0 generated tokens without a listed probability, 0 bans while measuring the loss.
+
+### Repetition
+
+| Split | Form | Lang | Prompts | Loops | Rate | Median start | Latest start | Periods | Ended by EOS | Limit, no loop (censored) |
+|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|
+| tuning | raw | de | 15 | 13 | 0.867 | 0.0 | 2 | [1 1 2 2 2 2 2 2 2 5 6 13 21] | 1 | 1 |
+| tuning | raw | en | 15 | 10 | 0.667 | 0.5 | 216 | [2 2 3 4 5 6 6 7 15 17] | 1 | 4 |
+| tuning | chat | de | 15 | 0 | 0.000 | - | - | [] | 14 | 1 |
+| tuning | chat | en | 15 | 0 | 0.000 | - | - | [] | 14 | 1 |
+| tuning | chat-think | de | 2 | 0 | 0.000 | - | - | [] | 2 | 0 |
+| tuning | chat-think | en | 2 | 0 | 0.000 | - | - | [] | 2 | 0 |
+| held-out | raw | de | 9 | 8 | 0.889 | 0.0 | 8 | [1 1 2 2 4 5 7 9] | 0 | 1 |
+| held-out | raw | en | 9 | 2 | 0.222 | 210.5 | 238 | [3 7] | 0 | 7 |
+| held-out | chat | de | 9 | 0 | 0.000 | - | - | [] | 9 | 0 |
+| held-out | chat | en | 9 | 0 | 0.000 | - | - | [] | 9 | 0 |
+| held-out | chat-think | de | 2 | 0 | 0.000 | - | - | [] | 2 | 0 |
+| held-out | chat-think | en | 2 | 0 | 0.000 | - | - | [] | 2 | 0 |
+
+The rate is a lower bound and the starts cover detected loops only; see [What the token limit hides](#what-the-token-limit-hides). Cells hold 2 to 15 prompts, and the tuning and held-out rows hold different prompts, with no capital prompt on the held-out side. The two chat generations at the limit are `story.de.chat` and `story.en.chat`. Every `chat-think` generation ended before its limit.
+
+### Answer accuracy
+
+| Split | Form | Lang | Scored | Correct | Wrong | Unanswered | Accuracy | Mentioned | Mention rate |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| tuning | raw | de | 11 | 3 | 8 | 0 | 0.273 | 3 | 0.273 |
+| tuning | raw | en | 11 | 10 | 1 | 0 | 0.909 | 10 | 0.909 |
+| tuning | chat | de | 11 | 11 | 0 | 0 | 1.000 | 11 | 1.000 |
+| tuning | chat | en | 11 | 11 | 0 | 0 | 1.000 | 11 | 1.000 |
+| tuning | chat-think | de | 1 | 1 | 0 | 0 | 1.000 | 1 | 1.000 |
+| tuning | chat-think | en | 1 | 1 | 0 | 0 | 1.000 | 1 | 1.000 |
+| held-out | raw | de | 5 | 0 | 5 | 0 | 0.000 | 0 | 0.000 |
+| held-out | raw | en | 5 | 4 | 1 | 0 | 0.800 | 4 | 0.800 |
+| held-out | chat | de | 5 | 5 | 0 | 0 | 1.000 | 5 | 1.000 |
+| held-out | chat | en | 5 | 5 | 0 | 0 | 1.000 | 5 | 1.000 |
+| held-out | chat-think | de | 2 | 2 | 0 | 0 | 1.000 | 2 | 1.000 |
+| held-out | chat-think | en | 2 | 2 | 0 | 0 | 1.000 | 2 | 1.000 |
+
+The low raw German numbers, from `per_record`: 13 of the 16 scored prompts are wrong because no accepted term occurs, and each of the 13 loops from token 0, as in " Deutschland Deutschland". The other three are correct: `question-capital.de.raw` does not loop, while `capitals-context.de.raw` and `wall-year.de.raw` give the answer and also loop from token 0. "Mentioned" equals "Correct" in every row of this run.
+
+### Held-out loss
+
+| Split | Lang | Texts | Positions | Zero probability | Mean NLL (nats) | Perplexity |
+|---|---|---:|---:|---:|---:|---:|
+| tuning | de | 2 | 75 | 0 | 3.5593 | 35.138 |
+| tuning | en | 2 | 71 | 0 | 3.1641 | 23.666 |
+| held-out | de | 2 | 64 | 0 | 3.5902 | 36.240 |
+| held-out | en | 2 | 63 | 0 | 3.9640 | 52.668 |
+
+Each cell holds 2 texts. These numbers are for before and after comparisons on this corpus, and [are not comparable with the PPL in real-checkpoint.md](#held-out-loss).
+
+### Documented controls
+
+| Prompt | Split | Documented | Loops here | Start | Period | p(first) | p(in loop) | Agrees |
+|---|---|---|---|---:|---:|---:|---:|---|
+| berlin-lead.de.raw | tuning | loop | true | 0 | 13 | 0.931 | 0.999 | true |
+| capital-germany.de.raw | tuning | loop | true | 0 | 1 | 0.843 | 0.999 | true |
+| capital-germany.en.raw | tuning | non-loop | true | 64 | 15 | 0.519 | 0.997 | false |
+| capitals-context.de.raw | tuning | loop | true | 0 | 21 | 0.980 | 1.000 | true |
+| capitals-context.en.raw | tuning | non-loop | true | 143 | 6 | 0.777 | 0.986 | false |
+| eot-capital.de.raw | tuning | loop | true | 0 | 5 | 0.422 | 0.995 | true |
+| eot-capital.en.raw | tuning | loop | true | 0 | 3 | 0.336 | 0.996 | true |
+| moe-explain.de.chat | tuning | non-loop | false | - | - | - | - | true |
+| question-capital.de.raw | tuning | non-loop | false | - | - | - | - | true |
+| rhine-clause.de.raw | held-out | loop | true | 0 | 2 | 0.395 | 0.998 | true |
+| rhine-context.en.raw | held-out | non-loop | true | 238 | 3 | 0.856 | 0.951 | false |
+| think-sky.de.chat-think | tuning | non-loop | false | - | - | - | - | true |
+
+9 of the 12 agree. All 6 documented loops loop here. The 3 that differ are English prompts documented as not looping, and they loop here from token 64, 143 and 238 of 256. For all three, the documented continuation is the beginning of this run's text as well. Two of those documented runs stopped at 40 tokens; the third, `capital-germany.en.raw`, documents one sentence without stating its length. So those documents do not show the tokens where these loops start, and this run does not contradict them. It also ran at another ubatch.
