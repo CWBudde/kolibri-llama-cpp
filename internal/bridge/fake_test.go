@@ -29,9 +29,10 @@ type fakeTurn struct {
 	calls     []fakeCall
 	finish    string // default: tool_calls with calls, stop without
 
-	raw    string // replays these bytes as the response, a captured stream for example
-	rawCT  string // their content type; default text/event-stream
-	status int    // the status of raw; default 200
+	raw     string // replays these bytes as the response, a captured stream for example
+	rawCT   string // their content type; default text/event-stream
+	status  int    // the status of raw; default 200
+	rawHang bool   // blocks after raw until the client goes away
 
 	cutAfter  int    // ends the connection after this many events, 0 means don't
 	cutLine   bool   // ... in the middle of the next one
@@ -208,6 +209,10 @@ func (f *fakeLlama) serve(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(script.status)
 		}
 		_, _ = w.Write([]byte(script.raw))
+		if script.rawHang {
+			w.(http.Flusher).Flush()
+			waitForClient()
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -301,17 +306,49 @@ func checkTrace(t *testing.T, res *Result) {
 	if last.Kind != EventRequestEnd || last.Stop != res.Stop {
 		t.Errorf("last event %+v, result stop %s", last, res.Stop)
 	}
-	turns := 0
+	turns, inTurn := 0, 0
+	calls := map[string]bool{} // started calls, and whether each has its result
 	for i, e := range res.Trace {
 		if e.Seq != i+1 || e.RequestID != res.RequestID {
 			t.Errorf("event %d: %+v", i, e)
 		}
-		if e.Kind == EventTurnStart {
+		switch e.Kind {
+		case EventTurnStart:
+			if inTurn != 0 {
+				t.Errorf("event %d: turn %d starts inside turn %d", i, e.Turn, inTurn)
+			}
 			turns++
+			inTurn = e.Turn
+		case EventTurnEnd:
+			if e.Turn != inTurn {
+				t.Errorf("event %d: turn %d ends inside turn %d", i, e.Turn, inTurn)
+			}
+			inTurn = 0
+		case EventCallStart:
+			if _, seen := calls[e.CallID]; seen {
+				t.Errorf("event %d: call %s starts twice", i, e.CallID)
+			}
+			calls[e.CallID] = false
+		case EventCallEnd:
+			if done, seen := calls[e.CallID]; !seen || done {
+				t.Errorf("event %d: call %s ends without a running start", i, e.CallID)
+			}
+			calls[e.CallID] = true
 		}
+	}
+	if inTurn != 0 {
+		t.Errorf("turn %d never ended", inTurn)
 	}
 	if turns != res.Turns {
 		t.Errorf("%d turn_start events, result says %d turns", turns, res.Turns)
+	}
+	// Only a request stopped from outside can leave a call without a result.
+	if res.Stop != StopCancelled && res.Stop != StopRequestTimeout {
+		for id, done := range calls {
+			if !done {
+				t.Errorf("call %s has no result, stop %s", id, res.Stop)
+			}
+		}
 	}
 }
 

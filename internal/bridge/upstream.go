@@ -115,7 +115,7 @@ func newClient(base string) *client {
 }
 
 // complete runs one turn. A nil *Failure means a response that ended properly, whatever its finish
-// reason: the caller decides what a turn may do.
+// reason: the caller decides what a turn may do. With a failure, the turn may be nil or partial.
 func (c *client) complete(ctx context.Context, body []byte, lim Limits, onDelta func(Delta)) (*Turn, *Failure) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
 	if err != nil {
@@ -273,7 +273,8 @@ func (a *assembler) done() []ToolCall {
 }
 
 // readStream reads events until [DONE]. Only [DONE] ends a turn: llama-server always sends it after
-// the finish chunk, and it doesn't send it after an error.
+// the finish chunk, and it doesn't send it after an error. With a failure, the turn is what arrived
+// before it.
 func readStream(body io.Reader, lim Limits, onDelta func(Delta)) (*Turn, *Failure) {
 	turn := &Turn{}
 	calls := &assembler{lim: lim, calls: map[int]*ToolCall{}}
@@ -287,24 +288,24 @@ func readStream(body io.Reader, lim Limits, onDelta func(Delta)) (*Turn, *Failur
 		}
 		data, ok := bytes.CutPrefix(line, []byte("data:"))
 		if !ok {
-			return nil, failure(StopBadUpstream, "unexpected line in the stream: %s", snippet(line))
+			return turn, failure(StopBadUpstream, "unexpected line in the stream: %s", snippet(line))
 		}
 		data = bytes.TrimPrefix(data, []byte(" "))
 		if string(data) == "[DONE]" {
 			turn.Calls = calls.done()
 			if turn.Finish == "" {
-				return nil, failure(StopBadUpstream, "[DONE] without a finish_reason")
+				return turn, failure(StopBadUpstream, "[DONE] without a finish_reason")
 			}
 			return turn, nil
 		}
 		var c chunk
 		if err := json.Unmarshal(data, &c); err != nil {
-			return nil, failure(StopBadUpstream, "an event is not JSON: %v: %s", err, snippet(data))
+			return turn, failure(StopBadUpstream, "an event is not JSON: %v: %s", err, snippet(data))
 		}
 		if c.Error != nil {
 			f := failure(StopUpstreamError, "%s", c.Error.Message)
 			f.HTTPStatus, f.UpstreamType = c.Error.Code, c.Error.Type
-			return nil, f
+			return turn, f
 		}
 		if c.Model != "" {
 			turn.Model = c.Model
@@ -314,7 +315,7 @@ func readStream(body io.Reader, lim Limits, onDelta func(Delta)) (*Turn, *Failur
 		}
 		for _, choice := range c.Choices {
 			if choice.Index != 0 {
-				return nil, failure(StopBadUpstream, "choice %d: only one choice is expected", choice.Index)
+				return turn, failure(StopBadUpstream, "choice %d: only one choice is expected", choice.Index)
 			}
 			if d := choice.Delta; d.Content != nil || d.ReasoningContent != nil {
 				delta := Delta{Model: turn.Model}
@@ -332,7 +333,7 @@ func readStream(body io.Reader, lim Limits, onDelta func(Delta)) (*Turn, *Failur
 			}
 			for _, d := range choice.Delta.ToolCalls {
 				if f := calls.add(d); f != nil {
-					return nil, f
+					return turn, f
 				}
 			}
 			if choice.FinishReason != nil {
@@ -343,11 +344,11 @@ func readStream(body io.Reader, lim Limits, onDelta func(Delta)) (*Turn, *Failur
 	err := scanner.Err()
 	switch {
 	case errors.Is(err, errTooLarge), errors.Is(err, bufio.ErrTooLong):
-		return nil, failure(StopResponseTooLarge, "the response passes %d bytes", lim.MaxTurnBytes)
+		return turn, failure(StopResponseTooLarge, "the response passes %d bytes", lim.MaxTurnBytes)
 	case err != nil:
-		return nil, failure(StopStreamBroken, "the stream broke with %d call fragments held back: %v", len(calls.calls), err)
+		return turn, failure(StopStreamBroken, "the stream broke with %d call fragments held back: %v", len(calls.calls), err)
 	}
-	return nil, failure(StopStreamBroken, "the stream ended before [DONE] with %d calls held back", len(calls.calls))
+	return turn, failure(StopStreamBroken, "the stream ended before [DONE] with %d calls held back", len(calls.calls))
 }
 
 // readWhole reads a non-streaming response. The bridge always asks for a stream, a server that

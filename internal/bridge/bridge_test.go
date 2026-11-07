@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"reflect"
 	"runtime"
 	"strings"
@@ -458,6 +460,13 @@ func TestCancelOneCall(t *testing.T) {
 	if len(ends) != 1 || ends[0].Code != "cancelled" || ends[0].JobState != "CANCELLED" {
 		t.Fatalf("results %+v", ends)
 	}
+	var requested bool
+	for _, e := range res.Trace {
+		requested = requested || (e.Kind == EventCancelRequested && e.CallID == "t1c0")
+	}
+	if !requested {
+		t.Error("the trace doesn't show the cancel")
+	}
 	if _, err := b.CancelCall("r", "t1c0"); err == nil {
 		t.Error("a call of a finished request can still be cancelled")
 	}
@@ -563,21 +572,32 @@ func TestCancelUnknownCallOfARunningRequest(t *testing.T) {
 // Cancelling during a turn cuts the upstream connection: llama-server stops generating when its
 // client leaves. The reason is the cancel, not the broken stream it causes.
 func TestCancelDuringATurn(t *testing.T) {
+	// A fragment of a call, then text: when the text arrives, the bridge has read the fragment.
+	insideACall := `data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"id":"x","type":"function","function":{"name":"int_add","arguments":"{\"a\":"}}]}}]}` + "\n\n" +
+		`data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"text"}}]}` + "\n\n"
 	for _, c := range []struct {
 		name string
 		turn fakeTurn
 	}{
 		{"before the first event", fakeTurn{hang: true}},
-		{"inside a call", fakeTurn{calls: []fakeCall{{"int_add", `{"a":"1","b":"2"}`}}, hangAfter: 3}},
+		{"inside a call", fakeTurn{raw: insideACall, rawHang: true}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFake(t, c.turn)
 			b := newBridge(t, f)
-			go func() {
-				waitFor(t, func() bool { return f.requestCount() == 1 })
-				b.Cancel("r")
-			}()
-			res := runBody(t, b, userBody)
+			var cb Callbacks
+			if c.turn.hang {
+				go func() {
+					waitFor(t, func() bool { return f.requestCount() == 1 })
+					b.Cancel("r")
+				}()
+			} else {
+				cb.Delta = func(Delta) { b.Cancel("r") }
+			}
+			res, err := b.Run(context.Background(), "r", []byte(userBody), cb)
+			if err != nil {
+				t.Fatal(err)
+			}
 			wantStop(t, res, StopCancelled)
 			if res.Calls != 0 {
 				t.Errorf("%d calls ran", res.Calls)
@@ -587,10 +607,17 @@ func TestCancelDuringATurn(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("the upstream connection stayed open")
 			}
+			var ends int
 			for _, e := range res.Trace {
-				if e.Kind == EventTurnEnd && e.Code != "cancelled" {
-					t.Errorf("turn_end says %q", e.Code)
+				if e.Kind == EventTurnEnd {
+					ends++
+					if e.Code != "cancelled" {
+						t.Errorf("turn_end says %q", e.Code)
+					}
 				}
+			}
+			if ends != 1 {
+				t.Errorf("%d turn_end events", ends)
 			}
 		})
 	}
@@ -670,6 +697,15 @@ func TestCallLimits(t *testing.T) {
 			t.Fatalf("%d calls, %d requests", res.Calls, f.requestCount())
 		}
 	})
+	t.Run("exactly the limit per request", func(t *testing.T) {
+		f := newFake(t, fakeTurn{calls: []fakeCall{call, call}}, fakeTurn{calls: []fakeCall{call, call}}, fakeTurn{content: "done"})
+		b := newBridge(t, f, func(c *Config) { c.Limits.MaxCalls = 4 })
+		res := runBody(t, b, userBody)
+		wantStop(t, res, StopCompleted)
+		if res.Calls != 4 {
+			t.Fatalf("%d calls", res.Calls)
+		}
+	})
 	t.Run("per turn", func(t *testing.T) {
 		f := newFake(t, fakeTurn{calls: []fakeCall{call, call, call, call, call}})
 		res := runBody(t, newBridge(t, f), userBody)
@@ -738,15 +774,108 @@ func TestAStreamThatBreaks(t *testing.T) {
 		{"non-streaming, no choice", fakeTurn{raw: `{"choices":[]}`, rawCT: "application/json"}, StopBadUpstream},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			f := newFake(t, fakeTurn{calls: []fakeCall{{"int_add", `{"a":"5","b":"5"}`}}}, c.turn)
+			f := newFake(t, fakeTurn{content: "first turn text", calls: []fakeCall{{"int_add", `{"a":"5","b":"5"}`}}}, c.turn)
 			res := runBody(t, newBridge(t, f), userBody)
 			wantStop(t, res, c.want)
+			if res.Content != c.turn.content {
+				t.Errorf("content %q, the broken turn had %q", res.Content, c.turn.content)
+			}
 			// The first turn's call ran, the broken turn's didn't.
 			if res.Calls != 1 || len(callEnds(res)) != 1 || res.Turns != 2 {
 				t.Fatalf("%d calls, %d turns", res.Calls, res.Turns)
 			}
 			if strings.Contains(fmt.Sprint(res.Trace), "t2c0") {
 				t.Fatal("the broken turn's call shows up in the trace")
+			}
+		})
+	}
+}
+
+// A turn that fails is the last turn: the result has its text so far, and no finish reason even if
+// the finish chunk arrived. The turn before it, which did finish, doesn't stand in for it.
+func TestAFailedTurnIsTheLastTurn(t *testing.T) {
+	first := fakeTurn{reasoning: "first thought", content: "first turn text", calls: []fakeCall{{"int_add", `{"a":"5","b":"5"}`}}}
+	for _, c := range []struct {
+		name              string
+		turn              fakeTurn
+		content, thinking string
+	}{
+		{"no [DONE]", fakeTurn{reasoning: "second", content: "partial second", noDone: true}, "partial second", "second"},
+		{"cut after the finish chunk", fakeTurn{content: "partial", cutAfter: 3 + len(fragments("partial")) - 1}, "partial", ""},
+		{"an HTTP error", fakeTurn{raw: `{"error":{"code":500,"message":"m"}}`, rawCT: "application/json", status: 500}, "", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake(t, first, c.turn)
+			res := runBody(t, newBridge(t, f), userBody)
+			if res.Stop == StopCompleted {
+				t.Fatalf("stop %s", res.Stop)
+			}
+			if res.Content != c.content || res.Reasoning != c.thinking || res.Finish != "" {
+				t.Errorf("content %q, reasoning %q, finish %q", res.Content, res.Reasoning, res.Finish)
+			}
+			if res.Model == "" {
+				t.Error("the model's name is gone")
+			}
+		})
+	}
+}
+
+// What llama-server can't parse goes back wrapped: encoding/json takes more than its parser does. The
+// real server's side of this is TestTinyCheckpointAcceptsTheEchoOfMalformedArguments.
+func TestEchoArguments(t *testing.T) {
+	wrapped := func(args string) string {
+		encoded, err := json.Marshal(map[string]string{"_malformed": args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(encoded)
+	}
+	for _, args := range []string{
+		`{"a":"1"}`, `{}`, `{"data":"\ud83d\ude00"}`, `{"data":"\uD83D\uDE00"}`, `{"data":"\\ud800"}`, `{"\ud83d\ude00":1}`,
+		`{"data":"\u0000"}`, `{"a":1e308,"b":-1.5E-3,"c":1e-999,"d":0e999}`, `[1,2]`, `{"data":"é\n\"\\"}`,
+		`{"a":` + strings.Repeat("9", 300) + `}`,
+	} {
+		if got := echoArguments(args); got != args {
+			t.Errorf("%s went back as %s", args, got)
+		}
+	}
+	for _, args := range []string{
+		`nonsense`, `{`, ``, // not JSON
+		`{"data":"\ud800"}`, `{"data":"\uDBFF"}`, `{"data":"\udc00"}`, `{"data":"a\ud800b"}`, `{"data":"\ud800\n"}`,
+		`{"data":"\ud800\u0041"}`, `{"data":"\ud800\ud800"}`, `{"data":"\ud83d\ude00\ud800"}`, `{"\ud800":1}`, `{"data":"\\\ud800"}`,
+		`{"a":1e999}`, `{"a":-1e999}`, `{"a":1E+400}`, `[1.5e309]`,
+	} {
+		if got := echoArguments(args); got != wrapped(args) {
+			t.Errorf("%s went back as %s", args, got)
+		}
+	}
+	// A wrapped text is clipped.
+	if got := echoArguments(`{"a":` + strings.Repeat("9", 400) + `}`); !strings.HasPrefix(got, `{"_malformed":"{\"a\":999`) || len(got) > 300 {
+		t.Errorf("400 digits went back as %s", got)
+	}
+	if got := echoArguments("{\"a\":\"\xff\"}"); !json.Valid([]byte(got)) || !strings.Contains(got, "_malformed") {
+		t.Errorf("invalid UTF-8 went back as %q", got)
+	}
+}
+
+// A lone surrogate runs: encoding/json reads it as U+FFFD. The echo is what must not end the request.
+func TestArgumentsTheServerCantParseStillReachTheModel(t *testing.T) {
+	for _, c := range []struct {
+		name, op, args, code string
+	}{
+		{"lone surrogate", "hash_sha256", `{"data":"\ud800"}`, ""},
+		{"overflowing number", "int_add", `{"a":1e999,"b":"2"}`, string(ops.CodeInvalidArgument)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake(t, fakeTurn{calls: []fakeCall{{c.op, c.args}}}, fakeTurn{content: "done"})
+			res := runBody(t, newBridge(t, f), userBody)
+			wantStop(t, res, StopCompleted)
+			if ends := callEnds(res); len(ends) != 1 || ends[0].Code != c.code {
+				t.Fatalf("results %+v", ends)
+			}
+			got := f.messages(1)[1]["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+			if !strings.Contains(got, "_malformed") {
+				t.Fatalf("echo %s", got)
 			}
 		})
 	}
@@ -804,6 +933,22 @@ func TestUpstreamProblems(t *testing.T) {
 			t.Fatalf("the prompt went elsewhere: %+v", res.Failure)
 		}
 	})
+	t.Run("an upstream error body is bounded", func(t *testing.T) {
+		// Whole, this would parse as a message. Past 64 KiB it is cut, and only the status is left.
+		raw := `{"error":{"code":500,"type":"server_error","message":"` + strings.Repeat("x", 70<<10) + `"}}`
+		f := newFake(t, fakeTurn{raw: raw, rawCT: "application/json", status: http.StatusInternalServerError})
+		res := runBody(t, newBridge(t, f), userBody)
+		wantStop(t, res, StopUpstreamHTTP)
+		if res.Failure.Message != "HTTP 500" || res.Failure.UpstreamType != "" {
+			t.Fatalf("%+v", res.Failure)
+		}
+	})
+	t.Run("proxy settings are ignored", func(t *testing.T) {
+		// http.ProxyFromEnvironment caches its answer and skips localhost, so no request can show this.
+		if newClient("http://x").http.Transport.(*http.Transport).Proxy != nil {
+			t.Fatal("the transport has a proxy function")
+		}
+	})
 	t.Run("a response past the limit", func(t *testing.T) {
 		for _, c := range []struct {
 			name string
@@ -842,6 +987,18 @@ func TestClientRequestsThatAreRefused(t *testing.T) {
 		`{"messages":[{"role":"user","content":"x"}],"n_predict":-1}`,
 		`{"messages":[{"role":"user","content":"x"}],"max_completion_tokens":5}`,
 		`{"messages":[{"role":"user","content":"x"}],"stream_options":{"include_usage":false}}`,
+		`{"messages":[{"role":"user","content":"x"}],"json_schema":{"type":"object"}}`,
+		`{"messages":[{"role":"user","content":"x"}],"function_call":"auto"}`,
+		`{"messages":[{"role":"user","content":"x"}],"continue_final_message":true}`,
+		`{"messages":[{"role":"user","content":"x"}],"add_generation_prompt":false}`,
+		// llama-server's own names for what the fields above do.
+		`{"messages":[{"role":"user","content":"x"}],"chat_template_kwargs":{"tools":null}}`,
+		`{"messages":[{"role":"user","content":"x"}],"chat_template_kwargs":{"messages":[{"role":"user","content":"replaced"}]}}`,
+		`{"messages":[{"role":"user","content":"x"}],"chat_template_kwargs":{}}`,
+		`{"messages":[{"role":"user","content":"x"}],"n_cmpl":2}`,
+		`{"messages":[{"role":"user","content":"x"}],"reasoning_format":"none"}`,
+		`{"messages":[{"role":"user","content":"x"}],"echo":true}`,
+		`{"messages":[{"role":"user","content":"x"}],"something_new":1}`,
 	} {
 		_, err := b.Run(context.Background(), "", []byte(body), Callbacks{})
 		var refused *RequestError
@@ -854,6 +1011,27 @@ func TestClientRequestsThatAreRefused(t *testing.T) {
 	}
 	if f.requestCount() != 0 {
 		t.Errorf("%d requests reached the server", f.requestCount())
+	}
+}
+
+// What a client may set reaches the server as it was written.
+func TestClientFieldsThatPassThrough(t *testing.T) {
+	f := newFake(t, fakeTurn{content: "x"})
+	body := `{"messages":[{"role":"user","content":"x"}],"model":"m","user":"u","seed":7,"stop":["a"],"logit_bias":[[1,2]],` +
+		`"reasoning_effort":"low","parallel_tool_calls":false,"cache_prompt":false,"temperature":0.5,"top_p":0.9,"top_k":40,"min_p":0.1,` +
+		`"typical_p":1,"presence_penalty":0.1,"frequency_penalty":0.2,"repeat_penalty":1.1,"repeat_last_n":64,"tool_choice":"auto","n":1,"max_tokens":9}`
+	wantStop(t, runBody(t, newBridge(t, f), body), StopCompleted)
+	var sent, given map[string]json.RawMessage
+	if err := json.Unmarshal(f.request(0), &sent); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(body), &given); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range given {
+		if name != "messages" && string(sent[name]) != string(value) {
+			t.Errorf("%s: sent %s, given %s", name, sent[name], value)
+		}
 	}
 }
 
@@ -927,16 +1105,22 @@ func TestReproducible(t *testing.T) {
 
 // The scheduler's limit on open requests, and a request ID in use.
 func TestAdmission(t *testing.T) {
-	f := newFakeFunc(t, func(int, []byte) fakeTurn { return fakeTurn{hang: true} })
+	const holdBody = `{"messages":[{"role":"user","content":"hold"}]}`
+	f := newFakeFunc(t, func(_ int, body []byte) fakeTurn {
+		if strings.Contains(string(body), "hold") {
+			return fakeTurn{hang: true}
+		}
+		return fakeTurn{content: "x"}
+	})
 	b := newBridge(t, f, func(c *Config) { c.Limits.MaxRequests = 2 })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
-	for _, id := range []string{"one", "two"} {
+	hold := func(ctx context.Context, id string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := b.Run(ctx, id, []byte(userBody), Callbacks{})
+			res, err := b.Run(ctx, id, []byte(holdBody), Callbacks{})
 			if err != nil {
 				t.Error(err)
 				return
@@ -944,6 +1128,8 @@ func TestAdmission(t *testing.T) {
 			wantStop(t, res, StopCancelled)
 		}()
 	}
+	hold(ctx, "one")
+	hold(ctx, "two")
 	waitFor(t, func() bool { return f.requestCount() == 2 })
 	var refused *RequestError
 	if _, err := b.Run(context.Background(), "one", []byte(userBody), Callbacks{}); !errors.As(err, &refused) || refused.Status != http.StatusConflict {
@@ -954,11 +1140,138 @@ func TestAdmission(t *testing.T) {
 	}
 	cancel()
 	wg.Wait()
-	// Both slots are free again, and an ID can be used again.
-	g := newFake(t, fakeTurn{content: "x"}, fakeTurn{content: "y"})
-	b2 := newBridge(t, g)
-	wantStop(t, runBody(t, b2, userBody), StopCompleted)
-	wantStop(t, runBody(t, b2, userBody), StopCompleted)
+	// Both slots are free again, and an ID can be used again: one request holds a slot, another runs.
+	again, stop := context.WithCancel(context.Background())
+	defer stop()
+	seen := f.requestCount()
+	hold(again, "one")
+	waitFor(t, func() bool { return f.requestCount() == seen+1 })
+	res, err := b.Run(context.Background(), "two", []byte(userBody), Callbacks{})
+	if err != nil {
+		t.Fatalf("the second slot: %v", err)
+	}
+	wantStop(t, res, StopCompleted)
+	stop()
+	wg.Wait()
+}
+
+// A generated ID shares its namespace with the IDs clients choose, and a request that named nothing
+// can't be a duplicate.
+func TestGeneratedIDsStepAroundClientIDs(t *testing.T) {
+	f := newFakeFunc(t, func(_ int, body []byte) fakeTurn {
+		if strings.Contains(string(body), "hold") {
+			return fakeTurn{hang: true}
+		}
+		return fakeTurn{content: "x"}
+	})
+	b := newBridge(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := b.Run(ctx, "req-1", []byte(`{"messages":[{"role":"user","content":"hold"}]}`), Callbacks{}); err != nil {
+			t.Error(err)
+		}
+	}()
+	waitFor(t, func() bool { return f.requestCount() == 1 })
+	res, err := b.Run(context.Background(), "", []byte(userBody), Callbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStop(t, res, StopCompleted)
+	if res.RequestID != "req-2" {
+		t.Errorf("request ID %s", res.RequestID)
+	}
+	cancel()
+	<-done
+}
+
+// Two runs with generated IDs on one bridge have one canonical trace.
+func TestCanonicalIgnoresGeneratedIDs(t *testing.T) {
+	f := newFakeFunc(t, func(_ int, body []byte) fakeTurn {
+		if strings.Contains(string(body), `"role":"tool"`) {
+			return fakeTurn{content: "done"}
+		}
+		return fakeTurn{calls: []fakeCall{{"int_add", `{"a":"1","b":"2"}`}}}
+	})
+	b := newBridge(t, f)
+	first, err := b.Run(context.Background(), "", []byte(userBody), Callbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := b.Run(context.Background(), "", []byte(userBody), Callbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.RequestID == second.RequestID {
+		t.Fatalf("both are %s", first.RequestID)
+	}
+	if !reflect.DeepEqual(Canonical(first.Trace), Canonical(second.Trace)) {
+		t.Errorf("the traces differ:\n%+v\n%+v", Canonical(first.Trace), Canonical(second.Trace))
+	}
+}
+
+// A client that blocks in a callback holds up its own request, not a cancel call, and the cancel takes
+// effect at once. The event reaches the callback afterwards, in order.
+func TestCancelDoesntWaitForACallback(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var seen []Event // only the run's goroutine touches it until results is read
+	f := newFake(t, fakeTurn{hang: true})
+	b := newBridge(t, f)
+	results := make(chan *Result, 1)
+	go func() {
+		res, err := b.Run(context.Background(), "r", []byte(userBody), Callbacks{Event: func(e Event) {
+			seen = append(seen, e)
+			if e.Kind == EventTurnStart {
+				once.Do(func() { close(entered) })
+				<-release
+			}
+		}})
+		if err != nil {
+			t.Error(err)
+		}
+		results <- res
+	}()
+	<-entered
+	cancelled := make(chan struct{})
+	go func() {
+		defer close(cancelled)
+		if _, err := b.CancelCall("r", "t9c9"); err == nil {
+			t.Error("an unknown call can be cancelled")
+		}
+		if !b.Cancel("r") {
+			t.Error("the request isn't running")
+		}
+	}()
+	select {
+	case <-cancelled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the cancel call waits for the client")
+	}
+	close(release)
+	res := <-results
+	wantStop(t, res, StopCancelled)
+	if res.Failure.Message != errCancelled.Error() {
+		t.Errorf("failure %+v", res.Failure)
+	}
+	if !reflect.DeepEqual(seen, res.Trace) {
+		t.Errorf("the callback saw %+v\nthe trace is %+v", seen, res.Trace)
+	}
+}
+
+// After request_end nothing is added and nothing is sent: a late cancel call finds a finished handler.
+func TestNothingAfterTheEndOfARequest(t *testing.T) {
+	var seen int
+	r := &run{b: newBridge(t, newFake(t)), id: "r", began: time.Now(), cb: Callbacks{Event: func(Event) { seen++ }}}
+	r.emit(Event{Kind: EventRequestEnd})
+	r.record(Event{Kind: EventCancelRequested})
+	r.emit(Event{Kind: EventCancelRequested})
+	if len(r.trace) != 1 || seen != 1 {
+		t.Errorf("%d events in the trace, the callback saw %d", len(r.trace), seen)
+	}
 }
 
 func TestManyRequestsAtOnce(t *testing.T) {
@@ -993,8 +1306,17 @@ func TestManyRequestsAtOnce(t *testing.T) {
 
 func TestClosingTheBridgeEndsRequests(t *testing.T) {
 	started := make(chan struct{}, 1)
+	var stopped atomic.Int32
+	// A worker that takes a moment to stop: Close has to wait for it, not just tell it.
+	op := ops.DefineForTest("slow_op", func(ctx context.Context, _ json.RawMessage) (json.RawMessage, *ops.Error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond)
+		stopped.Add(1)
+		return nil, ops.Failure(ops.CodeCancelled, "stopped")
+	})
 	f := newFake(t, fakeTurn{calls: []fakeCall{{"slow_op", `{}`}}})
-	cfg := Config{Upstream: f.srv.URL, Limits: testLimits(), OpLimits: ops.DefaultLimits(), Ops: []ops.Op{slowOp(started, nil)}}
+	cfg := Config{Upstream: f.srv.URL, Limits: testLimits(), OpLimits: ops.DefaultLimits(), Ops: []ops.Op{op}}
 	b, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1012,6 +1334,9 @@ func TestClosingTheBridgeEndsRequests(t *testing.T) {
 	defer cancel()
 	if err := b.Close(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if stopped.Load() != 1 {
+		t.Error("Close returned with a worker still running")
 	}
 	wantStop(t, <-results, StopCancelled)
 	if _, err := b.Run(context.Background(), "r2", []byte(userBody), Callbacks{}); err == nil {
@@ -1270,6 +1595,240 @@ func TestHTTPStreamingFailure(t *testing.T) {
 	}
 }
 
+// bigAnswer is one delta past any socket buffer, then a proper end. A client that doesn't read parks
+// the write of it. Ordinary deltas would get there too, only later.
+func bigAnswer() string {
+	return `data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"` + strings.Repeat("x", 16<<20) + `"}}]}` + "\n\n" +
+		`data: {"choices":[{"finish_reason":"stop","index":0,"delta":{}}]}` + "\n\ndata: [DONE]\n\n"
+}
+
+// stuckClient posts a request and never reads a byte of the answer.
+func stuckClient(t *testing.T, srv *httptest.Server, id, body string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.(*net.TCPConn).SetReadBuffer(4096); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nX-Request-Id: %s\r\nContent-Length: %d\r\n\r\n%s", id, len(body), body); err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+// serveAndWatch serves the bridge and reports each chat handler that returned, by its request ID.
+func serveAndWatch(t *testing.T, b *Bridge) (*httptest.Server, <-chan string) {
+	t.Helper()
+	ended := make(chan string, 16)
+	handler := b.Handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r)
+		if r.URL.Path == "/v1/chat/completions" {
+			ended <- r.Header.Get("X-Request-Id")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, ended
+}
+
+func waitForEnd(t *testing.T, ended <-chan string, id string) {
+	t.Helper()
+	select {
+	case got := <-ended:
+		if got != id {
+			t.Fatalf("handler of %q ended, waiting for %q", got, id)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the handler of %q is still running", id)
+	}
+}
+
+const streamBody = `{"messages":[{"role":"user","content":"x"}],"stream":true}`
+
+// A streaming client that stops reading loses its request at the write deadline. Nothing else could
+// end it: Step is parked in the write, where no context reaches it, past every other limit.
+func TestHTTPStreamingClientThatStopsReading(t *testing.T) {
+	f := newFake(t, fakeTurn{raw: bigAnswer()}, fakeTurn{content: "fine"})
+	var final atomic.Value
+	b := newBridge(t, f, func(c *Config) {
+		c.Limits.MaxRequests = 1
+		c.Limits.MaxTurnBytes = 64 << 20
+		c.Limits.WriteTimeout = 500 * time.Millisecond
+		c.Trace = func(e Event) {
+			if e.Kind == EventRequestEnd {
+				final.Store(e)
+			}
+		}
+	})
+	srv, ended := serveAndWatch(t, b)
+	stuckClient(t, srv, "stuck", streamBody)
+	waitForEnd(t, ended, "stuck")
+	e, _ := final.Load().(Event)
+	if e.Stop != StopCancelled || e.Failure == nil || !strings.Contains(e.Failure.Message, "went away") {
+		t.Errorf("end %+v, failure %+v", e, e.Failure)
+	}
+	// The one slot is free.
+	if resp, raw := post(t, srv.URL+"/v1/chat/completions", userBody, "X-Request-Id", "next"); resp.StatusCode != http.StatusOK {
+		t.Errorf("%d: %s", resp.StatusCode, raw)
+	}
+}
+
+// brokenWriter is a client whose writes fail, without the context that net/http would cancel too.
+type brokenWriter struct {
+	http.ResponseWriter
+	writes int
+}
+
+func (w *brokenWriter) Write([]byte) (int, error) {
+	w.writes++
+	return 0, errors.New("broken pipe")
+}
+
+// A failed write ends the request by itself, and is the last one tried.
+func TestAFailedWriteEndsTheRequest(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	w := &brokenWriter{ResponseWriter: httptest.NewRecorder()}
+	out := &sseWriter{b: newBridge(t, newFake(t)), w: w, fail: cancel}
+	out.event("", map[string]any{"a": 1})
+	out.done()
+	if w.writes != 1 {
+		t.Errorf("%d writes", w.writes)
+	}
+	if err := context.Cause(ctx); err == nil || !strings.Contains(err.Error(), "writing to the client: broken pipe") {
+		t.Errorf("cause %v", err)
+	}
+}
+
+// parkedInWrite reports whether a goroutine is inside the stream's write.
+func parkedInWrite() bool {
+	buf := make([]byte, 4<<20)
+	return strings.Contains(string(buf[:runtime.Stack(buf, true)]), "(*sseWriter).write")
+}
+
+// A cancel call answers while the run's goroutine is stuck in a write to its client. The write's
+// deadline is far off here, so nothing but the cancel call's own path can answer.
+func TestHTTPCancelWhileTheClientIsStuck(t *testing.T) {
+	f := newFake(t, fakeTurn{raw: bigAnswer()})
+	var mu sync.Mutex
+	var kinds []EventKind
+	var failure *Failure
+	b := newBridge(t, f, func(c *Config) {
+		c.Limits.MaxTurnBytes = 64 << 20
+		c.Limits.WriteTimeout = time.Hour
+		c.Trace = func(e Event) {
+			mu.Lock()
+			defer mu.Unlock()
+			kinds = append(kinds, e.Kind)
+			if e.Kind == EventRequestEnd {
+				failure = e.Failure
+			}
+		}
+	})
+	srv, ended := serveAndWatch(t, b)
+	conn := stuckClient(t, srv, "stuck", streamBody)
+	waitFor(t, parkedInWrite)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(srv.URL+"/v1/executions/stuck/cancel", "application/json", strings.NewReader(`{"call_id":"t9c9"}`))
+	if err != nil {
+		t.Fatalf("cancelling a call: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("cancelling a call: %d", resp.StatusCode)
+	}
+	resp, err = client.Post(srv.URL+"/v1/executions/stuck/cancel", "application/json", nil)
+	if err != nil {
+		t.Fatalf("cancelling the request: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"cancelled":true`) {
+		t.Errorf("%d: %s", resp.StatusCode, raw)
+	}
+	conn.Close() // ends the write, whose deadline is an hour away
+	waitForEnd(t, ended, "stuck")
+	mu.Lock()
+	defer mu.Unlock()
+	var requested int
+	for _, k := range kinds {
+		if k == EventCancelRequested {
+			requested++
+		}
+	}
+	if requested != 2 || kinds[len(kinds)-1] != EventRequestEnd {
+		t.Errorf("events %v", kinds)
+	}
+	if failure == nil || failure.Message != errCancelled.Error() {
+		t.Errorf("failure %+v", failure)
+	}
+}
+
+// A client that doesn't read its non-streaming answer holds no slot, since the request has ended, but
+// its handler must not stay forever either.
+func TestHTTPCompletionClientThatStopsReading(t *testing.T) {
+	f := newFake(t, fakeTurn{raw: bigAnswer()})
+	b := newBridge(t, f, func(c *Config) {
+		c.Limits.MaxTurnBytes = 64 << 20
+		c.Limits.WriteTimeout = 200 * time.Millisecond
+	})
+	srv, ended := serveAndWatch(t, b)
+	stuckClient(t, srv, "stuck", userBody)
+	waitForEnd(t, ended, "stuck")
+}
+
+// A deadline covers one write. A healthy client isn't cut because a turn was slow, in a stream or
+// before a whole answer, and the deadline of its last write doesn't outlast the response: the
+// connection is still good for a request that sets none.
+func TestHTTPDeadlinesAreForOneWrite(t *testing.T) {
+	const timeout = 250 * time.Millisecond
+	slow := func() { time.Sleep(3 * timeout) }
+	f := newFake(t, fakeTurn{content: "a", onRequest: slow}, fakeTurn{content: "b", onRequest: slow})
+	b := newBridge(t, f, func(c *Config) { c.Limits.WriteTimeout = timeout })
+	srv := serveBridge(t, b)
+	client := srv.Client()
+	resp, err := client.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(streamBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || !strings.Contains(string(raw), "[DONE]") {
+		t.Fatalf("%v: %s", err, raw)
+	}
+	resp, err = client.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(userBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("%d, %v: %s", resp.StatusCode, err, raw)
+	}
+	time.Sleep(3 * timeout)
+	var reused bool
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused }}
+	for _, path := range []string{"/health", "/v1/bridge/tools"} {
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		_, err = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK || !reused {
+			t.Errorf("%s: %d, %v, connection reused: %v", path, resp.StatusCode, err, reused)
+		}
+		time.Sleep(3 * timeout)
+	}
+}
+
 // A client that leaves cancels the request and its upstream connection.
 func TestHTTPClientLeaves(t *testing.T) {
 	var ended sync.WaitGroup
@@ -1325,8 +1884,13 @@ func TestHTTPCancel(t *testing.T) {
 	if resp, raw := post(t, srv.URL+"/v1/executions/c1/cancel", `{"call_id":"nope"}`); resp.StatusCode != http.StatusNotFound {
 		t.Errorf("unknown call: %d: %s", resp.StatusCode, raw)
 	}
-	if resp, raw := post(t, srv.URL+"/v1/executions/c1/cancel", `{bad`); resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("bad body: %d: %s", resp.StatusCode, raw)
+	for _, body := range []string{`{bad`, `{"call_id":""}`, `{"call_id":null}`, `{"call_id":5}`} {
+		if resp, raw := post(t, srv.URL+"/v1/executions/c1/cancel", body); resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: %d: %s", body, resp.StatusCode, raw)
+		}
+	}
+	if b.running("c1") == coproc.Closed {
+		t.Error("a bad call_id ended the request")
 	}
 	// The whole request.
 	if resp, raw := post(t, srv.URL+"/v1/executions/c1/cancel", ``); resp.StatusCode != http.StatusOK {
@@ -1378,7 +1942,7 @@ func TestHTTPManifestAndHealth(t *testing.T) {
 	if out.Protocol != ops.Version || len(out.Ops) != 1 || out.Ops[0].Name != "int_add" || out.Ops[0].Output["type"] != "object" {
 		t.Errorf("%+v", out)
 	}
-	if out.Limits["max_turns"] == 0 || out.Limits["max_int_bits"] == 0 {
+	if out.Limits["max_turns"] == 0 || out.Limits["max_int_bits"] == 0 || out.Limits["write_timeout_ms"] == 0 {
 		t.Errorf("limits %v", out.Limits)
 	}
 	health, err := http.Get(srv.URL + "/health")

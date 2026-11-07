@@ -28,7 +28,7 @@ client ──HTTP──> kolibri-bridge ──HTTP, streaming──> llama-serve
                    └─ operations: internal/bridge/ops
 ```
 
-The bridge is a client of `/v1/chat/completions`, and a server of the same API. It adds the tools, runs the loop and returns the last turn as an ordinary completion.
+The bridge is a client of `/v1/chat/completions`, and a server of the same API. It adds the tools and runs the loop. A completion holds the last turn's text only. A stream carries the text of every turn as it arrives, so that a client sees `Let me add.3` where a completion says `3`. A client that wants one answer asks for a completion, or reads the turn boundaries from the trace events.
 
 **Why the tool-call path:** Kolibri's template, `<tool_call>` tokens, grammar and parser already work ([chat.md](chat.md)), and the real checkpoint has returned a parsed call through them ([real-checkpoint.md](real-checkpoint.md)). A new special token would need tokenizer and template work. A hook in llama-server's slot loop would be a patch to carry, and would only change what a pause costs, not what the model can do.
 
@@ -80,13 +80,13 @@ An operation is an OpenAI tool of the same name, so the grammar constrains each 
 
 A failed operation goes back to the model, which may repair it. A failed turn ends the request. The stop reasons are `completed`, `turn_limit`, `call_limit`, `truncated`, `unparsed_call`, `stream_broken`, `upstream_unreachable`, `upstream_http`, `upstream_error`, `bad_upstream`, `response_too_large`, `turn_timeout`, `request_timeout`, `cancelled` and `internal`.
 
-**HTTP.** `POST /v1/chat/completions` takes OpenAI's request, with `X-Request-Id` to name it. A success is a `chat.completion` plus a `kolibri_bridge` object: stop reason, turns, calls, every message and the trace. A failure is an error status with the same object. With `"stream": true` the answer comes in llama-server's chunks, the trace as named `kolibri_bridge` events, and a failure as an error event without `[DONE]`.
+**HTTP.** `POST /v1/chat/completions` takes OpenAI's request, with `X-Request-Id` to name it. A success is a `chat.completion` plus a `kolibri_bridge` object: stop reason, turns, calls, every message and the trace. A failure is an error status with the same object, whose `content` is what the failed turn wrote before it failed and whose `finish_reason` is absent. With `"stream": true` the answer comes in llama-server's chunks with every turn's text, the trace as named `kolibri_bridge` events, and a failure as an error event without `[DONE]`.
 
-- `POST /v1/executions/{id}/cancel` ends a request. The upstream connection is cut, which stops llama-server's generation.
-- The same with `{"call_id":"t1c0"}` cancels one operation: the model reads `cancelled` as its result and the request goes on. The answer's `cancelled` is false if it already had a result.
+- `POST /v1/executions/{id}/cancel` ends a request. The upstream connection is cut, which stops llama-server's generation. The answer doesn't wait for the request's client: its trace gets the `cancel_requested` event at once, and its stream at the next event.
+- The same with `{"call_id":"t1c0"}` cancels one operation: the model reads `cancelled` as its result and the request goes on. The answer's `cancelled` is false if it already had a result. An empty or null `call_id` is HTTP 400, not a cancel of the whole request: only a body without the field means that.
 - `GET /v1/bridge/tools` lists the version, the limits and every operation's input and output schema. `kolibri-bridge -ops` prints the same.
 
-A client's `tools`, `functions`, `grammar`, `json_schema`, `response_format`, `n_predict`, `max_completion_tokens`, `stream_options`, `continue_final_message` and `add_generation_prompt` are refused, as is a `tool_choice` other than `auto` or an `n` other than 1. They would replace the bridge or change what a turn can produce. Everything else passes through.
+A client's request may hold `messages`, `stream`, `tool_choice` (only `auto`), `n` (only 1), `max_tokens` (within the limit), `model`, `user`, `seed`, `stop`, `logit_bias`, `reasoning_effort`, `parallel_tool_calls`, `cache_prompt`, `temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `presence_penalty`, `frequency_penalty`, `repeat_penalty` and `repeat_last_n`. These pass through as written. **Any other field is refused with HTTP 400.** That covers `tools`, `functions`, `function_call`, `grammar`, `json_schema`, `response_format`, `n_predict`, `max_completion_tokens`, `stream_options`, `continue_final_message` and `add_generation_prompt`, and it covers what llama-server reads under other names, such as `chat_template_kwargs` and `n_cmpl`. A list of what to refuse kept missing those, so this is a list of what to accept.
 
 ## Operations
 
@@ -100,7 +100,7 @@ A client's `tools`, `functions`, `grammar`, `json_schema`, `response_format`, `n
 | `array_min`, `array_max` | `values`, not empty | `value` |
 | `array_sort` | `values`, `descending` (optional) | `values` |
 | `array_reverse` | `values` | `values` |
-| `hash_sha256`, `hash_sha512` | `data`, `encoding` (`utf8`, `hex`, `base64`; optional) | `hex` |
+| `hash_sha256`, `hash_sha512` | `data`, `encoding` (`utf8`, `hex`, `base64`; absent means `utf8`, empty is refused) | `hex`; `base64` is strict: no line breaks, no non-zero trailing bits |
 
 **Arithmetic is exact, with these limits:**
 
@@ -109,7 +109,7 @@ A client's `tools`, `functions`, `grammar`, `json_schema`, `response_format`, `n
 - Both sides use decimal strings: an optional minus and digits, with no leading zero and no `-0`.
 - A JSON integer is accepted within int64. Past that it is refused, even though the operation could compute it, as the next section explains.
 
-A JSON string with a lone surrogate escape (`"\ud800"`) decodes to U+FFFD, as everywhere in encoding/json. `hash_*` hashes that replacement.
+A JSON string with a lone surrogate escape (`"\ud800"`) decodes to U+FFFD, as everywhere in encoding/json, so `hash_*` hashes that replacement and not what the model wrote. The real server can't parse such arguments, so the echo wraps them, as the next section says, and the model reads the result.
 
 ## What the real server showed
 
@@ -119,12 +119,13 @@ These came from llama-server on the `cmd/kolibri-tiny` checkpoint. They shaped t
 |---|---|---|
 | The server parses a call's arguments to render the next prompt. `9223372036854775808` comes out as `-9223372036854775808`, `99999999999999999999999` as `1e+23` | JSON numbers past int64 are refused. Integers go as strings, which survive | `TestTinyCheckpointCorruptsLargeJSONNumbers` |
 | The grammar for `{"type":"integer"}` allows 16 digits (`common/json-schema-to-grammar.cpp`), while a string pattern is unbounded | The schema uses a string with a pattern. A model under the integer grammar couldn't write a longer number | `TestTinyCheckpointCompilesEverySchema` checks the grammar |
-| Arguments that aren't JSON make the next turn HTTP 500 | The echo wraps them as `{"_malformed":"..."}` so the model gets to read its error | `TestTinyCheckpointRefusesRawMalformedArguments`, `TestTinyCheckpointAcceptsTheEchoOfMalformedArguments` |
+| Arguments that aren't JSON make the next turn HTTP 500. So do arguments that encoding/json takes and the server's parser doesn't: a lone surrogate escape, and a number that overflows a double | The echo wraps all of these as `{"_malformed":"..."}`, so the model gets to read its result. That can be a successful one, as with `hash_*` and a surrogate. Other JSON goes back as it is, also when it isn't an object: the server takes `5` and `null` | `TestTinyCheckpointRefusesRawMalformedArguments`, `TestTinyCheckpointAcceptsTheEchoOfMalformedArguments`, `TestEchoArguments` |
+| `chat_template_kwargs` overrides the template's variables: a `messages` key replaces the rendered messages, and the bridge delivers results by appending to them | Refused | `TestTinyCheckpointTemplateKwargsReplaceTheMessages`, `TestClientRequestsThatAreRefused` |
 | A turn out of tokens returns a complete-looking call and a second one that is only `{`, with `finish_reason: "length"` | Only `"tool_calls"` runs anything | `TestCapturedCutTurnExecutesNothing` |
 | Text the parser can't read is an error event after a 200, without `[DONE]`. A repeated `<tool_call>` token comes back as plain content | `upstream_error`, `unparsed_call` | `TestCapturedParseErrorMidStream`, `TestAnAnswerCutOrWithAnUnparsedCall` |
 | `tool_choice: "required"` allows free text before the first call: the grammar's root has a free-text rule (`until-182?`) ahead of `tool-calls`. It doesn't make a call come first | The bridge uses `auto`. Only the tiny test uses `required`, with a prefilled `<tool_call>` | `forceCall` |
 | Under `required`, `parallel_tool_calls: false` didn't stop several calls in one turn | The limits count every call, and the bridge doesn't send the field by itself | `TestCallLimits` |
-| The tools cost prompt tokens: 46 without tools, 600 with the four of the acceptance task, 1926 with all 15 | `-allow` matters. The tiny checkpoint's 2048-token context barely fits them all | `TestTinyCheckpointCompilesEverySchema` |
+| The tools cost prompt tokens: 51 without tools, 605 with the four of the acceptance task, 1931 with all 15, on llama.cpp `90311e5a2` | `-allow` matters. The tiny checkpoint's 2048-token context barely fits them all | `TestTinyCheckpointCompilesEverySchema` |
 
 `testdata/bridge` holds the captured bytes. `TestCaptureFixtures` regenerates them, and `TestFakeHasTheCapturedShapes` holds the test server to their key paths.
 
@@ -136,6 +137,7 @@ These came from llama-server on the `cmd/kolibri-tiny` checkpoint. They shaped t
 | Calls per request, per turn | 64, 8 | `call_limit`. All of a turn runs or none of it |
 | Time of an operation | 5 s | the model reads `timeout` |
 | Time of a turn, of a request | 15 min, 1 h | `turn_timeout`, `request_timeout` |
+| Time of one write to a client | 30 s | `cancelled`: the client went away, and its slot is free |
 | Bytes of a turn's response, of a client's request | 8 MiB, 16 MiB | `response_too_large`, HTTP 413 |
 | `max_tokens` of a turn | 4096 | refused |
 | Arguments, array length, integer, result | 256 KiB, 4096, 4096 bits, 1 MiB | the model reads the error |
@@ -143,6 +145,7 @@ These came from llama-server on the `cmd/kolibri-tiny` checkpoint. They shaped t
 
 **What the limits don't do:**
 
+- **A write to a client can't be interrupted.** A turn's text goes to a stream on the request's own goroutine, so that a client that stops reading parks the turn in the write, where neither a timeout nor a cancel reaches it. The write's deadline ends that. So a stuck client can hold its request for up to one write timeout past the turn timeout, the request timeout or a cancel call. A cancel call answers at once all the same.
 - **Memory and time inside an operation are bounded by input size, not enforced.** There is no rlimit or separate process. The operations can't be interrupted inside a `math/big` call, so the checks run before the work. After a timeout the worker's context ends and its result is ignored, but a worker stuck in a call would keep its goroutine. No real operation can get stuck, since every input is bounded.
 - **"No filesystem or network" holds because the operations are plain Go functions in a registry.** The model picks a name from a list and passes JSON. `TestImportsStayPure` keeps `os`, `net`, `time` and random sources out of the direct imports of `internal/bridge/ops`. That is not a sandbox against hostile code, and there is no way to load code.
 - **The bridge talks to one upstream.** It ignores proxy settings and doesn't follow redirects.
@@ -161,7 +164,7 @@ All pass, and the real-server tests below are skipped without their environment 
 - malformed arguments, unknown and disallowed operations, overflow and division by zero;
 - a model that never stops calling;
 - a stream cut before a call, inside the arguments, inside an event, after the finish chunk and before `[DONE]`;
-- a hanging server, a slow operation, cancellation during an operation and during a turn, and a client that leaves;
+- a hanging server, a slow operation, cancellation during an operation and during a turn, a client that leaves, and a client that stops reading, with a stream or a whole answer;
 - parallel calls finishing in the other order, sixteen requests at once;
 - eight runs of one script giving the same bytes upstream, the same messages and the same canonical trace, with the server's random IDs in play.
 
@@ -180,7 +183,7 @@ third_party/llama.cpp/build/bin/llama-server -m $D/kolibri-tiny-f32.gguf --host 
 KOLIBRI_BRIDGE_TINY_URL=http://127.0.0.1:18731 go test -race -count=1 -v -run TestTinyCheckpoint ./internal/bridge/
 ```
 
-All six tests pass. A random model called `array_sum`, `int_div` and `hash_sha256`, the operations ran, the real template rendered their results, and two runs gave the same canonical trace.
+All seven tests pass. A random model called `array_sum`, `int_div` and `hash_sha256`, the operations ran, the real template rendered their results, and two runs gave the same canonical trace.
 
 ### The acceptance test, which has not run
 
@@ -233,3 +236,46 @@ Each of these was applied alone to the code and reverted. All 28 made `go test -
 | Results in reverse call order | `TestParallelCallsKeepTheirOrder`, `TestManyRequestsAtOnce`, `TestCancelACallThatIsDone` |
 | Cancel does nothing | `TestCancelDuringATurn`, `TestCancelDuringAnOperation`, `TestHTTPCancel` |
 | Request body not limited | `TestHTTPRefusals` |
+
+A later review ran more mutations against that suite and found ten that survived: the call limit off by one, four refused fields left out of the test, `Close` not waiting for workers, a dropped cancel event, an unbounded upstream error body, events after `request_end`, and proxy settings kept from the environment. So the table above was never all the coverage it may look like. The fixes that followed came with these 38, each applied alone to a copy of the code, and all of them make `go test -count=1 ./internal/bridge/... ./cmd/kolibri-bridge/` fail. They ran without `-race`. The first run had one survivor: a write deadline set at the start of every response, which turned out to do nothing, because net/http clears a connection's deadline when a response ends. That code is gone. The 28 above were not rerun after these changes.
+
+| Mutation | Failed tests |
+|---|---|
+| No write deadline | `TestHTTPCompletionClientThatStopsReading`, `TestHTTPStreamingClientThatStopsReading` |
+| A failed write does not end the request | `TestAFailedWriteEndsTheRequest` |
+| Writes go on after a failed one | `TestAFailedWriteEndsTheRequest` |
+| Deadline not renewed per stream write | `TestHTTPDeadlinesAreForOneWrite` |
+| Deadline not renewed before a whole answer | `TestHTTPDeadlinesAreForOneWrite` |
+| Cancel writes to the client itself | `TestHTTPCancelWhileTheClientIsStuck` |
+| A cancel of one call writes to the client itself | `TestHTTPCancelWhileTheClientIsStuck` |
+| Trace lock held during the callbacks | `TestCancelDoesntWaitForACallback` |
+| Echo trusts json.Valid | `TestArgumentsTheServerCantParseStillReachTheModel`, `TestEchoArguments` |
+| Echo: overflow not checked | `TestArgumentsTheServerCantParseStillReachTheModel`, `TestEchoArguments` |
+| Echo: lone low surrogate not checked | `TestEchoArguments` |
+| Echo: lone high surrogate not checked | `TestEchoArguments` |
+| chat_template_kwargs accepted | `TestClientRequestsThatAreRefused` |
+| n_cmpl accepted | `TestClientRequestsThatAreRefused` |
+| json_schema accepted | `TestClientRequestsThatAreRefused` |
+| function_call accepted | `TestClientRequestsThatAreRefused` |
+| continue_final_message accepted | `TestClientRequestsThatAreRefused` |
+| add_generation_prompt accepted | `TestClientRequestsThatAreRefused` |
+| An accepted field dropped | `TestClientFieldsThatPassThrough` |
+| A failed turn keeps the turn before it | `TestAFailedTurnIsTheLastTurn`, `TestAStreamThatBreaks` |
+| A failed turn keeps its finish reason | `TestAFailedTurnIsTheLastTurn` |
+| A failed stream drops its text | `TestAFailedTurnIsTheLastTurn`, `TestAStreamThatBreaks` |
+| A generated ID can be a duplicate | `TestGeneratedIDsStepAroundClientIDs` |
+| An empty call_id cancels the request | `TestHTTPCancel` |
+| A null call_id cancels the request | `TestHTTPCancel` |
+| Canonical keeps the request ID | `TestCanonicalIgnoresGeneratedIDs` |
+| Failed turn has no turn_end | `TestCancelDuringATurn`, `TestAStreamThatBreaks` and 7 more |
+| A result without its call_end | `TestAcceptanceJudge`, `TestMultiStepChain` |
+| Call limit off by one | `TestCallLimits` |
+| Close does not wait for workers | `TestClosingTheBridgeEndsRequests` |
+| A cancel of one call leaves no event | `TestCancelOneCall`, `TestHTTPCancelWhileTheClientIsStuck` |
+| Upstream error body unbounded | `TestUpstreamProblems` |
+| Events after request_end kept | `TestNothingAfterTheEndOfARequest` |
+| Proxy settings kept | `TestUpstreamProblems` |
+| A closed request keeps its slot | `TestAdmission`, `TestHTTPStreamingClientThatStopsReading` |
+| Hash: empty encoding accepted | `TestMalformedAndInvalidArguments` |
+| Hash: non-zero trailing bits accepted | `TestMalformedAndInvalidArguments` |
+| Hash: base64 line breaks accepted | `TestMalformedAndInvalidArguments` |

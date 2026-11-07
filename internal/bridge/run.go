@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"kolibri-llm/internal/bridge/ops"
 	"kolibri-llm/internal/coproc"
@@ -29,6 +32,7 @@ type Limits struct {
 	OpTimeout       time.Duration // one operation's run time
 	TurnTimeout     time.Duration // one completion, prompt processing included
 	RequestTimeout  time.Duration // the whole request
+	WriteTimeout    time.Duration // one write to an HTTP client: one that stops reading can't hold a request
 }
 
 // DefaultLimits returns the limits of a default bridge. The durations leave room for the real model
@@ -46,13 +50,14 @@ func DefaultLimits() Limits {
 		OpTimeout:       5 * time.Second,
 		TurnTimeout:     15 * time.Minute,
 		RequestTimeout:  time.Hour,
+		WriteTimeout:    30 * time.Second,
 	}
 }
 
 func (l Limits) validate() error {
 	if l.MaxTurns <= 0 || l.MaxCalls <= 0 || l.MaxCallsPerTurn <= 0 || l.MaxRequests <= 0 || l.MaxRunningOps <= 0 ||
 		l.MaxTurnTokens <= 0 || l.MaxTurnBytes <= 0 || l.MaxRequestBytes <= 0 || l.OpTimeout <= 0 ||
-		l.TurnTimeout <= 0 || l.RequestTimeout <= 0 {
+		l.TurnTimeout <= 0 || l.RequestTimeout <= 0 || l.WriteTimeout <= 0 {
 		return fmt.Errorf("bridge: every limit must be positive: %+v", l)
 	}
 	return nil
@@ -194,11 +199,16 @@ func invalid(format string, args ...any) *RequestError {
 	return &RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: fmt.Sprintf(format, args...)}
 }
 
-// forbidden are the fields of a client's request that would take the bridge's place, or change what
-// a turn's output can be, behind its back.
-var forbidden = []string{
-	"tools", "functions", "function_call", "grammar", "json_schema", "response_format",
-	"n_predict", "max_completion_tokens", "continue_final_message", "add_generation_prompt", "stream_options",
+// accepted are the fields of a client's request. llama-server reads many more, and some of them take
+// the bridge's place or change what a turn can produce: tools and grammar do, but so do
+// chat_template_kwargs, whose keys override the template's variables, messages and tools included,
+// and n_cmpl, the server's name for n. So this lists what is known to be harmless and refuses the
+// rest, rather than listing what is known to be harmful.
+var accepted = map[string]bool{
+	"messages": true, "stream": true, "tool_choice": true, "n": true, "max_tokens": true, // checked below
+	"model": true, "user": true, "seed": true, "stop": true, "logit_bias": true, "reasoning_effort": true, "parallel_tool_calls": true,
+	"cache_prompt": true, "temperature": true, "top_p": true, "top_k": true, "min_p": true, "typical_p": true,
+	"presence_penalty": true, "frequency_penalty": true, "repeat_penalty": true, "repeat_last_n": true,
 }
 
 var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -215,9 +225,9 @@ func (b *Bridge) parseChat(raw []byte) (*chat, *RequestError) {
 	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
 		return nil, invalid("the body is not a JSON object")
 	}
-	for _, name := range forbidden {
-		if _, ok := fields[name]; ok {
-			return nil, invalid("field %q is not allowed: the bridge sets it, or it would change what a turn can produce", name)
+	for name := range fields {
+		if !accepted[name] {
+			return nil, invalid("field %q is not accepted: the bridge sets it, it could change what a turn can produce, or the bridge doesn't know it", clipText(name))
 		}
 	}
 	c := &chat{fields: fields}
@@ -261,14 +271,16 @@ func (b *Bridge) parseChat(raw []byte) (*chat, *RequestError) {
 	return c, nil
 }
 
-// Callbacks gets what happens during a request, on the goroutine that runs it.
+// Callbacks gets what happens during a request, on the goroutine that runs it. A callback that blocks
+// holds up that request, but not a cancel call.
 type Callbacks struct {
 	Delta func(Delta)
 	Event func(Event)
 }
 
 // Result is the outcome of a request. A failed request still has its trace, its messages and the
-// last turn's text. The trace is complete: it ends in request_end.
+// last turn's text, as far as that turn got. A turn that failed has no finish reason. The trace is
+// complete: it ends in request_end.
 type Result struct {
 	RequestID string            `json:"request_id"`
 	Protocol  int               `json:"protocol"`
@@ -296,12 +308,8 @@ func (b *Bridge) Run(ctx context.Context, id string, body []byte, cb Callbacks) 
 }
 
 func (b *Bridge) start(ctx context.Context, id string, c *chat, cb Callbacks) (*Result, error) {
-	if id == "" {
-		b.mu.Lock()
-		b.last++
-		id = fmt.Sprintf("req-%d", b.last)
-		b.mu.Unlock()
-	} else if !requestIDPattern.MatchString(id) {
+	generated := id == ""
+	if !generated && !requestIDPattern.MatchString(id) {
 		return nil, invalid("request ID %q doesn't match %s", clipText(id), requestIDPattern)
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -313,7 +321,22 @@ func (b *Bridge) start(ctx context.Context, id string, c *chat, cb Callbacks) (*
 		b: b, id: id, cancel: cancel, cb: cb, fields: c.fields, messages: c.messages, began: time.Now(),
 		calls: map[coproc.JobID]*call{},
 	}
-	req, err := b.sched.Open(coproc.RequestID(id), r)
+	var req *coproc.Request
+	var err error
+	for {
+		if generated {
+			b.mu.Lock()
+			b.last++
+			id = fmt.Sprintf("req-%d", b.last)
+			b.mu.Unlock()
+			r.id = id
+		}
+		req, err = b.sched.Open(coproc.RequestID(id), r)
+		// A client may have named its request req-7. One that named nothing can't be a duplicate.
+		if !generated || !errors.Is(err, coproc.ErrDuplicateRequest) {
+			break
+		}
+	}
 	switch {
 	case errors.Is(err, coproc.ErrDuplicateRequest):
 		return nil, &RequestError{Status: http.StatusConflict, Type: "duplicate_request", Message: fmt.Sprintf("request %s is running", id)}
@@ -350,7 +373,8 @@ var (
 	errCancelled      = errors.New("cancelled by a cancel call")
 )
 
-// Cancel ends a running request. It reports whether the request was running.
+// Cancel ends a running request. It reports whether the request was running. It doesn't wait for the
+// client: see record.
 func (b *Bridge) Cancel(id string) bool {
 	b.mu.Lock()
 	r := b.runs[id]
@@ -358,7 +382,7 @@ func (b *Bridge) Cancel(id string) bool {
 	if r == nil {
 		return false
 	}
-	r.emit(Event{Kind: EventCancelRequested})
+	r.record(Event{Kind: EventCancelRequested})
 	r.cancel(errCancelled)
 	return true
 }
@@ -373,7 +397,7 @@ func (b *Bridge) CancelCall(id, callID string) (bool, error) {
 	if r == nil {
 		return false, fmt.Errorf("no running request %q", id)
 	}
-	r.emit(Event{Kind: EventCancelRequested, CallID: callID})
+	r.record(Event{Kind: EventCancelRequested, CallID: callID})
 	if err := r.req.Cancel(coproc.JobID(callID)); err != nil {
 		return false, err
 	}
@@ -412,10 +436,14 @@ type run struct {
 	traceMu sync.Mutex
 	seq     int
 	trace   []Event
-	ended   bool // request_end has been emitted: a late cancel call finds nothing to report to
+	sent    int  // how much of the trace has gone to the sink and the callback
+	ended   bool // request_end has been recorded: a late cancel call finds nothing to report to
 }
 
-func (r *run) emit(e Event) {
+// record adds an event to the trace without telling anyone. A cancel call stops here, on its own
+// goroutine: whatever the client is doing, it mustn't keep a cancel from taking effect or from being
+// answered. The run's goroutine sends the event on at its next emit, and request_end always comes.
+func (r *run) record(e Event) {
 	r.traceMu.Lock()
 	defer r.traceMu.Unlock()
 	if r.ended {
@@ -427,11 +455,23 @@ func (r *run) emit(e Event) {
 	e.RequestID = r.id
 	e.ElapsedMS = time.Since(r.began).Milliseconds()
 	r.trace = append(r.trace, e)
-	if r.b.cfg.Trace != nil {
-		r.b.cfg.Trace(e)
-	}
-	if r.cb.Event != nil {
-		r.cb.Event(e)
+}
+
+// emit records an event and sends what the trace holds so far on. Only the run's goroutine calls it,
+// so the events go out in order, and no lock is held while a slow client takes them.
+func (r *run) emit(e Event) {
+	r.record(e)
+	r.traceMu.Lock()
+	pending := r.trace[r.sent:]
+	r.sent = len(r.trace)
+	r.traceMu.Unlock()
+	for _, e := range pending {
+		if r.b.cfg.Trace != nil {
+			r.b.cfg.Trace(e)
+		}
+		if r.cb.Event != nil {
+			r.cb.Event(e)
+		}
 	}
 }
 
@@ -456,6 +496,7 @@ func (r *run) Step(ctx context.Context) (string, error) {
 		if cause := r.causeFailure(context.Cause(turnCtx)); cause != nil {
 			f = cause
 		}
+		r.last = r.failedTurn(turn)
 		r.emit(Event{Kind: EventTurnEnd, Turn: r.turns, Code: string(f.Reason)})
 		return "", f
 	}
@@ -470,6 +511,19 @@ func (r *run) Step(ctx context.Context) (string, error) {
 		Content: clipText(turn.Content), Reasoning: clipText(turn.Reasoning), Usage: &usage,
 	})
 	return turn.Content, nil
+}
+
+// failedTurn is what's left of a turn that failed, which may be nothing: its text so far and no
+// finish reason, even if the finish chunk arrived. It is the last turn now, not the one before it.
+func (r *run) failedTurn(turn *Turn) *Turn {
+	failed := &Turn{}
+	if turn != nil {
+		failed.Content, failed.Reasoning, failed.Model = turn.Content, turn.Reasoning, turn.Model
+	}
+	if failed.Model == "" && r.last != nil {
+		failed.Model = r.last.Model
+	}
+	return failed
 }
 
 // requestBody builds a turn's request. encoding/json sorts the keys of a map, so that the same
@@ -558,10 +612,12 @@ type toolMessage struct {
 
 // echoArguments returns a call's arguments for the assistant message of the next prompt.
 // llama-server parses them to render the template and answers HTTP 500 if it can't, so that arguments
-// the model got wrong, whose error it should get to read, would end the request instead. Valid JSON
-// goes back byte for byte. Anything else is wrapped, so that the model still sees what it wrote.
+// the model got wrong, whose error it should get to read, would end the request instead. JSON the
+// server can parse goes back byte for byte. Anything else is wrapped, so that the model still sees
+// what it wrote. The operation itself may have run: encoding/json takes some of what the server
+// doesn't.
 func echoArguments(args string) string {
-	if json.Valid([]byte(args)) {
+	if json.Valid([]byte(args)) && serverCanParse(args) {
 		return args
 	}
 	const limit = 256
@@ -573,6 +629,74 @@ func echoArguments(args string) string {
 		return "{}"
 	}
 	return string(wrapped)
+}
+
+// serverCanParse says whether llama-server's JSON parser, nlohmann's, takes text that json.Valid has
+// taken. It is stricter there in three ways: invalid UTF-8, an escape of a lone surrogate, and a number
+// that overflows a double, whether written as 1e999 or with 400 digits.
+func serverCanParse(text string) bool {
+	if !utf8.ValidString(text) {
+		return false
+	}
+	for i := 0; i < len(text); {
+		switch c := text[i]; {
+		case c == '"':
+			end, ok := scanString(text, i+1)
+			if !ok {
+				return false
+			}
+			i = end
+		case c == '-' || (c >= '0' && c <= '9'):
+			end := i + 1
+			for end < len(text) && strings.IndexByte("+-.eE0123456789", text[end]) >= 0 {
+				end++
+			}
+			if f, _ := strconv.ParseFloat(text[i:end], 64); math.IsInf(f, 0) {
+				return false
+			}
+			i = end
+		default:
+			i++
+		}
+	}
+	return true
+}
+
+// scanString reads a valid JSON string from just after its opening quote to just after its closing
+// one. It reports false on an escape of a surrogate that isn't half of a pair.
+func scanString(text string, i int) (end int, ok bool) {
+	escapeAt := func(i int) (rune, bool) {
+		if i+6 > len(text) || text[i] != '\\' || text[i+1] != 'u' {
+			return 0, false
+		}
+		v, err := strconv.ParseUint(text[i+2:i+6], 16, 16)
+		return rune(v), err == nil
+	}
+	for i < len(text) {
+		switch text[i] {
+		case '"':
+			return i + 1, true
+		case '\\':
+			if v, isUnicode := escapeAt(i); isUnicode {
+				if v >= 0xDC00 && v <= 0xDFFF {
+					return 0, false
+				}
+				if v >= 0xD800 && v <= 0xDBFF {
+					low, isEscape := escapeAt(i + 6)
+					if !isEscape || low < 0xDC00 || low > 0xDFFF {
+						return 0, false
+					}
+					i += 6
+				}
+				i += 6
+				continue
+			}
+			i += 2
+		default:
+			i++
+		}
+	}
+	return 0, false
 }
 
 // controller is the deterministic plan of a request: a turn, then for each of its calls Execute, and
@@ -713,6 +837,10 @@ func (r *run) causeFailure(cause error) *Failure {
 		return failure(StopRequestTimeout, "the request ran past %v", lim.RequestTimeout)
 	case errors.Is(cause, context.DeadlineExceeded):
 		return failure(StopRequestTimeout, "the caller's deadline passed")
+	case errors.Is(cause, context.Canceled):
+		// net/http cancels a request's context when a write to its client fails, before the write
+		// returns to us, so that this covers a client that stopped reading as well.
+		return failure(StopCancelled, "the client went away, or the bridge is closing")
 	}
 	return failure(StopCancelled, "%v", cause)
 }

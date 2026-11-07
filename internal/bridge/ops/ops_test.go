@@ -95,6 +95,7 @@ func TestExactResults(t *testing.T) {
 		{"hash_sha256", `{"data":"616263","encoding":"hex"}`, `{"hex":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}`},
 		{"hash_sha256", `{"data":"YWJj","encoding":"base64"}`, `{"hex":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}`},
 		{"hash_sha256", `{"data":"abc","encoding":"utf8"}`, `{"hex":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}`},
+		{"hash_sha256", `{"data":"QQ==","encoding":"base64"}`, `{"hex":"559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"}`},
 		{"hash_sha512", `{"data":"abc"}`, `{"hex":"ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"}`},
 		// A small JSON integer is accepted where a string is expected, and written back as a string.
 		{"int_add", `{"a":2,"b":-3}`, `{"value":"-1"}`},
@@ -219,6 +220,11 @@ func TestMalformedAndInvalidArguments(t *testing.T) {
 		{"hash_sha256", `{"data":"zz","encoding":"hex"}`, CodeInvalidArgument},
 		{"hash_sha256", `{"data":"***","encoding":"base64"}`, CodeInvalidArgument},
 		{"hash_sha256", `{"data":"a","encoding":"rot13"}`, CodeInvalidArgument},
+		{"hash_sha256", `{"data":"a","encoding":""}`, CodeInvalidArgument},
+		{"hash_sha256", `{"data":"a","encoding":null}`, CodeInvalidArgument},
+		{"hash_sha256", `{"data":"QR==","encoding":"base64"}`, CodeInvalidArgument}, // non-zero trailing bits
+		{"hash_sha256", `{"data":"Q\nQ==","encoding":"base64"}`, CodeInvalidArgument},
+		{"hash_sha256", `{"data":"QQ==\r\n","encoding":"base64"}`, CodeInvalidArgument},
 
 		{"int_add", `{"v":2,"a":"1","b":"2"}`, CodeUnsupportedVersion},
 		{"int_add", `{"v":"1","a":"1","b":"2"}`, CodeUnsupportedVersion},

@@ -278,8 +278,8 @@ type powInput struct {
 }
 
 type hashInput struct {
-	Data     string `json:"data"`
-	Encoding string `json:"encoding"`
+	Data     string  `json:"data"`
+	Encoding *string `json:"encoding"` // nil if absent; empty is not in the schema's enum
 }
 
 type hashResult struct {
@@ -296,20 +296,29 @@ func hashOp(name, desc string, sum func([]byte) []byte) Op {
 	}
 	return define(name, desc, input, []prop{{name: "hex", schema: strSchema}},
 		func(_ context.Context, _ Limits, in hashInput) (hashResult, *Error) {
+			encoding := "utf8"
+			if in.Encoding != nil {
+				encoding = *in.Encoding
+			}
 			var data []byte
 			var err error
-			switch in.Encoding {
-			case "", "utf8":
+			switch encoding {
+			case "utf8":
 				data = []byte(in.Data)
 			case "hex":
 				data, err = hex.DecodeString(in.Data)
 			case "base64":
-				data, err = base64.StdEncoding.DecodeString(in.Data)
+				// Strict refuses non-zero trailing bits. The decoder skips line breaks even then, and
+				// two different strings shouldn't be one input without an error.
+				if strings.ContainsAny(in.Data, "\r\n") {
+					return hashResult{}, errorf(CodeInvalidArgument, "data is not valid base64: it has a line break")
+				}
+				data, err = base64.StdEncoding.Strict().DecodeString(in.Data)
 			default:
-				return hashResult{}, errorf(CodeInvalidArgument, "unknown encoding %q", clip(in.Encoding))
+				return hashResult{}, errorf(CodeInvalidArgument, "unknown encoding %q", clip(encoding))
 			}
 			if err != nil {
-				return hashResult{}, errorf(CodeInvalidArgument, "data is not valid %s: %v", in.Encoding, err)
+				return hashResult{}, errorf(CodeInvalidArgument, "data is not valid %s: %v", encoding, err)
 			}
 			return hashResult{hex.EncodeToString(sum(data))}, nil
 		})

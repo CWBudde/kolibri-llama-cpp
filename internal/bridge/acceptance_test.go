@@ -337,7 +337,7 @@ func tinyLimits() Limits {
 }
 
 // tinyAllow keeps the prompt small: the tiny checkpoint's context is 2048 tokens, and every tool
-// together takes 1926 of them. TestTinyCheckpointCompilesEverySchema covers the rest.
+// together takes 1931 of them. TestTinyCheckpointCompilesEverySchema covers the rest.
 func tinyAllow() []string { return []string{"array_sum", "hash_sha256", "int_add", "int_div"} }
 
 // Through the real llama-server on the tiny checkpoint: a forced call on the first turn, then a turn
@@ -465,10 +465,29 @@ func TestTinyCheckpointCompilesEverySchema(t *testing.T) {
 // back as they are. The first turn is scripted, the second goes to the real server.
 func TestTinyCheckpointAcceptsTheEchoOfMalformedArguments(t *testing.T) {
 	url := tinyURL(t)
-	for _, args := range []string{`{`, `nonsense`, ``, `{"a":"1"`} {
+	for _, c := range []struct {
+		op, args string
+		code     ops.Code
+	}{
+		{"int_add", `{`, ops.CodeMalformedArguments},
+		{"int_add", `nonsense`, ops.CodeMalformedArguments},
+		{"int_add", ``, ops.CodeMalformedArguments},
+		{"int_add", `{"a":"1"`, ops.CodeMalformedArguments},
+		// JSON to encoding/json, not to the server. The surrogate even runs: only the echo can fail it.
+		{"hash_sha256", `{"data":"\ud800"}`, ""},
+		{"hash_sha256", `{"data":"\udc00"}`, ""},
+		{"int_add", `{"a":1e999,"b":"2"}`, ops.CodeInvalidArgument},
+		{"int_add", `{"a":-1e999,"b":"2"}`, ops.CodeInvalidArgument},
+		// JSON to both, but not an object.
+		{"int_add", `5`, ops.CodeMalformedArguments},
+		{"int_add", `null`, ops.CodeMalformedArguments},
+		{"int_add", `"x"`, ops.CodeMalformedArguments},
+		{"int_add", `[1]`, ops.CodeMalformedArguments},
+	} {
+		op, args := c.op, c.args
 		f := newFakeFunc(t, func(turn int, body []byte) fakeTurn {
 			if turn == 0 {
-				return fakeTurn{calls: []fakeCall{{"int_add", args}}}
+				return fakeTurn{calls: []fakeCall{{op, args}}}
 			}
 			resp, err := http.Post(strings.TrimSuffix(url, "/")+"/v1/chat/completions", "application/json", bytes.NewReader(body))
 			if err != nil {
@@ -482,9 +501,9 @@ func TestTinyCheckpointAcceptsTheEchoOfMalformedArguments(t *testing.T) {
 			}
 			return fakeTurn{raw: string(raw), rawCT: resp.Header.Get("Content-Type"), status: resp.StatusCode}
 		})
-		res := runBody(t, newBridge(t, f), tinyEOSBody)
+		res := runBody(t, newBridge(t, f, func(cfg *Config) { cfg.Allow = tinyAllow() }), tinyEOSBody)
 		wantStop(t, res, StopCompleted)
-		if ends := callEnds(res); len(ends) != 1 || ends[0].Code != string(ops.CodeMalformedArguments) {
+		if ends := callEnds(res); len(ends) != 1 || ends[0].Code != string(c.code) {
 			t.Fatalf("%q: results %+v", args, ends)
 		}
 	}
@@ -501,6 +520,22 @@ func TestTinyCheckpointRefusesRawMalformedArguments(t *testing.T) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusInternalServerError || !strings.Contains(string(raw), "Failed to parse tool call arguments") {
+		t.Fatalf("%d: %s", resp.StatusCode, raw)
+	}
+}
+
+// The reason chat_template_kwargs is refused: its keys override the template's variables. The bridge
+// delivers a result by appending to messages, so that this could keep it from the model.
+func TestTinyCheckpointTemplateKwargsReplaceTheMessages(t *testing.T) {
+	url := tinyURL(t)
+	body := `{"messages":[{"role":"user","content":"real"}],"chat_template_kwargs":{"messages":[{"role":"user","content":"replaced"}]}}`
+	resp, err := http.Post(strings.TrimSuffix(url, "/")+"/apply-template", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "replaced") || strings.Contains(string(raw), "real") {
 		t.Fatalf("%d: %s", resp.StatusCode, raw)
 	}
 }

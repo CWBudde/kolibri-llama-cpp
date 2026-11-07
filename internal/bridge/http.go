@@ -1,13 +1,13 @@
 package bridge
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"kolibri-llm/internal/bridge/ops"
@@ -29,6 +29,14 @@ func (b *Bridge) Handler() http.Handler {
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
 	})
 	return mux
+}
+
+// extendWriteDeadline bounds the next write to a client of a chat request, whose slot or handler a
+// client that stops reading could hold. The last one stays set for what net/http still flushes when
+// the handler has returned, and net/http clears it after that, for the connection's next request. A
+// writer without deadlines isn't a network connection, so nothing can get stuck in it.
+func (b *Bridge) extendWriteDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(b.cfg.Limits.WriteTimeout))
 }
 
 // statusOf maps a stop reason to the status of a non-streaming response.
@@ -61,6 +69,7 @@ func errorBody(status int, kind, message string) map[string]any {
 
 func (b *Bridge) handleChat(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, b.cfg.Limits.MaxRequestBytes))
+	b.extendWriteDeadline(w)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
@@ -82,6 +91,7 @@ func (b *Bridge) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := b.start(r.Context(), id, c, Callbacks{})
+	b.extendWriteDeadline(w)
 	if err != nil {
 		var refused *RequestError
 		if errors.As(err, &refused) {
@@ -117,12 +127,16 @@ func completion(res *Result) map[string]any {
 	}
 }
 
-// sseWriter serializes events: deltas and trace events come from the run's goroutine, a cancel call's
-// trace event from another one. It sends the headers with the first event.
+// sseWriter writes a stream on the run's goroutine, the only one that touches it. It sends the headers
+// with the first event. A write has a deadline, because no context can interrupt one: a client that
+// stops reading would park the turn here, past every other limit, with its request slot. A write that
+// fails ends the request through fail, and the writes after it do nothing.
 type sseWriter struct {
-	mu      sync.Mutex
+	b       *Bridge
 	w       http.ResponseWriter
+	fail    context.CancelCauseFunc
 	started bool
+	broken  bool
 }
 
 func (s *sseWriter) begin() {
@@ -135,10 +149,18 @@ func (s *sseWriter) begin() {
 }
 
 func (s *sseWriter) write(text string) {
+	if s.broken {
+		return
+	}
 	s.begin()
-	_, _ = io.WriteString(s.w, text) // a client that left cancels the request through its context
-	if f, ok := s.w.(http.Flusher); ok {
-		f.Flush()
+	s.b.extendWriteDeadline(s.w)
+	_, err := io.WriteString(s.w, text)
+	if err == nil {
+		err = http.NewResponseController(s.w).Flush()
+	}
+	if err != nil && !errors.Is(err, http.ErrNotSupported) {
+		s.broken = true
+		s.fail(fmt.Errorf("writing to the client: %w", err))
 	}
 }
 
@@ -152,21 +174,15 @@ func (s *sseWriter) event(name string, v any) {
 		fmt.Fprintf(&b, "event: %s\n", name)
 	}
 	fmt.Fprintf(&b, "data: %s\n\n", encoded)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.write(b.String())
 }
 
 func (s *sseWriter) done() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.write("data: [DONE]\n\n")
 }
 
 // refuse answers a refused request. Refusal comes before the first event, so a status still fits.
 func (s *sseWriter) refuse(status int, body any) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	writeJSON(s.w, status, body)
 }
 
@@ -182,8 +198,10 @@ func chunkOf(id, model string, delta map[string]any, finish any) map[string]any 
 // only looks at unnamed data can ignore. A failure the client should see as a status has to happen
 // before the first byte; once the stream is open it is an error event.
 func (b *Bridge) serveStream(w http.ResponseWriter, r *http.Request, id string, c *chat) {
-	out := &sseWriter{w: w}
-	res, err := b.start(r.Context(), id, c, Callbacks{
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	out := &sseWriter{b: b, w: w, fail: cancel}
+	res, err := b.start(ctx, id, c, Callbacks{
 		Delta: func(d Delta) {
 			delta := map[string]any{}
 			if d.Content != "" {
@@ -213,7 +231,7 @@ func (b *Bridge) serveStream(w http.ResponseWriter, r *http.Request, id string, 
 func (b *Bridge) handleCancel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
-		CallID string `json:"call_id"`
+		CallID json.RawMessage `json:"call_id"`
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
 	if err != nil {
@@ -224,13 +242,20 @@ func (b *Bridge) handleCancel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody(http.StatusBadRequest, "invalid_request_error", "the body is not JSON"))
 		return
 	}
-	if req.CallID != "" {
-		cancelled, err := b.CancelCall(id, req.CallID)
+	// Only a body without the field means the whole request. A client whose call ID came out empty
+	// wants one operation cancelled, and must not lose the request.
+	if req.CallID != nil {
+		var callID string
+		if err := json.Unmarshal(req.CallID, &callID); err != nil || callID == "" {
+			writeJSON(w, http.StatusBadRequest, errorBody(http.StatusBadRequest, "invalid_request_error", "call_id must be a non-empty string; leave it out to cancel the whole request"))
+			return
+		}
+		cancelled, err := b.CancelCall(id, callID)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, errorBody(http.StatusNotFound, "not_found", err.Error()))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"request_id": id, "call_id": req.CallID, "cancelled": cancelled})
+		writeJSON(w, http.StatusOK, map[string]any{"request_id": id, "call_id": callID, "cancelled": cancelled})
 		return
 	}
 	if !b.Cancel(id) {
@@ -253,8 +278,8 @@ func (b *Bridge) Manifest() map[string]any {
 			"max_turns": lim.MaxTurns, "max_calls": lim.MaxCalls, "max_calls_per_turn": lim.MaxCallsPerTurn,
 			"max_turn_tokens": lim.MaxTurnTokens, "max_turn_bytes": lim.MaxTurnBytes,
 			"op_timeout_ms": lim.OpTimeout.Milliseconds(), "turn_timeout_ms": lim.TurnTimeout.Milliseconds(),
-			"request_timeout_ms": lim.RequestTimeout.Milliseconds(),
-			"max_arg_bytes":      b.cfg.OpLimits.MaxArgBytes, "max_int_bits": b.cfg.OpLimits.MaxIntBits,
+			"request_timeout_ms": lim.RequestTimeout.Milliseconds(), "write_timeout_ms": lim.WriteTimeout.Milliseconds(),
+			"max_arg_bytes": b.cfg.OpLimits.MaxArgBytes, "max_int_bits": b.cfg.OpLimits.MaxIntBits,
 			"max_array_len": b.cfg.OpLimits.MaxArrayLen, "max_result_bytes": b.cfg.OpLimits.MaxResultBytes,
 		},
 		"ops": list,

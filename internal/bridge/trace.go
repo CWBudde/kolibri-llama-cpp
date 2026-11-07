@@ -73,11 +73,12 @@ func sha256Hex(s []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Canonical returns a trace without what legitimately differs between two identical runs. Two runs
-// of one request against one script have the same canonical trace.
+// Canonical returns a trace without what legitimately differs between two identical runs: a generated
+// request ID differs too. Two runs of one request against one script have the same canonical trace.
 func Canonical(events []Event) []Event {
 	out := slices.Clone(events)
 	for i := range out {
+		out[i].RequestID = ""
 		out[i].ElapsedMS = 0
 		out[i].UpstreamID = ""
 		out[i].Usage = nil

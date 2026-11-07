@@ -64,6 +64,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, ready fun
 	fs.DurationVar(&lim.OpTimeout, "op-timeout", lim.OpTimeout, "one operation's run time")
 	fs.DurationVar(&lim.TurnTimeout, "turn-timeout", lim.TurnTimeout, "one completion, prompt processing included")
 	fs.DurationVar(&lim.RequestTimeout, "request-timeout", lim.RequestTimeout, "the whole request")
+	fs.DurationVar(&lim.WriteTimeout, "write-timeout", lim.WriteTimeout, "one write to a client; one that stops reading for this long loses its request")
 	fs.IntVar(&opLim.MaxArgBytes, "max-arg-bytes", opLim.MaxArgBytes, "bytes of an operation's arguments")
 	fs.IntVar(&opLim.MaxIntBits, "max-int-bits", opLim.MaxIntBits, "bits of an integer input or result")
 	fs.IntVar(&opLim.MaxArrayLen, "max-array-len", opLim.MaxArrayLen, "elements of an array input")
@@ -118,7 +119,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, ready fun
 		closeBridge()
 		return err
 	}
-	// No WriteTimeout: a response lasts as long as its request, which has limits of its own.
+	// No WriteTimeout: a response lasts as long as its request, and the bridge sets a deadline on each
+	// write itself, so that a client that stops reading can't hold one open.
 	srv := &http.Server{Handler: b.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(listener) }()
@@ -136,5 +138,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, ready fun
 	closeBridge()
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdown)
+	if err := srv.Shutdown(shutdown); err != nil {
+		_ = srv.Close() // a write to a stuck client may still have its deadline ahead of it
+		return err
+	}
+	return nil
 }
