@@ -1,6 +1,6 @@
 # Execution bridge
 
-**Result: the bridge of issue #59 exists and runs tool calls end to end through real llama-server on random tiny weights, but it has not met a real model. The issue's acceptance criterion, unmodified Kolibri completing a deterministic multi-step task through the bridge, has NOT been shown.** The test for it is written, is skipped by default and has not run on a real weight.
+**Result: Kolibri completed issue #59's deterministic three-step task through the bridge on the first attempt, on one quantized weight. `TestAcceptanceRealModel` passed with two runs and one canonical trace ([the real run](#the-real-run-2026-11-07)). That is one task at temperature 0, with the steps spelled out in the prompt. It gives no success rate, no recovery from a failed call and no comparison with ordinary tool calling.** The test is skipped by default, since it needs a real weight.
 
 This is runtime tool execution, not hidden-state integration. A model reaches an operation only by writing a tool call into its output, and reads the result only as text in its next prompt. Nothing here patches llama.cpp, touches the weights or reads a hidden state.
 
@@ -10,15 +10,15 @@ This is runtime tool execution, not hidden-state integration. A model reaches an
 |---|---|
 | Inference architecture and insertion point | done: [Where it sits](#where-it-sits) |
 | Versioned protocol: request IDs, typed input and output, errors, cancellation | done: `internal/bridge/ops`, `POST /v1/executions/{id}/cancel` |
-| Detect a complete request, pause, execute, feed back, resume | done against the fake and against real llama-server on tiny weights. **Not on a real model** |
+| Detect a complete request, pause, execute, feed back, resume | done against the fake, against real llama-server on tiny weights, and on a real weight for three calls in sequence. A streaming client and parallel calls haven't met a real model |
 | Deterministic operations: arithmetic, arrays, hashing | done, 15 operations |
 | Optional WebAssembly, FFT or PDE plugins | **not done.** No code runs here that isn't in this repo |
 | Allowlist, limits, no filesystem or network, trace | done, with the limits named below. **No OS sandbox** |
 | Tests: malformed requests, timeouts, reproducibility, multi-step calls | done, with `-race` |
-| Unmodified Kolibri completes a multi-step task | **NOT shown.** `TestAcceptanceRealModel` is written and has not run |
+| Unmodified Kolibri completes a multi-step task | **Shown for one task on one quantized weight:** [the real run](#the-real-run-2026-11-07) |
 | PLAN's benchmark of correctness, latency, token overhead and failure recovery | **not done.** No timing in this document is a result |
 
-The fake shows the bridge handles what a server sends. The tiny checkpoint shows real llama-server accepts what the bridge sends. Neither shows that Kolibri plans these calls, copies 36 digits correctly or reads a result the right way. Only the real run can.
+The fake shows the bridge handles what a server sends. The tiny checkpoint shows real llama-server accepts what the bridge sends. Neither shows what Kolibri does with these calls. The real run shows that it follows steps given in its prompt, copies 36 digits correctly and reads a result the right way, on this one task.
 
 ## Where it sits
 
@@ -32,7 +32,7 @@ The bridge is a client of `/v1/chat/completions`, and a server of the same API. 
 
 **Why the tool-call path:** Kolibri's template, `<tool_call>` tokens, grammar and parser already work ([chat.md](chat.md)), and the real checkpoint has returned a parsed call through them ([real-checkpoint.md](real-checkpoint.md)). A new special token would need tokenizer and template work. A hook in llama-server's slot loop would be a patch to carry, and would only change what a pause costs, not what the model can do.
 
-**What that costs:** a pause isn't a suspended generation. It is the end of an HTTP response, and a resume is a new request whose prompt llama-server renders again from the messages. What of the KV cache survives is the prefix the two prompts share. On the tiny checkpoint the second turn of a loop reported 230 of 320 prompt tokens cached. The template also writes a call's arguments back normalized, not as generated, so everything from there on is decoded again. `coproc.Generator` is the seam where a real in-place pause would go; here a `Step` is a whole completion, so the scheduler's "no token while BLOCKED" holds per turn, not per token.
+**What that costs:** a pause isn't a suspended generation. It is the end of an HTTP response, and a resume is a new request whose prompt llama-server renders again from the messages. What of the KV cache survives is the prefix the two prompts share. On the tiny checkpoint the second turn of a loop reported 230 of 320 prompt tokens cached. The template also writes a call's arguments back normalized, not as generated, so everything from there on is decoded again. On the real weight the three resumes reported 857 of 981, 1098 of 1174 and 1298 of 1399 prompt tokens cached, so they decoded 124, 76 and 101 tokens, the result they had to read included. `coproc.Generator` is the seam where a real in-place pause would go; here a `Step` is a whole completion, so the scheduler's "no token while BLOCKED" holds per turn, not per token.
 
 ## How a request runs
 
@@ -185,7 +185,7 @@ KOLIBRI_BRIDGE_TINY_URL=http://127.0.0.1:18731 go test -race -count=1 -v -run Te
 
 All seven tests pass. A random model called `array_sum`, `int_div` and `hash_sha256`, the operations ran, the real template rendered their results, and two runs gave the same canonical trace.
 
-### The acceptance test, which has not run
+### The acceptance test
 
 `TestAcceptanceRealModel` asks the model to multiply `987654321987654321` by `123456789123456789`, add 1, and take the SHA-256 of the sum's digits. The prompt asks for the digest only, and a model can't work that out in its head. The test passes only with `stop` = `completed`, the three calls in order with exact operands, each result exact, and exactly the expected digest in the answer. The expected values are literals computed outside this repo's code. A mistake the model repairs doesn't fail the test but shows up in the trace. `TestAcceptanceJudge` shows on the fake that a wrong digest, a miscopied number, a skipped step, an answer without tools, steps out of order and a truncated end all fail.
 
@@ -193,14 +193,43 @@ It needs a real weight, llama-server built from the fork, and the machine to its
 
 ```sh
 third_party/llama.cpp/build/bin/llama-server -m ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf \
-    -ngl 99 -c 16384 -np 1 --jinja --host 127.0.0.1 --port 8099 &
-KOLIBRI_BRIDGE_ACCEPT_URL=http://127.0.0.1:8099 KOLIBRI_BRIDGE_ACCEPT_TRACE=accept-trace.jsonl \
+    -ngl 99 -c 16384 -np 1 --jinja --host 127.0.0.1 --port 8099 --expert-cache 128 &
+KOLIBRI_BRIDGE_ACCEPT_URL=http://127.0.0.1:8099 KOLIBRI_BRIDGE_ACCEPT_RUNS=2 KOLIBRI_BRIDGE_ACCEPT_TRACE=accept-trace.jsonl \
     go test -race -count=1 -timeout 3h -v -run TestAcceptanceRealModel ./internal/bridge/
 ```
 
-It refuses a server whose template isn't the released one (sha256 `9ba35d4b…`), and a weight with `tiny` in its file name. Its plumbing has run on random weights only, under another file name, and it failed as it should: stop reason `truncated`, 0 of 3 steps, a 722-token prompt. That says nothing about Kolibri. `KOLIBRI_BRIDGE_ACCEPT_RUNS=2` repeats the task and requires one canonical trace. Prompt caching may make that fail on a server that decodes a cached prefix differently, which would be worth knowing. `KOLIBRI_BRIDGE_ACCEPT_EFFORT` sets `reasoning_effort`, default `low`.
+It refuses a server whose template isn't the released one (sha256 `9ba35d4b…`), and a weight with `tiny` in its file name. Before the real run its plumbing ran on random weights, under another file name, and failed as it should: stop reason `truncated`, 0 of 3 steps, a 722-token prompt. `KOLIBRI_BRIDGE_ACCEPT_RUNS=2` repeats the task and requires one canonical trace. Prompt caching may make that fail on a server that decodes a cached prefix differently. `KOLIBRI_BRIDGE_ACCEPT_EFFORT` sets `reasoning_effort`, default `low`. Without `--expert-cache 128` the server is resident, which has not run this test.
 
-The outcome is open. Kolibri may use the tools, may stop after a step, may miscopy a number or may ignore them. Each of those is a clean, machine-readable result of this test.
+#### The real run, 2026-11-07
+
+One attempt. Its settings were written down before the server started: `KOLIBRI_BRIDGE_ACCEPT_RUNS=2`, the effort at its default `low`. The test passed with exit status 0. No bridge bug came up, so no code changed and nothing was rerun. The records are in `~/models/eval/bridge-acceptance/attempt-1/`: `plan.txt`, `test.log`, `server.log`, `expert-cache-stats.json` and `trace.jsonl` (sha256 `39e4e0d7…`).
+
+| | |
+|---|---|
+| Weight | `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, a real file on the internal drive. Kolibri's released weights, quantized: no training and no adapter. The test checked the template's hash |
+| Server | llama-server `90311e5a2` (fork `feat/kolibri1-waves`), started as above, plus `--expert-cache-stats`. The stats file reports 128 slots, waves off and no load failure |
+| Bridge | `aacc096`, in process through `Bridge.Run`, with streaming to the server. `-race` on |
+| Request | temperature 0, seed 7, `max_tokens` 2048, `reasoning_effort` low, four operations allowed |
+
+What the model did, the same in both runs:
+
+| Turn | Finish | Output | Result |
+|---|---|---|---|
+| 1 | `tool_calls` | `int_mul`, `a` `987654321987654321`, `b` `123456789123456789` | `121932631356500531347203169112635269` |
+| 2 | `tool_calls` | `int_add`, `a` `121932631356500531347203169112635269`, `b` `1` | `121932631356500531347203169112635270` |
+| 3 | `tool_calls` | `hash_sha256`, `data` `121932631356500531347203169112635270` | `8794da494318df92e876854b96a3ed629fa76ad21764a7562a1b6b5bbb76428f` |
+| 4 | `stop` | `8794da494318df92e876854b96a3ed629fa76ad21764a7562a1b6b5bbb76428f` | |
+
+Every call succeeded the first time. Each run took 4276 prompt tokens over its four turns and 492 completion tokens. Its reasoning names the next step and repeats the last result; it doesn't try the arithmetic itself. `bc` and `shasum -a 256` gave the same product and digest from the numbers above.
+
+**What this doesn't show:**
+
+- **A success rate.** Run 2 has the same seed and temperature on the same server, so it isn't an independent sample. It does show that the prompt cache changed nothing here: its first turn had 717 of 722 prompt tokens cached, and its canonical trace equals run 1's. That trace leaves out the request ID, the elapsed time, the upstream ID and the token counts.
+- **Planning.** The prompt lists the steps and says to use the tools, and only four of the 15 operations were on offer. Kolibri followed a plan. It didn't work one out, and it didn't have to decide whether a tool was needed.
+- **Failure recovery.** No call failed, so a real model has not read an error and repaired a call. That path has run on the fake and on tiny weights only.
+- **The HTTP API.** The client side ran in process. `kolibri-bridge`, a streaming client and parallel calls haven't met a real model.
+- **Other weights and modes.** Only this quantization ran, under the expert cache. BF16 and a resident server did not run.
+- **Speed or overhead.** The run wasn't timed, and it has no baseline without tools. PLAN's benchmark is still open.
 
 ## Do the tests catch regressions?
 

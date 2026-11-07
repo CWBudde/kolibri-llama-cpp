@@ -1279,11 +1279,11 @@ This is an **optional, model-agnostic research track**, separate from the Kolibr
 
 ### Phase A — Runtime execution bridge ([#59](https://github.com/CWBudde/kolibri-llama-cpp/issues/59))
 
-State: `internal/bridge` and `cmd/kolibri-bridge`, [docs/execution-bridge.md](docs/execution-bridge.md). They run against a fake and against real llama-server on tiny weights. **The gate below has not been shown:** `TestAcceptanceRealModel` is written and has not run on a real weight.
+State: `internal/bridge` and `cmd/kolibri-bridge`, [docs/execution-bridge.md](docs/execution-bridge.md). They run against a fake, against real llama-server on tiny weights, and once on a real weight. **The gate below is shown for one task only:** `TestAcceptanceRealModel` passed on the first attempt, two runs with one canonical trace, on `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf` at temperature 0, with the steps given in the prompt. No call failed, so recovery on a real model is not shown, and the safety limits are tested on the fake and on tiny weights, not on a real model.
 
 - [x] Identify the least invasive integration point in the llama.cpp inference/server loop; preserve existing Kolibri tool-call and chat-template behavior. — outside llama-server, as a client of its chat API. No patch, and a pause is the end of a request.
 - [x] Define a versioned structured execution protocol with typed inputs, results, errors, cancellation and correlation IDs. Prefer existing tool-call formatting initially; new special tokens require explicit tokenizer/template compatibility work.
-- [ ] Implement pause → bounded execution → result injection → resume, with streaming and multiple calls tested. — done on the fake and on tiny weights, not yet on a real model.
+- [x] Implement pause → bounded execution → result injection → resume, with streaming and multiple calls tested. — done on the fake and on tiny weights. On a real weight: three calls in sequence with streaming from the server. A streaming client and parallel calls haven't met a real model.
 - [ ] Start with simple deterministic operations; evaluate sandboxed WebAssembly for arbitrary programs, keeping domain libraries as optional extensions. — 15 operations; WebAssembly not evaluated.
 - [ ] Enforce resource limits (time, memory, fuel), no network/filesystem by default, and structured tracing. — limits on turns, calls, bytes, time and input size, and a trace. Memory is bounded by input size only, and there is no OS sandbox.
 - [ ] Benchmark correctness, latency, token overhead and failure recovery against ordinary tool calling.
