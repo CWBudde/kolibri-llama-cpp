@@ -289,9 +289,10 @@ func command(name string, args ...string) (string, error) {
 }
 
 // sample appends one line for the process pid to w; it returns false once the
-// process is gone. The last column is the page cache's share of the model
-// file in MiB, "-" without a model or off macOS.
-func sample(w io.Writer, pid int, tokens int, model string) bool {
+// process is gone. The next to last column is the page cache's share of the model
+// file in MiB, "-" without a model or off macOS; with side-files, a further column
+// is theirs, summed.
+func sample(w io.Writer, pid int, tokens int, model string, sidefiles []string) bool {
 	p := strconv.Itoa(pid)
 	rss, err := command("ps", "-o", "rss=", "-p", p)
 	if err != nil {
@@ -309,7 +310,17 @@ func sample(w io.Writer, pid int, tokens int, model string) bool {
 			cached = fmt.Sprintf("%.0f", v)
 		}
 	}
-	fmt.Fprintf(w, "%s %.0f %.0f %.0f %s %d %d %s\n", time.Now().Format("15:04:05"), rssKiB/1024, fp, sw, level, tokens, pageins(), cached)
+	side := ""
+	if len(sidefiles) > 0 {
+		var sum float64
+		for _, path := range sidefiles {
+			if v, err := pageCacheMiB(path); err == nil {
+				sum += v
+			}
+		}
+		side = fmt.Sprintf(" %.0f", sum)
+	}
+	fmt.Fprintf(w, "%s %.0f %.0f %.0f %s %d %d %s%s\n", time.Now().Format("15:04:05"), rssKiB/1024, fp, sw, level, tokens, pageins(), cached, side)
 	return true
 }
 
@@ -323,6 +334,11 @@ func main() {
 	pid := flag.Int("pid", 0, "llama-server PID to sample; 0 disables sampling")
 	every := flag.Duration("every", 10*time.Second, "sampling interval")
 	model := flag.String("model", "", "with -pid: also sample how much of this file (the GGUF) the page cache holds")
+	var sidefiles []string
+	flag.Func("sidefile", "with -pid: also sample how much of this side-file the page cache holds; repeatable", func(v string) error {
+		sidefiles = append(sidefiles, v)
+		return nil
+	})
 	size := flag.Int("window", 2048, "tokens per reported window")
 	dir := flag.String("out", ".", "output directory")
 	summaryPath := flag.String("summary", "", "also write the request's summary as JSON: latency percentiles, tokens/s, token IDs")
@@ -379,12 +395,16 @@ func main() {
 	if *pid > 0 {
 		samples := create("samples.txt")
 		defer samples.Close()
-		fmt.Fprintln(samples, "time rss_mib footprint_mib swap_used_mib pressure tokens pageins page_cache_mib")
+		columns := "time rss_mib footprint_mib swap_used_mib pressure tokens pageins page_cache_mib"
+		if len(sidefiles) > 0 {
+			columns += " sidefile_cache_mib"
+		}
+		fmt.Fprintln(samples, columns)
 		go func() {
 			defer close(sampled)
 			tick := time.NewTicker(*every)
 			defer tick.Stop()
-			for sample(samples, *pid, int(count.Load()), *model) {
+			for sample(samples, *pid, int(count.Load()), *model, sidefiles) {
 				select {
 				case <-done:
 					return

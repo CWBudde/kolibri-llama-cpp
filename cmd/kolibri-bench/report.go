@@ -39,7 +39,8 @@ type streamSummary struct {
 // tokens, wall_seconds, splits and metal_commits.
 type cacheStats struct {
 	ExpertCache *struct {
-		Buffered bool `json:"buffered"`
+		Buffered bool    `json:"buffered"`
+		Sidefile *string `json:"sidefile"`
 	} `json:"expert_cache"`
 	Decode struct {
 		Needed       int64   `json:"needed"`
@@ -47,6 +48,8 @@ type cacheStats struct {
 		DemandBytes  int64   `json:"demand_bytes"`
 		WaitSeconds  float64 `json:"wait_seconds"`
 		Failures     int64   `json:"load_failures"`
+		Loads        int64   `json:"loads"`
+		Preads       int64   `json:"preads"`
 		RemapSeconds float64 `json:"remap_seconds"`
 		Tokens       int64   `json:"tokens"`
 		WallSeconds  float64 `json:"wall_seconds"`
@@ -55,6 +58,8 @@ type cacheStats struct {
 	} `json:"decode"`
 	Prefill struct {
 		Failures int64 `json:"load_failures"`
+		Loads    int64 `json:"loads"`
+		Preads   int64 `json:"preads"`
 	} `json:"prefill"`
 	Process struct {
 		DiskBytesRead    *int64 `json:"disk_bytes_read"`
@@ -84,13 +89,14 @@ func loadResults(dir string) ([]runResult, error) {
 
 // samplePeaks are the largest values of a kolibri-stream samples.txt, in MiB;
 // PageCache is -1 if no line has the page_cache_mib column (older files, or
-// not measured).
+// not measured). The side-files' pages are a further column: Sidefile is their
+// peak, -1 without that column, and PageCache's peak counts them too.
 type samplePeaks struct {
-	RSS, Footprint, PageCache float64
+	RSS, Footprint, PageCache, Sidefile float64
 }
 
 func peaks(r io.Reader) samplePeaks {
-	p := samplePeaks{PageCache: -1}
+	p := samplePeaks{PageCache: -1, Sidefile: -1}
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
@@ -105,6 +111,12 @@ func peaks(r io.Reader) samplePeaks {
 		}
 		if len(f) > 7 {
 			if v, err := strconv.ParseFloat(f[7], 64); err == nil {
+				if len(f) > 8 {
+					if u, err := strconv.ParseFloat(f[8], 64); err == nil {
+						p.Sidefile = max(p.Sidefile, u)
+						v += u
+					}
+				}
 				p.PageCache = max(p.PageCache, v)
 			}
 		}
@@ -515,6 +527,10 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 	}
 	fmt.Fprintln(w)
 
+	if !readsCheck(w, m, runs) {
+		allEqual = false
+	}
+
 	fmt.Fprintln(w)
 	for _, g := range m.Gates {
 		v := evalGate(m, g, runs)
@@ -550,6 +566,70 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 		fmt.Fprintf(w, "- %s%s %s at %g GiB against the best of %s: %s\n", kind, what, g.Candidate, g.CeilingGiB, strings.Join(g.Baselines, ", "), result)
 	}
 	return allEqual
+}
+
+// readsCheck runs for a matrix with a side-file arm: it proves from the stats
+// what the arms read. Every completed cache run names the side-file its flags
+// gave (none on the GGUF path) and took one pread per expert it loaded (3 on the
+// GGUF path), in both phases. Any other run fails the report: its speed would
+// not be the speed of what the arm claims to be.
+func readsCheck(w io.Writer, m matrix, runs []runResult) bool {
+	if len(m.sidefiles()) == 0 {
+		return true
+	}
+	ok := true
+	for _, c := range m.Configs {
+		if !usesCache(c.Args) {
+			continue
+		}
+		want, onSide := sidefileArg(c.Args)
+		per := int64(3)
+		if onSide {
+			per = 1
+		}
+		var n, loads, preads int64
+		var bad []string
+		for _, r := range runs {
+			if r.Config != c.Name || r.Status != statusOK {
+				continue
+			}
+			n++
+			s := r.Stats
+			switch {
+			case s == nil || s.ExpertCache == nil:
+				bad = append(bad, r.key()+" wrote no stats")
+				continue
+			case onSide && (s.ExpertCache.Sidefile == nil || *s.ExpertCache.Sidefile != want):
+				got := "none"
+				if s.ExpertCache.Sidefile != nil {
+					got = *s.ExpertCache.Sidefile
+				}
+				bad = append(bad, fmt.Sprintf("%s read from %s", r.key(), got))
+			case !onSide && s.ExpertCache.Sidefile != nil:
+				bad = append(bad, fmt.Sprintf("%s read from %s", r.key(), *s.ExpertCache.Sidefile))
+			}
+			if s.Decode.Preads != per*s.Decode.Loads || s.Prefill.Preads != per*s.Prefill.Loads {
+				bad = append(bad, fmt.Sprintf("%s took %d preads for %d experts in prefill and %d for %d in decode", r.key(),
+					s.Prefill.Preads, s.Prefill.Loads, s.Decode.Preads, s.Decode.Loads))
+			}
+			loads += s.Decode.Loads + s.Prefill.Loads
+			preads += s.Decode.Preads + s.Prefill.Preads
+		}
+		kind := "PASS"
+		if len(bad) > 0 {
+			kind, ok = "FAIL", false
+		}
+		from := "the GGUF"
+		if onSide {
+			from = want
+		}
+		fmt.Fprintf(w, "- %s reads %s: %d runs from %s, %d preads for %d experts, want %d each", kind, c.Name, n, from, preads, loads, per)
+		if len(bad) > 0 {
+			fmt.Fprintf(w, "; %s", strings.Join(bad, "; "))
+		}
+		fmt.Fprintln(w)
+	}
+	return ok
 }
 
 // decodeTable writes the decode time per token from the stats, split into the
