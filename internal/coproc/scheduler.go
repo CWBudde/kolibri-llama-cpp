@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -65,7 +66,8 @@ type Scheduler struct {
 
 	mu       sync.Mutex
 	requests map[RequestID]*Request
-	queue    []*job // runnable jobs waiting for a slot, in order
+	queue    []*job // jobs that can start, waiting for a slot, in order; all IDLE, of open requests
+	stale    bool   // a job left IDLE outside dispatch, so the queue may hold it
 	running  int
 	lastGen  Generation
 	stopped  bool
@@ -242,6 +244,8 @@ func (s *Scheduler) settle(j *job, state JobState, result string, err error) {
 		s.running--
 		j.timer.Stop()
 		j.cancel()
+	} else {
+		s.stale = true
 	}
 	j.state, j.result, j.err = state, result, err
 
@@ -278,16 +282,20 @@ type start struct {
 // job, which is what makes a start at most once. The deadline starts here and reaches the
 // consumer as an ordinary event, so it races a completion in one place, the channel.
 func (s *Scheduler) dispatch() []start {
+	// Every settle runs in an update, so a settled job is out of the queue when the mutex is released.
+	// This is what bounds the queue: slots can stay taken for MaxTimeout while clients keep closing.
+	if s.stale {
+		s.queue = slices.DeleteFunc(s.queue, func(j *job) bool { return j.state != JobIdle })
+		s.stale = false
+	}
 	if s.stopped {
 		return nil
 	}
 	var starts []start
 	for s.running < s.cfg.MaxRunning && len(s.queue) > 0 {
 		j := s.queue[0]
+		s.queue[0] = nil // the backing array must not keep a closed request alive
 		s.queue = s.queue[1:]
-		if j.state != JobIdle {
-			continue // settled while it waited for a slot
-		}
 		s.lastGen++
 		s.running++
 		j.state = JobRunning

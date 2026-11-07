@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
+	"weak"
 )
 
 // WAIT unblocks only on its own job's outcome. Every event that doesn't match is counted and
@@ -668,5 +670,77 @@ func TestLimits(t *testing.T) {
 				t.Fatalf("stats %+v", got)
 			}
 		})
+	})
+}
+
+// The queue holds only jobs that can still start. Closing a request or cancelling a job takes its
+// entries out at once, however long the running jobs keep the slots.
+func TestQueueDropsSettledJobs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, func(c *Config) { c.MaxRunning, c.MaxRequests, c.MaxJobsPerRequest = 1, 2, 4 })
+		queued := func() int {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return len(s.queue)
+		}
+		holder := open(t, s, "holder", &MockGenerator{})
+		must(t, holder, Execute{Job: "hold", Program: "manual"})
+		synctest.Wait()
+
+		for range 10 {
+			r := open(t, s, "r", &MockGenerator{})
+			for i := range 4 {
+				must(t, r, Execute{Job: JobID(strconv.Itoa(i)), Program: "sum"})
+			}
+			if got := queued(); got != 4 {
+				t.Fatalf("%d jobs queued, want 4", got)
+			}
+			r.Close()
+			if got := queued(); got != 0 {
+				t.Fatalf("%d jobs queued after Close, want 0", got)
+			}
+		}
+
+		r := open(t, s, "r", &MockGenerator{})
+		must(t, r, Execute{Job: "cancelled", Program: "sum"})
+		must(t, r, Execute{Job: "left", Program: "sum", Args: []string{"3"}})
+		if err := r.Cancel("cancelled"); err != nil {
+			t.Fatal(err)
+		}
+		if got := queued(); got != 1 {
+			t.Fatalf("%d jobs queued after Cancel, want 1", got)
+		}
+
+		// The job that is left still runs when the slot frees.
+		publish(t, s, synctest.Wait, done(t, holder, "hold", "x"))
+		wantJob(t, r, "left", JobDone)
+		wantJob(t, r, "cancelled", JobCancelled)
+	})
+}
+
+// A closed request must be collectable while the scheduler lives on. The queue's backing array is
+// the one place that could keep it: a job taken off the head stays in the slot behind the slice.
+func TestClosedRequestIsNotRetained(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, func(c *Config) { c.MaxRunning = 2 })
+		holder := open(t, s, "holder", &MockGenerator{})
+		must(t, holder, Execute{Job: "hold", Program: "manual"})
+		synctest.Wait()
+
+		ref := func() weak.Pointer[Request] {
+			r := open(t, s, "r", &MockGenerator{})
+			must(t, r, Execute{Job: "dispatched", Program: "manual"})
+			synctest.Wait()
+			// The second slot is taken, so these two stay queued until Close.
+			must(t, r, Execute{Job: "queued", Program: "manual"})
+			must(t, r, Execute{Job: "queued too", Program: "manual"})
+			r.Close()
+			return weak.Make(r)
+		}()
+		runtime.GC()
+		if ref.Value() != nil {
+			t.Fatal("the scheduler still holds a closed request")
+		}
+		wantState(t, holder, Ready) // keeps the scheduler's other request in use up to here
 	})
 }
