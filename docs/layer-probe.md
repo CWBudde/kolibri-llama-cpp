@@ -85,7 +85,7 @@ The report enforces this where it can. It never replaces a report, and only `Def
 
 ### What the text alone gives
 
-**On the committed rows the text's surface gives the execute label on 39 of 40 smoke rows, so the bag of words is far below what the text shows.** The words `aber`, `ohne`, `but` and `without` are in all 10 refusals and in none of the other 30 rows, and of those 30 only the 20 computations and A-011 hold a digit. The surface rule, "a digit and none of those words", errs only on A-011 (`warum die 7 als Glückszahl gilt`). It was written after seeing the rows. These scores need no weight, and `TestBaselines` and `TestSurfaceCues` hold the rule's:
+**On the committed rows the text's surface gives the execute label on 39 of 40 smoke rows, so the bag of words is far below what the text shows.** The words `aber`, `ohne`, `but` and `without` are in all 10 refusals and in none of the other 30 rows, and of those 30 only the 20 computations and A-011 hold a digit. On execute the surface rule is "a digit and none of those words", and it errs only on A-011 (`warum die 7 als Glückszahl gilt`). On family a digit and a conjunction can't assign anything, so the rule is that gate followed by the fixed keyword list (`surfaceFamily`), 26 words and symbols that name an operation. Its one error there is C-007 (`Berechne die Fibonacci-Zahl F(38) ...`), labelled `algorithm` and read as `arithmetic`, because `berechne` is on the arithmetic list and that list goes first. It gets A-011 right. The rule was written after seeing the rows. These scores need no weight, and on execute `TestBaselines` and `TestSurfaceCues` hold them:
 
 | Baseline | Execute, balanced | Family, balanced |
 |---|---|---|
@@ -95,7 +95,7 @@ The report enforces this where it can. It never replaces a report, and only `Def
 | prompt length | 0.625 | 0.483 |
 | bag of words | 0.650 | 0.450 |
 
-So a probe at 0.90 beats the bag of words, and the keyword rule, and still reads less than the surface rule. And a probe at or above 0.975 doesn't show more than these two cues either: these rows can't separate reading what a prompt asks from reading a digit and a conjunction. The dataset keeps this on purpose rather than hide it by rewording a few rows: 40 prompts validate the pipeline, and the larger set below is where the cues have to be broken.
+So a probe at 0.90 beats the bag of words, and the keyword rule, and still reads less than the surface rule. And on execute a probe at or above 0.975 doesn't show more than these two cues either: for that target these rows can't separate reading what a prompt asks from reading a digit and a conjunction. On family the bar is those cues plus the keyword list. The dataset keeps this on purpose rather than hide it by rewording a few rows: 40 prompts validate the pipeline, and the larger set below is where the cues have to be broken.
 
 ### What a result would and wouldn't mean
 
@@ -137,7 +137,7 @@ go run ./cmd/kolibri-probe report -capture ~/models/eval/layer-probe-<date>
 **One capture and one report, 2026-11-07, from commit `4e35417`, with the committed definitions.** The report wrote `report.md` and no `report-deviation-*`. Everything is in `~/models/eval/layer-probe-20261107`.
 
 - **Weight.** `/Users/christian/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, a real file on the internal drive (`model_realpath`), sha256 `93720b94a5a383f5bad07677ca05014bf0681a662e646ea3b1b196cda33c88bc`.
-- **Build.** `third_party/llama.cpp` at `90311e5a2`, on branch `feat/kolibri1-waves`, with waves off (the cache's stats file says `waves: false`).
+- **Build.** `third_party/llama.cpp` at `90311e5a2`, on fork branch `feat/kolibri1-waves`, with waves off (the cache's stats file says `waves: false`). That branch is outside the patch series: `feat/kolibri1` without its last commit, plus the Stage E4 waves code ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)), which changes `src/llama-graph.cpp`, the file that builds the graph this capture reads. Waves off is a runtime flag. Whether a build without that code gives the same activations has not been measured. `check_capture.py`'s tiny runs used the same build.
 - **Settings.** `MTL0`, 10 threads, 128 cache slots, effective ubatch 21, `n_ctx` 512, reasoning mode `none`. Two captures compare only at equal settings.
 - **Dataset.** sha256 `e4681b761c1542876ab72c4db1f3d44e1de6c7b1190e2c532116496c00c2cc90`, as committed.
 
@@ -185,7 +185,7 @@ Held out by grouped cross-validation: 40 rows, 25 groups, 5 folds, 20 label shuf
 
 ### What these scores say
 
-- **Against the surface rule, the bar.** No probe clears it in a way that counts. On execute, three layers tie it and layer 50 is above it by one row of 40. On operation family all four are below it. The rule was written after seeing the rows, which favors it, and [clearing it wouldn't rule its cues out](#what-a-result-would-and-wouldnt-mean).
+- **Against the surface rule, the bar.** No probe clears it in a way that counts. On execute, three layers tie it and layer 50 is above it by one row of 40. On operation family, where the bar is the gate plus the keyword list, all four are below it. The rule was written after seeing the rows, which favors it, and [clearing it wouldn't rule its cues out](#what-a-result-would-and-wouldnt-mean).
 - **Against the other baselines.** On execute all four probes are above the keyword rule, prompt length and bag of words. On operation family all four are above prompt length and bag of words, but by balanced accuracy only layer 40 is above the keyword rule's 0.783: layers 10 and 50 (0.767) and 25 (0.733) are below it. By plain accuracy all four are above its 0.700.
 - **Single rows.** All probes get the 14 execute hard negatives right, where the surface rule errs on A-011. Each of layers 10, 25 and 40 has one execute error of its own: layers 10 and 40 a false alarm outside the hard negatives, layer 25 a missed computation. `report.json` doesn't record which rows, and one row is no finding either way.
 - **Shuffled labels.** Each real score is above the highest of its 20 shuffles, and no shuffle reaches it. That excludes chance, not the text: random weights decode too.
@@ -203,6 +203,7 @@ Held out by grouped cross-validation: 40 rows, 25 groups, 5 folds, 20 label shuf
 ### Not run or not reported
 
 - The real weight on the CPU, resident on Metal, and compared with a resident run.
+- A build without the Stage E4 code, such as `feat/kolibri1`: see [Build](#results).
 - The other position, `--reasoning default`.
 - The capture's overhead: [no figure is taken](#metal-cpu-and-the-expert-cache) from these decodes, and this was not a timed run.
 
