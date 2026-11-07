@@ -744,3 +744,26 @@ func TestClosedRequestIsNotRetained(t *testing.T) {
 		wantState(t, holder, Ready) // keeps the scheduler's other request in use up to here
 	})
 }
+
+// A worker owns the Args it gets. Changing them mustn't change the registry's record, or an
+// identical retry reads as a conflict and a controller answering that with a new key runs the side
+// effect twice.
+func TestWorkerChangingItsArgsDoesNotChangeTheJob(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, m := setup(t, nil)
+		m.Programs["scribble"] = MockProgram{Run: func(args []string, _ map[JobID]string) (string, error) {
+			args[0] = "changed"
+			return "ok", nil
+		}}
+		r, _ := openChecked(t, s, "r")
+		a := Execute{Job: "a", Program: "scribble", Args: []string{"1"}}
+		must(t, r, a)
+		must(t, r, Wait{Job: "a"})
+		if obs := must(t, r, a); !obs.Existing {
+			t.Fatalf("retry: %+v", obs)
+		}
+		if n := m.StartCount("a"); n != 1 {
+			t.Fatalf("started %d times", n)
+		}
+	})
+}

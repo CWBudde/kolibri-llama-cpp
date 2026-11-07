@@ -311,7 +311,7 @@ func (s *Scheduler) dispatch() []start {
 
 		spec := JobSpec{
 			RequestID: j.req.id, ID: j.id, IdempotencyKey: j.key, Generation: j.generation,
-			Program: j.program, Args: j.args, DepResults: make(map[JobID]string, len(j.depNames)),
+			Program: j.program, Args: slices.Clone(j.args), DepResults: make(map[JobID]string, len(j.depNames)),
 		}
 		for _, name := range j.depNames {
 			spec.DepResults[name] = j.req.jobs[name].result
