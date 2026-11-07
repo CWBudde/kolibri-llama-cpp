@@ -305,6 +305,10 @@ func (r *Request) applyWait(ctx context.Context, a Wait) Observation {
 	s.mu.Lock()
 	j, ok := r.jobs[a.Job]
 	switch {
+	case r.state == Closed: // Close can land after admit
+		s.mu.Unlock()
+		obs.Err = ErrRequestClosed
+		return obs
 	case !ok:
 		s.mu.Unlock()
 		obs.Err = fmt.Errorf("%w: %s", ErrUnknownJob, a.Job)
