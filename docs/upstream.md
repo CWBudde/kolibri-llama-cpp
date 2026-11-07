@@ -397,11 +397,35 @@ and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
 (`7ade40f0`, `git diff --quiet` rc 0).
 
 **Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on fork branch
-`feat/kolibri1-sidefile` (`dd2040eaf`), not on `feat/kolibri1` yet. The patch is
-the plain diff of that branch's two commits against `feat/kolibri1`. The series
-0008, 0010, 0011, 0012 and 0014 applied to a clean `184f6536` equals that
-branch's tree (`53739515`, `git diff --quiet` rc 0). If its gates fail, the
-number is retired as 0013's was.
+`feat/kolibri1-sidefile` (`1f6ce476c`), not on `feat/kolibri1` yet. The patch is
+the plain diff of that branch against `feat/kolibri1`. The series 0008, 0010,
+0011, 0012 and 0014 applied to a clean `184f6536` equals that branch's tree
+(`d8ee53b6`), and without 0014 it equals `feat/kolibri1`'s (`e4937d7a`, both by
+`git write-tree`). If its gates fail, the number is retired as 0013's was.
+
+**Review fixes (fork PRs #13 and #15, 2026-11-07).** Two findings were real; the
+fixes are `634e34bb4` on `feat/kolibri1`, merged into the side-file branch, and
+`1f6ce476c` there. The first is in 0011, the second in 0014.
+- **A LoRA on the routed experts was left out silently.** The matmuls read the
+  slots, and an adapter's weight is looked up by tensor name. Such an adapter now
+  fails to load, by name.
+- **The side-file's table sized an allocation.** Its GGUF header length was
+  checked only against the GGUF's size. The hash now reads in pieces of 1 MiB, and
+  a length past the first expert row is refused.
+
+Neither touches what a read returns or how long it takes. E3's benchmark ran on
+`dd2040eaf` before these commits, and nothing here asks to repeat it.
+
+Three findings were declined, with the reasons on the PRs: the Kolibri-only
+options in `common/arg.cpp` (twice, on #13 and #14), since this checklist is
+upstream's and a slot count is the machine's memory budget, not model metadata;
+and experts spread over several GGUF files, a stated limit that fails with an
+error.
+
+| Mutation | Result |
+|---|---|
+| M70: the LoRA refusal off (`if (false && ...)`) | `check_expert_cache.py`: "FAIL LoRA on ffn_gate_exps with the cache: exits 0 without generating, refused by name", the same for up and down, "FAIL: 3 failures", rc 1 |
+| M71: the bound on the GGUF header off (`if (false && gguf_head > first_row)`) | `test-expert-cache`: "FAIL a GGUF header as long as the GGUF", "FAIL a GGUF header one byte into the experts" |
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's

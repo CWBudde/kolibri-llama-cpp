@@ -75,7 +75,7 @@ index 03b4efa10..bf6d6c35f 100644
      llama-grammar.cpp
      llama-graph.cpp
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 12eca257f..472591129 100644
+index ca8af2414..5559df2f9 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -105,14 +105,14 @@ std::string counts_json(const llama_expert_cache_counts & c, const std::string &
@@ -104,7 +104,7 @@ index 12eca257f..472591129 100644
      if (p.n_slots_layer && p.n_layer_slots > 0) {
          if (p.n_layer_slots != n_layer) {
              throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
-@@ -352,12 +352,23 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -363,12 +363,23 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      throw std::runtime_error("expert cache: not supported on this platform");
  #endif
  
@@ -129,7 +129,7 @@ index 12eca257f..472591129 100644
      if (prefetch_k > 0) {
          markov = std::make_unique<llama_expert_markov>(n_layer, n_expert, prefetch_half_life, prefetch_mix);
      }
-@@ -376,7 +387,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -387,7 +398,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      }
      LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s%s\n",
          __func__, *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
@@ -138,7 +138,7 @@ index 12eca257f..472591129 100644
  }
  
  uint32_t llama_expert_cache::max_ubatch() const {
-@@ -417,7 +428,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -428,7 +439,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
          int l = -1;
          int e = -1;
          if (slots->failure(l, e)) {
@@ -147,7 +147,7 @@ index 12eca257f..472591129 100644
          }
          GGML_ABORT("expert cache: layer %d needs more distinct experts in one ubatch of %d tokens than its %d slots",
              il, n_tokens, n_slots[il]);
-@@ -434,34 +445,16 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -445,34 +456,16 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
      op_seconds[decode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
  }
  
@@ -189,7 +189,7 @@ index 12eca257f..472591129 100644
  }
  
  std::string llama_expert_cache::stats_json() const {
-@@ -476,10 +469,11 @@ std::string llama_expert_cache::stats_json() const {
+@@ -487,10 +480,11 @@ std::string llama_expert_cache::stats_json() const {
      const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + (diag ? ", " + diag->json_fields() : std::string());
      return format(
          "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
@@ -203,7 +203,7 @@ index 12eca257f..472591129 100644
          process_json(pc, disk_read0, pageins0, faults0).c_str());
  }
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
-index 9370af36f..a554d440b 100644
+index e5b40fea4..3e5d9d7c2 100644
 --- a/src/llama-expert-cache.h
 +++ b/src/llama-expert-cache.h
 @@ -10,6 +10,7 @@
@@ -214,7 +214,7 @@ index 9370af36f..a554d440b 100644
  #include "llama-expert-slots.h"
  
  #include "ggml.h"
-@@ -99,7 +100,7 @@ struct llama_expert_cache {
+@@ -102,7 +103,7 @@ struct llama_expert_cache {
      std::string stats_json() const;
  
  private:
@@ -223,7 +223,7 @@ index 9370af36f..a554d440b 100644
  
      const int n_layer, n_expert, n_expert_used;
      std::vector<int> n_slots; // per layer
-@@ -109,6 +110,7 @@ private:
+@@ -112,6 +113,7 @@ private:
      double prefetch_mix;
      std::string stats_path;
      bool buffered; // misses read through the page cache
@@ -231,7 +231,7 @@ index 9370af36f..a554d440b 100644
  
      std::vector<tensors>  stacked;
      std::vector<tensors>  slot_t; // the slot tensors; offs unused
-@@ -129,6 +131,10 @@ private:
+@@ -132,6 +134,10 @@ private:
      std::string path;
      int fd = -1;
  
@@ -244,10 +244,10 @@ index 9370af36f..a554d440b 100644
      std::vector<int> pred;
 diff --git a/src/llama-expert-sidefile.cpp b/src/llama-expert-sidefile.cpp
 new file mode 100644
-index 000000000..30245707a
+index 000000000..a33f26211
 --- /dev/null
 +++ b/src/llama-expert-sidefile.cpp
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,456 @@
 +#include "llama-expert-sidefile.h"
 +
 +#include "llama-impl.h"
@@ -371,20 +371,19 @@ index 000000000..30245707a
 +
 +} // namespace
 +
-+void llama_expert_sha256(const void * data, size_t n, uint8_t out[32]) {
-+    uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
-+    const uint8_t * p = (const uint8_t *) data;
-+    size_t left = n;
-+    for (; left >= 64; left -= 64, p += 64) {
-+        sha256_block(h, p);
-+    }
++namespace {
++
++constexpr uint32_t sha256_start[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
++
++// the last left < 64 of n bytes at p, the padding, and the digest
++void sha256_finish(uint32_t h[8], const uint8_t * p, size_t left, uint64_t n, uint8_t out[32]) {
 +    uint8_t tail[128] = {};
 +    if (left > 0) {
 +        memcpy(tail, p, left);
 +    }
 +    tail[left] = 0x80;
 +    const size_t blocks = left + 9 <= 64 ? 1 : 2;
-+    const uint64_t bits = (uint64_t) n * 8;
++    const uint64_t bits = n * 8;
 +    for (int i = 0; i < 8; ++i) {
 +        tail[blocks*64 - 1 - i] = (uint8_t) (bits >> (8*i));
 +    }
@@ -396,6 +395,56 @@ index 000000000..30245707a
 +            out[4*i + j] = (uint8_t) (h[i] >> (24 - 8*j));
 +        }
 +    }
++}
++
++} // namespace
++
++void llama_expert_sha256(const void * data, size_t n, uint8_t out[32]) {
++    uint32_t h[8];
++    memcpy(h, sha256_start, sizeof(h));
++    const uint8_t * p = (const uint8_t *) data;
++    size_t left = n;
++    for (; left >= 64; left -= 64, p += 64) {
++        sha256_block(h, p);
++    }
++    sha256_finish(h, p, left, n, out);
++}
++
++bool llama_expert_sha256_file(int fd, uint64_t n, uint8_t out[32]) {
++#if defined(__APPLE__) || defined(__linux__)
++    uint32_t h[8];
++    memcpy(h, sha256_start, sizeof(h));
++    std::vector<uint8_t> piece(1024*1024); // whole blocks, so only the last piece leaves a tail
++    uint64_t done = 0;
++    while (true) {
++        const size_t want = (size_t) std::min<uint64_t>(n - done, piece.size());
++        size_t got = 0;
++        while (got < want) {
++            const ssize_t r = pread(fd, piece.data() + got, want - got, (off_t) (done + got));
++            if (r < 0 && errno == EINTR) {
++                continue;
++            }
++            if (r <= 0) {
++                return false;
++            }
++            got += (size_t) r;
++        }
++        const size_t whole = want/64*64;
++        for (size_t i = 0; i < whole; i += 64) {
++            sha256_block(h, piece.data() + i);
++        }
++        done += want;
++        if (done == n) {
++            sha256_finish(h, piece.data() + whole, want - whole, n, out);
++            return true;
++        }
++    }
++#else
++    GGML_UNUSED(fd);
++    GGML_UNUSED(n);
++    GGML_UNUSED(out);
++    return false;
++#endif
 +}
 +
 +bool llama_expert_read_rows(int fd, const std::string & path, const std::array<llama_expert_stacked, 3> & stacked, int e,
@@ -582,14 +631,20 @@ index 000000000..30245707a
 +        if ((uint64_t) sg.st_size != gguf_size) {
 +            throw fail(format("written from another GGUF: its size was %llu, this one has %llu", (unsigned long long) gguf_size, (unsigned long long) sg.st_size));
 +        }
-+        if (gguf_head > gguf_size) {
-+            throw fail(format("GGUF header of %llu bytes in a GGUF of %llu", (unsigned long long) gguf_head, (unsigned long long) gguf_size));
++        // the table is the file's word for this length: it may size no allocation, and a real header
++        // ends before the data section, so before the experts
++        uint64_t first_row = gguf_size;
++        for (const auto & lt : stacked) {
++            for (const auto & st : lt) {
++                first_row = std::min(first_row, st.offset);
++            }
 +        }
-+        std::vector<uint8_t> head(gguf_head);
-+        if (!read_at(fd_gguf, head.data(), head.size(), 0)) {
++        if (gguf_head > first_row) {
++            throw fail(format("GGUF header of %llu bytes reaches into the experts at %llu", (unsigned long long) gguf_head, (unsigned long long) first_row));
++        }
++        if (!llama_expert_sha256_file(fd_gguf, gguf_head, got)) {
 +            throw fail("cannot read the GGUF's header");
 +        }
-+        llama_expert_sha256(head.data(), head.size(), got);
 +        if (memcmp(got, &table[56], sizeof(got)) != 0) {
 +            throw fail(format("written from another GGUF: its header's sha256 was %s, this one's is %s", hex(&table[56], 32).c_str(), hex(got, 32).c_str()));
 +        }
@@ -651,10 +706,10 @@ index 000000000..30245707a
 +}
 diff --git a/src/llama-expert-sidefile.h b/src/llama-expert-sidefile.h
 new file mode 100644
-index 000000000..247e54830
+index 000000000..e81239692
 --- /dev/null
 +++ b/src/llama-expert-sidefile.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,88 @@
 +#pragma once
 +
 +// [EXPERIMENTAL] The expert cache's reads, independent of ggml: from the GGUF with one pread per
@@ -694,6 +749,9 @@ index 000000000..247e54830
 +
 +// sha256 of n bytes: the side-file's table and the GGUF's header
 +void llama_expert_sha256(const void * data, size_t n, uint8_t out[32]);
++
++// sha256 of a file's first n bytes, read in pieces of fixed size; false if it cannot read them all
++bool llama_expert_sha256_file(int fd, uint64_t n, uint8_t out[32]);
 +
 +// one stacked tensor, as the model has it
 +struct llama_expert_stacked {
@@ -816,7 +874,7 @@ index 746dd66cb..3952741b4 100644
  
      return result;
 diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
-index 157750c17..2d07d0807 100644
+index 157750c17..1f0cc3080 100644
 --- a/tests/test-expert-cache.cpp
 +++ b/tests/test-expert-cache.cpp
 @@ -1,19 +1,32 @@
@@ -876,7 +934,7 @@ index 157750c17..2d07d0807 100644
  }
  
  // every id maps to a slot that holds it
-@@ -295,6 +314,487 @@ static void test_stress() {
+@@ -295,6 +314,520 @@ static void test_stress() {
      CHECK(d.prefetch_issued > 0 && d.prefetch_used > 0);
  }
  
@@ -1177,6 +1235,32 @@ index 157750c17..2d07d0807 100644
 +}
 +
 +// every wrong table is refused, by name of what is wrong
++// in pieces or at once, across the piece size
++static void test_sha256_file() {
++    const char * tmp = getenv("TMPDIR");
++    std::string path = std::string(tmp ? tmp : "/tmp") + "/test-expert-sha256-XXXXXX";
++    const int fd = mkstemp(path.data());
++    CHECK(fd >= 0);
++    const size_t piece = 1024*1024;
++    std::vector<uint8_t> data(3*piece + 17);
++    std::mt19937 rng(7);
++    for (auto & b : data) {
++        b = (uint8_t) rng();
++    }
++    CHECK(write(fd, data.data(), data.size()) == (ssize_t) data.size());
++    for (const size_t n : { (size_t) 0, (size_t) 1, (size_t) 55, (size_t) 56, (size_t) 63, (size_t) 64, (size_t) 65,
++                            piece - 1, piece, piece + 1, 2*piece, data.size() }) {
++        uint8_t want[32], got[32];
++        llama_expert_sha256(data.data(), n, want);
++        CHECK(llama_expert_sha256_file(fd, n, got));
++        CHECK(hex32(want) == hex32(got));
++    }
++    uint8_t got[32];
++    CHECK(!llama_expert_sha256_file(fd, data.size() + 1, got));
++    close(fd);
++    unlink(path.c_str());
++}
++
 +static void test_sidefile_refusals() {
 +    sidefile_fixture x;
 +    const int fd = open(x.gguf_path.c_str(), O_RDONLY);
@@ -1242,6 +1326,13 @@ index 157750c17..2d07d0807 100644
 +    expect("another GGUF's size", "another GGUF");
 +    with_table([](std::vector<uint8_t> & t) { t[56] ^= 1; });
 +    expect("another GGUF's header", "another GGUF");
++    // the table is checksummed, so this is what a crafted one says; nothing the size of the claim is allocated
++    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, 48, x.gguf.size()); });
++    expect("a GGUF header as long as the GGUF", "reaches into the experts");
++    with_table([](std::vector<uint8_t> & t) { F::set_u64(t, 48, F::head + 1); });
++    expect("a GGUF header one byte into the experts", "reaches into the experts");
++    with_table([](std::vector<uint8_t> & t) { F::set_u64(t, 48, F::head - 1); });
++    expect("a shorter GGUF header", "another GGUF");
 +
 +    // a truncated or extended file, with a good table
 +    x.write_side(x.table, x.file_size() - F::align);
@@ -1364,7 +1455,7 @@ index 157750c17..2d07d0807 100644
  static void test_top_k() {
      std::vector<int> out;
      llama_expert_top_k({0.5, 2.0, 1.0, 2.0, 0.0}, 3, out);
-@@ -346,6 +846,11 @@ static void test_markov_fixture(const char * path) {
+@@ -346,6 +879,11 @@ static void test_markov_fixture(const char * path) {
  }
  
  int main(int argc, char ** argv) {
@@ -1376,7 +1467,7 @@ index 157750c17..2d07d0807 100644
      test_lru();
      test_pinned();
      test_pinned_loading();
-@@ -355,7 +860,15 @@ int main(int argc, char ** argv) {
+@@ -355,7 +893,16 @@ int main(int argc, char ** argv) {
      test_in_flight();
      test_failures();
      test_stress();
@@ -1387,6 +1478,7 @@ index 157750c17..2d07d0807 100644
 +#ifdef HAVE_SIDEFILE_TESTS
 +    test_sidefile_slots();
 +    test_sidefile_read_failure();
++    test_sha256_file();
 +    test_sidefile_refusals();
 +#endif
      if (argc > 1) {

@@ -188,6 +188,28 @@ index 97250c2e8..03b4efa10 100644
      llama-grammar.cpp
      llama-graph.cpp
      llama-hparams.cpp
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index 824601ed6..a18dac9c3 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-adapter.h"
+ 
++#include "llama-expert-cache.h"
+ #include "llama-impl.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+@@ -339,6 +340,10 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
+         if (model.hdmd.inverse_blocks.count(name)) {
+             throw std::runtime_error("LoRA tensor '" + name + "' targets a prism.hadamard latent lookup table, which is not supported");
+         }
++        // the expert cache's matmuls read its slot tensors under the slots' ids: the delta would be silently left out
++        if (model.expert_cache && model.expert_cache->holds(model_tensor)) {
++            throw std::runtime_error("LoRA tensor '" + name + "' targets a routed expert, which the expert cache reads from its slots: not supported");
++        }
+ 
+         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+ 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index ca84fc405..3c994ad91 100644
 --- a/src/llama-context.cpp
@@ -260,10 +282,10 @@ index 6938fb103..5d5a0e842 100644
  
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 000000000..2a328401d
+index 000000000..bc42e48e5
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,438 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -448,6 +470,17 @@ index 000000000..2a328401d
 +        n += gr.buf ? ggml_backend_buffer_get_size(gr.buf) : 0;
 +    }
 +    return n;
++}
++
++bool llama_expert_cache::holds(const ggml_tensor * t) const {
++    for (const auto & layer : stacked) {
++        for (const ggml_tensor * s : layer.t) {
++            if (s == t) {
++                return true;
++            }
++        }
++    }
++    return false;
 +}
 +
 +void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std::vector<ggml_backend_dev_t> & devs, int fd_loader) {
@@ -693,10 +726,10 @@ index 000000000..2a328401d
 +}
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
 new file mode 100644
-index 000000000..ec772aeaf
+index 000000000..571f876c9
 --- /dev/null
 +++ b/src/llama-expert-cache.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,111 @@
 +#pragma once
 +
 +// [EXPERIMENTAL] A bounded cache of routed experts (Kolibri only).
@@ -740,6 +773,9 @@ index 000000000..ec772aeaf
 +    // starts the I/O threads; it throws on failure. The slots are host memory, which pread writes:
 +    // a CPU buffer, or host memory the device uses in place (buffer_from_host_ptr, e.g. Metal).
 +    void init(const std::vector<tensors> & stacked, const std::vector<ggml_backend_dev_t> & devs, int fd);
++
++    // whether t is one of the stacked expert tensors this cache reads in place of the model's
++    bool holds(const ggml_tensor * t) const;
 +
 +    // the largest ubatch whose experts always fit: the fewest slots of a layer over n_expert_used
 +    uint32_t max_ubatch() const;

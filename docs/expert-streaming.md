@@ -445,7 +445,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4.json -out ~/models/eval/exp
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
 - The expert layers must be on the CPU or on a device that can use host memory in place (Metal); CUDA and the like are rejected.
-- Kolibri only, no LoRA on the routed experts. The experts must be in one file.
+- Kolibri only. A LoRA on the routed experts is refused at load, since the matmuls read the slots and its delta would be left out; a LoRA on anything else, the router's input weight among them, works as without the cache. The experts must be in one file; the load refuses them otherwise.
 - A ubatch of one token counts as decode, also in a prompt. In a prefill ubatch the last layer sees only the output rows, so the predictor's counts of that layer cover fewer tokens than the trace replays of Stage B.
 - LRU only. Layer budgets can be set with `--expert-cache-layers`, but nothing writes the Stage A allocation to such a file yet.
 - `-fit` does not know about the slot buffer.

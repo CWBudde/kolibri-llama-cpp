@@ -62,6 +62,11 @@ prefetch and buffered reads):
   fallback), another GGUF's rows, another GGUF's header, a side-file without the cache; a flipped data
   byte loads, since the load does not hash 31 GB, and kolibri-sidefile verify reports it.
 
+LoRA (patch 0011): an adapter on a stacked expert tensor is refused at load with the cache, for gate, up and
+down, since the matmuls read the slots and the delta would be left out. The same adapter loads without the
+cache and changes the text, and an adapter on the router's input weight, which the cache does not hold, gives
+the resident run's text with the cache.
+
 With --real GGUF it checks a real checkpoint on the GPU instead: the first 160 tokens of a
 locality workload (128 prefilled, 32 decoded), resident against the cache with 128 and 64 slots per
 layer, with and without prefetch, again bit-identical, with the same counter checks; with waves the
@@ -95,6 +100,29 @@ WAVE_SLOTS = [16, 18, 24, 64, 384]
 N_GROWN = 4  # 4 tokens' 24 pairs at 18 slots: 2 waves built, and a union above 2 * 6 grows them
 N_GROWN_REAL = 6  # likewise on a real checkpoint: 36 pairs at 18 slots, 3 waves built
 N_BENCH_UBATCH = 512  # testdata/bench/e4.json's arms prefill in ubatches of the server's default
+
+
+def write_lora(llama_cpp: Path, path: Path, base: Path, targets: list[str], rank: int = 2, seed: int = 1) -> None:
+    """A rank-limited LoRA adapter of random weights for these tensors of the GGUF base."""
+    sys.path.insert(0, str(llama_cpp / "gguf-py"))
+    import gguf
+    import numpy as np
+
+    dims = {t.name: [int(d) for d in t.shape] for t in gguf.GGUFReader(base).tensors}
+    w = gguf.GGUFWriter(path, gguf.GGUFReader(base).fields["general.architecture"].contents())
+    w.add_type("adapter")
+    w.add_string("adapter.type", "lora")
+    rng = np.random.default_rng(seed)
+    for name in targets:
+        d = dims[name]  # ggml order; numpy's is the reverse
+        a = rng.standard_normal(tuple(([d[0], rank] + d[2:])[::-1]), dtype=np.float32) * 0.5
+        b = rng.standard_normal(tuple(([rank, d[1]] + d[2:])[::-1]), dtype=np.float32) * 0.5
+        w.add_tensor(f"{name}.lora_a", a)
+        w.add_tensor(f"{name}.lora_b", b)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
 
 
 def has_waves(r: Runner, llama_cpp: Path) -> bool:
@@ -512,6 +540,22 @@ def main() -> None:
                 rs, rok = str(e), False
             report(resident.returncode == 0 and rok and resident.stdout == plain.stdout,
                    f"llama-completion --expert-cache-stats without the cache: decode timing only, same text ({rs if not rok else rs['decode']})")
+            # a LoRA on the experts the cache holds is refused; without the cache, or on what it does not hold, it applies
+            for kind in ("gate", "up", "down"):
+                lora = Path(tmp) / f"lora-{kind}.gguf"
+                write_lora(args.llama_cpp, lora, gguf, [f"blk.0.ffn_{kind}_exps.weight"])
+                refused_run = subprocess.run(base + ["--expert-cache", "16", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+                report(refused_run.returncode != 0 and refused_run.stdout.strip() == "" and "reads from its slots" in refused_run.stderr,
+                       f"LoRA on ffn_{kind}_exps with the cache: exits {refused_run.returncode} without generating, refused by name")
+                applied = subprocess.run(base + ["-ub", "2", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+                report(applied.returncode == 0 and applied.stdout.strip() != "" and applied.stdout != plain.stdout,
+                       f"LoRA on ffn_{kind}_exps without the cache: loads and changes the text ({applied.stdout.strip()[:40]!r})")
+            lora = Path(tmp) / "lora-router.gguf"
+            write_lora(args.llama_cpp, lora, gguf, ["blk.0.ffn_gate_inp.weight"])
+            on_resident = subprocess.run(base + ["-ub", "2", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+            on_cache = subprocess.run(base + ["--expert-cache", "16", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+            report(on_resident.returncode == 0 and on_cache.returncode == 0 and on_resident.stdout != plain.stdout and on_cache.stdout == on_resident.stdout,
+                   f"LoRA on the router's input with the cache: same text as without it, changed by the adapter ({on_cache.stdout.strip()[:40]!r}{'' if on_cache.returncode == 0 else ' ' + on_cache.stderr[-300:]})")
             odd = Path(tmp) / 'we"ird\\na\tme.gguf'
             shutil.copyfile(gguf, odd)
             stats.unlink(missing_ok=True)
