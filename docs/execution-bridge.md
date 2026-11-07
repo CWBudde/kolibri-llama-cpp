@@ -1,6 +1,6 @@
 # Execution bridge
 
-**Result: Kolibri completed issue #59's deterministic three-step task through the bridge on the first attempt, on one quantized weight. `TestAcceptanceRealModel` passed with two runs and one canonical trace ([the real run](#the-real-run-2026-11-07)). That is one task at temperature 0, with the steps spelled out in the prompt. It gives no success rate, no recovery from a failed call and no comparison with ordinary tool calling.** The test is skipped by default, since it needs a real weight.
+**Result: Kolibri completed a deterministic three-step task through the bridge on the first attempt, on one quantized weight. The task was written for issue #59's criterion; the issue names no task. `TestAcceptanceRealModel` passed with two runs and one canonical trace ([the real run](#the-real-run-2026-11-07)). That is one task at temperature 0, with the steps spelled out in the prompt. It gives no success rate, no recovery from a failed call and no comparison with ordinary tool calling.** The test is skipped by default, since it needs a real weight.
 
 This is runtime tool execution, not hidden-state integration. A model reaches an operation only by writing a tool call into its output, and reads the result only as text in its next prompt. Nothing here patches llama.cpp, touches the weights or reads a hidden state.
 
@@ -113,19 +113,19 @@ A JSON string with a lone surrogate escape (`"\ud800"`) decodes to U+FFFD, as ev
 
 ## What the real server showed
 
-These came from llama-server on the `cmd/kolibri-tiny` checkpoint. They shaped the code and are tests now.
+These came from llama-server on the `cmd/kolibri-tiny` checkpoint, and they shaped the code. The last column says what a test holds. Where it says no test, the behavior was only observed, and no test would notice if the server changed.
 
 | Finding | Consequence | Test |
 |---|---|---|
 | The server parses a call's arguments to render the next prompt. `9223372036854775808` comes out as `-9223372036854775808`, `99999999999999999999999` as `1e+23` | JSON numbers past int64 are refused. Integers go as strings, which survive | `TestTinyCheckpointCorruptsLargeJSONNumbers` |
-| The grammar for `{"type":"integer"}` allows 16 digits (`common/json-schema-to-grammar.cpp`), while a string pattern is unbounded | The schema uses a string with a pattern. A model under the integer grammar couldn't write a longer number | `TestTinyCheckpointCompilesEverySchema` checks the grammar |
+| The grammar for `{"type":"integer"}` allows 16 digits (`common/json-schema-to-grammar.cpp`), while a string pattern is unbounded | The schema uses a string with a pattern. A model under the integer grammar couldn't write a longer number | `TestTinyCheckpointCompilesEverySchema` holds the string pattern's unbounded grammar. No test holds the 16-digit bound, which this row reads from the source |
 | Arguments that aren't JSON make the next turn HTTP 500. So do arguments that encoding/json takes and the server's parser doesn't: a lone surrogate escape, and a number that overflows a double | The echo wraps all of these as `{"_malformed":"..."}`, so the model gets to read its result. That can be a successful one, as with `hash_*` and a surrogate. Other JSON goes back as it is, also when it isn't an object: the server takes `5` and `null` | `TestTinyCheckpointRefusesRawMalformedArguments`, `TestTinyCheckpointAcceptsTheEchoOfMalformedArguments`, `TestEchoArguments` |
 | `chat_template_kwargs` overrides the template's variables: a `messages` key replaces the rendered messages, and the bridge delivers results by appending to them | Refused | `TestTinyCheckpointTemplateKwargsReplaceTheMessages`, `TestClientRequestsThatAreRefused` |
 | A turn out of tokens returns a complete-looking call and a second one that is only `{`, with `finish_reason: "length"` | Only `"tool_calls"` runs anything | `TestCapturedCutTurnExecutesNothing` |
 | Text the parser can't read is an error event after a 200, without `[DONE]`. A repeated `<tool_call>` token comes back as plain content | `upstream_error`, `unparsed_call` | `TestCapturedParseErrorMidStream`, `TestAnAnswerCutOrWithAnUnparsedCall` |
-| `tool_choice: "required"` allows free text before the first call: the grammar's root has a free-text rule (`until-182?`) ahead of `tool-calls`. It doesn't make a call come first | The bridge uses `auto`. Only the tiny test uses `required`, with a prefilled `<tool_call>` | `forceCall` |
-| Under `required`, `parallel_tool_calls: false` didn't stop several calls in one turn | The limits count every call, and the bridge doesn't send the field by itself | `TestCallLimits` |
-| The tools cost prompt tokens: 51 without tools, 605 with the four of the acceptance task, 1931 with all 15, on llama.cpp `90311e5a2` | `-allow` matters. The tiny checkpoint's 2048-token context barely fits them all | `TestTinyCheckpointCompilesEverySchema` |
+| `tool_choice: "required"` allows free text before the first call: the grammar's root has a free-text rule (`until-182?`) ahead of `tool-calls`. It doesn't make a call come first | The bridge uses `auto`. Only the tiny test uses `required`, with a prefilled `<tool_call>` | No test: observed on tiny weights. `forceCall` uses `required` and asserts nothing about this. `TestClientRequestsThatAreRefused` holds that a client can't ask for `required` |
+| Under `required`, `parallel_tool_calls: false` didn't stop several calls in one turn | The limits count every call, and the bridge doesn't send the field by itself | No test of the server's behavior: observed on tiny weights. `TestCallLimits` holds the bridge's own limits, on the fake |
+| The tools cost prompt tokens: 51 without tools, 605 with the four of the acceptance task, 1931 with all 15, on llama.cpp `90311e5a2` | `-allow` matters. The tiny checkpoint's 2048-token context barely fits them all | No test: `TestTinyCheckpointCompilesEverySchema` logs the figure for all 15 and asserts none of these |
 
 `testdata/bridge` holds the captured bytes. `TestCaptureFixtures` regenerates them, and `TestFakeHasTheCapturedShapes` holds the test server to their key paths.
 
@@ -168,7 +168,7 @@ All pass, and the real-server tests below are skipped without their environment 
 - parallel calls finishing in the other order, sixteen requests at once;
 - eight runs of one script giving the same bytes upstream, the same messages and the same canonical trace, with the server's random IDs in play.
 
-`FuzzExecute` ran 1.5 million executions without a panic or an unstable answer.
+`FuzzExecute` ran 1.5 million executions without a panic or an unstable answer. That was before `aacc096` changed how `hash_*` reads its input (an empty encoding is refused, base64 is strict), and it wasn't rerun.
 
 ### On real llama-server with tiny weights
 
@@ -187,9 +187,11 @@ All seven tests pass. A random model called `array_sum`, `int_div` and `hash_sha
 
 ### The acceptance test
 
+Issue #59's criterion is that unmodified Kolibri completes a deterministic multi-step program task, and it names no task. This one, its prompt and its four allowed operations were written with the test (`e41f652`), before the real run.
+
 `TestAcceptanceRealModel` asks the model to multiply `987654321987654321` by `123456789123456789`, add 1, and take the SHA-256 of the sum's digits. The prompt asks for the digest only, and a model can't work that out in its head. The test passes only with `stop` = `completed`, the three calls in order with exact operands, each result exact, and exactly the expected digest in the answer. The expected values are literals computed outside this repo's code. A mistake the model repairs doesn't fail the test but shows up in the trace. `TestAcceptanceJudge` shows on the fake that a wrong digest, a miscopied number, a skipped step, an answer without tools, steps out of order and a truncated end all fail.
 
-It needs a real weight, llama-server built from the fork, and the machine to itself: **a resident run wires about 33 GiB. Two have panicked this 48 GiB Mac, so check that no other run holds a weight.**
+It needs a real weight, llama-server built from the fork, and the machine to itself: **a resident run wires about 33 GiB, so two would wire about 66 GiB on this 48 GiB Mac. One resident run with a 16 GiB `mlock` hog has already panicked it ([expert-streaming.md](expert-streaming.md)), so check that no other run holds a weight.**
 
 ```sh
 third_party/llama.cpp/build/bin/llama-server -m ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf \
@@ -198,7 +200,7 @@ KOLIBRI_BRIDGE_ACCEPT_URL=http://127.0.0.1:8099 KOLIBRI_BRIDGE_ACCEPT_RUNS=2 KOL
     go test -race -count=1 -timeout 3h -v -run TestAcceptanceRealModel ./internal/bridge/
 ```
 
-It refuses a server whose template isn't the released one (sha256 `9ba35d4b…`), and a weight with `tiny` in its file name. Before the real run its plumbing ran on random weights, under another file name, and failed as it should: stop reason `truncated`, 0 of 3 steps, a 722-token prompt. `KOLIBRI_BRIDGE_ACCEPT_RUNS=2` repeats the task and requires one canonical trace. Prompt caching may make that fail on a server that decodes a cached prefix differently. `KOLIBRI_BRIDGE_ACCEPT_EFFORT` sets `reasoning_effort`, default `low`. Without `--expert-cache 128` the server is resident, which has not run this test.
+It refuses a server whose template isn't the released one (sha256 `9ba35d4b…`), and a weight with `tiny` in its file name. Neither identifies the weights. Before the real run its plumbing ran on random weights, under another file name, got past both checks and failed as it should: stop reason `truncated`, 0 of 3 steps, a 722-token prompt. `KOLIBRI_BRIDGE_ACCEPT_RUNS=2` repeats the task and requires one canonical trace. Prompt caching may make that fail on a server that decodes a cached prefix differently. `KOLIBRI_BRIDGE_ACCEPT_EFFORT` sets `reasoning_effort`, default `low`. Without `--expert-cache 128` the server is resident, which has not run this test.
 
 #### The real run, 2026-11-07
 
@@ -206,7 +208,7 @@ One attempt. Its settings were written down before the server started: `KOLIBRI_
 
 | | |
 |---|---|
-| Weight | `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, a real file on the internal drive. Kolibri's released weights, quantized: no training and no adapter. The test checked the template's hash |
+| Weight | `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, a real file on the internal drive. Kolibri's released weights, quantized: no training and no adapter. The test checked the template's hash, not the weight's |
 | Server | llama-server `90311e5a2` (fork `feat/kolibri1-waves`), started as above, plus `--expert-cache-stats`. The stats file reports 128 slots, waves off and no load failure |
 | Bridge | `aacc096`, in process through `Bridge.Run`, with streaming to the server. `-race` on |
 | Request | temperature 0, seed 7, `max_tokens` 2048, `reasoning_effort` low, four operations allowed |
@@ -229,6 +231,8 @@ Every call succeeded the first time. Each run took 4276 prompt tokens over its f
 - **Failure recovery.** No call failed, so a real model has not read an error and repaired a call. That path has run on the fake and on tiny weights only.
 - **The HTTP API.** The client side ran in process. `kolibri-bridge`, a streaming client and parallel calls haven't met a real model.
 - **Other weights and modes.** Only this quantization ran, under the expert cache. BF16 and a resident server did not run.
+- **Another build.** The server was fork branch `feat/kolibri1-waves`, which is outside the patch series: `feat/kolibri1` without its last commit, plus the Stage E4 waves code ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)). The run didn't pass `--expert-cache-waves`, and the stats file reports waves off, but that is a runtime flag. Whether a build without that code gives the same trace has not been measured. `TestTinyCheckpoint` ran on the same build.
+- **The weight's hash, in this run's own records.** `attempt-1` names the file and holds no hash of it, and the test's check doesn't identify it. The file at that path is `93720b94…` in `~/models/eval/layer-probe-20261107/capture.json`, written about five minutes after the test ended, and its modification time is 2026-10-23. A later run should put the weight's SHA-256 in `plan.txt`.
 - **Speed or overhead.** The run wasn't timed, and it has no baseline without tools. PLAN's benchmark is still open.
 
 ## Do the tests catch regressions?

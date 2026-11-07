@@ -21,9 +21,10 @@ import (
 	"kolibri-llm/internal/bridge/ops"
 )
 
-// The acceptance task of issue #59. Three steps, each needing the last one's exact output. A model
-// can't do the last step in its head, so a correct digest in the answer means the results went
-// through it. The expected values are literals, computed outside this repo's Go code.
+// The acceptance task, written for issue #59's criterion: the issue names no task. Three steps, each
+// needing the last one's exact output. A model can't do the last step in its head, so a correct
+// digest in the answer means the results went through it. The expected values are literals, computed
+// outside this repo's Go code.
 const (
 	acceptA       = "987654321987654321"
 	acceptB       = "123456789123456789"
@@ -32,7 +33,8 @@ const (
 	acceptDigest  = "8794da494318df92e876854b96a3ed629fa76ad21764a7562a1b6b5bbb76428f"
 
 	// sha256 of the chat_template in tokenizer_config.json of the pinned revision, the same constant
-	// as tools/chat/check_chat.py. It tells unmodified Kolibri from anything else on that port.
+	// as tools/chat/check_chat.py. It tells the released template from another one. It doesn't identify
+	// the weights: random weights under another file name get past it.
 	kolibriTemplateSHA256 = "9ba35d4bd6baa26b66aa75d03a922dfee98b16bb1fa37481b195d247267b0f97"
 )
 
@@ -209,10 +211,10 @@ func checkServerIsKolibri(t *testing.T, url string) {
 	t.Logf("server: %s, n_ctx %d", props.ModelPath, props.Settings.NCtx)
 }
 
-// TestAcceptanceRealModel is issue #59's acceptance criterion: unmodified Kolibri completes a
-// deterministic multi-step task through the bridge, checked exactly. It needs a real weight in a
-// running llama-server, which is why it is skipped by default. See docs/execution-bridge.md for the
-// commands and for the one real run so far.
+// TestAcceptanceRealModel tests issue #59's acceptance criterion on one task: unmodified Kolibri
+// completes a deterministic multi-step task through the bridge, checked exactly. It needs a real
+// weight in a running llama-server, which is why it is skipped by default. See
+// docs/execution-bridge.md for the commands and for the one real run so far.
 //
 //	KOLIBRI_BRIDGE_ACCEPT_URL   the server, for example http://127.0.0.1:8099; unset: skip
 //	KOLIBRI_BRIDGE_ACCEPT_RUNS  runs of the task, default 1; above 1 they must give one trace
