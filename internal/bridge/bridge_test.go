@@ -1232,6 +1232,44 @@ func TestCanonicalIgnoresGeneratedIDs(t *testing.T) {
 	}
 }
 
+// The messages of a completed request are the whole conversation, its answer included. The answer goes
+// no further: it isn't in a prompt.
+func TestMessagesEndInTheAnswer(t *testing.T) {
+	f := newFake(t,
+		fakeTurn{reasoning: "plan", calls: []fakeCall{{"int_add", `{"a":"2","b":"3"}`}}},
+		fakeTurn{reasoning: "Done.", content: "The answer."})
+	res := runBody(t, newBridge(t, f), userBody)
+	wantStop(t, res, StopCompleted)
+	if len(res.Messages) != 4 {
+		t.Fatalf("%d messages: %s", len(res.Messages), res.Messages)
+	}
+	want := `{"role":"assistant","content":"The answer.","reasoning_content":"Done."}`
+	if got := string(res.Messages[3]); got != want {
+		t.Errorf("the last message is %s, want %s", got, want)
+	}
+	if f.requestCount() != 2 || len(f.messages(1)) != 3 {
+		t.Errorf("%d requests, the last prompt has %d messages", f.requestCount(), len(f.messages(1)))
+	}
+
+	// A turn that ended the request any other way isn't a message. Its text is in Content.
+	for _, c := range []struct {
+		name string
+		turn fakeTurn
+		want StopReason
+	}{
+		{"out of tokens", fakeTurn{content: "cut", finish: "length"}, StopTruncated},
+		{"a call the server didn't parse", fakeTurn{content: "<tool_call>cut"}, StopUnparsedCall},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res := runBody(t, newBridge(t, newFake(t, c.turn)), userBody)
+			wantStop(t, res, c.want)
+			if len(res.Messages) != 1 || res.Content != c.turn.content {
+				t.Errorf("messages %s, content %q", res.Messages, res.Content)
+			}
+		})
+	}
+}
+
 // A client that blocks in a callback holds up its own request, not a cancel call, and the cancel takes
 // effect at once. The event reaches the callback afterwards, in order.
 func TestCancelDoesntWaitForACallback(t *testing.T) {
@@ -1279,6 +1317,107 @@ func TestCancelDoesntWaitForACallback(t *testing.T) {
 	}
 	if !reflect.DeepEqual(seen, res.Trace) {
 		t.Errorf("the callback saw %+v\nthe trace is %+v", seen, res.Trace)
+	}
+}
+
+// runBlocked starts a request and returns once its callback is holding the first event of a kind.
+// release lets the request go on, and result waits for its end.
+func runBlocked(t *testing.T, b *Bridge, kind EventKind) (release func(), result func() *Result) {
+	t.Helper()
+	entered := make(chan struct{})
+	gate := make(chan struct{})
+	var once sync.Once
+	results := make(chan *Result, 1)
+	go func() {
+		res, err := b.Run(context.Background(), "r", []byte(userBody), Callbacks{Event: func(e Event) {
+			if e.Kind == kind {
+				once.Do(func() { close(entered) })
+				<-gate
+			}
+		}})
+		if err != nil {
+			t.Error(err)
+		}
+		results <- res
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("no %s event", kind)
+	}
+	return sync.OnceFunc(func() { close(gate) }), func() *Result { return <-results }
+}
+
+func cancelEvents(res *Result) int {
+	var n int
+	for _, e := range res.Trace {
+		if e.Kind == EventCancelRequested {
+			n++
+		}
+	}
+	return n
+}
+
+// Once request_end is recorded the outcome is fixed, though the client may still be taking that event.
+// A cancel call then says the request isn't running, rather than reporting a cancel that didn't happen.
+func TestCancelAfterRequestEndIsRecorded(t *testing.T) {
+	t.Run("request", func(t *testing.T) {
+		b := newBridge(t, newFake(t, fakeTurn{content: "fine"}))
+		release, result := runBlocked(t, b, EventRequestEnd)
+		defer release()
+		if b.Cancel("r") {
+			t.Error("a cancel of a request whose outcome is fixed reports success")
+		}
+		release()
+		res := result()
+		wantStop(t, res, StopCompleted)
+		if n := cancelEvents(res); n != 0 {
+			t.Errorf("%d cancel events", n)
+		}
+	})
+	t.Run("call", func(t *testing.T) {
+		// The one call that could still answer true: its job was cancelled and keeps that state.
+		started := make(chan struct{}, 1)
+		b := newBridge(t, newFake(t, fakeTurn{calls: []fakeCall{{"slow_op", `{}`}}}, fakeTurn{content: "fine"}),
+			func(c *Config) { c.Ops = []ops.Op{slowOp(started, nil)} })
+		go func() {
+			<-started
+			if cancelled, err := b.CancelCall("r", "t1c0"); err != nil || !cancelled {
+				t.Errorf("cancelled %v, %v", cancelled, err)
+			}
+		}()
+		release, result := runBlocked(t, b, EventRequestEnd)
+		defer release()
+		if cancelled, err := b.CancelCall("r", "t1c0"); err == nil {
+			t.Errorf("a call of a request whose outcome is fixed answers cancelled %v", cancelled)
+		}
+		release()
+		res := result()
+		wantStop(t, res, StopCompleted)
+		if n := cancelEvents(res); n != 1 {
+			t.Errorf("%d cancel events, want the one before the end", n)
+		}
+	})
+}
+
+// A cancel that got its true before request_end is the request's outcome, whatever the turn did. The
+// callback holds call_refused here, with the request already on its way to truncated.
+func TestCancelBeforeRequestEndDecidesTheOutcome(t *testing.T) {
+	f := newFake(t, fakeTurn{calls: []fakeCall{{"int_add", `{"a":"1","b":"2"}`}}, finish: "length"})
+	b := newBridge(t, f)
+	release, result := runBlocked(t, b, EventCallRefused)
+	defer release()
+	if !b.Cancel("r") {
+		t.Error("the request isn't running")
+	}
+	release()
+	res := result()
+	wantStop(t, res, StopCancelled)
+	if res.Failure.Message != errCancelled.Error() || res.Finish != "" {
+		t.Errorf("failure %+v, finish %q", res.Failure, res.Finish)
+	}
+	if n := cancelEvents(res); n != 1 {
+		t.Errorf("%d cancel events", n)
 	}
 }
 
@@ -1462,6 +1601,10 @@ func TestHTTPCompletion(t *testing.T) {
 	}
 	if out.Bridge.Stop != StopCompleted || out.Bridge.Protocol != ops.Version || out.Bridge.Turns != 2 || out.Bridge.Calls != 1 || len(out.Bridge.Trace) == 0 {
 		t.Errorf("%+v", out.Bridge)
+	}
+	last := out.Bridge.Messages[len(out.Bridge.Messages)-1]
+	if want := `{"role":"assistant","content":"42","reasoning_content":"easy"}`; string(last) != want {
+		t.Errorf("last message %s, want %s", last, want)
 	}
 }
 

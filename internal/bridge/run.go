@@ -290,7 +290,9 @@ type Callbacks struct {
 
 // Result is the outcome of a request. A failed request still has its trace, its messages and the
 // last turn's text, as far as that turn got. A turn that failed has no finish reason. The trace is
-// complete: it ends in request_end.
+// complete: it ends in request_end. The messages are the client's, then each turn that went on with
+// its results, then the answer, if the last turn gave one. A turn that ended the request any other
+// way isn't among them: its text is in Content.
 type Result struct {
 	RequestID string            `json:"request_id"`
 	Protocol  int               `json:"protocol"`
@@ -383,31 +385,30 @@ var (
 	errCancelled      = errors.New("cancelled by a cancel call")
 )
 
-// Cancel ends a running request. It reports whether the request was running. It doesn't wait for the
-// client: see record.
+// Cancel ends a running request. It reports whether it did: true means the request's stop reason is
+// cancelled. A request whose request_end is recorded has its outcome, so it counts as not running,
+// even while its client is still taking that event. Cancel doesn't wait for the client: see record.
 func (b *Bridge) Cancel(id string) bool {
 	b.mu.Lock()
 	r := b.runs[id]
 	b.mu.Unlock()
-	if r == nil {
+	if r == nil || !r.record(Event{Kind: EventCancelRequested}) {
 		return false
 	}
-	r.record(Event{Kind: EventCancelRequested})
 	r.cancel(errCancelled)
 	return true
 }
 
 // CancelCall cancels one operation of a running request. The model gets the error "cancelled" as
 // that call's result and the request goes on. An operation that already has a result keeps it, and
-// the answer is false.
+// the answer is false. As for Cancel, a request whose request_end is recorded isn't running.
 func (b *Bridge) CancelCall(id, callID string) (bool, error) {
 	b.mu.Lock()
 	r := b.runs[id]
 	b.mu.Unlock()
-	if r == nil {
+	if r == nil || !r.record(Event{Kind: EventCancelRequested, CallID: callID}) {
 		return false, fmt.Errorf("no running request %q", id)
 	}
-	r.record(Event{Kind: EventCancelRequested, CallID: callID})
 	if err := r.req.Cancel(coproc.JobID(callID)); err != nil {
 		return false, err
 	}
@@ -449,29 +450,43 @@ type run struct {
 	trace   []Event
 	sent    int  // how much of the trace has gone to the sink and the callback
 	ended   bool // request_end has been recorded: a late cancel call finds nothing to report to
+	// A cancel of the whole request has been recorded, and answered true. finish holds to that.
+	cancelRequested bool
 }
 
 // record adds an event to the trace without telling anyone. A cancel call stops here, on its own
 // goroutine: whatever the client is doing, it mustn't keep a cancel from taking effect or from being
 // answered. The run's goroutine sends the event on at its next emit, and request_end always comes.
-func (r *run) record(e Event) {
+// It reports false once request_end is recorded, when the event is dropped.
+func (r *run) record(e Event) bool {
 	r.traceMu.Lock()
 	defer r.traceMu.Unlock()
+	return r.recordLocked(e)
+}
+
+func (r *run) recordLocked(e Event) bool {
 	if r.ended {
-		return
+		return false
 	}
 	r.ended = e.Kind == EventRequestEnd
+	r.cancelRequested = r.cancelRequested || (e.Kind == EventCancelRequested && e.CallID == "")
 	r.seq++
 	e.Seq = r.seq
 	e.RequestID = r.id
 	e.ElapsedMS = time.Since(r.began).Milliseconds()
 	r.trace = append(r.trace, e)
+	return true
 }
 
-// emit records an event and sends what the trace holds so far on. Only the run's goroutine calls it,
-// so the events go out in order, and no lock is held while a slow client takes them.
+// emit records an event and sends what the trace holds so far on.
 func (r *run) emit(e Event) {
 	r.record(e)
+	r.send()
+}
+
+// send passes on what the trace holds and hasn't passed on yet. Only the run's goroutine calls it, so
+// the events go out in order, and no lock is held while a slow client takes them.
+func (r *run) send() {
 	r.traceMu.Lock()
 	pending := r.trace[r.sent:]
 	r.sent = len(r.trace)
@@ -767,6 +782,13 @@ func (c *controller) planTurn() bool {
 			stop = failure(StopUnparsedCall, "turn %d answered with %q in its content: the server did not parse it as a call", r.turns, r.b.cfg.CallMarker)
 			break
 		}
+		// The answer is the end of the conversation. No prompt reads it, so it changes no request.
+		encoded, err := json.Marshal(assistantMessage{Role: "assistant", Content: turn.Content, ReasoningContent: turn.Reasoning})
+		if err != nil {
+			stop = failure(StopInternal, "encoding the assistant message: %v", err)
+			break
+		}
+		r.messages = append(r.messages, encoded)
 		r.stop = StopCompleted
 		return false
 	case turn.Finish != "tool_calls" || len(turn.Calls) == 0:
@@ -877,7 +899,17 @@ func (r *run) finish(ctx context.Context, runErr error) {
 		r.stopWith(f)
 	}
 	usage := r.usage
-	r.emit(Event{Kind: EventRequestEnd, Stop: r.stop, Failure: r.fail, Turn: r.turns, Calls: r.nCalls, Usage: &usage})
+	// A cancel call answers true if it gets in before request_end. Taking the outcome and recording
+	// it under one hold of the lock makes that answer hold, also for a cancel that came after the
+	// outcome was decided: a turn that ran out of tokens, say, with a client holding up call_refused.
+	r.traceMu.Lock()
+	if r.cancelRequested && r.stop != StopCancelled {
+		r.stopWith(failure(StopCancelled, "%v", errCancelled))
+		r.last = r.failedTurn(r.last) // a failure has no finish reason
+	}
+	r.recordLocked(Event{Kind: EventRequestEnd, Stop: r.stop, Failure: r.fail, Turn: r.turns, Calls: r.nCalls, Usage: &usage})
+	r.traceMu.Unlock()
+	r.send()
 }
 
 func (r *run) result() *Result {
