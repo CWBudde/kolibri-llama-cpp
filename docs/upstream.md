@@ -392,9 +392,10 @@ applied to a clean `184f6536` gives exactly the fork's tree (`7ade40f0`).
 **Patch 0013 is retired (Phase 11, Stage E4, 2026-11-06).** Its gates failed at
 0 GiB, so the number is kept and the code stays on fork branch
 `feat/kolibri1-waves` (`90311e5a2`, fork PR #14, open and not merged). It never
-reached `feat/kolibri1`. The next patch is 0014. The series 0008, 0010, 0011
-and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
-(`7ade40f0`, `git diff --quiet` rc 0).
+reached `feat/kolibri1`. At that date the next patch was 0014, and the series
+0008, 0010, 0011 and 0012 applied to a clean `184f6536` equalled
+`feat/kolibri1`'s tree (`7ade40f0`, `git diff --quiet` rc 0). The current tree
+is in the next paragraph.
 
 **Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on fork branch
 `feat/kolibri1-sidefile` (`1f6ce476c`), not on `feat/kolibri1` yet. The patch is
@@ -432,8 +433,11 @@ error.
 
 | Mutation | Result |
 |---|---|
-| M70: the LoRA refusal off (`if (false && ...)`) | `check_expert_cache.py`: "FAIL LoRA on ffn_gate_exps with the cache: exits 0 without generating, refused by name", the same for up and down, "FAIL: 3 failures", rc 1 |
-| M71: the bound on the GGUF header off (`if (false && gguf_head > first_row)`) | `test-expert-cache`: "FAIL a GGUF header as long as the GGUF", "FAIL a GGUF header one byte into the experts" |
+| M80: the LoRA refusal off (`if (false && ...)`) | `check_expert_cache.py`: "FAIL LoRA on ffn_gate_exps with the cache: exits 0 without generating, refused by name", the same for up and down, "FAIL: 3 failures", rc 1 |
+| M81: the bound on the GGUF header off (`if (false && gguf_head > first_row)`) | `test-expert-cache`: "FAIL a GGUF header as long as the GGUF", "FAIL a GGUF header one byte into the experts", "2 checks failed", rc 1. Rerun on an export of `1f6ce476c`: `~/models/eval/expert-bench-e3.runner/review-controls.log` |
+
+Commit `da2f581`'s message calls these two M70 and M71. PR #77 uses those numbers
+for the loop baseline, so they moved to M80 and M81.
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's

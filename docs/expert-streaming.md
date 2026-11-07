@@ -286,7 +286,7 @@ These are observations. Each says what it does not establish.
 - The wait's change is stable in every same-repetition pair: 5.69, 5.63 and 5.90 at 0 GiB, and 5.65, 5.80 and 5.13 at 16 GiB.
 - The change in "other" is not separated from its spread. At 0 GiB the ranges overlap (41.93–44.16 against 37.75–43.90), and 2.66 is less than the side-file's own spread of 6.16. At 16 GiB the side-file's range lies inside the baseline's. Same-repetition changes are +4.18, +2.66 and +0.26, and -3.11, +1.13 and +1.64. So the data establish the wait's gain and do not establish an effect on "other".
 - The plan expected up to the 14 ms wait. 8.85 ms of it remain.
-- `run.json` has no prefill wait field, so prefill's load wait was not measured, and the prefill gain is not split up.
+- **Prefill's wait fell too, and it is about 55% of the prefill gain.** `run.json` keeps only part of the counters; each run's `stats.json` has `prefill.wait_seconds`. Median per run: 50.66 (50.57–51.07) to 37.05 (36.84–37.27) s at 0 GiB, and 50.77 (50.67–51.92) to 36.85 (36.80–38.99) s at 16 GiB, so 13.61 and 13.92 s less. Prefill time, the requests' `prompt_ms` summed per run, went from 135.01 to 110.66 s and from 135.01 to 109.86 s, so 24.35 and 25.15 s less. The wait is about 56% and 55% of that. The remaining 44 to 45% is not attributed.
 
 **The disk bytes fit whole 16 KiB pages on the GGUF path, as arithmetic only.**
 
@@ -303,7 +303,7 @@ These are observations. Each says what it does not establish.
 - The same token IDs in the same run differ widely: run 3's warm coding is 16.79 against its cold 25.17, while `sidefile/16g/r1` goes 17.16 cold to 21.98 warm. The 5 requests with a p50 under 42 ms are all on the side-file arm, at different positions. The GGUF arm's lowest p50 is 46.3 ms.
 - Same-workload decode SD is 2.81, 3.11, 3.17 and 1.16 on the side-file (coding, research, hr, medtech) against 0.84, 0.75, 1.02 and 1.33 on the GGUF path. Wait and "other" are recorded per run, not per request, so the requests cannot be split. Page-ins correlate with decode rate at -0.42 on requests under 1,000 page-ins, which establishes nothing.
 
-**The baseline did not move beyond its run-to-run range, with small differences.**
+**The baseline did not move beyond its run-to-run range, with one exception and small differences.**
 
 | `iq3-cache128`, 0 / 16 GiB | E3 | E4 | E0 |
 |---|--:|--:|--:|
@@ -314,9 +314,9 @@ These are observations. Each says what it does not establish.
 | Wait ms/token | 14.48 / 14.63 | 14.65 / 14.35 | 15.05 / 16.09 |
 | Other ms/token | 42.65 / 42.76 | 41.07 / 41.28 | 40.90 / 39.57 |
 
-E3's fastest warm prompt at 0 GiB (88.77) is above E4's (86.7) by 2.4%. Disk is about 448.7 GB in all three, and the token IDs of this arm in E4 and E0 equal E3's in all 5 requests of every repetition. E4's undisturbed repetitions ran with others' CPU mean 36–52, against 61–87 here. E4's and E0's `run.json` have no `server_sha256`, server path, loads or preads, so builds and load counts cannot be compared across stages from these files.
+E3's fastest warm prompt at 0 GiB (88.77) is above E4's (86.7) by 2.4%. The exception: E3's cold TTFT at 0 GiB (33.08–33.24 s) is below E0's whole range (34.38–35.71 s, 2 repetitions), by 1.1 s or more. Disk is about 448.7 GB in all three, and the token IDs of this arm in E4 and E0 equal E3's in all 5 requests of every repetition. E4's undisturbed repetitions ran with others' CPU mean 36–52, against 61–87 here. E4's and E0's `run.json` have no `server_sha256`, server path, loads or preads, so builds and load counts cannot be compared across stages from these files.
 
-**E3's and E4's prefill gains cannot be added.** 106 and 300 t/s (waves) are the same kind of number on the same matrix args and workloads, with similar baselines, but not the same work. The side-file arm has its baseline's loads, hits and token IDs. E4's waves arms have decode hits of 92.3%, 25.0 GB of demand and 299.96 GB of disk, and token IDs equal to E3's in 0 of 5 requests in every repetition. No run combines the two, and waves' code is not in E3's build. The ratios to each stage's own baseline are 1.2× (E3) and about 3.5× (E4, 301.4 against 86.0). For reference, E0's buffered arm gave 110.0 t/s at 0 GiB but 53.8 at 16 GiB, and the side-file gives 106.5 and 106.8.
+**E3's and E4's prefill gains cannot be added.** 106 and 300 t/s (waves) are the same kind of number on the same matrix args and workloads, with similar baselines, but not the same work. The side-file arm has its baseline's loads, hits and token IDs. E4's two waves arms have decode hits of 92.3%, 25.0 GB of decode demand, and token IDs equal to E3's in 0 of 5 requests in every repetition. `iq3-cache128-waves` reads 299.96 GB of disk, and `iq3-cache128-waves-buffered` a median of 33.89 GB at 0 GiB and 286.91 GB at 16 GiB. No run combines the two, and waves' code is not in E3's build. The ratios to each stage's own baseline are 1.2× (E3) and about 3.5× (E4, 301.4 against 86.0). For reference, E0's buffered arm gave 110.0 t/s at 0 GiB but 53.8 at 16 GiB, and the side-file gives 106.5 and 106.8.
 
 **For E6's condition, the facts only.** On the side-file at 0 GiB, decode takes 49.48 ms/token: wait 8.85 (17.9%), remap 0.63 (1.3%), other 39.98 (80.8%). At 16 GiB: 52.17, wait 8.86 (17.0%), remap 0.66 (1.3%), other 42.66 (81.8%). On the GGUF path the wait is 25.0% and 25.2%. So the wait is smaller than "other" by a factor of about 4.5 to 4.8, but "other" is a remainder, not one measured cost. This build still has 102 splits per token, so it does not contain E2's change, and there are no timed E2 results here. These are E3's facts alone, not "E2 and E3". E6's decision is left open.
 
@@ -326,7 +326,7 @@ E3's fastest warm prompt at 0 GiB (88.77) is above E4's (86.7) by 2.4%. Disk is 
 - **The fork branch is not squashed.** The force-push that would have squashed `dbac35709` and `dd2040eaf` into one commit was denied, so both stayed. Merge `26a059be8` and `1f6ce476c` followed them, so the branch now has four commits over `feat/kolibri1`. The patch is the branch's plain diff, so the series is unaffected.
 - **The alignment rationale for `F_NOCACHE` is unmeasured.** What XNU's cluster layer wants comes from its source as remembered. No arm isolates alignment: the benchmark measures one aligned read against three unaligned ones as a whole.
 - **Reads take the padded extent.** That is 4,096 bytes per expert more than the rows hold, on every miss.
-- **The load's identity check is no security boundary.** The reviewer's finding on `gguf_head`, that a table with a valid checksum could claim the whole model and force an allocation of tens of GB, was fixed in `1f6ce476c` after the runs (control M71, [upstream.md](upstream.md)). The table's checksum has no key, and `gguf_head` has no lower bound, so a crafted table can still pass the identity check. That stays as it is, because the side-file is a local file the user wrote.
+- **The load's identity check is no security boundary.** The reviewer's finding on `gguf_head`, that a table with a valid checksum could claim the whole model and force an allocation of tens of GB, was fixed in `1f6ce476c` after the runs (control M81, [upstream.md](upstream.md)). The table's checksum has no key, and `gguf_head` has no lower bound, so a crafted table can still pass the identity check. That stays as it is, because the side-file is a local file the user wrote.
 - **The decode rule passes on either metric, and the 16 GiB pass rests on tokens/s, not p95.** Whether to set a stricter bar is the owner's call.
 - **One machine, 3 repetitions, a busy background.** All 12 runs started with a load average of 1.65 to 2.91 and about 4.1 GiB of swap. All r3 repetitions are the slowest block for decode ms/token and have the highest others' CPU mean, in all 4 cells. Time order and background load cannot be separated. The arms are interleaved, so both are affected.
 
@@ -346,13 +346,13 @@ E3's fastest warm prompt at 0 GiB (88.77) is above E4's (86.7) by 2.4%. Disk is 
 
 ### Lossless evidence
 
-Bit identity with `np.array_equal` against a resident run at the same ubatch and, on the GPU, the same split (`check_expert_cache.py`), never loosened. The timed runs add token IDs: 30 of 30 side-file requests equal the reference, and all 60 requests of both arms are equal, compared on the IDs themselves. The check counts below are from before the review fixes. After them the tiny check gives "PASS: 0 failures", `test-expert-cache` passes, and the real IQ3 pair has 0 differences on 8 experts per layer (commit `da2f581`). The 40 real checks are not recorded as repeated on `1f6ce476c`.
+Bit identity with `np.array_equal` against a resident run at the same ubatch and, on the GPU, the same split (`check_expert_cache.py`), never loosened. The timed runs add token IDs: 30 of 30 side-file requests equal the reference, and all 60 requests of both arms are equal, compared on the IDs themselves. The check counts below are from before the review fixes. After them the tiny check gives "PASS: 0 failures", `test-expert-cache` passes, and the real IQ3 pair has 0 differences on 450 experts of 50 layers (`test-expert-cache --sidefile`, argument 8; commit `da2f581` calls that 8 experts per layer). That pair was not rerun for the review: its output line is copied from the session into `~/models/eval/expert-bench-e3.runner/review-controls.log`, which also holds the reruns below. The 39 real checks are not recorded as repeated on `1f6ce476c`.
 
 | Check | Result |
 |---|---|
-| Tiny, F32 and Q8_0, CPU and Metal: 6, 16, 64 and 384 slots, with and without prefetch and buffered reads, slots per layer, half the layers on Metal, repacking on | "PASS: 0 failures", 336 checks. The 48 side-file runs of that grid are bit-identical both to the resident run and to the GGUF path |
-| Real IQ3 on Metal (`--real`, no hog): 128 and 64 slots, the same variants | "PASS: 0 failures", 40 checks. At 128 slots 7,173 and 966 preads for 7,173 and 966 experts in prefill and decode, against 21,519 and 2,898 on the GGUF path |
-| Build without the option (`third_party/llama.cpp`, the waves build) | "PASS: 0 failures", 380 checks, the side-file checks skipped with a note |
+| Tiny, F32 and Q8_0, CPU and Metal: 6, 16, 64 and 384 slots, with and without prefetch and buffered reads, slots per layer, half the layers on Metal, repacking on | "PASS: 0 failures", 335 checks. The 48 side-file runs of that grid are bit-identical both to the resident run and to the GGUF path |
+| Real IQ3 on Metal (`--real`, no hog): 128 and 64 slots, the same variants | "PASS: 0 failures", 39 checks. At 128 slots 7,173 and 966 preads for 7,173 and 966 experts in prefill and decode, against 21,519 and 2,898 on the GGUF path |
+| Build without the option (`third_party/llama.cpp`, the waves build) | "PASS: 0 failures", 379 checks, the side-file checks skipped with a note |
 | `test-expert-cache`, also in ctest | "all expert cache tests passed": the three tensors' bytes on both paths, 27 refusals by name, a read past the end, 3 and 1 preads |
 | `test-expert-cache --sidefile`, the ranges from the GGUF's own header by ggml's gguf API | tiny: all 2,304 experts; IQ3: 450 experts, the first and last of each layer among them. No difference; `verify` covers all of IQ3 |
 | `kolibri-sidefile verify` on IQ3 | every extent byte-identical to the GGUF |
@@ -368,7 +368,7 @@ Bit identity with `np.array_equal` against a resident run at the same ubatch and
 - **M56, `readsCheck` accepting runs with no loads:** `TestReadsCheck` fails, with "0 preads for 0 experts" printed as PASS.
 - **M57, one build's runs not compared:** with `buildCheck` accepting two digests, `TestBuildCheck` fails. With `serverBuild` hashing only the binary, `TestServerBuild` fails on a rebuilt library.
 - **M58, `kolibri-bench` not reading the server's `--help`:** `TestCheckServer` fails.
-- **M59, the refusal of a side-file without the cache moved back behind the load:** the tiny check fails 1 check ("FAIL: 1 failures"), the one that wants no `load_tensors:` line in the refused run's verbose log. On the tiny router model, the fix took the refused run's peak RSS from 520 MB to 129 MB.
+- **M59, the refusal of a side-file without the cache moved back behind the load:** the tiny check fails 1 check ("FAIL: 1 failures"), the one that wants no `load_tensors:` line in the refused run's verbose log. Peak RSS of the refused run on the tiny router model, by `/usr/bin/time -l`, on `1f6ce476c` with this mutation and without it: 521 to 522 MB against 128 to 130 MB on F32, and 248 to 250 MB against 128 to 130 MB on Q8_0 (3 runs per file, 6 without). Peak memory footprint is 128 to 132 MB in all of them, so the RSS difference does not show in the footprint. Log: `~/models/eval/expert-bench-e3.runner/review-controls.log`.
 
 ### Benchmark validity
 
@@ -385,7 +385,7 @@ The page cache serves resident pages even with `F_NOCACHE`, and reading the file
 
 **What the 12 runs show about these guards:**
 
-- **Status and sleep:** all 12 are ok, from 02:35:57 to 03:27:17 on 2026-11-07, under a `caffeinate` assertion, on AC power. `pmset -g log` has no Sleep, Wake or DarkWake inside any run's window, and the last true event is a Wake about 28 hours before the first run. Wall time from start to "ok" exceeds load plus request time by only 3.0 to 8.4 s per run, so no gap suggests a clock jump.
+- **Status and sleep:** all 12 are ok, from 02:35:57 to 03:27:17 on 2026-11-07, under a `caffeinate` assertion, on AC power. `pmset -g log` has no Sleep, Wake or DarkWake inside any run's window, and the last true event is a Wake about 28 hours before the first run. Wall time from `run.json`'s `started` to the driver log's "ok" exceeds `load_seconds` plus each request's `prompt_ms` and `predicted_ms` by about 3.4 to 9.0 s per run, so no gap suggests a clock jump. The log has whole seconds, which can add up to 1 s to that.
 - **Eviction:** in all 12 runs the GGUF and the side-file show 0 pages resident after eviction. Before it, the GGUF had 576 to 178,332 of 2,170,182 pages and the side-file 0 or 10 of 1,996,810. Every location reads "(home volume)".
 - **The hidden tier:** `peak_sidefile_cache_mib` is 0 everywhere. `end_sidefile_cache_mib` is 0.156 MiB (10 pages) on 5 of 6 side-file runs and 0 on `sidefile/16g/r3`.
 - **The build:** all 12 runs carry `server_sha256` `e5dcda2e6e56...` and one server path, and the build on disk still gives that digest after the runs.
