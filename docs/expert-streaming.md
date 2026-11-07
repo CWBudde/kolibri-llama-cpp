@@ -1,6 +1,6 @@
 # Expert streaming: the runtime expert cache
 
-Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill".
+Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose benchmark has not run yet, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill".
 
 ## How it works
 
@@ -12,6 +12,7 @@ Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts ins
   - The buffers count as weights, so the scheduler runs each layer's expert matmuls where its slots are.
 - **The remap op.** In `build_moe_ffn`, after the router's selection and its weights, a CPU custom op maps the router's ids to slots, `ffn_moe_slots-<layer>`. The three `mul_mat_id` read the slot tensors with these slot ids. The expert weights keep the router's own ids, and the router chooses every expert; a prediction only decides what is read ahead.
 - **Loads.** A missing expert is read with `pread` into its slot: three ranges per expert (gate, up, down), from a second descriptor of the GGUF with `F_NOCACHE` (macOS), so the bytes do not stay in the page cache. On unified memory there is no host-to-device copy: the read from the SSD into the slot *is* the transfer. Reads of pages that are already in the page cache are served from it, `F_NOCACHE` notwithstanding.
+  With `--expert-cache-sidefile` a miss is one `pread` of one extent instead (patch 0014, "Stage E3" below).
 - **Bookkeeping** (`src/llama-expert-slots.*`, independent of ggml):
   - LRU per layer;
   - a demand queue ahead of a prefetch queue, served by I/O threads;
@@ -34,6 +35,7 @@ Options of every `common` tool (llama-cli, llama-completion, llama-server):
 | `--expert-prefetch K[,HALF_LIFE[,MIX]]` | prefetch K experts per layer, ranked by the predictor (default off; half-life 1 token, mix 0.75, Stage B's same-token choice) |
 | `--expert-cache-stats FNAME` | write the counters as JSON when the model is freed; without `--expert-cache` the decode timing alone (patch 0012) |
 | `--expert-cache-buffered` | read misses through the page cache instead of with `F_NOCACHE` (macOS; default off, patch 0012) |
+| `--expert-cache-sidefile FNAME` | read misses from this side-file, one `pread` per expert; the load fails if its table does not match the model and the GGUF, with no fallback (patch 0014) |
 
 ```sh
 B=third_party/llama.cpp/build/bin
@@ -63,6 +65,9 @@ In the C API it is `llama_model_params.expert_cache`, a `llama_expert_cache_para
   - in `decode`, over every ubatch of one token: `tokens`; `wall_seconds`, from the graph's build or reuse to the outputs' copy, synchronized; `splits`, the scheduler's graph splits; and `metal_commits`, the Metal command buffers committed meanwhile (`null` without the Metal backend). `wall_seconds − wait_seconds − remap_seconds` is the rest: compute, syncs and graph handling.
   - Without the cache, `--expert-cache-stats` writes `{"expert_cache": null, "decode": {tokens, wall_seconds, splits, metal_commits}, "process": {...}}`, the process counters measured since the model was loaded.
   - Known counts per decoded token on Metal (control M42, in the tiny check): 2 splits resident, 2 + 2 per layer with the cache (each layer's remap is a CPU split); IQ3: 2 and 102. Commits: 2 per Metal split plus 1 for the output copy, so 3 and 103.
+- Patch 0014 adds (Phase 11, Stage E3):
+  - `expert_cache.sidefile`, the side-file as given, or `null` on the GGUF path;
+  - `loads` and `preads` per phase: the experts read into a slot, and the read calls they took. A run on the side-file has one per expert and a run on the GGUF path three, so `preads / loads` proves which path ran.
 - `process`, measured since the cache was set up: `disk_bytes_read` and `pageins` from `proc_pid_rusage`, `major_faults` from `getrusage`, and the lifetime peak `max_phys_footprint`. A counter the platform does not measure is `null`: on Linux all but `major_faults`.
 - The file name is a JSON string, escaped.
 
@@ -199,6 +204,68 @@ The `-ub 21` control differs from resident IQ3 at the default ubatch (512) from 
 - **Performance gate, demand cache: passed.** At the 16 GiB ceiling resident IQ3 does not fit, and the cache beats `--cpu-moe`, the best arm that runs there, on both decode (every repetition at 16.9 to 19.1 tokens/s, against at most 12.6) and p95 (81.6 to 85.3 ms, against at least 123.2). Without a ceiling (INFO) resident Metal is 3.2 times faster in decode (60.1 against 18.5 tokens/s) and 13 times in prefill, and `--cpu-moe` prefills 3.3 times faster than the cache (273 against 83 tokens/s) with a lower p95 (60.9 against 78.9 ms): the cache pays off only once the experts no longer fit. Q8_0, which never fits (INFO): 13.0 against 6.5 tokens/s and 112 against 323 ms p95 for `--cpu-moe --no-repack`.
 - **Performance gate, prefetch: passed by the rule, on tail latency alone.** At 16 GiB every repetition's p95 (77.0 to 80.7 ms) is below the demand cache's best (81.6 ms); decode overlaps (17.8 to 18.9 against 16.9 to 19.1 tokens/s). The margin is about 5%. It does not hold without a ceiling (p95 75.5 to 83.6 against 77.8 to 80.7 ms, INFO) or for Q8_0 (116 against 112 ms, INFO). Its third repetition at 16 GiB ran on 2026-10-20, four days after the demand cache's, since the earlier attempts slept. Prefetch reads 6.8 GB more per run without fewer misses.
 - Whether the patch and the prefetch option are kept is the user's decision; this benchmark only reports.
+
+## Stage E3: one read per expert
+
+Phase 11, Stage E3. A side-file next to the GGUF holds each expert's gate, up and down rows in one aligned extent, and a miss reads it with one `pread`. **The code and the checks exist. The benchmark has not run, so nothing here says whether it is faster.** Patch 0014 is on fork branch `feat/kolibri1-sidefile`, not yet on `feat/kolibri1`. By the plan's stop rule it stays in the series only if the gates pass. E3 is not built on waves.
+
+### The side-file
+
+- **Where:** `<GGUF>.experts`, with its manifest as `<GGUF>.experts.manifest.json`. For IQ3 that is `~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf.experts`: 32,715,735,040 bytes (30.5 GiB, 78.8 MB of it table and padding, 0.24%), sha256 `83c6c88e60e55fd517ba002e1c1cab3c1b47bea4570403e594868edef9692bfe`.
+- **Rebuild:** `go run ./cmd/kolibri-sidefile write -gguf ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf -force` (48.0 s), then `verify` with the same `-gguf` (37.6 s). `write` refuses to replace a file without `-force`, and it renames only a complete file into place. It is derived data: nothing is lost if it goes, and `kolibri-models` has no master for it.
+- **Layout:** a table (the format is at the top of `cmd/kolibri-sidefile/format.go` and in `src/llama-expert-sidefile.h`), then one extent per layer and expert: the rows as the GGUF has them, then zeros up to the alignment. A read takes the padded extent, so it is aligned at both ends and never meets the end of the file. Row sizes come from each tensor, because IQ3's `down` differs: 696,320 bytes against 501,760.
+- **Alignment, 16 KiB:** the VM page on Apple silicon and a multiple of the SSD's 4 KiB block. No page holds two experts, so buffered reads do not drag in a neighbour and `mincore` counts per expert. As far as XNU's cluster layer goes, a direct `F_NOCACHE` read needs both the file offset and the destination aligned. That comes from its source as remembered and was not measured here.
+- **One read, then copies:** a slot's three rows sit in three tensors, and they are no multiples of a block (IQ3's gate rows are 122.5 blocks of 4 KiB). So the read goes to a page-aligned staging buffer per I/O thread, and three copies take the rows out. That costs about 1.7 MB of memory per thread, and the copy's time is part of `io_seconds`.
+
+### What is checked when
+
+**The load checks the table. It does not check the data.** It refuses, saying what failed: bad magic, the version, the table's sha256, the layer and expert counts, each tensor's row size, type and GGUF offset, extents out of range, misaligned or overlapping, the file's size, and the GGUF's identity (its size and the sha256 of its header). A missing file fails the load: there is no fallback to the GGUF. **A flipped byte in an extent still loads, and a run that uses that expert reads the wrong bytes.** Hashing about 31 GB at every load would cost tens of seconds, so only `kolibri-sidefile verify` checks the data: it rehashes every extent and the whole file, compares every extent byte for byte with the GGUF, and accepts no field of the manifest on trust. The loader does not read the JSON manifest; the checksummed table in the side-file is what it checks.
+
+**Concurrency needed no change.** A remap queues all of a layer's misses, and the I/O threads (default 4, as E1's curve advises) take them from one queue. `test-expert-cache` holds a load until all four threads are inside one remap's loads. Prefetch uses the same load path, so it works on both paths.
+
+### Correctness so far
+
+Bit identity with `np.array_equal` against a resident run at the same ubatch and, on the GPU, the same split (`check_expert_cache.py`), never loosened:
+
+| Check | Result |
+|---|---|
+| Tiny, F32 and Q8_0, CPU and Metal: 6, 16, 64 and 384 slots, with and without prefetch and buffered reads, slots per layer, half the layers on Metal, repacking on | "PASS: 0 failures", 336 checks. The 48 side-file runs of that grid are bit-identical both to the resident run and to the GGUF path |
+| Real IQ3 on Metal (`--real`, no hog): 128 and 64 slots, the same variants | "PASS: 0 failures", 40 checks. At 128 slots 7,173 and 966 preads for 7,173 and 966 experts in prefill and decode, against 21,519 and 2,898 on the GGUF path |
+| Build without the option (`third_party/llama.cpp`, the waves build) | "PASS: 0 failures", 380 checks, the side-file checks skipped with a note |
+| `test-expert-cache`, also in ctest | "all expert cache tests passed": the three tensors' bytes on both paths, 27 refusals by name, a read past the end, 3 and 1 preads |
+| `test-expert-cache --sidefile`, the ranges from the GGUF's own header by ggml's gguf API | tiny: all 2,304 experts; IQ3: 450 experts, the first and last of each layer among them. No difference; `verify` covers all of IQ3 |
+| `kolibri-sidefile verify` on IQ3 | every extent byte-identical to the GGUF |
+
+### Negative controls
+
+- **M50, wrong extent offsets:** the writer's table sends each expert to its neighbour's extent, with a valid checksum, so the load accepts it. All 56 side-file lines against the resident run fail (max |diff| up to 1.44), "FAIL: 139 failures", and the same-misses and pair checks fail with them.
+- **M51, a corrupt manifest**, on an APFS clone of the real side-file: a flipped table byte is refused at load ("table checksum mismatch", exit 1, no text generated), and `verify` reports it. One edited extent hash in the JSON manifest: `verify` reports "layer 7 expert 11: sha256 ..., the manifest says ...", exit 1.
+- **M52, the load without its checksum test:** `test-expert-cache` fails 3 checks, and the tiny check fails 2 ("FAIL: 2 failures").
+- **M53, `kolibri-bench` without the side-file's eviction:** `TestEvictSidefile` fails.
+- **M54, eviction works on the real file:** `shasum` left 1,820,300 of 1,996,810 pages resident (28,442 MiB), and `kolibri-evict` took them to 0. `shasum`'s read is the hazard the next section guards against.
+
+### Benchmark validity
+
+The page cache serves resident pages even with `F_NOCACHE`, and reading the file for a hash leaves it resident (M54), so an arm could read from memory and look fast. So:
+
+- **Every run of every arm evicts the GGUF and every side-file of the matrix**, and `run.json` records it (`evict`, `evict_sidefiles`, and `sidefile` for the arm's own file). The driver stops, with no result, if a side-file is missing or stays more than 1% resident.
+- **The hidden tier counts for the arm as for any other.** `peak_page_cache_mib` and `end_page_cache_mib` sum the GGUF and the side-file, with the side-file's part beside them. All arms sample the same files, so the sampling costs them the same.
+- **A missing side-file is loud:** the driver stops before its first run, and a later loss fails the server's load, which fails the report. Nothing falls back to the GGUF.
+- **The report proves the path:** with a side-file arm in the matrix it fails unless each run's stats name the file its flags gave and show 1 pread per expert (3 on the GGUF path) in both phases.
+- **`fits` and the quiet rule do not special-case the arm.** Its `--expert-cache 128` counts as the GGUF arm's does (a test holds them equal).
+- **No timing yet.** A smoke run of the exact flags with 8 generated tokens gave 5,117 and 219 preads for 5,117 and 219 experts on the side-file, 15,351 and 657 on the GGUF path, the same token IDs, and at most the table's 10 pages of the side-file in the page cache. Its speed was not read.
+
+### Reproduce
+
+The matrix `testdata/bench/e3.json` holds 12 runs: `iq3-cache128` and `iq3-cache128-sidefile`, with every other flag the same, at 0 and 16 GiB, 3 repetitions each. Decode and prefill of the side-file against the GGUF path decide at both ceilings, by `kolibri-bench`'s existing rule. TTFT is info only. Token IDs must be exactly equal.
+
+```sh
+go run ./cmd/kolibri-sidefile verify -gguf ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
+go run ./cmd/kolibri-bench -matrix testdata/bench/e3.json -out ~/models/eval/expert-bench-e3 \
+  -server third_party/llama.cpp-e3/build/bin/llama-server
+.venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp-e3
+.venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp-e3 --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
+```
 
 ## Stage E4: waves for prefill
 

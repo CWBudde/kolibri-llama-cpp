@@ -372,6 +372,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0010 continuation tests | no | tests on top of 0008 |
 | 0011, 0012 expert cache | no | the fork's own work, rebased (below) |
 | 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
+| 0014 expert cache side-file | no | the fork's own work, Stage E3; its benchmark has not run ([expert-streaming.md](expert-streaming.md#stage-e3-one-read-per-expert)) |
 
 ### Controls
 
@@ -394,6 +395,12 @@ applied to a clean `184f6536` gives exactly the fork's tree (`7ade40f0`).
 reached `feat/kolibri1`. The next patch is 0014. The series 0008, 0010, 0011
 and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
 (`7ade40f0`, `git diff --quiet` rc 0).
+
+**Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on fork branch
+`feat/kolibri1-sidefile` (`dbac35709`), not on `feat/kolibri1` yet. The series
+0008, 0010, 0011, 0012 and 0014 applied to a clean `184f6536` equals that
+branch's tree (`132a5020`, `git diff --quiet` rc 0). If its gates fail, the
+number is retired as 0013's was.
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's
