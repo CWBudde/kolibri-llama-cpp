@@ -89,10 +89,14 @@ func (r *Request) Job(id JobID) (JobInfo, bool) {
 // actions run out or ctx ends. emit, which may be nil, gets the user-visible answer tokens. It runs
 // before the request leaves GENERATING, so a token can't go out after a second driver has moved the
 // request on, and a token that was generated goes out even if ctx ends right after it. Actions from
-// inside emit are rejected as not READY. Run doesn't close the request.
+// inside emit are rejected as not READY. Run doesn't close the request, so a job it started keeps
+// running after ctx ends, until its outcome or the request's Close.
 func (r *Request) Run(ctx context.Context, c Controller, emit func(string)) error {
 	var obs Observation
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		a, ok := c.Next(obs)
 		if !ok {
 			return nil
@@ -101,15 +105,13 @@ func (r *Request) Run(ctx context.Context, c Controller, emit func(string)) erro
 		if obs.Err != nil && (errors.Is(obs.Err, ErrRequestClosed) || errors.Is(obs.Err, ErrActionLimit)) {
 			return obs.Err
 		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 	}
 }
 
 // Apply runs one action in READY and returns its observation. A Wait blocks the caller until the
 // job has its outcome. If ctx ends during a Wait, the awaited job is cancelled, as nothing is left
-// to wait for it. Failures are reported in the observation, never by leaving the request stuck.
+// to wait for it. An Execute under a context that has ended registers nothing. Failures are reported
+// in the observation, never by leaving the request stuck.
 func (r *Request) Apply(ctx context.Context, a Action) Observation {
 	return r.apply(ctx, a, nil)
 }
@@ -123,7 +125,7 @@ func (r *Request) apply(ctx context.Context, a Action, emit func(string)) Observ
 	case Continue:
 		obs = r.applyContinue(ctx, emit)
 	case Execute:
-		obs = r.applyExecute(a)
+		obs = r.applyExecute(ctx, a)
 	case Wait:
 		obs = r.applyWait(ctx, a)
 	case ReadResult:
@@ -196,8 +198,12 @@ func (r *Request) applyContinue(ctx context.Context, emit func(string)) Observat
 	return obs
 }
 
-func (r *Request) applyExecute(a Execute) Observation {
+func (r *Request) applyExecute(ctx context.Context, a Execute) Observation {
 	obs := Observation{Job: a.Job}
+	if err := ctx.Err(); err != nil {
+		obs.Err = err
+		return obs
+	}
 	cfg := r.s.cfg
 	if a.Job == "" || a.Program == "" || a.Timeout < 0 || a.Timeout > cfg.MaxTimeout {
 		obs.Err = fmt.Errorf("%w: job %q program %q timeout %v", ErrInvalidAction, a.Job, a.Program, a.Timeout)
