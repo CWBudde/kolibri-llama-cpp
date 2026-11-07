@@ -353,3 +353,57 @@ func TestIdempotentRetries(t *testing.T) {
 		})
 	})
 }
+
+// A worker finds a dependency's result under the name its Execute gave it, also if that name is an
+// alias, and gets it once: a program that adds up its dependencies mustn't count an alias twice.
+func TestDependencyNamedByAnAlias(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, m := setup(t, nil)
+		r, _ := openChecked(t, s, "r")
+		first := Execute{Job: "first", IdempotencyKey: "k", Program: "sum", Args: []string{"4", "5"}}
+		must(t, r, first)
+		retry := first
+		retry.Job = "retry"
+		if obs := must(t, r, retry); !obs.Existing || obs.Job != "first" {
+			t.Fatalf("retry: %+v", obs)
+		}
+		must(t, r, Wait{Job: "first"})
+
+		deps := func(job JobID) map[JobID]string {
+			t.Helper()
+			for _, spec := range m.Starts() {
+				if spec.ID == job {
+					return spec.DepResults
+				}
+			}
+			t.Fatalf("job %s did not start", job)
+			return nil
+		}
+
+		c := Execute{Job: "c", Program: "sum", Dependencies: []JobID{"retry"}}
+		must(t, r, c)
+		must(t, r, Wait{Job: "c"})
+		if got := deps("c"); len(got) != 1 || got["retry"] != "9" {
+			t.Fatalf("job c got %v, want retry:9 alone", got)
+		}
+		if got := jobInfo(t, r, "c"); got.State != JobDone || got.Result != "9" {
+			t.Fatalf("job c: %+v", got)
+		}
+
+		both := Execute{Job: "both", Program: "sum", Dependencies: []JobID{"retry", "first", "retry"}}
+		must(t, r, both)
+		must(t, r, Wait{Job: "both"})
+		if got := deps("both"); len(got) != 2 || got["retry"] != "9" || got["first"] != "9" {
+			t.Fatalf("job both got %v, want first:9 and retry:9", got)
+		}
+
+		// Both names mean one job, so naming it the other way is still a retry and starts nothing.
+		c.Dependencies = []JobID{"first"}
+		if obs := must(t, r, c); !obs.Existing {
+			t.Fatalf("retry of c: %+v", obs)
+		}
+		if n := m.StartCount("c"); n != 1 {
+			t.Fatalf("job c started %d times", n)
+		}
+	})
+}

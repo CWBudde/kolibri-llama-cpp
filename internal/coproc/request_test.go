@@ -3,6 +3,7 @@ package coproc
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -163,6 +164,8 @@ func TestCompletionDuringGenerationWaitsForTheBoundary(t *testing.T) {
 	})
 }
 
+// blockingGen ignores its context, so this is a call that can't be aborted. TestCloseAbortsARunningGeneratorCall
+// covers one that can.
 func TestCloseDuringGenerationDiscardsTheToken(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, _ := setup(t, nil)
@@ -302,5 +305,161 @@ func TestRunStopsWhenTheRequestCloses(t *testing.T) {
 		r.Close()
 		wantErr(t, <-finished, ErrRequestClosed)
 		wantErr(t, r.Apply(context.Background(), Continue{}).Err, ErrRequestClosed)
+	})
+}
+
+// Close can land between an action's gate and its critical section, where only applyWait can see
+// it. A waiter must then hear of the close: a retryable ErrNotReady makes Run report success for a
+// job that never finished.
+func TestWaitReportsAClosedRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		g := &blockingGen{release: make(chan struct{}), entered: make(chan struct{})}
+		r := open(t, s, "r", g)
+		must(t, r, Execute{Job: "a", Program: "manual"})
+		synctest.Wait()
+		ctx := context.Background()
+
+		// Any other state stays retryable.
+		token := make(chan Observation, 1)
+		go func() { token <- r.Apply(ctx, Continue{}) }()
+		<-g.entered
+		wantErr(t, r.applyWait(ctx, Wait{Job: "a"}).Err, ErrNotReady)
+		close(g.release)
+		<-token
+
+		r.Close()
+		wantErr(t, r.applyWait(ctx, Wait{Job: "a"}).Err, ErrRequestClosed)
+		wantErr(t, r.applyWait(ctx, Wait{Job: "nope"}).Err, ErrRequestClosed)
+	})
+}
+
+// Run emits a token inside the GENERATING claim, so it can't go out after a second driver has moved
+// the request on.
+func TestRunEmitsInsideTheGeneratingClaim(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		r, _ := openChecked(t, s, "r", "a", "b")
+		must(t, r, Execute{Job: "j", Program: "manual"})
+		synctest.Wait()
+		var emitted []string
+		sc := &Script{Actions: []Action{Continue{}, Continue{}}}
+		err := r.Run(context.Background(), sc, func(tok string) {
+			emitted = append(emitted, tok)
+			wantState(t, r, Generating)
+			wantErr(t, r.Apply(context.Background(), Wait{Job: "j"}).Err, ErrNotReady)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(emitted, []string{"a", "b"}) {
+			t.Fatalf("emitted %v", emitted)
+		}
+		wantState(t, r, Ready)
+	})
+}
+
+// The token of a request that closed during its Step is discarded, by Run as by Apply.
+func TestRunDoesNotEmitTheTokenOfAClosedRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		g := &blockingGen{release: make(chan struct{}), entered: make(chan struct{})}
+		r := open(t, s, "r", g)
+		finished := make(chan error, 1)
+		go func() {
+			finished <- r.Run(context.Background(), &Script{Actions: []Action{Continue{}}}, func(tok string) {
+				t.Errorf("emitted %q from a closed request", tok)
+			})
+		}()
+		<-g.entered
+		r.Close()
+		close(g.release)
+		wantErr(t, <-finished, ErrRequestClosed)
+	})
+}
+
+// cancellingGen ends a context right after generating a token.
+type cancellingGen struct {
+	*MockGenerator
+	cancel context.CancelFunc
+	after  int
+}
+
+func (g *cancellingGen) Step(ctx context.Context) (string, error) {
+	tok, err := g.MockGenerator.Step(ctx)
+	if g.Decoded() == g.after {
+		g.cancel()
+	}
+	return tok, err
+}
+
+// A token that was generated goes out even if ctx ends right after it, so the answer doesn't fall
+// behind the decode position.
+func TestRunEmitsATokenGeneratedBeforeCtxEnded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g := &cancellingGen{MockGenerator: &MockGenerator{Preamble: []string{"a", "b", "c"}}, cancel: cancel, after: 2}
+		r := open(t, s, "r", g)
+		var emitted []string
+		sc := &Script{Actions: []Action{Continue{}, Continue{}, Continue{}}}
+		wantErr(t, r.Run(ctx, sc, func(tok string) { emitted = append(emitted, tok) }), context.Canceled)
+		if g.Decoded() != 2 || !slices.Equal(emitted, []string{"a", "b"}) {
+			t.Fatalf("decoded %d, emitted %v", g.Decoded(), emitted)
+		}
+	})
+}
+
+// A context that has ended starts nothing: not through Run, and not through Apply.
+func TestDeadContextStartsNoJob(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, m := setup(t, nil)
+		r, _ := openChecked(t, s, "r")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		sc := &Script{Actions: []Action{Execute{Job: "run", Program: "slow"}}}
+		wantErr(t, r.Run(ctx, sc, nil), context.Canceled)
+		wantErr(t, r.Apply(ctx, Execute{Job: "apply", Program: "slow"}).Err, context.Canceled)
+		synctest.Wait()
+
+		for _, id := range []JobID{"run", "apply"} {
+			if _, ok := r.Job(id); ok {
+				t.Errorf("job %s registered under a dead context", id)
+			}
+			if n := m.StartCount(string(id)); n != 0 {
+				t.Errorf("job %s started %d times", id, n)
+			}
+		}
+		wantState(t, r, Ready)
+		if sc.next != 0 {
+			t.Errorf("controller asked %d times under a dead context", sc.next)
+		}
+	})
+}
+
+// ctxGen blocks until its context ends, like a decode that checks for an abort.
+type ctxGen struct{ entered chan struct{} }
+
+func (g ctxGen) Step(ctx context.Context) (string, error) {
+	close(g.entered)
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func (g ctxGen) Deliver(context.Context, ResultMessage) error { return nil }
+
+// Close aborts a running generator call. Without that this test deadlocks.
+func TestCloseAbortsARunningGeneratorCall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		g := ctxGen{entered: make(chan struct{})}
+		r := open(t, s, "r", g)
+		token := make(chan Observation, 1)
+		go func() { token <- r.Apply(context.Background(), Continue{}) }()
+		<-g.entered
+		r.Close()
+		wantErr(t, (<-token).Err, ErrRequestClosed)
 	})
 }

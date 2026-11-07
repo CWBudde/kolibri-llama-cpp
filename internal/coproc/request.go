@@ -10,8 +10,10 @@ import (
 )
 
 // Generator stands in for the inference context of a request: its decode position, KV cache and
-// prompt. Phase 5 puts llama.cpp behind it. The scheduler never calls it while the request is
-// BLOCKED and never calls both methods at once.
+// prompt. Phase 5 puts llama.cpp behind it. A generator belongs to one request. The scheduler never
+// calls it while the request is BLOCKED and never calls both methods at once. It stays in use until
+// the Apply or Run that called it has returned, or until Shutdown has returned nil, even if its
+// request was closed earlier: Close doesn't wait for a call.
 type Generator interface {
 	// Step generates one token and returns at a boundary between tokens.
 	Step(ctx context.Context) (string, error)
@@ -86,41 +88,46 @@ func (r *Request) Job(id JobID) (JobInfo, bool) {
 }
 
 // Run drives the request with a controller until the controller finishes, the request closes, its
-// actions run out or ctx ends. emit, which may be nil, gets the user-visible answer tokens. Run
-// doesn't close the request.
+// actions run out or ctx ends. emit, which may be nil, gets the user-visible answer tokens. It runs
+// before the request leaves GENERATING, so a token can't go out after a second driver has moved the
+// request on, and a token that was generated goes out even if ctx ends right after it. Actions from
+// inside emit are rejected as not READY. Run doesn't close the request, so a job it started keeps
+// running after ctx ends, until its outcome or the request's Close.
 func (r *Request) Run(ctx context.Context, c Controller, emit func(string)) error {
 	var obs Observation
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		a, ok := c.Next(obs)
 		if !ok {
 			return nil
 		}
-		obs = r.Apply(ctx, a)
+		obs = r.apply(ctx, a, emit)
 		if obs.Err != nil && (errors.Is(obs.Err, ErrRequestClosed) || errors.Is(obs.Err, ErrActionLimit)) {
 			return obs.Err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if _, isToken := a.(Continue); isToken && obs.Err == nil && emit != nil {
-			emit(obs.Token)
 		}
 	}
 }
 
 // Apply runs one action in READY and returns its observation. A Wait blocks the caller until the
 // job has its outcome. If ctx ends during a Wait, the awaited job is cancelled, as nothing is left
-// to wait for it. Failures are reported in the observation, never by leaving the request stuck.
+// to wait for it. An Execute under a context that has ended registers nothing. Failures are reported
+// in the observation, never by leaving the request stuck.
 func (r *Request) Apply(ctx context.Context, a Action) Observation {
+	return r.apply(ctx, a, nil)
+}
+
+func (r *Request) apply(ctx context.Context, a Action, emit func(string)) Observation {
 	if err := r.admit(); err != nil {
 		return Observation{Action: a, Err: err}
 	}
 	var obs Observation
 	switch a := a.(type) {
 	case Continue:
-		obs = r.applyContinue(ctx)
+		obs = r.applyContinue(ctx, emit)
 	case Execute:
-		obs = r.applyExecute(a)
+		obs = r.applyExecute(ctx, a)
 	case Wait:
 		obs = r.applyWait(ctx, a)
 	case ReadResult:
@@ -161,6 +168,8 @@ func (r *Request) useInference(ctx context.Context) (context.Context, func() err
 		return nil, nil, fmt.Errorf("%w: %s", ErrNotReady, r.state)
 	}
 	r.state = Generating
+	claim := make(chan struct{})
+	r.s.claims[r] = claim
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(r.ctx, cancel)
 	return ctx, func() error {
@@ -168,6 +177,8 @@ func (r *Request) useInference(ctx context.Context) (context.Context, func() err
 		cancel()
 		r.s.mu.Lock()
 		defer r.s.mu.Unlock()
+		delete(r.s.claims, r)
+		close(claim)
 		if r.state == Closed {
 			return ErrRequestClosed
 		}
@@ -176,7 +187,7 @@ func (r *Request) useInference(ctx context.Context) (context.Context, func() err
 	}, nil
 }
 
-func (r *Request) applyContinue(ctx context.Context) Observation {
+func (r *Request) applyContinue(ctx context.Context, emit func(string)) Observation {
 	var obs Observation
 	ctx, release, err := r.useInference(ctx)
 	if err != nil {
@@ -184,14 +195,21 @@ func (r *Request) applyContinue(ctx context.Context) Observation {
 		return obs
 	}
 	obs.Token, obs.Err = r.gen.Step(ctx)
+	if obs.Err == nil && emit != nil && r.State() != Closed {
+		emit(obs.Token)
+	}
 	if err := release(); err != nil {
 		return Observation{Err: err} // the token of a closed request is not an answer
 	}
 	return obs
 }
 
-func (r *Request) applyExecute(a Execute) Observation {
+func (r *Request) applyExecute(ctx context.Context, a Execute) Observation {
 	obs := Observation{Job: a.Job}
+	if err := ctx.Err(); err != nil {
+		obs.Err = err
+		return obs
+	}
 	cfg := r.s.cfg
 	if a.Job == "" || a.Program == "" || a.Timeout < 0 || a.Timeout > cfg.MaxTimeout {
 		obs.Err = fmt.Errorf("%w: job %q program %q timeout %v", ErrInvalidAction, a.Job, a.Program, a.Timeout)
@@ -244,6 +262,7 @@ func (r *Request) register(a Execute) (j *job, existing bool, err error) {
 	}
 	slices.SortFunc(deps, func(x, y *job) int { return cmp.Compare(x.id, y.id) })
 	deps = slices.Compact(deps)
+	depNames := slices.Compact(slices.Sorted(slices.Values(a.Dependencies)))
 
 	byID, hasID := r.jobs[a.Job]
 	byKey, hasKey := r.byKey[a.IdempotencyKey]
@@ -267,7 +286,7 @@ func (r *Request) register(a Execute) (j *job, existing bool, err error) {
 
 	j = &job{
 		req: r, id: a.Job, key: a.IdempotencyKey, program: a.Program,
-		args: slices.Clone(a.Args), timeout: a.Timeout, deps: deps,
+		args: slices.Clone(a.Args), timeout: a.Timeout, deps: deps, depNames: depNames,
 	}
 	r.jobs[a.Job] = j
 	r.byKey[a.IdempotencyKey] = j
@@ -305,6 +324,10 @@ func (r *Request) applyWait(ctx context.Context, a Wait) Observation {
 	s.mu.Lock()
 	j, ok := r.jobs[a.Job]
 	switch {
+	case r.state == Closed: // Close can land after admit
+		s.mu.Unlock()
+		obs.Err = ErrRequestClosed
+		return obs
 	case !ok:
 		s.mu.Unlock()
 		obs.Err = fmt.Errorf("%w: %s", ErrUnknownJob, a.Job)
@@ -396,7 +419,8 @@ func (r *Request) Cancel(id JobID) error {
 // Close tears the request down: its jobs without an outcome are cancelled, a waiter is released
 // with ErrRequestClosed, a running generator call is cancelled and its token discarded. Later
 // events for the request are dropped, also if a new request reuses the ID. Close can be called
-// again.
+// again. It doesn't wait for a generator call, which can outlast it if it doesn't honor its context:
+// before freeing the inference context, a caller joins its Apply or Run, or calls Shutdown.
 func (r *Request) Close() {
 	s := r.s
 	s.update(func() {
@@ -427,7 +451,8 @@ type job struct {
 	program    string
 	args       []string
 	timeout    time.Duration
-	deps       []*job // sorted by ID
+	deps       []*job  // sorted by ID
+	depNames   []JobID // the names the Execute gave them, which may be aliases
 	dependents []*job
 	pending    int // dependencies not yet DONE
 

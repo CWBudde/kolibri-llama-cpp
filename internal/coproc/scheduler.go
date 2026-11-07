@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 )
@@ -65,11 +67,13 @@ type Scheduler struct {
 
 	mu       sync.Mutex
 	requests map[RequestID]*Request
-	queue    []*job // runnable jobs waiting for a slot, in order
+	queue    []*job // jobs that can start, waiting for a slot, in order; all IDLE, of open requests
+	stale    bool   // a job left IDLE outside dispatch, so the queue may hold it
 	running  int
 	lastGen  Generation
 	stopped  bool
 	stats    Stats
+	claims   map[*Request]chan struct{} // running generator calls, also of closed requests
 }
 
 // NewScheduler starts a scheduler. Shutdown ends it.
@@ -87,6 +91,7 @@ func NewScheduler(cp Coprocessor, cfg Config) (*Scheduler, error) {
 		stop:     make(chan struct{}),
 		loopDone: make(chan struct{}),
 		requests: make(map[RequestID]*Request),
+		claims:   make(map[*Request]chan struct{}),
 	}
 	go s.loop()
 	return s, nil
@@ -117,7 +122,9 @@ func (s *Scheduler) Stats() Stats {
 
 // Shutdown closes every request, which cancels their jobs and releases their waiters, and stops
 // consuming events. Events still queued refer to closed requests and are dropped. It returns once
-// the consumer has ended or ctx is done, and can be called again.
+// the consumer has ended and every generator call has returned, or ctx is done, and can be called
+// again. After a nil return no generator is in use. A generator or an emit callback that calls it
+// must pass a context that ends, since Shutdown then waits for its caller.
 func (s *Scheduler) Shutdown(ctx context.Context) error {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
@@ -134,10 +141,21 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 	})
 	select {
 	case <-s.loopDone:
-		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// No claim can start now: every request is closed and Open is refused.
+	s.mu.Lock()
+	claims := slices.Collect(maps.Values(s.claims))
+	s.mu.Unlock()
+	for _, claim := range claims {
+		select {
+		case <-claim:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // loop is the only consumer of the channel. It blocks until an event arrives.
@@ -242,6 +260,8 @@ func (s *Scheduler) settle(j *job, state JobState, result string, err error) {
 		s.running--
 		j.timer.Stop()
 		j.cancel()
+	} else {
+		s.stale = true
 	}
 	j.state, j.result, j.err = state, result, err
 
@@ -278,16 +298,20 @@ type start struct {
 // job, which is what makes a start at most once. The deadline starts here and reaches the
 // consumer as an ordinary event, so it races a completion in one place, the channel.
 func (s *Scheduler) dispatch() []start {
+	// Every settle runs in an update, so a settled job is out of the queue when the mutex is released.
+	// This is what bounds the queue: slots can stay taken for MaxTimeout while clients keep closing.
+	if s.stale {
+		s.queue = slices.DeleteFunc(s.queue, func(j *job) bool { return j.state != JobIdle })
+		s.stale = false
+	}
 	if s.stopped {
 		return nil
 	}
 	var starts []start
 	for s.running < s.cfg.MaxRunning && len(s.queue) > 0 {
 		j := s.queue[0]
+		s.queue[0] = nil // the backing array must not keep a closed request alive
 		s.queue = s.queue[1:]
-		if j.state != JobIdle {
-			continue // settled while it waited for a slot
-		}
 		s.lastGen++
 		s.running++
 		j.state = JobRunning
@@ -303,10 +327,10 @@ func (s *Scheduler) dispatch() []start {
 
 		spec := JobSpec{
 			RequestID: j.req.id, ID: j.id, IdempotencyKey: j.key, Generation: j.generation,
-			Program: j.program, Args: j.args, DepResults: make(map[JobID]string, len(j.deps)),
+			Program: j.program, Args: slices.Clone(j.args), DepResults: make(map[JobID]string, len(j.depNames)),
 		}
-		for _, d := range j.deps {
-			spec.DepResults[d.id] = d.result
+		for _, name := range j.depNames {
+			spec.DepResults[name] = j.req.jobs[name].result
 		}
 		starts = append(starts, start{job: j, ctx: ctx, spec: spec})
 	}
