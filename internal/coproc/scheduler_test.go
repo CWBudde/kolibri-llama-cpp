@@ -767,3 +767,35 @@ func TestWorkerChangingItsArgsDoesNotChangeTheJob(t *testing.T) {
 		}
 	})
 }
+
+// Once Shutdown has returned nil no generator call is running, so the caller can free the inference
+// contexts. A generator that doesn't return on its context holds Shutdown up to Shutdown's own
+// context, whether the request was still open or had been closed before.
+func TestShutdownWaitsForARunningGeneratorCall(t *testing.T) {
+	for name, closeFirst := range map[string]bool{"open": false, "closed": true} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, _ := setup(t, nil)
+				g := &blockingGen{release: make(chan struct{}), entered: make(chan struct{})}
+				r := open(t, s, "r", g)
+				token := make(chan Observation, 1)
+				go func() { token <- r.Apply(context.Background(), Continue{}) }()
+				<-g.entered
+				if closeFirst {
+					r.Close() // returns during the call
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				wantErr(t, s.Shutdown(ctx), context.DeadlineExceeded)
+				wantState(t, r, Closed)
+
+				close(g.release)
+				wantErr(t, (<-token).Err, ErrRequestClosed)
+				if err := s.Shutdown(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			})
+		})
+	}
+}
