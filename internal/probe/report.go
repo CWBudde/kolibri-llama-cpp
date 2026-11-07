@@ -215,28 +215,80 @@ func scores(items []Item, labels, pred []int, prob []float64, task Task) Metrics
 	return m
 }
 
+// ShuffleScheme names the permutation behind Shuffled. Reports from before it carry no scheme: they
+// permuted rows one by one, which docs/layer-probe.md says and why that was replaced.
+const ShuffleScheme = "whole-groups-among-equal-sizes-v2"
+
 // Shuffled is the control of one probe: the same probe on permuted labels.
 type Shuffled struct {
 	Runs           int     `json:"runs"`
+	Scheme         string  `json:"scheme"`
 	MeanBalanced   float64 `json:"mean_balanced_accuracy"`
 	MaxBalanced    float64 `json:"max_balanced_accuracy"`
 	ChanceBalanced float64 `json:"chance_balanced_accuracy"`
 	ShareAtOrAbove float64 `json:"share_of_runs_at_or_above_real"`
 }
 
+// groupSizes holds the rows of each paraphrase group, one list of groups per group size, in
+// ascending size and in the rows' order, so that a seed gives one sequence of permutations.
+func groupSizes(items []Item) [][][]int {
+	rows := map[string][]int{}
+	var names []string
+	for i, it := range items {
+		if _, ok := rows[it.ParaphraseGroup]; !ok {
+			names = append(names, it.ParaphraseGroup)
+		}
+		rows[it.ParaphraseGroup] = append(rows[it.ParaphraseGroup], i)
+	}
+	bySize := map[int][][]int{}
+	for _, g := range names {
+		bySize[len(rows[g])] = append(bySize[len(rows[g])], rows[g])
+	}
+	sizes := make([]int, 0, len(bySize))
+	for n := range bySize {
+		sizes = append(sizes, n)
+	}
+	slices.Sort(sizes)
+	out := make([][][]int, len(sizes))
+	for i, n := range sizes {
+		out[i] = bySize[n]
+	}
+	return out
+}
+
+// permuteGroups writes a permutation of labels to perm. A paraphrase group is the unit the folds
+// hold out, so it is the unit that moves: each group takes the block of labels of a group of its own
+// size, which keeps what a group's labels are together, and groups of two sizes can't swap blocks.
+// Inside its new group a block is shuffled too. Otherwise a block of (execute, no) would land on
+// another such group as it was, and since the dataset writes a computation before its refusal, each
+// of those rows would keep its real label.
+func permuteGroups(r *rand.Rand, sizes [][][]int, labels, perm []int) {
+	for _, groups := range sizes {
+		order := r.Perm(len(groups))
+		for i, g := range groups {
+			from := groups[order[i]]
+			for j, row := range g {
+				perm[row] = labels[from[j]]
+			}
+			r.Shuffle(len(g), func(a, b int) { perm[g[a]], perm[g[b]] = perm[g[b]], perm[g[a]] })
+		}
+	}
+}
+
 // shuffled runs the probe on permuted labels. Labels that are permuted carry no information about
 // the activations, so a real gap between the probe and this control is the least a score must show.
 func shuffled(fk []foldKernels, items []Item, labels []int, task Task, l2 float64, runs int, seed uint64, real float64) (Shuffled, error) {
 	k := len(task.Classes)
-	s := Shuffled{Runs: runs, ChanceBalanced: 1 / float64(k)}
+	s := Shuffled{Runs: runs, Scheme: ShuffleScheme, ChanceBalanced: 1 / float64(k)}
 	r := rand.New(rand.NewPCG(seed, 0x5eed))
-	perm := slices.Clone(labels)
+	sizes := groupSizes(items)
+	perm := make([]int, len(labels))
 	atOrAbove := 0
 	for run, tries := 0, 0; run < runs; tries++ {
 		if tries > 100*runs {
 			return s, fmt.Errorf("%s: %d label permutations left a class without training rows", task.Name, tries)
 		}
-		r.Shuffle(len(perm), func(i, j int) { perm[i], perm[j] = perm[j], perm[i] })
+		permuteGroups(r, sizes, labels, perm)
 		oof, err := crossValidate(fk, perm, k, l2)
 		if err != nil { // a permutation can empty a class of one fold's training rows
 			continue
@@ -519,7 +571,7 @@ func (r *Report) Markdown() string {
 	for _, c := range r.Caveats {
 		fmt.Fprintf(&b, "- %s\n", c)
 	}
-	fmt.Fprintf(&b, "\nDefinitions: L2 %g on standardized activations scaled to unit expected squared norm, %d label shuffles per probe, seed %d. All scores are held out by grouped cross-validation.\n", r.Options.L2, r.Options.Shuffles, r.Options.Seed)
+	fmt.Fprintf(&b, "\nDefinitions: L2 %g on standardized activations scaled to unit expected squared norm, %d label shuffles per probe that move whole paraphrase groups' labels among groups of one size (%s), seed %d. All scores are held out by grouped cross-validation.\n", r.Options.L2, r.Options.Shuffles, ShuffleScheme, r.Options.Seed)
 	for _, task := range []Task{TaskExecute, TaskFamily} {
 		fmt.Fprintf(&b, "\n## %s (%s)\n\n", task.Name, strings.Join(task.Classes, ", "))
 		fmt.Fprintf(&b, "| Row | Kind | Accuracy | Balanced | Macro F1 | Execute P | Execute R | Hard negatives | Paraphrase agreement | Brier | ECE | Shuffled balanced, mean (max) |\n")

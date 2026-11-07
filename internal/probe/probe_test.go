@@ -3,6 +3,7 @@ package probe
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -165,7 +166,12 @@ func TestProbeFindsSignal(t *testing.T) {
 	}
 }
 
-// Control M75: on shuffled labels the same probe on the same activations scores near chance.
+// Control M75: on shuffled labels the same probe on the same activations scores near chance. The
+// bound is on the mean of 200 runs. A run here has a deviation of about 0.10 on execute and 0.04 on
+// family, the same with whole groups moving as with single rows, so the mean's standard error is
+// about 0.007 and 0.003. Both schemes sit below chance by more than that, 0.03 on execute and 0.02
+// on family: a fold's test rows take their class counts from the training rows. 0.05 holds that
+// offset with margin and was not moved when the scheme changed.
 func TestM75ShuffledLabelsNearChance(t *testing.T) {
 	rows := smokeRows()
 	for _, task := range []Task{TaskExecute, TaskFamily} {
@@ -180,6 +186,9 @@ func TestM75ShuffledLabelsNearChance(t *testing.T) {
 				continue
 			}
 			s := r.Shuffled
+			if s.Scheme != ShuffleScheme {
+				t.Errorf("%s: scheme %q", task.Name, s.Scheme)
+			}
 			if math.Abs(s.MeanBalanced-s.ChanceBalanced) > 0.05 {
 				t.Errorf("%s: shuffled balanced accuracy %.3f, chance %.3f", task.Name, s.MeanBalanced, s.ChanceBalanced)
 			}
@@ -189,6 +198,141 @@ func TestM75ShuffledLabelsNearChance(t *testing.T) {
 			if s.ShareAtOrAbove != 0 {
 				t.Errorf("%s: %.3f of the shuffles reach the real score", task.Name, s.ShareAtOrAbove)
 			}
+		}
+	}
+}
+
+// groupLabels lists each group's size and sorted labels: what a permutation must keep.
+func groupLabels(sizes [][][]int, labels []int) []string {
+	var out []string
+	for _, groups := range sizes {
+		for _, g := range groups {
+			ls := make([]int, len(g))
+			for i, row := range g {
+				ls[i] = labels[row]
+			}
+			slices.Sort(ls)
+			out = append(out, fmt.Sprint(len(g), ls))
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// higherFirst counts, over the pairs, those with two labels and those of them with the higher first.
+func higherFirst(pairs [][]int, labels []int) (first, mixed int) {
+	for _, g := range pairs {
+		if labels[g[0]] != labels[g[1]] {
+			mixed++
+			if labels[g[0]] > labels[g[1]] {
+				first++
+			}
+		}
+	}
+	return first, mixed
+}
+
+// Control M91: a label shuffle moves the unit the folds hold out. It keeps the labels of a group
+// together, swaps only groups of one size, and draws the labels' order inside a group anew. The
+// mutations are the row-level shuffle used before, which breaks the first, and a block that keeps
+// its row order, which breaks the last: the dataset writes a computation before its refusal, so such
+// a block has the higher label first every time and leaves a pair it lands on with its real labels.
+func TestM91ShufflesMoveWholeGroups(t *testing.T) {
+	rows := smokeRows()
+	sizes := groupSizes(rows)
+	if len(sizes) != 2 || len(sizes[0]) != 10 || len(sizes[1]) != 15 {
+		t.Fatalf("the smoke rows' groups: %d sizes", len(sizes))
+	}
+	pairs := sizes[1]
+	const draws = 2000
+	for _, task := range []Task{TaskExecute, TaskFamily} {
+		labels := make([]int, len(rows))
+		for i, it := range rows {
+			labels[i] = task.Label(it)
+		}
+		want := groupLabels(sizes, labels)
+		original := slices.Clone(labels)
+		r := rand.New(rand.NewPCG(Seed, 0x5eed))
+		perm := make([]int, len(labels))
+		first, mixed := 0, 0
+		for range draws {
+			permuteGroups(r, sizes, labels, perm)
+			if got := groupLabels(sizes, perm); !slices.Equal(got, want) {
+				t.Fatalf("%s: a group's labels came apart: %v, want %v", task.Name, got, want)
+			}
+			f, m := higherFirst(pairs, perm)
+			first, mixed = first+f, mixed+m
+		}
+		if !slices.Equal(labels, original) {
+			t.Errorf("%s: the shuffle changed the real labels", task.Name)
+		}
+		if share := float64(first) / float64(mixed); share < 0.48 || share > 0.52 {
+			t.Errorf("%s: the higher label is first in %.3f of the mixed pairs, want half", task.Name, share)
+		}
+
+		// the row-level shuffle: the check above would fail it
+		copy(perm, labels)
+		apart := 0
+		for range draws {
+			r.Shuffle(len(perm), func(i, j int) { perm[i], perm[j] = perm[j], perm[i] })
+			if !slices.Equal(groupLabels(sizes, perm), want) {
+				apart++
+			}
+		}
+		if apart < draws*9/10 {
+			t.Errorf("%s: the row-level shuffle kept the groups' labels in %d of %d draws; the control lost its point", task.Name, draws-apart, draws)
+		}
+		// a block that keeps its row order: so would the share
+		if f, m := higherFirst(pairs, labels); f != m || m == 0 {
+			t.Errorf("%s: the higher label is first in %d of %d real pairs; the control lost its point", task.Name, f, m)
+		}
+	}
+
+	// shuffled itself: labels constant per group on activations that carry only the group's
+	// fingerprint, where a group's rows are all right or all wrong only if the group moves whole.
+	const groups, perGroup, dim = 20, 4, 64
+	r := rand.New(rand.NewPCG(9, 9))
+	var items []Item
+	fp := Matrix{Rows: groups * perGroup, Dim: dim, Data: make([]float32, groups*perGroup*dim)}
+	for g := range groups {
+		noise := make([]float64, dim)
+		for d := range noise {
+			noise[d] = r.NormFloat64()
+		}
+		for p := range perGroup {
+			name := "g" + strconv.Itoa(g)
+			items = append(items, Item{ID: name + "-" + strconv.Itoa(p), ParaphraseGroup: name, TemplateID: name, ExecuteExpected: g%2 == 0, OperationFamily: FamilyNone, Prompt: name})
+			row := fp.Row(g*perGroup + p)
+			for d := range row {
+				row[d] = float32(noise[d] + 0.1*r.NormFloat64())
+			}
+		}
+	}
+	labels := make([]int, len(items))
+	for i, it := range items {
+		labels[i] = TaskExecute.Label(it)
+	}
+	folds, err := GroupFolds(items, 5, Seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := shuffled(kernelsOf(fp, folds, len(items)), items, labels, TaskExecute, 0.01, 200, Seed, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 200 runs reach 0.788 here; the row-level shuffle, whose spread is half of this, reaches 0.663
+	if s.MaxBalanced < 0.72 {
+		t.Errorf("shuffled balanced accuracy reaches only %.3f on labels constant per group: single rows are moving", s.MaxBalanced)
+	}
+
+	a, b := rand.New(rand.NewPCG(Seed, 0x5eed)), rand.New(rand.NewPCG(Seed, 0x5eed))
+	pa, pb := make([]int, len(labels)), make([]int, len(labels))
+	sz := groupSizes(items)
+	for range 10 {
+		permuteGroups(a, sz, labels, pa)
+		permuteGroups(b, sz, labels, pb)
+		if !slices.Equal(pa, pb) {
+			t.Fatal("the permutation is not deterministic for a seed")
 		}
 	}
 }
