@@ -1116,6 +1116,8 @@ Close these gaps without giving up the lead.
 
 **Verdict** ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E2: GPU remap"): by the Stage D rule, the GPU remap's slowest repetition must beat the best baseline's fastest on decode, or its highest p95 must be below the baseline's lowest. At 16 GiB it does neither against `iq3-cache128-prefetch12`: 18.94 against 19.00 t/s (0.054 short), 79.33 against 78.58 ms (0.75 over). At 0 GiB it does both against `iq3-cache128`: 19.02 against 18.91 t/s, 79.67 against 80.75 ms. The stop rule applies: patch 0015 is removed, number kept, and the code stays on fork branch `feat/kolibri1-gpu-remap` (`0bb0f5444`, fork PR #16, draft, open and not merged). The next patch is 0016. The stack benchmark of E2 and E3 was conditional on E2 passing, so it did not run in this stage. The owner asked for it afterwards (see the entry below). Whether to repeat E2 with a new pre-registered matrix is the owner's open decision, and it is not planned.
 
+**Patch 0016 (2026-11-08):** this verdict stands, and patch 0015 stays retired. The GPU remap enters the series on top of the side-file instead, as patch 0016 through fork PR #16, because E2 and E3 together passed their registered gates against prefetch (below). Merging fork PR #16 is the owner's decision. The box below stays open, since it belongs to this stage's failed gate.
+
 Only if E1's overhead control shows the overhead.
 
 - [ ] Encode the expert path so a decoded token no longer needs a scheduler split and CPU sync at every MoE layer. Candidates, decided by a measured prototype:

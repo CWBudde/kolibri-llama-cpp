@@ -1,6 +1,6 @@
 # Expert streaming: the runtime expert cache
 
-Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose deciding gates passed, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill". Stage E2's GPU remap was benchmarked, its deciding gate failed at 16 GiB and passed at 0 GiB, and its code also stays out of the patch series; it is in "Stage E2: GPU remap". The two together, whose deciding gates passed on a fork branch that the series does not contain, are in "Stage E2 and E3 together".
+Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose deciding gates passed, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill". Stage E2's GPU remap alone failed its deciding gate at 16 GiB and passed at 0 GiB; it is in "Stage E2: GPU remap". The two together passed their registered gates, also against prefetch, so the GPU remap is patch 0016 on top of the side-file; that is in "Stage E2 and E3 together".
 
 ## How it works
 
@@ -36,6 +36,7 @@ Options of every `common` tool (llama-cli, llama-completion, llama-server):
 | `--expert-cache-stats FNAME` | write the counters as JSON when the model is freed; without `--expert-cache` the decode timing alone (patch 0012) |
 | `--expert-cache-buffered` | read misses through the page cache instead of with `F_NOCACHE` (macOS; default off, patch 0012) |
 | `--expert-cache-sidefile FNAME` | read misses from this side-file, one `pread` per expert; the load fails if its table does not match the model and the GGUF, with no fallback (patch 0014) |
+| `--expert-cache-gpu-remap` | map the router's ids to slots on the GPU, so a layer that hits needs no CPU split; Metal only, refused with `--expert-prefetch` (patch 0016, "Stage E2: GPU remap") |
 
 ```sh
 B=third_party/llama.cpp/build/bin
@@ -68,6 +69,7 @@ In the C API it is `llama_model_params.expert_cache`, a `llama_expert_cache_para
 - Patch 0014 adds (Phase 11, Stage E3):
   - `expert_cache.sidefile`, the side-file as given, or `null` on the GGUF path;
   - `loads` and `preads` per phase: the experts read into a slot, and the read calls they took. A run on the side-file has one per expert and a run on the GGUF path three, so `preads / loads` proves which path ran.
+- Patch 0016 adds `expert_cache.gpu_remap`, whether the GPU remap is on (Phase 11, Stage E2).
 - `process`, measured since the cache was set up: `disk_bytes_read` and `pageins` from `proc_pid_rusage`, `major_faults` from `getrusage`, and the lifetime peak `max_phys_footprint`. A counter the platform does not measure is `null`: on Linux all but `major_faults`, on iOS, tvOS and visionOS the same.
 - The file name is a JSON string, escaped.
 
@@ -576,7 +578,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4.json -out ~/models/eval/exp
 
 ## Stage E2: GPU remap
 
-Phase 11, Stage E2. `--expert-cache-gpu-remap` removes the scheduler split and CPU sync at every expert layer that hits. **The option exists only on fork branch `feat/kolibri1-gpu-remap` (commit `0bb0f5444`, fork PR [#16](https://github.com/CWBudde/llama.cpp/pull/16), draft, open and not merged). It is not in the patch series and not on `feat/kolibri1`.**
+Phase 11, Stage E2. `--expert-cache-gpu-remap` removes the scheduler split and CPU sync at every expert layer that hits. **This stage's own gate failed at 16 GiB, and patch 0015 stays retired. The option is now patch 0016, on top of the side-file, because E2 and E3 together passed their registered gates against prefetch ("Stage E2 and E3 together" below). It reaches `feat/kolibri1` through fork PR [#16](https://github.com/CWBudde/llama.cpp/pull/16) (`b001e946f`). The section below records E2 alone, at `0bb0f5444`.**
 
 ### Verdict
 
@@ -1005,7 +1007,7 @@ One disturbed repetition decided the 16 GiB result above, so the owner asked for
 
 ### The build
 
-Fork branch `feat/kolibri1-e2-e3`, commit `b001e946f`, merges `feat/kolibri1` (`c0b2de9be`, the series) and `feat/kolibri1-gpu-remap` (`abc6835f1`). It has no fork PR, and `feat/kolibri1` and the patch series are unchanged. The conflicts Known limits lists were all side-by-side additions: the two options, their fields and their stats keys. The features meet only in `load()`, where a side-file read replaces the three-part read of the GGUF. `check_expert_cache.py --stack-only` holds the stack to the unsplit resident run's logits and to the GPU remap's counters on the GGUF path.
+Fork branch `feat/kolibri1-e2-e3`, commit `b001e946f`, merges `feat/kolibri1` (`c0b2de9be`, the series) and `feat/kolibri1-gpu-remap` (`abc6835f1`). Since 2026-11-08 it is also the head of fork PR #16: `feat/kolibri1-gpu-remap` was fast-forwarded to it, and `git diff c0b2de9be b001e946f` is patch 0016. Applying the series to `184f6536` gives its tree, `6b84facb`. `feat/kolibri1` stays at `c0b2de9be` until that PR is merged. The conflicts Known limits lists were all side-by-side additions: the two options, their fields and their stats keys. The features meet only in `load()`, where a side-file read replaces the three-part read of the GGUF. `check_expert_cache.py --stack-only` holds the stack to the unsplit resident run's logits and to the GPU remap's counters on the GGUF path.
 
 ### Open decisions
 

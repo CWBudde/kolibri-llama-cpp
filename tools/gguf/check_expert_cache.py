@@ -33,8 +33,8 @@ the CPU its weights are not repacked (the slots are not either).
   --expert-cache-stats without the cache writes the decode timing alone; with a quote, a backslash and a tab in the
   model's file name the stats are still valid JSON and name the file.
 
-GPU remap (--expert-cache-gpu-remap): only on fork branch feat/kolibri1-gpu-remap, not in the patch
-series (Stage E2's gate failed at 16 GiB), so without it these checks are skipped with a note, and --gpu-remap-only is an error. The
+GPU remap (--expert-cache-gpu-remap): patch 0016, on top of the side-file (fork PR #16). Without it
+these checks are skipped with a note, and --gpu-remap-only is an error. The
 router's ids become slots on the GPU, with no CPU split: the logits must be bit-identical to the
 UNSPLIT resident run on Metal (Stage E2's requirement; a same-split reference would not do), and
 the counters equal the CPU remap's, since a gate defers but never changes what the remaps do. With
@@ -98,8 +98,8 @@ of each layer and not the whole file: kolibri-sidefile verify does that.
     check_expert_cache.py --llama-cpp third_party/llama.cpp-e2 --gpu-remap-only   # the GPU remap checks alone
     check_expert_cache.py --llama-cpp third_party/llama.cpp-e2e3 --stack-only     # the side-file and the GPU remap together
 
-The stack (--expert-cache-sidefile with --expert-cache-gpu-remap): only on fork branch
-feat/kolibri1-e2-e3, a build to benchmark them together, not in the patch series. On a build with both
+The stack (--expert-cache-sidefile with --expert-cache-gpu-remap): patches 0014 and 0016 together, the
+build that fork branch feat/kolibri1-e2-e3 benchmarked. On a build with both
 options the logits must be bit-identical to the UNSPLIT resident run and to the GPU remap on the GGUF
 path, with its counters, one pread per expert and 2 scheduler splits per decoded token. --real checks
 the same on the real weight.

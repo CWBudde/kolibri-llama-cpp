@@ -375,6 +375,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
 | 0014 expert cache side-file | no | the fork's own work, Stage E3; its four deciding gates passed on 2026-11-07, merged by fork PR #15 ([expert-streaming.md](expert-streaming.md#stage-e3-one-read-per-expert)) |
 | 0015 expert cache GPU remap | no | retired 2026-11-07, the fork's own work: Stage E2's gate failed at 16 GiB and passed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e2-gpu-remap)) |
+| 0016 expert cache GPU remap on the side-file | no | the fork's own work, 2026-11-08: E2 and E3 together passed their registered gates against prefetch, through fork PR #16 ([expert-streaming.md](expert-streaming.md#stage-e2-and-e3-together)) |
 
 ### Controls
 
@@ -486,7 +487,13 @@ failed at 16 GiB and passed at 0 GiB, so the number is kept and the code stays
 on fork branch `feat/kolibri1-gpu-remap` (`0bb0f5444`, fork PR #16, draft, open
 and not merged). It never reached `feat/kolibri1`. The series' glob matched it only on Stage E2's
 branch, from `35b6ee2` until `5c40670` moved it to `pending/`, and the patch is not
-in this PR's merge. The next patch is 0016.
+in this PR's merge. The next patch was 0016.
+
+**Patch 0016 is the GPU remap on top of the side-file (2026-11-08).** E2 and E3
+together passed their registered gates against prefetch, so the remap enters the
+series after all, now as `git diff c0b2de9be b001e946f`. Fork PR #16's branch was
+fast-forwarded to `b001e946f`, and a squash merge gives the series' tree. The next
+patch is 0017.
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's
@@ -535,8 +542,8 @@ the CPU they still are.
   after each `ffn_moe_topk` (`Runner.logits(split_after=...)`) and reports the
   difference to the unsplit run as info. The CPU still compares against the
   plain resident run.
-- E2 removes the CPU split, behind `--expert-cache-gpu-remap`, on fork branch
-  `feat/kolibri1-gpu-remap` only (its decode gate failed at 16 GiB). There it
+- E2 removes the CPU split, behind `--expert-cache-gpu-remap`: patch 0016, on
+  top of the side-file (E2 alone failed its decode gate at 16 GiB). It
   requires bit identity to the unsplit run (`check_expert_cache.py`, tiny and
   real IQ3, "PASS: 0 failures") and the same token IDs as `iq3-resident-ub21`
   on the real workload (exact in `testdata/bench/e2.json`: 30 of 30 requests).
