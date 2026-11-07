@@ -453,12 +453,13 @@ Each was applied, recorded and reverted; then a forced rebuild and a rerun of th
 | Control | `test-expert-cache` | Tiny `--gpu-remap-only` |
 |---|---|---|
 | **M60:** `copy_table` swaps the slot of every odd expert: a wrong slot id in the GPU table | fails: 4667 checks failed | fails: "FAIL: 37 failures", max \|diff\| 1.11 |
-| **M61:** cb_eval splits the GPU arm after each `ffn_moe_topk`, as the CPU remap's splits do | passes | fails: "FAIL: 33 failures": 14 splits per token instead of 2, and bit identity, max \|diff\| 0.134 |
+| **M61:** a CPU op per layer back in the GPU arm's graph, as the CPU remap has | passes | fails: "FAIL: 75 failures": 14 scheduler splits per token instead of 2, and bit identity, max \|diff\| 0.134 |
 | **M62:** the gate stops but leaves the later dispatches on: the invariant's second point | passes | fails: logits NaN on the first configurations, then the guard aborts ("gate 3 stopped again after its loads") |
 | **M63:** `copy_table` never writes -1, so an evicted expert stays in the table | fails: 7891 checks failed | fails: "FAIL: 17 failures", max \|diff\| 1.11 |
 | **M64:** the run resumes one node after the stopped gate | passes | fails: "FAIL: 37 failures", max \|diff\| 2.23 |
 | **M65:** the remap does not wait for loads, the table lists loading slots, and a load takes 2 ms longer: the invariant's fourth point | fails: 5680 checks failed | fails: "FAIL: 34 failures", max \|diff\| 1.26 |
 | **M67:** the plain path's `n_nodes_0` encoder boundary is dropped | passes | fails: "FAIL: 27 failures", max \|diff\| 0.134 |
+| **M69:** cb_eval splits the GPU arm's computation after each `ffn_moe_topk` | passes | fails: "FAIL: 33 failures": bit identity, max \|diff\| 0.134, and the command buffer bound. The split count stays 2, because the scheduler does not count these |
 
 Two more controls change what a run costs or counts, not what it computes, so bit identity holds under them by design. They do not meet the rule that a control fails bit identity; they guard the counts:
 
