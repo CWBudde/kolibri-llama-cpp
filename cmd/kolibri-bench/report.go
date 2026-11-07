@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -415,8 +416,8 @@ func fmtRange(v []float64, prec int) string {
 }
 
 // report writes the tables and verdicts as Markdown and returns false if an
-// exact equivalence failed, or a completed cache run failed a load or wrote no
-// stats.
+// exact equivalence failed, a completed cache run failed a load or wrote no
+// stats, or the runs of one build came from different binaries.
 func report(w io.Writer, m matrix, runs []runResult) bool {
 	fmt.Fprintln(w, "| Config | Ceiling | Runs | Load s | Cold TTFT s | Cold decode t/s | Warm prompt t/s | Warm decode t/s | Warm p50 ms | Warm p95 ms | Page-ins MiB/token | Peak RSS GiB | Peak footprint GiB | Decode hits | Disk GB read |")
 	fmt.Fprintln(w, "|---|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
@@ -530,6 +531,9 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 	if !readsCheck(w, m, runs) {
 		allEqual = false
 	}
+	if !buildCheck(w, m, runs) {
+		allEqual = false
+	}
 
 	fmt.Fprintln(w)
 	for _, g := range m.Gates {
@@ -571,8 +575,10 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 // readsCheck runs for a matrix with a side-file arm: it proves from the stats
 // what the arms read. Every completed cache run names the side-file its flags
 // gave (none on the GGUF path) and took one pread per expert it loaded (3 on the
-// GGUF path), in both phases. Any other run fails the report: its speed would
-// not be the speed of what the arm claims to be.
+// GGUF path), in both phases, with experts loaded in both: 0 preads for 0 loads
+// is what a build without these counters writes, and it proves nothing. Any other
+// run fails the report: its speed would not be the speed of what the arm claims
+// to be.
 func readsCheck(w io.Writer, m matrix, runs []runResult) bool {
 	if len(m.sidefiles()) == 0 {
 		return true
@@ -612,6 +618,10 @@ func readsCheck(w io.Writer, m matrix, runs []runResult) bool {
 				bad = append(bad, fmt.Sprintf("%s took %d preads for %d experts in prefill and %d for %d in decode", r.key(),
 					s.Prefill.Preads, s.Prefill.Loads, s.Decode.Preads, s.Decode.Loads))
 			}
+			if s.Decode.Loads <= 0 || s.Prefill.Loads <= 0 {
+				bad = append(bad, fmt.Sprintf("%s loaded %d experts in prefill and %d in decode, want some in both (a build without patch 0014?)", r.key(),
+					s.Prefill.Loads, s.Decode.Loads))
+			}
 			loads += s.Decode.Loads + s.Prefill.Loads
 			preads += s.Decode.Preads + s.Prefill.Preads
 		}
@@ -628,6 +638,53 @@ func readsCheck(w io.Writer, m matrix, runs []runResult) bool {
 			fmt.Fprintf(w, "; %s", strings.Join(bad, "; "))
 		}
 		fmt.Fprintln(w)
+	}
+	return ok
+}
+
+// buildCheck proves that a comparison compares one build. The completed runs of
+// a build (the fork's -server, or one a config names) must all carry the same
+// serverBuild: a resume after a rebuild, or with another -server, would otherwise
+// mix two. A digest is the identity, and the path only says where it was. Results
+// from before the driver recorded it have none, and are not asked unless the
+// matrix has a side-file arm, where every run has one.
+func buildCheck(w io.Writer, m matrix, runs []runResult) bool {
+	ok := true
+	var builds []string
+	for _, c := range m.Configs {
+		if !slices.Contains(builds, c.Server) {
+			builds = append(builds, c.Server)
+		}
+	}
+	for _, build := range builds {
+		count := map[string]int{}
+		where := map[string]string{}
+		for _, r := range runs {
+			if c, found := m.config(r.Config); found && c.Server == build && r.Status == statusOK {
+				count[r.ServerSHA256]++
+				where[r.ServerSHA256] = r.Server
+			}
+		}
+		if len(count) == 0 || (len(count) == 1 && count[""] > 0 && len(m.sidefiles()) == 0) {
+			continue
+		}
+		name := "the fork's -server"
+		if build != "" {
+			name = build
+		}
+		var parts []string
+		for _, digest := range slices.Sorted(maps.Keys(count)) {
+			if digest == "" {
+				parts = append(parts, fmt.Sprintf("%d runs with no recorded build", count[digest]))
+			} else {
+				parts = append(parts, fmt.Sprintf("%d runs on %.12s (%s)", count[digest], digest, where[digest]))
+			}
+		}
+		kind := "PASS"
+		if len(count) > 1 || count[""] > 0 {
+			kind, ok = "FAIL", false
+		}
+		fmt.Fprintf(w, "- %s build %s: %s\n", kind, name, strings.Join(parts, ", "))
 	}
 	return ok
 }

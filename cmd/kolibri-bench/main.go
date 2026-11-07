@@ -16,8 +16,10 @@
 // from FILE. "~/" expands as in the model's path, and a relative path resolves
 // from the repository root, where the driver runs. A missing side-file stops
 // the driver before the first run, and later fails the load: nothing falls
-// back to the GGUF. The report fails unless each such run's stats name that
-// file and show one pread per expert (3 on the GGUF path).
+// back to the GGUF. A -server whose --help does not list the flag also stops the
+// driver before the first run, for every arm of such a matrix. The report fails
+// unless each such run's stats name that file and show one pread per expert (3
+// on the GGUF path), with experts loaded in both phases.
 //
 // Every run of a config, a ceiling and a repetition:
 //  1. waits until the machine is quiet: a 1-minute load below -quiet-load,
@@ -26,7 +28,8 @@
 //  2. evicts the GGUF and every side-file of the matrix from the page cache
 //     (cmd/kolibri-evict), for a cold start: reads of resident pages come from
 //     memory even with F_NOCACHE, and writing or verifying a side-file leaves
-//     it resident. A side-file that stays resident stops the benchmark;
+//     it resident. A GGUF or a side-file that stays resident stops the
+//     benchmark: an idle Metal server left on the file is enough to keep it so;
 //  3. at a ceiling above 0, wires that much memory (cmd/kolibri-memhog);
 //  4. starts llama-server and times it until /health answers;
 //  5. sends the cold request, then the warm ones (cmd/kolibri-stream -tokens
@@ -44,13 +47,16 @@
 // result. A resident run whose wired weights and hog exceed the memory, or a
 // cache run whose slots do not fit beside the hog, is recorded as "does not
 // fit" without starting it (see fits). The report goes to stdout and
-// <out>/report.md; it exits 1 if an exact equivalence fails or a cache run
-// failed to load an expert.
+// <out>/report.md; it exits 1 if an exact equivalence fails, a cache run failed
+// to load an expert, or the runs of one build came from different binaries
+// (run.json records each run's server and its sha256: see serverBuild).
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -377,6 +383,64 @@ func (m matrix) missingServers(servers map[string]string, only []string) []strin
 	return missing
 }
 
+// checkServer stops a benchmark before its first run if a matrix with a
+// side-file arm would run on a server without the flag. Such a server fails every
+// side-file run, and its GGUF runs would stay behind as a baseline from another
+// build, which a resume keeps.
+func (m matrix) checkServer(server string) error {
+	if len(m.sidefiles()) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, server, "--help").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s --help: %w: %s", server, err, out[max(0, len(out)-300):])
+	}
+	if !strings.Contains(string(out), sidefileFlag) {
+		return fmt.Errorf("%s: its --help does not list %s, so it is not a build with patch 0014 (-server)", server, sidefileFlag)
+	}
+	return nil
+}
+
+// serverBuild is the sha256 of a llama-server build: of the binary and of the
+// libraries beside it. The check is against the build, not only the binary:
+// with shared libraries (build/bin here) nearly all the code, the expert cache
+// included, is in libllama and the binary does not change when they are rebuilt.
+func serverBuild(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	entries, err := os.ReadDir(filepath.Dir(resolved))
+	if err != nil {
+		return "", err
+	}
+	files := []string{resolved}
+	for _, e := range entries {
+		// a library's other names are symlinks to the one regular file
+		lib := strings.HasSuffix(e.Name(), ".dylib") || strings.HasSuffix(e.Name(), ".so") || strings.Contains(e.Name(), ".so.")
+		if lib && e.Type().IsRegular() {
+			files = append(files, filepath.Join(filepath.Dir(resolved), e.Name()))
+		}
+	}
+	all := sha256.New()
+	for _, file := range files {
+		f, err := os.Open(file)
+		if err != nil {
+			return "", err
+		}
+		h := sha256.New()
+		_, err = io.Copy(h, f)
+		f.Close()
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(all, "%s %x\n", filepath.Base(file), h.Sum(nil))
+	}
+	return hex.EncodeToString(all.Sum(nil)), nil
+}
+
 const (
 	statusOK            = "ok"
 	statusLoadFailed    = "load failed"
@@ -403,6 +467,9 @@ type runResult struct {
 	Load1      float64   `json:"load1_at_start"`
 	SwapMiB    float64   `json:"swap_used_mib_at_start"`
 	Evict      string    `json:"evict"`
+	// the binary this run started and its build: see serverBuild
+	Server       string `json:"server,omitempty"`
+	ServerSHA256 string `json:"server_sha256,omitempty"`
 	// the side-files of the matrix, evicted like the GGUF in every run, so that
 	// no arm reads one from memory or runs beside another arm's cached pages
 	EvictSidefiles []string `json:"evict_sidefiles,omitempty"`
@@ -554,14 +621,17 @@ type bench struct {
 	cached    func(path string) (float64, error) // pageCacheMiB; tests replace it
 }
 
-// residualSidefile is the share of a side-file that may stay in the page cache
-// after its eviction. Above it the cold reads would partly come from memory.
-const residualSidefile = 0.01
+// residualEvicted is the share of a GGUF or a side-file that may stay in the page
+// cache after its eviction. Above it the cold reads would partly come from memory.
+const residualEvicted = 0.01
 
 // evict drops the run's model and every side-file of the matrix from the page
 // cache and records it. Every arm does the same, so that also the GGUF arm
 // starts without a side-file's pages in memory. An error is the driver's own:
-// a missing file, or a side-file that stayed resident, makes the benchmark invalid.
+// a missing file, or a file that stayed resident, makes the benchmark invalid.
+// kolibri-evict exits 0 whatever stays: pages another process wired or locked
+// (a stray Metal server, a --mlock) survive it, so the limit is checked here. It
+// holds for both arms: without it only the GGUF arm could read from memory.
 func (b *bench) evict(spec runSpec, res *runResult) error {
 	line := func(path string) (string, error) {
 		out, err := exec.Command(filepath.Join(b.bin, "kolibri-evict"), path).CombinedOutput()
@@ -570,8 +640,26 @@ func (b *bench) evict(spec runSpec, res *runResult) error {
 		}
 		return strings.TrimSpace(string(out)), nil
 	}
+	gone := func(what, path, evicted string) error {
+		st, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		mib, err := b.cached(path)
+		if err != nil {
+			return fmt.Errorf("%s %s: %w", what, path, err)
+		}
+		if limit := residualEvicted * float64(st.Size()) / (1 << 20); mib > limit {
+			return fmt.Errorf("%s %s: %.0f MiB stay in the page cache after eviction, above %.0f MiB: its reads would come from memory; does another process hold it, such as a stray llama-server? (%s)",
+				what, path, mib, limit, evicted)
+		}
+		return nil
+	}
 	var err error
 	if res.Evict, err = line(spec.Config.Model); err != nil {
+		return err
+	}
+	if err := gone("model", spec.Config.Model, res.Evict); err != nil {
 		return err
 	}
 	for _, path := range b.m.sidefiles() {
@@ -580,16 +668,8 @@ func (b *bench) evict(spec runSpec, res *runResult) error {
 			return err
 		}
 		res.EvictSidefiles = append(res.EvictSidefiles, l)
-		st, err := os.Stat(path)
-		if err != nil {
+		if err := gone("side-file", path, l); err != nil {
 			return err
-		}
-		mib, err := b.cached(path)
-		if err != nil {
-			return fmt.Errorf("side-file %s: %w", path, err)
-		}
-		if limit := residualSidefile * float64(st.Size()) / (1 << 20); mib > limit {
-			return fmt.Errorf("side-file %s: %.0f MiB stay in the page cache after eviction, above %.0f MiB: its reads would come from memory (%s)", path, mib, limit, l)
 		}
 	}
 	return nil
@@ -690,6 +770,12 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 	res.QuietWaitS, res.Load1, res.SwapMiB = wait.Seconds(), m.Load1, m.SwapMiB
 	res.Started = time.Now()
 
+	// per run, not per driver: a rebuild while the driver waits or between
+	// resumes must show
+	res.Server = b.servers[spec.Config.Server]
+	if res.ServerSHA256, err = serverBuild(res.Server); err != nil {
+		return res, err
+	}
 	if err := b.evict(spec, &res); err != nil {
 		return res, err
 	}
@@ -715,7 +801,7 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 		return res, err
 	}
 	defer lf.Close()
-	srv := exec.Command(b.servers[spec.Config.Server], b.m.serverArgs(spec.Config, b.port, filepath.Join(dir, "stats.json"))...)
+	srv := exec.Command(res.Server, b.m.serverArgs(spec.Config, b.port, filepath.Join(dir, "stats.json"))...)
 	srv.Stdout, srv.Stderr = lf, lf
 	t0 := time.Now()
 	if err := srv.Start(); err != nil {
@@ -922,6 +1008,9 @@ func main() {
 			log.Fatalf("%s: %v", *matrixPath, err)
 		}
 		servers[""] = abs(*server)
+		if err := m.checkServer(servers[""]); err != nil {
+			log.Fatalf("%s: %v", *matrixPath, err)
+		}
 		b := &bench{m: m, out: dir, bin: filepath.Join(dir, "bin"), servers: servers, manifest: abs(*manifest),
 			workloads: abs(*workloads), port: *port, quiet: quietRule{*quietLoad, *quietSwap, 2},
 			every: 30 * time.Second, reqTO: 30 * time.Minute, loadTO: 20 * time.Minute, cached: pageCacheMiB}

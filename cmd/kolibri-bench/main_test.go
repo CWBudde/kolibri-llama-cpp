@@ -866,15 +866,18 @@ echo "$1: 5 of 9 pages resident before, 0 after (0 MiB evicted)"
 // TestEvictSidefile: every run of every arm evicts the GGUF and the matrix's
 // side-files, records it, and stops if one is missing or stays resident: the
 // page cache serves resident pages even with F_NOCACHE, and writing or verifying
-// a side-file leaves it resident.
+// a side-file leaves it resident, as a stray Metal server does for the GGUF.
 func TestEvictSidefile(t *testing.T) {
 	dir := t.TempDir()
 	side := filepath.Join(dir, "m.experts")
-	if err := os.WriteFile(side, make([]byte, 1<<24), 0o644); err != nil { // 16 MiB
-		t.Fatal(err)
+	model := filepath.Join(dir, "m.gguf")
+	for _, path := range []string{side, model} {
+		if err := os.WriteFile(path, make([]byte, 1<<24), 0o644); err != nil { // 16 MiB
+			t.Fatal(err)
+		}
 	}
-	gguf := config{Name: "a", Model: "/m.gguf", Args: []string{"--expert-cache", "128"}}
-	arm := config{Name: "b", Model: "/m.gguf", Args: []string{"--expert-cache", "128", sidefileFlag, side}}
+	gguf := config{Name: "a", Model: model, Args: []string{"--expert-cache", "128"}}
+	arm := config{Name: "b", Model: model, Args: []string{"--expert-cache", "128", sidefileFlag, side}}
 	m := matrix{Configs: []config{gguf, arm}}
 	for _, c := range m.Configs {
 		b, logPath := fakeEvict(t, m, func(string) (float64, error) { return 0.1, nil })
@@ -886,22 +889,52 @@ func TestEvictSidefile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := "/m.gguf\n" + side + "\n"; string(got) != want {
+		if want := model + "\n" + side + "\n"; string(got) != want {
 			t.Errorf("%s evicted %q, want %q", c.Name, got, want)
 		}
-		if !strings.HasPrefix(res.Evict, "/m.gguf:") || len(res.EvictSidefiles) != 1 || !strings.HasPrefix(res.EvictSidefiles[0], side+":") {
+		if !strings.HasPrefix(res.Evict, model+":") || len(res.EvictSidefiles) != 1 || !strings.HasPrefix(res.EvictSidefiles[0], side+":") {
 			t.Errorf("%s recorded %q and %q", c.Name, res.Evict, res.EvictSidefiles)
 		}
 	}
 
-	b, _ := fakeEvict(t, m, func(string) (float64, error) { return 1, nil }) // 1 MiB of 16: 6%
+	// 1 MiB of 16 (6%) resident in one file, the other evicted: both files, both arms
+	residentIn := func(path string) func(string) (float64, error) {
+		return func(p string) (float64, error) {
+			if p == path {
+				return 1, nil
+			}
+			return 0, nil
+		}
+	}
 	var res runResult
-	if err := b.evict(runSpec{Config: arm}, &res); err == nil || !strings.Contains(err.Error(), "stay in the page cache") {
-		t.Errorf("a resident side-file: %v", err)
+	for _, tc := range []struct {
+		arm  config
+		path string
+		want string
+	}{
+		{arm, side, "side-file " + side},
+		{arm, model, "model " + model},
+		{gguf, side, "side-file " + side},
+		{gguf, model, "model " + model},
+	} {
+		b, _ := fakeEvict(t, m, residentIn(tc.path))
+		if err := b.evict(runSpec{Config: tc.arm}, &res); err == nil || !strings.Contains(err.Error(), "stay in the page cache") || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s with %s resident: %v", tc.arm.Name, tc.path, err)
+		}
+	}
+	// a matrix with no side-file is held to the same limit
+	single := matrix{Configs: []config{gguf}}
+	b, _ := fakeEvict(t, single, residentIn(model))
+	if err := b.evict(runSpec{Config: gguf}, &res); err == nil || !strings.Contains(err.Error(), "model "+model) {
+		t.Errorf("a resident GGUF, no side-file: %v", err)
+	}
+	b, _ = fakeEvict(t, single, func(string) (float64, error) { return 0, errors.New("mincore") })
+	if err := b.evict(runSpec{Config: gguf}, &res); err == nil || !strings.Contains(err.Error(), "mincore") {
+		t.Errorf("a failed measurement: %v", err)
 	}
 
 	gone := filepath.Join(dir, "fail.experts")
-	m = matrix{Configs: []config{{Name: "b", Model: "/m.gguf", Args: []string{"--expert-cache", "128", sidefileFlag, gone}}}}
+	m = matrix{Configs: []config{{Name: "b", Model: model, Args: []string{"--expert-cache", "128", sidefileFlag, gone}}}}
 	b, _ = fakeEvict(t, m, func(string) (float64, error) { return 0, nil })
 	if err := b.evict(runSpec{Config: m.Configs[0]}, &res); err == nil || !strings.Contains(err.Error(), "no such file") {
 		t.Errorf("a missing side-file: %v", err)
@@ -909,12 +942,12 @@ func TestEvictSidefile(t *testing.T) {
 
 	// without side-files only the model, as before
 	m = matrix{Configs: []config{gguf}}
-	b, logPath := fakeEvict(t, m, nil)
+	b, logPath := fakeEvict(t, m, func(string) (float64, error) { return 0, nil })
 	res = runResult{}
 	if err := b.evict(runSpec{Config: gguf}, &res); err != nil || len(res.EvictSidefiles) != 0 {
 		t.Errorf("no side-file: %v, %q", err, res.EvictSidefiles)
 	}
-	if got, _ := os.ReadFile(logPath); string(got) != "/m.gguf\n" {
+	if got, _ := os.ReadFile(logPath); string(got) != model+"\n" {
 		t.Errorf("evicted %q", got)
 	}
 }
@@ -958,6 +991,10 @@ func TestReadsCheck(t *testing.T) {
 		{"the GGUF arm on a side-file", []runResult{run("a", statsOf(t, "/m.experts", 30, 10))}, false, "a/0g/r1 read from /m.experts"},
 		{"one read per expert on the GGUF path", []runResult{run("a", statsOf(t, "", 10, 10))}, false, "took 10 preads for 10 experts"},
 		{"no stats", []runResult{run("b", nil)}, false, "wrote no stats"},
+		// E4's stats: decode hits, but neither loads nor preads
+		{"a GGUF baseline from a build without patch 0014", []runResult{run("a", statsOf(t, "", 0, 0))}, false, "a/0g/r1 loaded 0 experts in prefill and 0 in decode"},
+		{"no load in decode", []runResult{run("a", func() *cacheStats { s := statsOf(t, "", 30, 10); s.Decode.Loads, s.Decode.Preads = 0, 0; return s }())}, false, "loaded 10 experts in prefill and 0 in decode"},
+		{"no load in prefill", []runResult{run("a", func() *cacheStats { s := statsOf(t, "", 30, 10); s.Prefill.Loads, s.Prefill.Preads = 0, 0; return s }())}, false, "loaded 0 experts in prefill and 10 in decode"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var w strings.Builder
@@ -971,6 +1008,145 @@ func TestReadsCheck(t *testing.T) {
 	var w strings.Builder
 	if !readsCheck(&w, m, []runResult{run("a", nil)}) || w.Len() != 0 {
 		t.Errorf("no side-file: %q", w.String())
+	}
+}
+
+// TestBuildCheck: one build's runs carry one digest, and a comparison of two
+// builds fails the report.
+func TestBuildCheck(t *testing.T) {
+	side := matrix{Configs: []config{
+		{Name: "a", Args: []string{"--expert-cache", "128"}, Ceilings: []float64{0}, Reps: 2},
+		{Name: "b", Args: []string{"--expert-cache", "128", sidefileFlag, "/m.experts"}, Ceilings: []float64{0}, Reps: 2},
+	}}
+	named := matrix{Configs: []config{
+		{Name: "fork", Args: []string{"--expert-cache", "128"}, Ceilings: []float64{0}, Reps: 2},
+		{Name: "pr", Server: "pr25294", Args: []string{"--moe-stream-cache", "128s"}, Ceilings: []float64{0}, Reps: 2},
+	}}
+	run := func(cfg string, rep int, digest string) runResult {
+		return runResult{Config: cfg, Rep: rep, Status: statusOK, Server: "/srv/" + digest, ServerSHA256: digest}
+	}
+	for _, tc := range []struct {
+		name string
+		m    matrix
+		runs []runResult
+		ok   bool
+		want string
+	}{
+		{"one build", side, []runResult{run("a", 1, "x"), run("b", 1, "x")}, true, "PASS build the fork's -server: 2 runs on x (/srv/x)"},
+		{"a baseline from another build", side, []runResult{run("a", 1, "x"), run("b", 1, "y")}, false, "FAIL build the fork's -server: 1 runs on x (/srv/x), 1 runs on y (/srv/y)"},
+		{"a rebuild between repetitions of an arm", side, []runResult{run("b", 1, "x"), run("b", 2, "y")}, false, "FAIL build"},
+		{"a side-file matrix wants a digest", side, []runResult{run("a", 1, ""), run("b", 1, "")}, false, "FAIL build the fork's -server: 2 runs with no recorded build"},
+		{"a resume with the old driver", named, []runResult{run("fork", 1, ""), run("fork", 2, "x")}, false, "1 runs with no recorded build, 1 runs on x"},
+		{"named builds differ by design", named, []runResult{run("fork", 1, "x"), run("pr", 1, "y")}, true, "PASS build pr25294: 1 runs on y"},
+		{"a named build's own runs differ", named, []runResult{run("pr", 1, "x"), run("pr", 2, "y")}, false, "FAIL build pr25294"},
+		{"older results are not asked", named, []runResult{run("fork", 1, ""), run("pr", 1, "")}, true, ""},
+		{"a failed run is not compared", side, []runResult{run("a", 1, "x"), {Config: "b", Rep: 1, Status: statusLoadFailed, ServerSHA256: "y"}}, true, "PASS build the fork's -server: 1 runs on x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var w strings.Builder
+			if got := buildCheck(&w, tc.m, tc.runs); got != tc.ok || !strings.Contains(w.String(), tc.want) {
+				t.Errorf("buildCheck %v: %q; want %v, %q", got, w.String(), tc.ok, tc.want)
+			}
+			if tc.want == "" && w.Len() != 0 {
+				t.Errorf("wrote %q", w.String())
+			}
+		})
+	}
+	// it decides the report
+	var w strings.Builder
+	if report(&w, side, []runResult{run("a", 1, "x"), run("a", 2, "y")}) || !strings.Contains(w.String(), "FAIL build") {
+		t.Errorf("the report passed two builds: %s", w.String())
+	}
+}
+
+// TestServerBuild: the digest changes with the binary and with a library beside
+// it, where the code is, and not with the path or a library's other names.
+func TestServerBuild(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, text string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("llama-server", "server")
+	write("libllama.0.7.0.dylib", "library")
+	write("llama-completion", "another tool")
+	if err := os.Symlink("libllama.0.7.0.dylib", filepath.Join(dir, "libllama.dylib")); err != nil {
+		t.Fatal(err)
+	}
+	digest := func(path string) string {
+		t.Helper()
+		d, err := serverBuild(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	server := filepath.Join(dir, "llama-server")
+	first := digest(server)
+	if len(first) != 64 {
+		t.Errorf("digest %q", first)
+	}
+	link := filepath.Join(t.TempDir(), "srv")
+	if err := os.Symlink(server, link); err != nil {
+		t.Fatal(err)
+	}
+	if got := digest(link); got != first {
+		t.Errorf("through a symlink %s, want %s", got, first)
+	}
+	if err := os.Symlink("libllama.0.7.0.dylib", filepath.Join(dir, "libllama.0.dylib")); err != nil {
+		t.Fatal(err)
+	}
+	if got := digest(server); got != first {
+		t.Errorf("another name of a library changed the digest")
+	}
+	write("llama-completion", "another tool, rebuilt")
+	if got := digest(server); got != first {
+		t.Errorf("another tool changed the digest")
+	}
+	write("libllama.0.7.0.dylib", "library, rebuilt")
+	second := digest(server)
+	if second == first {
+		t.Errorf("a rebuilt library did not change the digest")
+	}
+	write("llama-server", "server, rebuilt")
+	if digest(server) == second {
+		t.Errorf("a rebuilt binary did not change the digest")
+	}
+	if _, err := serverBuild(filepath.Join(dir, "gone")); err == nil {
+		t.Errorf("a missing server has a digest")
+	}
+}
+
+// TestCheckServer: a matrix with a side-file arm stops before its first run on a
+// server without the flag; another matrix does not ask.
+func TestCheckServer(t *testing.T) {
+	dir := t.TempDir()
+	fake := func(name, script string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	side := matrix{Configs: []config{{Name: "b", Args: []string{"--expert-cache", "128", sidefileFlag, "/m.experts"}}}}
+	if err := side.checkServer(fake("with", `[ "$1" = --help ] && echo "--expert-cache-sidefile FNAME   read misses"`)); err != nil {
+		t.Errorf("a server with the flag: %v", err)
+	}
+	if err := side.checkServer(fake("without", `[ "$1" = --help ] && echo "--expert-cache N"`)); err == nil || !strings.Contains(err.Error(), "does not list "+sidefileFlag) {
+		t.Errorf("a server without the flag: %v", err)
+	}
+	if err := side.checkServer(fake("broken", "echo dyld: no library >&2; exit 134")); err == nil || !strings.Contains(err.Error(), "no library") {
+		t.Errorf("a server that does not start: %v", err)
+	}
+	if err := side.checkServer(filepath.Join(dir, "gone")); err == nil {
+		t.Errorf("a missing server passed")
+	}
+	plain := matrix{Configs: []config{{Name: "a", Args: []string{"--expert-cache", "128"}}}}
+	if err := plain.checkServer(filepath.Join(dir, "gone")); err != nil {
+		t.Errorf("no side-file: %v", err)
 	}
 }
 
