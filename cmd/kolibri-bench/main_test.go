@@ -604,7 +604,7 @@ func loadMatrix(t *testing.T, path string) matrix {
 // TestShippedMatrix checks that every config the equivalence checks and gates
 // name exists, at the ceilings they compare.
 func TestShippedMatrix(t *testing.T) {
-	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json", "../../testdata/bench/e4.json"} {
+	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json", "../../testdata/bench/e4.json", "../../testdata/bench/e2.json"} {
 		t.Run(filepath.Base(path), func(t *testing.T) { checkMatrix(t, loadMatrix(t, path)) })
 	}
 }
@@ -713,6 +713,52 @@ func TestE4Matrix(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("gates %q, want %q", got, want)
+	}
+}
+
+// TestE2Matrix keeps E2's two arms comparable with Stage D's and E4's cache (the
+// same workloads, model and slots), the second differing only by the GPU remap,
+// and fixes the gates as in the plan: decode by the Stage D rule at both ceilings.
+// The arms are not compared exactly: the CPU remap's splits round differently
+// from the unsplit graph the GPU remap keeps (docs/upstream.md, E0.1). Bit
+// identity to the unsplit resident run is check_expert_cache.py's.
+func TestE2Matrix(t *testing.T) {
+	d, e := loadMatrix(t, "../../testdata/bench/e4.json"), loadMatrix(t, "../../testdata/bench/e2.json")
+	if !slices.Equal(d.ServerArgs, e.ServerArgs) || d.PromptFirst != e.PromptFirst || d.NPredict != e.NPredict ||
+		d.Cold != e.Cold || !slices.Equal(d.Warm, e.Warm) {
+		t.Errorf("E2's workload settings differ from E4's")
+	}
+	base, ok := e.config("iq3-cache128")
+	if want, _ := d.config("iq3-cache128"); !ok || !slices.Equal(base.Args, want.Args) || base.Model != want.Model || base.Server != "" {
+		t.Errorf("iq3-cache128 differs from E4's: %+v against %+v", base, want)
+	}
+	arm, ok := e.config("iq3-cache128-gpuremap")
+	if !ok || !slices.Equal(arm.Args, append(slices.Clone(base.Args), "--expert-cache-gpu-remap")) || arm.Model != base.Model || arm.Server != base.Server {
+		t.Errorf("iq3-cache128-gpuremap differs by more than the option: %+v", arm)
+	}
+	if len(e.Configs) != 2 {
+		t.Errorf("%d configs, want the two arms", len(e.Configs))
+	}
+	for _, c := range []config{base, arm} {
+		if !slices.Equal(c.Ceilings, []float64{0, 16}) || c.Reps != 3 {
+			t.Errorf("%s: ceilings %v, %d reps", c.Name, c.Ceilings, c.Reps)
+		}
+	}
+	var got []string
+	for _, g := range e.Gates {
+		got = append(got, fmt.Sprintf("%s %s %g %v %s", g.Candidate, g.Metric, g.CeilingGiB, g.Decides, strings.Join(g.Baselines, "+")))
+	}
+	want := []string{
+		"iq3-cache128-gpuremap decode 0 true iq3-cache128",
+		"iq3-cache128-gpuremap decode 16 true iq3-cache128",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("gates %q, want %q", got, want)
+	}
+	for _, q := range e.Equivalence {
+		if q.Exact {
+			t.Errorf("equivalence of %s is exact: the arms' graphs fuse differently", q.Reference)
+		}
 	}
 }
 

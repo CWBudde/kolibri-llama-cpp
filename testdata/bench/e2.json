@@ -1,0 +1,18 @@
+{
+  "server_args": ["-ngl", "99", "-t", "10", "-c", "4096", "-np", "1", "--fit", "off"],
+  "prompt_first": 2048,
+  "n_predict": 128,
+  "cold": "coding",
+  "warm": ["coding", "research", "hr", "medtech"],
+  "configs": [
+    {"name": "iq3-cache128", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128"], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-cache128-gpuremap", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128", "--expert-cache-gpu-remap"], "ceilings_gib": [0, 16], "reps": 3}
+  ],
+  "equivalence": [
+    {"reference": "iq3-cache128", "arms": ["iq3-cache128-gpuremap"], "exact": false}
+  ],
+  "gates": [
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-gpuremap", "baselines": ["iq3-cache128"], "metric": "decode", "decides": true},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-gpuremap", "baselines": ["iq3-cache128"], "metric": "decode", "decides": true}
+  ]
+}
