@@ -164,6 +164,8 @@ func TestCompletionDuringGenerationWaitsForTheBoundary(t *testing.T) {
 	})
 }
 
+// blockingGen ignores its context, so this is a call that can't be aborted. TestCloseAbortsARunningGeneratorCall
+// covers one that can.
 func TestCloseDuringGenerationDiscardsTheToken(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, _ := setup(t, nil)
@@ -434,5 +436,30 @@ func TestDeadContextStartsNoJob(t *testing.T) {
 		if sc.next != 0 {
 			t.Errorf("controller asked %d times under a dead context", sc.next)
 		}
+	})
+}
+
+// ctxGen blocks until its context ends, like a decode that checks for an abort.
+type ctxGen struct{ entered chan struct{} }
+
+func (g ctxGen) Step(ctx context.Context) (string, error) {
+	close(g.entered)
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func (g ctxGen) Deliver(context.Context, ResultMessage) error { return nil }
+
+// Close aborts a running generator call. Without that this test deadlocks.
+func TestCloseAbortsARunningGeneratorCall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		g := ctxGen{entered: make(chan struct{})}
+		r := open(t, s, "r", g)
+		token := make(chan Observation, 1)
+		go func() { token <- r.Apply(context.Background(), Continue{}) }()
+		<-g.entered
+		r.Close()
+		wantErr(t, (<-token).Err, ErrRequestClosed)
 	})
 }
