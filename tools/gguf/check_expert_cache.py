@@ -47,7 +47,7 @@ it cannot work fails to load: on the CPU, with some layers off Metal, with prefe
 cache, where it would otherwise load fully resident. What it cannot run stops with its own diagnosis,
 in a child process, since both abort: a cb_eval that stops between a layer's matmuls, and
 llama_set_warmup, whose router ids are wider than the gate's slot ids. A cb_eval that stops outside
-the matmuls still runs, and a decode the abort callback ended leaves no gate state behind.
+the matmuls still runs, and a decode the abort callback ended does not stop the next one.
 
 Waves (--expert-cache-waves): only on fork branch feat/kolibri1-waves, not in the patch series
 (patch 0013 is retired, docs/expert-streaming.md, "Stage E4"). Against a checkout without them the
@@ -125,13 +125,22 @@ if what == "warmup":
     r.lib.llama_set_warmup(ctx, True)
     print("decoded", r.lib.llama_decode(ctx, batch))
 elif what == "abort":
+    # end one decode at each of the callback's calls in turn, until a decode gets through. Only the
+    # CPU backend hears it through llama_set_abort_callback, so these end before their ubatch's gates
+    calls, stop_at, rc = [0], [0], 2
+
     @r.ffi.callback("bool(void *)")
     def stop(user_data):
-        return True
+        calls[0] += 1
+        return calls[0] == stop_at[0]
+
     r.lib.llama_set_abort_callback(ctx, stop, r.ffi.NULL)
-    first = r.lib.llama_decode(ctx, batch)
-    r.lib.llama_set_abort_callback(ctx, r.ffi.NULL, r.ffi.NULL)
-    print("decoded", first, r.lib.llama_decode(ctx, batch))
+    while rc == 2 and stop_at[0] < 20000:
+        calls[0] = 0
+        stop_at[0] += 1
+        r.lib.llama_memory_clear(r.lib.llama_get_memory(ctx), True)  # the ubatches before the end stay
+        rc = r.lib.llama_decode(ctx, batch)
+    print("aborted", stop_at[0] - 1, "then decoded", rc)
 r.lib.llama_batch_free(batch)
 r.lib.llama_free(ctx)
 r.lib.llama_model_free(model)
@@ -390,9 +399,9 @@ def main() -> None:
             report(run.returncode != 0 and "wider than the expert gate's slot ids" in run.stderr,
                    f"{label} {dev_name}, {n_slots} slots: llama_set_warmup's wider ids exit {run.returncode} and say why")
         run = child("abort", 64)
-        report(run.returncode == 0 and run.stdout.strip().endswith("decoded 2 0"),
-               f"{label} {dev_name}: a decode the abort callback ended leaves the next one free to run: "
-               f"{run.stdout.strip().splitlines()[-1:] if run.stdout.strip() else ''}, want decoded 2 0, rc {run.returncode}")
+        tail = run.stdout.strip().splitlines()[-1] if run.stdout.strip() else ""
+        report(run.returncode == 0 and tail.startswith("aborted ") and tail.endswith(" then decoded 0") and tail != "aborted 0 then decoded 0",
+               f"{label} {dev_name}: decodes the abort callback ended, one at each of its calls, leave the next one free to run: {tail!r}, rc {run.returncode}")
 
     def check_gpu_remap_hits(gguf: Path, dev_name: str, dev, tokens: list[int], k: int, stats: Path, label: str, n_slots: int = 384) -> None:
         """What a layer that hits costs (control M61): the same one-token decodes again after clearing
