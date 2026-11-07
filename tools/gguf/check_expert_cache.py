@@ -517,7 +517,7 @@ def main() -> None:
             stats.unlink(missing_ok=True)
             run = subprocess.run([str(bin_dir / "llama-completion"), "-m", str(odd), "-p", prompt, "-n", "4", "-no-cnv",
                                   "-c", "256", "--no-warmup", "--expert-cache", "16", "--expert-cache-stats", str(stats)],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True, errors="replace")  # no --temp 0: the tokens may not be UTF-8
             try:
                 named = json.loads(stats.read_text())["expert_cache"]["file"]
             except (OSError, ValueError) as e:
@@ -535,9 +535,12 @@ def main() -> None:
                 gone = subprocess.run(base + ["--expert-cache", "16", "--expert-cache-sidefile", str(sf) + ".gone"], capture_output=True, text=True)
                 report(gone.returncode != 0 and gone.stdout.strip() == "" and "no fallback" in gone.stderr,
                        f"llama-completion with a missing side-file exits {gone.returncode} without generating, no fallback to the GGUF")
-                alone = subprocess.run(base + ["--expert-cache-sidefile", str(sf)], capture_output=True, text=True)
-                report(alone.returncode != 0 and alone.stdout.strip() == "" and "without the cache" in alone.stderr,
-                       f"llama-completion with a side-file and no --expert-cache exits {alone.returncode} without generating")
+                # refused before any tensor is created: on the real model the load would wire the weights first
+                alone = subprocess.run(base + ["--expert-cache-sidefile", str(sf), "-v"], capture_output=True, text=True, errors="replace")
+                loading = subprocess.run(base + ["-n", "1", "-v"], capture_output=True, text=True, errors="replace")
+                report(alone.returncode != 0 and alone.stdout.strip() == "" and "without the cache" in alone.stderr
+                       and "load_tensors:" not in alone.stderr and "load_tensors:" in loading.stderr,
+                       f"llama-completion with a side-file and no --expert-cache exits {alone.returncode} without generating or loading a tensor")
             report(ok and plain.stdout == cached.stdout and plain.stdout.strip() != "",
                    f"llama-completion --expert-cache-layers/--expert-prefetch/--expert-cache-buffered/--expert-cache-stats: as asked, same text as without the cache "
                    f"({plain.stdout.strip()[:60]!r})" + ("" if ok else f" rc {plain.returncode}/{cached.returncode}: {cached.stderr.strip()[-300:]}"))

@@ -75,7 +75,7 @@ index 03b4efa10..bf6d6c35f 100644
      llama-grammar.cpp
      llama-graph.cpp
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 12eca257f..241950282 100644
+index 12eca257f..472591129 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -105,14 +105,14 @@ std::string counts_json(const llama_expert_cache_counts & c, const std::string &
@@ -138,6 +138,15 @@ index 12eca257f..241950282 100644
  }
  
  uint32_t llama_expert_cache::max_ubatch() const {
+@@ -417,7 +428,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+         int l = -1;
+         int e = -1;
+         if (slots->failure(l, e)) {
+-            GGML_ABORT("expert cache: reading expert %d of layer %d from %s failed", e, l, path.c_str());
++            GGML_ABORT("expert cache: reading expert %d of layer %d from %s failed", e, l, sidefile ? sidefile_path.c_str() : path.c_str());
+         }
+         GGML_ABORT("expert cache: layer %d needs more distinct experts in one ubatch of %d tokens than its %d slots",
+             il, n_tokens, n_slots[il]);
 @@ -434,34 +445,16 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
      op_seconds[decode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
  }
@@ -784,20 +793,21 @@ index 11e12b66a..813e33a21 100644
      llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load);
      ~llama_expert_slots();
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 746dd66cb..26365cd48 100644
+index 746dd66cb..3952741b4 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2075,6 +2075,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
-     }
+@@ -1598,6 +1598,10 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+ }
  
-     load_tensors_hadamard();
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 +    if (!expert_cache_requested() && params.expert_cache && params.expert_cache->sidefile_path && *params.expert_cache->sidefile_path) {
 +        throw std::runtime_error(format("expert cache: side-file %s given without the cache (--expert-cache)", params.expert_cache->sidefile_path));
 +    }
-     if (expert_cache_requested()) {
-         const int n_layer = (int) hparams.n_layer();
-         expert_cache = std::make_unique<llama_expert_cache>(*params.expert_cache, n_layer, (int) hparams.n_expert, (int) hparams.n_expert_used_max());
-@@ -3457,6 +3460,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
++
+     const auto & split_mode   = params.split_mode;
+     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+     const auto & tensor_split = params.tensor_split;
+@@ -3457,6 +3461,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
          /*.prefetch_mix       =*/ 0.75f,
          /*.stats_path         =*/ nullptr,
          /*.buffered           =*/ false,
