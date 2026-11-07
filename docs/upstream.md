@@ -372,7 +372,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0010 continuation tests | no | tests on top of 0008 |
 | 0011, 0012 expert cache | no | the fork's own work, rebased (below) |
 | 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
-| 0015 expert cache GPU remap | no | the fork's own work, on branch `feat/kolibri1-gpu-remap`, not on `feat/kolibri1`, and in `patches/llama.cpp/pending/`, outside the series: Stage E2's benchmark has not run ([expert-streaming.md](expert-streaming.md#stage-e2-gpu-remap)); its place and its order after 0014 are decided after the benchmark and #72's merge |
+| 0015 expert cache GPU remap | no | retired 2026-11-07, the fork's own work: Stage E2's gate failed at 16 GiB and passed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e2-gpu-remap)) |
 
 ### Controls
 
@@ -395,6 +395,15 @@ applied to a clean `184f6536` gives exactly the fork's tree (`7ade40f0`).
 reached `feat/kolibri1`. The next patch is 0014. The series 0008, 0010, 0011
 and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
 (`7ade40f0`, `git diff --quiet` rc 0).
+
+**Patch 0015 is retired (Phase 11, Stage E2, 2026-11-07).** Its deciding gate
+failed at 16 GiB and passed at 0 GiB, so the number is kept and the code stays
+on fork branch `feat/kolibri1-gpu-remap` (`0bb0f5444`, fork PR #16, draft, open
+and not merged). It never reached `feat/kolibri1` or the series' glob. The next
+patch is 0016. At this date `main` does not have PR #72: its 0008, 0010, 0011
+and 0012 applied to a clean `184f6536` give `7ade40f0`, while `feat/kolibri1`
+has moved to `e4937d7a`, because `634e34bb4` added the refusal of a LoRA on the
+cache's experts. PR #72's series without 0014 gives `e4937d7a`.
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's
@@ -443,11 +452,12 @@ the CPU they still are.
   after each `ffn_moe_topk` (`Runner.logits(split_after=...)`) and reports the
   difference to the unsplit run as info. The CPU still compares against the
   plain resident run.
-- E2 removes the CPU split, behind `--expert-cache-gpu-remap`, and then requires
-  bit identity to the unsplit run (`check_expert_cache.py`, tiny, so far), and
-  the same token IDs as `iq3-resident-ub21` on the real workload (exact in
-  `testdata/bench/e2.json`; not run yet). Without the option, `kolibri-bench`'s
-  exact equivalence of
+- E2 removes the CPU split, behind `--expert-cache-gpu-remap`, on fork branch
+  `feat/kolibri1-gpu-remap` only (its decode gate failed at 16 GiB). There it
+  requires bit identity to the unsplit run (`check_expert_cache.py`, tiny and
+  real IQ3, "PASS: 0 failures") and the same token IDs as `iq3-resident-ub21`
+  on the real workload (exact in `testdata/bench/e2.json`: 30 of 30 requests).
+  Without the option, `kolibri-bench`'s exact equivalence of
   `iq3-cache128` against `iq3-resident-ub21` compares differently fused
   graphs on master.
 

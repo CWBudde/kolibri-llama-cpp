@@ -33,8 +33,8 @@ the CPU its weights are not repacked (the slots are not either).
   --expert-cache-stats without the cache writes the decode timing alone; with a quote, a backslash and a tab in the
   model's file name the stats are still valid JSON and name the file.
 
-GPU remap (--expert-cache-gpu-remap): only on fork branch feat/kolibri1-gpu-remap, not yet in the patch
-series, so without it these checks are skipped with a note, and --gpu-remap-only is an error. The
+GPU remap (--expert-cache-gpu-remap): only on fork branch feat/kolibri1-gpu-remap, not in the patch
+series (Stage E2's gate failed at 16 GiB), so without it these checks are skipped with a note, and --gpu-remap-only is an error. The
 router's ids become slots on the GPU, with no CPU split: the logits must be bit-identical to the
 UNSPLIT resident run on Metal (Stage E2's requirement; a same-split reference would not do), and
 the counters equal the CPU remap's, since a gate defers but never changes what the remaps do. With
