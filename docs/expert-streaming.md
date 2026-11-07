@@ -852,7 +852,7 @@ A server without the option exits with "error: invalid argument: --expert-cache-
 
 ## Stage E2 and E3 together
 
-The side-file and the GPU remap in one build, on the IQ3 weight with 128 slots. The owner asked for this run after Stage E2. It is not one of PLAN's stages, and its gate was chosen for this run. **Both deciding gates passed, on decode and on p95. The build is on a fork branch only. This result does not change E2's recorded failure and does not put the GPU remap in the patch series; those are the owner's decisions.**
+The side-file and the GPU remap in one build, on the IQ3 weight with 128 slots. The owner asked for this run after Stage E2. It is not one of PLAN's stages, and its gate was chosen for this run. **Both deciding gates passed, on decode and on p95. The build is on a fork branch only. This result does not change E2's recorded failure and does not put the GPU remap in the patch series. A second matrix against prefetch, in "Against prefetch" below, did not pass at 16 GiB, on one disturbed repetition, so the series stays as it is.**
 
 - **The rule.** Stage D's, in `evalGate`, against whichever of `iq3-cache128-sidefile` and `iq3-cache128-gpuremap` has the better median decode at that ceiling. The gates in `testdata/bench/e2e3.json` were committed in `5e44bf4` (15:25:26), before the first timed run (15:27:21), and they were not moved. That commit recorded in advance that a pass would not put E2 in the series and that a failure would not retire the branch.
 - **Decode:** 24.63 t/s at 0 GiB against 20.49 for the side-file alone, and 24.05 at 16 GiB against 20.23 for the GPU remap alone (medians). Those are 20.2% and 18.9% above the selected baseline, and 38.9% and 40.5% above the plain cache.
@@ -910,7 +910,7 @@ Decode in ms per token, the medians over the whole run:
 
 ### How far this goes
 
-- **No prefetch arm.** The GPU remap refuses `--expert-prefetch`, so this matrix has none, and E2's failed gate was against `iq3-cache128-prefetch12`. This run does not repeat that gate. Across sessions, which no gate allows, that arm's 16 GiB decode was 18.54 (18.47–19.00) t/s in E2. The side-file with prefetch has never been measured.
+- **No prefetch arm.** The GPU remap refuses `--expert-prefetch`, so this matrix has none, and E2's failed gate was against `iq3-cache128-prefetch12`. This run does not repeat that gate. Across sessions, which no gate allows, that arm's 16 GiB decode was 18.54 (18.47–19.00) t/s in E2. "Against prefetch" below measures it on this build.
 - **The GPU remap passes against the plain cache at both ceilings here** (INFO, not deciding). Its recorded E2 failure stands.
 - **The arms do not generate the same tokens.** The stack and the GPU remap match resident, and the side-file and plain cache match each other, but the two groups differ in 4 of the 5 requests. The CPU remap's rounding differs from the unsplit graph (E0.1). The GPU remap path also has more misses, 30.14 against 27.11 per token, so by miss count the difference does not favor the stack.
 - **The p95 margins are small:** 1.9 ms at 0 GiB against the side-file, and 3.7 ms at 16 GiB against the GPU remap (1.7 ms against the side-file). The decode margins are wider.
@@ -918,6 +918,66 @@ Decode in ms per token, the medians over the whole run:
 - **One machine, one session, a busy background.** Runs started with a load average of 1.44 to 2.99 and 2.5 to 3.4 GiB of swap. Others' CPU averaged 53 to 124% per run and peaked at 106 to 558%, above 400% in four runs of repetition 2: `iq3-cache128/16g` (473), `iq3-cache128-gpuremap/0g` (558), `iq3-cache128-sidefile/0g` (418) and the stack's `0g` (553). Two of them set a gate value at 0 GiB: the side-file arm's fastest decode and the stack's highest p95. Dropping those runs would only widen the margins.
 - **Validity.** One digest for all 25 runs, `24bd5385848a`, over the server and its libraries; the tree restored after the controls gives the same digest. 0 pages resident after every eviction, all on the home volume. No sleep or wake events between 15:27 and 17:10, on AC power. The display stayed on throughout, as powerd's assertions show. The driver's build has revision `5e44bf4` with `vcs.modified=false`.
 - **Controls, each on the merged code, then reverted:** M96 (the stack reads the GGUF, 16 FAIL lines), M97 (a wrong expert from the side-file, 56), M98 (the merge drops the remap when a side-file is set, 92). All exit 1. The check's failure message first crashed on M98; that is fixed, and M98 was run again.
+
+### Against prefetch
+
+The first matrix left prefetch out, because the GPU remap refuses `--expert-prefetch`, so this second one adds it. **The stack passed at 0 GiB and did not pass at 16 GiB, so the rule keeps the GPU remap out of the patch series. One repetition decides that result, and the machine was busy during it.**
+
+- **The rule.** `testdata/bench/e2e3-prefetch.json` was committed in `e81fef7` (18:00:01), before the first timed run (18:00:11), and it was not moved. The GPU remap goes on towards a patch only if the stack passes both deciding gates, at 0 and 16 GiB, against the better of `iq3-cache128-prefetch12` and `iq3-cache128-sidefile-prefetch12`. The rule itself is Stage D's, in `evalGate`.
+- **0 GiB, against the side-file with prefetch: passed.** Slowest 23.17 against fastest 22.03 t/s (+5.2%), and highest p95 65.6 against lowest 67.9 ms.
+- **16 GiB, against the side-file with prefetch: not passed.** Slowest 7.13 against fastest 19.87 t/s (−64.1%), and highest p95 226.9 against lowest 68.4 ms.
+- **The repetition that decides it is `sidefile-gpuremap/16g/r3`.** The stack's other two repetitions at 16 GiB are 23.63 and 23.65 t/s, with p95 66.0 and 63.9 ms. Without r3 the stack would win this gate by +18.9% and 2.4 ms. The rule has no exclusions, so the result stands as not passed.
+- **Side-file with prefetch, measured for the first time, against prefetch (INFO, not deciding):** at 16 GiB it wins on decode and p95. At 0 GiB it wins on p95 only, since its slowest repetition (17.83 t/s) is below prefetch's fastest (18.18).
+
+#### Results
+
+`~/models/eval/expert-bench-e2e3-prefetch/report.md`, finished at 20:17 on 2026-11-07. All 19 runs have status ok, with 0 restarts and 0 expert load failures in the 18 cache runs. Each value is the median over 3 repetitions, with the range in brackets; `iq3-resident-ub21` has one run.
+
+| Arm | Ceiling | Warm decode t/s | Warm p95 ms | Warm prompt t/s | Cold TTFT s |
+|---|--:|--:|--:|--:|--:|
+| prefetch | 0 GiB | 16.83 (16.58–18.18) | 84.2 (79.9–86.7) | 83.4 (70.5–86.3) | 34.26 (33.51–35.01) |
+| prefetch | 16 GiB | 17.42 (16.66–17.52) | 82.6 (81.3–84.3) | 84.1 (77.0–85.6) | 35.12 (33.60–38.38) |
+| side-file with prefetch | 0 GiB | 20.16 (17.83–22.03) | 70.9 (67.9–71.0) | 105.0 (101.6–106.2) | 28.63 (27.07–29.43) |
+| side-file with prefetch | 16 GiB | 18.23 (18.16–19.87) | 73.8 (68.4–75.3) | 102.7 (102.6–104.7) | 28.50 (27.05–28.92) |
+| **both** | **0 GiB** | **23.36 (23.17–24.53)** | **65.0 (64.5–65.6)** | 101.9 (100.5–104.9) | 27.59 (27.29–28.85) |
+| **both** | **16 GiB** | **23.63 (7.13–23.65)** | **66.0 (63.9–226.9)** | 102.0 (39.8–105.2) | 28.30 (27.85–32.97) |
+| resident, ubatch 21 | 0 GiB | 59.48 | 17.3 | 197.9 | 10.32 |
+
+The gates compare the stack's worst repetition with the baseline's best:
+
+| Ceiling | Baseline | Decode margin | p95 margin | Selected by the rule |
+|---|---|--:|--:|---|
+| 0 GiB | side-file with prefetch | +1.14 t/s (+5.2%) | 2.3 ms | yes |
+| 0 GiB | prefetch | +4.99 t/s (+27.4%) | 14.3 ms | no |
+| 16 GiB | side-file with prefetch | −12.74 t/s (−64.1%) | −158.5 ms | yes |
+| 16 GiB | prefetch | −10.39 t/s (−59.3%) | −145.6 ms | no |
+
+A separate script recomputed the gates from each `run.json` and gives the same result.
+
+Decode in ms per token, the medians over the whole run:
+
+| Arm | Ceiling | Decode | Wait | Remap | Other | Splits | Commits |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| prefetch | 0 GiB | 59.49 | 14.56 | 1.031 | 43.95 | 102 | 103 |
+| prefetch | 16 GiB | 59.62 | 14.67 | 1.034 | 42.42 | 102 | 103 |
+| side-file with prefetch | 0 GiB | 53.51 | 9.05 | 1.016 | 42.95 | 102 | 103 |
+| side-file with prefetch | 16 GiB | 54.29 | 9.08 | 0.992 | 44.20 | 102 | 103 |
+| both | 0 GiB | 42.43 | 9.33 | 0.172 | 32.92 | 2 | 34 |
+| both | 16 GiB | 43.43 (43.09–128.59) | 9.34 (9.28–30.36) | 0.173 | 33.98 (33.58–96.75) | 2 | 34 |
+| resident, ubatch 21 | 0 GiB | 16.68 | 0 | 0 | 16.68 | 2 | 3 |
+
+#### How far this goes
+
+- **The disturbed repetition.** `sidefile-gpuremap/16g/r3` started at 18:57:10 and ended at 19:02:51, with others' CPU at 883% mean and 1150% max, against 58 to 89% mean in all 14 runs before it. Its page-ins per request were 30,245 to 676,464, against 441 to 493 in r1 and 453 to 639 in r2. The run's status is ok, and its tokens match resident.
+- **What the record shows about the cause.** `ps` puts the start of Docker Desktop's VM process at 18:57:37, 27 s into the run. Others' CPU is recorded only as a total, so no record ties the load to that process, and none says who started it. The quiet gate holds at the start of a run only, and it passed here at load 1.31.
+- **The disturbance outlasted that run.** The next two runs waited 691 s and 2792 s for a quiet machine, and `prefetch12/0g/r3` has others' CPU 183/1078. Swap rose from 2.5 GiB in the first 15 runs to 4.7 to 6.5 GiB in the last four, all of them prefetch arms. That difference is not balanced across arms. One of those four, `sidefile-prefetch12/16g/r3`, sets both of the selected baseline's values at 16 GiB, and it is that arm's fastest repetition.
+- **The 0 GiB pass is narrow:** +5.2% and 2.3 ms against the side-file with prefetch. That arm's range at 0 GiB is wide, 17.83 to 22.03 t/s, and its fastest repetition, r2, was clean (others 64/156).
+- **Prefill does not improve.** The stack's warm prompt and cold time to first token overlap the side-file with prefetch at both ceilings (INFO, not deciding).
+- **Prefetch adds little on top of the side-file.** Across sessions, which no gate allows, the side-file alone had 20.49 and 19.86 t/s, against 20.16 and 18.23 with prefetch here. The wait is the same, about 9 ms/token.
+- **A fixed order, again.** The stack ran first in each repetition here and last of the cache arms before. Across sessions, which no gate allows, it had 24.63 and 24.05 t/s last and has 23.36 and 23.63 first.
+- **The arms do not generate the same tokens.** The stack matches resident in 30 of 30 requests, and the side-file with prefetch matches prefetch in 30 of 30, but the two groups differ in 4 of the 5 requests. Hit rates are 90.0% for the stack and 91.0% for the prefetch arms.
+- **Far from resident:** 23.36 against 59.48 t/s at 0 GiB.
+- **Validity.** One digest for all 19 runs, `24bd5385848a`. 0 pages resident after every eviction, side-files included, all on the home volume. One `pread` per expert in the side-file arms and three in `iq3-cache128-prefetch12`. No sleep or wake events from 18:00 to 20:17, on AC power. `pmset` has user-activity assertions from 18:08 to 20:16. The driver's build has revision `e81fef7` with `vcs.modified=false`.
 
 ### The build
 
@@ -927,8 +987,7 @@ Fork branch `feat/kolibri1-e2-e3`, commit `b001e946f`, merges `feat/kolibri1` (`
 
 These are the owner's. None is planned, and merging this write-up decides none of them.
 
-- Whether the GPU remap enters the patch series on top of this result, as a new patch (0015 stays retired; the next number is 0016), and which fork PR carries it.
-- Whether a side-file with prefetch is worth measuring, since it is the one baseline this matrix leaves out.
+- Whether to repeat the 16 GiB comparison, since one disturbed repetition decides it. A repeat needs its own matrix, registered before it runs. Only then could the GPU remap go on towards a new patch (0015 stays retired; the next number is 0016) and a fork PR.
 - Whether E6 starts, against the facts above.
 - Whether to try the spinning waiter that [expert-decode-gap.md](expert-decode-gap.md) measured, now on this build. It has not been run here.
 
