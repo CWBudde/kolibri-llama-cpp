@@ -852,7 +852,7 @@ A server without the option exits with "error: invalid argument: --expert-cache-
 
 ## Stage E2 and E3 together
 
-The side-file and the GPU remap in one build, on the IQ3 weight with 128 slots. The owner asked for this run after Stage E2. It is not one of PLAN's stages, and its gate was chosen for this run. **Both deciding gates passed, on decode and on p95. The build is on a fork branch only. This result does not change E2's recorded failure and does not put the GPU remap in the patch series. A second matrix against prefetch, in "Against prefetch" below, did not pass at 16 GiB, on one disturbed repetition, so the series stays as it is.**
+The side-file and the GPU remap in one build, on the IQ3 weight with 128 slots. The owner asked for this run after Stage E2. It is not one of PLAN's stages, and its gate was chosen for this run. **Both deciding gates passed, on decode and on p95. The build is on a fork branch only. This result does not change E2's recorded failure and does not put the GPU remap in the patch series. A second matrix against prefetch, in "Against prefetch" below, passed at 0 GiB and did not pass at 16 GiB, where one disturbed repetition decided the result. One registered repeat at 16 GiB passed on decode. That meets the rule, so the GPU remap goes on towards patch 0016.**
 
 - **The rule.** Stage D's, in `evalGate`, against whichever of `iq3-cache128-sidefile` and `iq3-cache128-gpuremap` has the better median decode at that ceiling. The gates in `testdata/bench/e2e3.json` were committed in `5e44bf4` (15:25:26), before the first timed run (15:27:21), and they were not moved. That commit recorded in advance that a pass would not put E2 in the series and that a failure would not retire the branch.
 - **Decode:** 24.63 t/s at 0 GiB against 20.49 for the side-file alone, and 24.05 at 16 GiB against 20.23 for the GPU remap alone (medians). Those are 20.2% and 18.9% above the selected baseline, and 38.9% and 40.5% above the plain cache.
@@ -921,7 +921,7 @@ Decode in ms per token, the medians over the whole run:
 
 ### Against prefetch
 
-The first matrix left prefetch out, because the GPU remap refuses `--expert-prefetch`, so this second one adds it. **The stack passed at 0 GiB and did not pass at 16 GiB, so the rule keeps the GPU remap out of the patch series. One repetition decides that result, and the machine was busy during it.**
+The first matrix left prefetch out, because the GPU remap refuses `--expert-prefetch`, so this second one adds it. **The stack passed at 0 GiB and did not pass at 16 GiB. One repetition decided that result, and the machine was busy during it. The registered repeat below passed at 16 GiB.**
 
 - **The rule.** `testdata/bench/e2e3-prefetch.json` was committed in `e81fef7` (18:00:01), before the first timed run (18:00:11), and it was not moved. The GPU remap goes on towards a patch only if the stack passes both deciding gates, at 0 and 16 GiB, against the better of `iq3-cache128-prefetch12` and `iq3-cache128-sidefile-prefetch12`. The rule itself is Stage D's, in `evalGate`.
 - **0 GiB, against the side-file with prefetch: passed.** Slowest 23.17 against fastest 22.03 t/s (+5.2%), and highest p95 65.6 against lowest 67.9 ms.
@@ -979,6 +979,30 @@ Decode in ms per token, the medians over the whole run:
 - **Far from resident:** 23.36 against 59.48 t/s at 0 GiB.
 - **Validity.** One digest for all 19 runs, `24bd5385848a`. 0 pages resident after every eviction, side-files included, all on the home volume. One `pread` per expert in the side-file arms and three in `iq3-cache128-prefetch12`. No sleep or wake events from 18:00 to 20:17, on AC power. `pmset` has user-activity assertions from 18:08 to 20:16. The driver's build has revision `e81fef7` with `vcs.modified=false`.
 
+### The repeat at 16 GiB
+
+One disturbed repetition decided the 16 GiB result above, so the owner asked for one repeat of that comparison. **The stack passed it on decode. With the 0 GiB pass above, the rule from `e81fef7` is met, and the GPU remap goes on towards patch 0016. The failed 16 GiB result above stays recorded, next to this one.**
+
+- **The rule.** `testdata/bench/e2e3-prefetch-16g.json` has the three cache arms at 16 GiB, with 3 repetitions each, on the same build and in the same order. It was committed in `983f1b0` (00:10:27 on 2026-11-08), before the first timed run (00:10:39), and it was not moved. That commit also fixed three things: the 0 GiB pass above counts with this result, this is the only repeat, and a failure would keep the series as it is.
+- **Decode: won.** The stack's slowest repetition is 23.79 t/s, against 21.76 for the side-file with prefetch's fastest (+2.03 t/s, +9.3%).
+- **p95: no win.** The stack's highest is 68.4 ms, against that arm's lowest of 65.2 ms. Stage D's rule needs one win, so the gate passes.
+- **Against prefetch alone** (not selected): +6.35 t/s (+36.4%) on decode, and 17.0 ms under on p95.
+- **Lossless: holds.** The stack's 15 requests match the token IDs of `e2e3-prefetch`'s `iq3-resident-ub21` run on the same build. A script checked this, because the matrix has no resident arm. The side-file with prefetch matches prefetch in 15 of 15 requests.
+
+| Arm | Warm decode t/s | Warm p95 ms | Warm prompt t/s | Cold TTFT s | Decode ms/token | Wait | Other |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| prefetch | 16.98 (16.64–17.44) | 85.7 (85.4–89.0) | 76.0 (74.1–78.2) | 35.72 (35.66–39.90) | 59.54 | 16.18 | 42.31 |
+| side-file with prefetch | 18.90 (17.76–21.76) | 71.9 (65.2–73.7) | 102.1 (100.7–103.2) | 28.93 (28.83–28.96) | 52.09 | 9.16 | 41.94 |
+| **both** | **23.94 (23.79–24.67)** | 64.0 (62.8–68.4) | 102.2 (100.0–102.2) | 28.12 (28.11–28.83) | 42.18 | 9.47 | 32.61 |
+
+`~/models/eval/expert-bench-e2e3-prefetch-16g/report.md`, finished at 00:48 on 2026-11-08. All 9 runs have status ok, with 0 restarts and 0 expert load failures. Splits are 2 per token for the stack and 102 for the others. A separate script recomputed the gate from each `run.json` and gives the same result.
+
+- **The margin rests on one repetition of the baseline.** The side-file with prefetch again spans a wide range, 17.76 to 21.76 t/s (17.83 to 22.03 in the first matrix). Its fastest repetition, r1, sets the gate value, with others' CPU at 124% mean and 479% max.
+- **A busier background than the first 15 runs above, but the same for every arm.** Docker Desktop's VM stayed up with ten idle containers from the owner's other projects, and the commit recorded that before the run. Swap was 5.8 to 6.9 GiB at the start of each run. Others' CPU averaged 70 to 138% per run, with peaks of 128 to 479%. No run is like `sidefile-gpuremap/16g/r3` above.
+- **Prefill does not improve.** The stack's warm prompt overlaps the side-file with prefetch. Its cold time to first token ranges from 28.11 to 28.83 s, against 28.83 to 28.96 s. The ranges touch at 28.83, so that INFO gate is not passed. `prefetch12/r3`'s cold request had 252,041 page-ins, which sets that arm's slowest cold TTFT (INFO only).
+- **The two 16 GiB matrices together.** The stack's five undisturbed repetitions span 23.63 to 24.67 t/s, and the side-file with prefetch spans 17.76 to 21.76 over six repetitions. No gate combines the two matrices.
+- **Validity.** One digest for all 9 runs, `24bd5385848a`, the same as above. 0 pages resident after every eviction, side-files included, all on the home volume. The reads are as designed: one `pread` per expert in the side-file arms and three in prefetch. No sleep or wake events, on AC power. The driver's build has revision `983f1b0` with `vcs.modified=false`.
+
 ### The build
 
 Fork branch `feat/kolibri1-e2-e3`, commit `b001e946f`, merges `feat/kolibri1` (`c0b2de9be`, the series) and `feat/kolibri1-gpu-remap` (`abc6835f1`). It has no fork PR, and `feat/kolibri1` and the patch series are unchanged. The conflicts Known limits lists were all side-by-side additions: the two options, their fields and their stats keys. The features meet only in `load()`, where a side-file read replaces the three-part read of the GGUF. `check_expert_cache.py --stack-only` holds the stack to the unsplit resident run's logits and to the GPU remap's counters on the GGUF path.
@@ -987,7 +1011,7 @@ Fork branch `feat/kolibri1-e2-e3`, commit `b001e946f`, merges `feat/kolibri1` (`
 
 These are the owner's. None is planned, and merging this write-up decides none of them.
 
-- Whether to repeat the 16 GiB comparison, since one disturbed repetition decides it. A repeat needs its own matrix, registered before it runs. Only then could the GPU remap go on towards a new patch (0015 stays retired; the next number is 0016) and a fork PR.
+- Whether to merge patch 0016, the GPU remap on top of the side-file, through fork PR #16 into `feat/kolibri1` (0015 stays retired). The rule's result sends it there, and merging it is the owner's call.
 - Whether E6 starts, against the facts above.
 - Whether to try the spinning waiter that [expert-decode-gap.md](expert-decode-gap.md) measured, now on this build. It has not been run here.
 
