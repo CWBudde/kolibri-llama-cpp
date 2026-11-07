@@ -93,7 +93,7 @@ func DefaultLimits() Limits {
 	return Limits{
 		MaxArgBytes:    256 << 10,
 		MaxDepth:       8,
-		MaxIntBits:     4096, // 1234 decimal digits
+		MaxIntBits:     4096, // every number of 1233 decimal digits fits
 		MaxArrayLen:    4096,
 		MaxResultBytes: 1 << 20,
 	}

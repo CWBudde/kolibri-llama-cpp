@@ -505,16 +505,30 @@ func TestCancelACallThatIsDone(t *testing.T) {
 func TestNoTurnWhileAnOperationRuns(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	op := ops.DefineForTest("slow_op", func(context.Context, json.RawMessage) (json.RawMessage, *ops.Error) {
+	op := ops.DefineForTest("slow_op", func(ctx context.Context, _ json.RawMessage) (json.RawMessage, *ops.Error) {
 		started <- struct{}{}
-		<-release
-		return json.RawMessage(`{"value":"done"}`), nil
+		select {
+		case <-release:
+			return json.RawMessage(`{"value":"done"}`), nil
+		case <-ctx.Done():
+			return nil, ops.Failure(ops.CodeCancelled, "stopped")
+		}
 	})
 	f := newFake(t, fakeTurn{calls: []fakeCall{{"slow_op", `{}`}}}, fakeTurn{content: "done"})
 	b := newBridge(t, f, func(c *Config) { c.Ops = []ops.Op{op} })
 	results := make(chan *Result, 1)
-	go func() { results <- runBody(t, b, userBody) }()
-	<-started
+	go func() {
+		res, err := b.Run(context.Background(), "r", []byte(userBody), Callbacks{})
+		if err != nil {
+			t.Error(err)
+		}
+		results <- res
+	}()
+	select {
+	case <-started:
+	case res := <-results:
+		t.Fatalf("the operation never started: %+v", res.Failure)
+	}
 	waitFor(t, func() bool { return b.running("r") == coproc.Blocked })
 	if n := f.requestCount(); n != 1 {
 		t.Errorf("%d requests while the operation runs", n)

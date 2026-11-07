@@ -259,6 +259,10 @@ func TestLimits(t *testing.T) {
 	wantCode(t, r, "array_product", fmt.Sprintf(`{"values":[%q,"2"]}`, max), CodeOverflow)
 	wantCode(t, r, "array_sum", fmt.Sprintf(`{"values":[%q,"1"]}`, max), CodeOverflow)
 	wantResult(t, r, "array_sum", `{"values":["1","2","3"]}`, `{"value":"6"}`)
+	// The limit holds at every step, not only at the end: it is what bounds a long product's work.
+	// So a partial result past it is overflow, even when the final value would fit.
+	wantCode(t, r, "array_product", fmt.Sprintf(`{"values":[%q,"2","0"]}`, max), CodeOverflow)
+	wantCode(t, r, "array_sum", fmt.Sprintf(`{"values":[%q,"1","-1"]}`, max), CodeOverflow)
 	wantCode(t, r, "array_sum", `{"values":["1","2","3","4"]}`, CodeInputTooLarge)
 	wantCode(t, r, "hash_sha256", fmt.Sprintf(`{"data":%q}`, strings.Repeat("x", 400)), CodeInputTooLarge)
 	wantCode(t, r, "hash_sha512", `{"data":"abc"}`, CodeResultTooLarge) // 128 hex digits
