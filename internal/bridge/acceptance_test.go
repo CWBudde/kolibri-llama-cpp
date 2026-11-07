@@ -214,7 +214,7 @@ func checkServerIsKolibri(t *testing.T, url string) {
 // TestAcceptanceRealModel tests issue #59's acceptance criterion on one task: unmodified Kolibri
 // completes a deterministic multi-step task through the bridge, checked exactly. It needs a real
 // weight in a running llama-server, which is why it is skipped by default. See
-// docs/execution-bridge.md for the commands and for the one real run so far.
+// docs/execution-bridge.md for the commands and for the real runs so far.
 //
 //	KOLIBRI_BRIDGE_ACCEPT_URL   the server, for example http://127.0.0.1:8099; unset: skip
 //	KOLIBRI_BRIDGE_ACCEPT_RUNS  runs of the task, default 1; above 1 they must give one trace
