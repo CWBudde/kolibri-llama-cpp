@@ -43,7 +43,11 @@ run once more under GGML_METAL_FUSION_DISABLE=1, where it routes alike and the c
 exactly. Split control (M61): 2 scheduler splits per decoded token, as resident; and a pass that
 repeats earlier routing stops nowhere and costs what a resident token does (2 command buffers, 3
 commits). Metal commits: one per command buffer, plus 1 for each output copy. Requesting it where
-it cannot work fails to load: on the CPU, with some layers off Metal, and with prefetch.
+it cannot work fails to load: on the CPU, with some layers off Metal, with prefetch, and without a
+cache, where it would otherwise load fully resident. What it cannot run stops with its own diagnosis,
+in a child process, since both abort: a cb_eval that stops between a layer's matmuls, and
+llama_set_warmup, whose router ids are wider than the gate's slot ids. A cb_eval that stops outside
+the matmuls still runs, and a decode the abort callback ended leaves no gate state behind.
 
 Waves (--expert-cache-waves): only on fork branch feat/kolibri1-waves, not in the patch series
 (patch 0013 is retired, docs/expert-streaming.md, "Stage E4"). Against a checkout without them the
@@ -92,6 +96,46 @@ WAVE_SLOTS = [16, 18, 24, 64, 384]
 N_GROWN = 4  # 4 tokens' 24 pairs at 18 slots: 2 waves built, and a union above 2 * 6 grows them
 N_GROWN_REAL = 6  # likewise on a real checkpoint: 36 pairs at 18 slots, 3 waves built
 N_BENCH_UBATCH = 512  # testdata/bench/e4.json's arms prefill in ubatches of the server's default
+
+# What the GPU remap must refuse aborts the process, so check_gpu_remap_refusals runs it here, in a
+# child: python -c GPU_REMAP_CHILD <llama.cpp> <gguf> <what> <slots>
+GPU_REMAP_CHILD = """
+import sys
+from pathlib import Path
+from check_model import Runner
+
+llama_cpp, gguf, what, n_slots = Path(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+r = Runner(llama_cpp)
+dev = next(d for _, d in r.devices() if r.lib.ggml_backend_dev_type(d) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU)
+tokens = list(range(1000, 1040))
+if what.startswith("split_after="):
+    r.logits(gguf, dev, tokens, 10, no_repack=True, split_after=(what.split("=")[1],), expert_cache={"n_slots": n_slots, "gpu_remap": True})
+    print("decoded")
+    sys.exit(0)
+devs = r.ffi.new("ggml_backend_dev_t[]", [dev, r.ffi.NULL])
+ec = r.ffi.new("struct llama_expert_cache_params *", r.lib.llama_expert_cache_default_params())
+ec.n_slots, ec.gpu_remap = n_slots, True
+model = r.lib.llama_model_load_from_file(gguf.encode(), r.ll.model_default_params(devices=devs, n_gpu_layers=-1, expert_cache=ec, use_extra_bufts=False))
+ctx = r.lib.llama_init_from_model(model, r.ll.context_default_params(n_ctx=256, n_batch=len(tokens), n_ubatch=10, op_offload=False))
+batch = r.lib.llama_batch_init(len(tokens), 0, 1)
+for i, t in enumerate(tokens):
+    batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = t, i, 1, 0, True
+batch.n_tokens = len(tokens)
+if what == "warmup":
+    r.lib.llama_set_warmup(ctx, True)
+    print("decoded", r.lib.llama_decode(ctx, batch))
+elif what == "abort":
+    @r.ffi.callback("bool(void *)")
+    def stop(user_data):
+        return True
+    r.lib.llama_set_abort_callback(ctx, stop, r.ffi.NULL)
+    first = r.lib.llama_decode(ctx, batch)
+    r.lib.llama_set_abort_callback(ctx, r.ffi.NULL, r.ffi.NULL)
+    print("decoded", first, r.lib.llama_decode(ctx, batch))
+r.lib.llama_batch_free(batch)
+r.lib.llama_free(ctx)
+r.lib.llama_model_free(model)
+"""
 
 
 def has_waves(r: Runner, llama_cpp: Path) -> bool:
@@ -306,6 +350,50 @@ def main() -> None:
         except RuntimeError:
             report("needs every expert layer on Metal" in "".join(r.log), f"{label} {dev_name}: GPU remap with some layers off Metal fails to load, and says why")
 
+    def check_gpu_remap_refusals(gguf: Path, dev_name: str, dev, stats: Path, label: str) -> None:
+        """What the mode cannot load or run says so. Tiny checkpoints only: the refused run without a
+        cache would load the model fully resident if the refusal failed."""
+        if not gpu_remap_on:
+            return
+        what = f"{label} {dev_name}: GPU remap without a cache"
+        try:
+            r.logits(gguf, dev, list(range(1000, 1010)), 10, no_repack=True, expert_cache={"gpu_remap": True})
+            report(False, f"{what} loaded")
+        except RuntimeError:
+            report("needs --expert-cache or --expert-cache-layers" in "".join(r.log), f"{what} fails to load, and says why")
+        if not on_gpu(dev):
+            return
+
+        # the command line reaches that refusal, also when only the stats ask for params
+        tool = [str(args.llama_cpp / "build" / "bin" / "llama-completion"), "-m", str(gguf), "-p", "Hello", "-n", "4", "-no-cnv", "-c", "256", "--no-warmup", "--expert-cache-gpu-remap"]
+        for extra, how in (([], "alone"), (["--expert-cache-stats", str(stats)], "with --expert-cache-stats alone")):
+            run = subprocess.run(tool + extra, capture_output=True, text=True)
+            report(run.returncode != 0 and "needs --expert-cache or --expert-cache-layers" in run.stderr and run.stdout.strip() == "",
+                   f"{label}: llama-completion --expert-cache-gpu-remap {how} exits {run.returncode} and says why")
+
+        def child(child_what: str, n_slots: int) -> subprocess.CompletedProcess:
+            env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent)}
+            return subprocess.run([sys.executable, "-c", GPU_REMAP_CHILD, str(args.llama_cpp), str(gguf), child_what, str(n_slots)],
+                                  capture_output=True, text=True, env=env)
+
+        for node in ("ffn_moe_up", "ffn_moe_gate"):
+            run = child(f"split_after={node}", 64)
+            report(run.returncode != 0 and "reached its Metal gate again" in run.stderr and "went through the Metal gate" not in run.stderr,
+                   f"{label} {dev_name}: a cb_eval stopping after {node}, inside the layer, exits {run.returncode} and says why")
+        # the cut M69 makes, and one after the layer's last matmul: no layer is cut in two
+        for node in ("ffn_moe_topk", "ffn_moe_down"):
+            run = child(f"split_after={node}", 64)
+            report(run.returncode == 0 and run.stdout.strip().endswith("decoded"), f"{label} {dev_name}: a cb_eval stopping after {node}, outside the matmuls, runs, rc {run.returncode}")
+        # with 384 slots the widened ids fit the cache, and only the width check can stop them
+        for n_slots in (64, 384):
+            run = child("warmup", n_slots)
+            report(run.returncode != 0 and "wider than the expert gate's slot ids" in run.stderr,
+                   f"{label} {dev_name}, {n_slots} slots: llama_set_warmup's wider ids exit {run.returncode} and say why")
+        run = child("abort", 64)
+        report(run.returncode == 0 and run.stdout.strip().endswith("decoded 2 0"),
+               f"{label} {dev_name}: a decode the abort callback ended leaves the next one free to run: "
+               f"{run.stdout.strip().splitlines()[-1:] if run.stdout.strip() else ''}, want decoded 2 0, rc {run.returncode}")
+
     def check_gpu_remap_hits(gguf: Path, dev_name: str, dev, tokens: list[int], k: int, stats: Path, label: str, n_slots: int = 384) -> None:
         """What a layer that hits costs (control M61): the same one-token decodes again after clearing
         the KV cache route alike, so with every expert in a slot the last pass stops nowhere, and a
@@ -446,6 +534,7 @@ def main() -> None:
                     check_gpu_remap(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, cfg["num_hidden_layers"],
                                     cfg["num_experts_per_tok"], stats, outtype)
                     check_gpu_remap_hits(gguf, dev_name, dev, tokens[:N_PROMPT], cfg["num_experts_per_tok"], stats, outtype)
+                    check_gpu_remap_refusals(gguf, dev_name, dev, stats, outtype)
             check_gpu_remap_exact()
         elif args.waves_only:
             model = generate_tiny(Path(tmp), args.seed, "router")
@@ -473,6 +562,7 @@ def main() -> None:
                     check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], n_layer, cfg["num_experts"], k, stats, f"{outtype} grown waves", grown=True)
                     check_gpu_remap(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
                     check_gpu_remap_hits(gguf, dev_name, dev, tokens[:N_PROMPT], k, stats, outtype)
+                    check_gpu_remap_refusals(gguf, dev_name, dev, stats, outtype)
 
                 # fewer slots than one token's experts cannot work
                 try:
