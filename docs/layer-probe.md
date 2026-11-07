@@ -143,7 +143,7 @@ go run ./cmd/kolibri-probe report -capture ~/models/eval/layer-probe-<date>
 
 ### On the patch series
 
-The same capture was repeated on `feat/kolibri1` at `634e34bb4` (build 11839), which has no Stage E4 code. It was built Release with Metal in a worktree of its own, with the same `LLAMA_` and `GGML_` options as the other worktrees, and run with the commands in [Reproduce](#reproduce) from `ef27468`, whose only changes after `4e35417` are docs. Same weight, dataset, device, threads, slots and effective ubatch. Records: `~/models/eval/layer-probe-20261107-series`.
+The same capture was repeated on `feat/kolibri1` at `634e34bb4` (build 11839), which has no Stage E4 code. It was built Release with Metal in a worktree of its own, with the same `LLAMA_` and `GGML_` options as the waves build, and run with the commands in [Reproduce](#reproduce) from `ef27468`, whose only changes after `4e35417` are docs. Same weight, dataset, device, threads, slots and effective ubatch. Records: `~/models/eval/layer-probe-20261107-series`.
 
 | Compared with the run above | Result |
 |---|---|
