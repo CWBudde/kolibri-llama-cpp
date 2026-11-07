@@ -71,7 +71,7 @@ The callback only reads, and the check is exact: `np.array_equal`, no tolerance.
 
 ## Probes and report
 
-`kolibri-probe report -capture DIR` trains on activations alone and scores only held-out rows. The options below are **definitions, committed before any real capture, and they must not move afterwards**: `DefaultOptions` in `internal/probe/report.go`, the dataset, and the capture defaults in `tools/probe/capture.py`.
+`kolibri-probe report -capture DIR` trains on activations alone and scores only held-out rows. The options below are **definitions, committed before any real capture, and they must not move afterwards**: `DefaultOptions` in `internal/probe/report.go`, the dataset, and the capture defaults in `tools/probe/capture.py`. **One moved all the same, after the real capture: the label shuffle, [disclosed with the results](#the-label-shuffle-moved-after-the-capture).**
 
 The report enforces this where it can. It never replaces a report, and only `DefaultOptions` write `report.md`. `-l2`, `-folds` or `-shuffles` at another value write `report-deviation-*`, which says at its top what moved, so trying values leaves every try on disk under a name that says so. A `-dataset` whose bytes aren't the committed file's does the same, whatever its path and however well it passes the checks: its sha256 is compared with `CommittedDatasetSHA256`, and the report's name carries the start of it.
 
@@ -79,7 +79,7 @@ The report enforces this where it can. It never replaces a report, and only `Def
 - **Folds.** 5 folds by `paraphrase_group`, over the smoke split. `CheckFolds` runs before any training and refuses a group, template or numeric seed in train and test of a fold, whoever made the split.
 - **Baselines**, on the same folds: majority of the training rows, a fixed keyword rule, a fixed surface rule, the prompt's length through the same classifier, and a learned bag of words with the same classifier and regularization. The two rules' lists were written by the hand that wrote the prompts, which favors them.
 - **Scores.** Accuracy, balanced accuracy, macro F1, precision and recall of execute, hard negatives right, agreement of same-label rows within a group, Brier score and a 5-bin calibration error.
-- **Shuffled labels.** 20 runs per probe, same folds. A probe must beat them by more than their spread.
+- **Shuffled labels.** 20 runs per probe, same folds. A probe must beat them by more than their spread. A run moves the unit the folds hold out: each paraphrase group takes the block of labels of a group of its own size, in an order drawn anew inside the block. So every group keeps a set of labels that some group of its size really has, the class counts stay, and labels move only among the 10 single rows and among the 15 pairs. `report.json` names the scheme, `whole-groups-among-equal-sizes-v2`; a report without that field shuffled single rows.
 - **No confidence intervals.** The issue asks for them only where the sample supports them, and 40 rows in 25 groups doesn't. The report says so and gives none.
 - **Pilot prompts.** Trained on all smoke rows and read on the 4 pilot prompts, whose groups the smoke split doesn't share. One prompt per category: a pipeline check.
 
@@ -115,6 +115,7 @@ So a probe at 0.90 beats the bag of words, and the keyword rule, and still reads
 | M79 | the issue's numbers taken as zero-based | refused by the graph check and, at the last layer, by the missing node | `check_capture.py` |
 | M87 | a graph whose `l_out` lacks the post-FFN norm, has another block's or has only the routed experts | refused by the graph check, and by the report from `capture.json`. On the real tiny graph's record with those parts changed, since no fork build has that wiring | `check_capture.py`, `TestReadCaptureRefuses` |
 | M88 | a capture that wasn't checked: `--skip-logits-check`, also with a write into a node, or `--no-repeat` | the capture says UNCHECKED, the report refuses it | `check_capture.py`, `TestReadCaptureRefuses` |
+| M91 | labels shuffled row by row, as first committed, or blocks that keep their row order | a shuffle keeps each group's labels together among groups of one size, and the higher label of a pair comes first in half of the draws. The row-level shuffle fails the first, a kept row order the second, and on labels constant per group `shuffled` itself must reach the spread only whole groups give | `TestM91ShufflesMoveWholeGroups` |
 
 ## Reproduce
 
@@ -134,7 +135,7 @@ go run ./cmd/kolibri-probe report -capture ~/models/eval/layer-probe-<date>
 
 ## Results
 
-**One capture and one report, 2026-11-07, from commit `4e35417`, with the committed definitions.** The report wrote `report.md` and no `report-deviation-*`. Everything is in `~/models/eval/layer-probe-20261107`.
+**One capture, 2026-11-07, from commit `4e35417`, with the definitions committed then.** Its report wrote `report.md` and no `report-deviation-*`, and both are in `~/models/eval/layer-probe-20261107`. **The tables below are from a second report on the same activations, from `aa70025`, whose label shuffle [replaced the first's](#the-label-shuffle-moved-after-the-capture).** Only the shuffle columns differ. It is in `~/models/eval/layer-probe-20261107-groupshuffle`.
 
 - **Weight.** `/Users/christian/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, a real file on the internal drive (`model_realpath`), sha256 `93720b94a5a383f5bad07677ca05014bf0681a662e646ea3b1b196cda33c88bc`.
 - **Build.** `third_party/llama.cpp` at `90311e5a2`, on fork branch `feat/kolibri1-waves`, with waves off (the cache's stats file says `waves: false`). That branch is outside the patch series: `feat/kolibri1` without its last commit, plus the Stage E4 waves code ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)), which changes `src/llama-graph.cpp`, the file that builds the graph this capture reads. Waves off is a runtime flag. A build without that code gave byte-identical activations and logits at these settings: see [On the patch series](#on-the-patch-series). `check_capture.py`'s tiny runs used this build and have not been repeated on the series.
@@ -143,15 +144,15 @@ go run ./cmd/kolibri-probe report -capture ~/models/eval/layer-probe-<date>
 
 ### On the patch series
 
-The same capture was repeated on `feat/kolibri1` at `634e34bb4` (build 11839), which has no Stage E4 code. It was built Release with Metal in a worktree of its own, with the same `LLAMA_` and `GGML_` options as the waves build, and run with the commands in [Reproduce](#reproduce) from `ef27468`, whose only changes after `4e35417` are docs. Same weight, dataset, device, threads, slots and effective ubatch. Records: `~/models/eval/layer-probe-20261107-series`.
+The same capture was repeated on `feat/kolibri1` at `634e34bb4` (build 11839), which has no Stage E4 code. It was built Release with Metal in a worktree of its own, with the same `LLAMA_` and `GGML_` options as the waves build, and run with the commands in [Reproduce](#reproduce) from `ef27468`, whose only changes after `4e35417` are docs. Same weight, dataset, device, threads, slots and effective ubatch. Records: `~/models/eval/layer-probe-20261107-series`, and the second report on its activations in `~/models/eval/layer-probe-20261107-series-groupshuffle`.
 
 | Compared with the run above | Result |
 |---|---|
 | `layer-10`, `-25`, `-40`, `-50` `.npy` | byte-identical, and `np.array_equal` holds, on all 44 rows and 2560 dimensions |
 | Logits at each prompt's last token | byte-identical on all 44 prompts, `[44, 128000]` `float32`, sha256 `78f0bdb1…` on both builds |
 | Prompt tokens per row, template, graph check, logits check, repeat | equal in `capture.json` |
-| `report.md` | byte-identical |
-| `report.json` | differs only in the capture's provenance: `server`, `server_sha256`, `backend_sha256`, `llama_cpp_head` and three timing fields |
+| `report.md` | byte-identical, the first report's and the second's |
+| `report.json` | differs only in the capture's provenance, the first report's and the second's: `server`, `server_sha256`, `backend_sha256`, `llama_cpp_head` and three timing fields |
 
 `capture.json` keeps no logits, only the verdict of each run's own check, so the waves run's logits weren't on disk. Both builds were therefore run once more with `dump_logits.py`, which repeats the capture's plain pass (no callback, same settings) and writes the logits. The waves dump loaded `libllama` `f5801cb0…`, the same file the capture above records. Script, arrays and logs: `~/models/eval/layer-probe-20261107-logits`.
 
@@ -171,7 +172,7 @@ The same capture was repeated on `feat/kolibri1` at `634e34bb4` (build 11839), w
 
 ### Execute (no, execute)
 
-Held out by grouped cross-validation: 40 rows, 25 groups, 5 folds, 20 label shuffles per probe. The tables are the report's.
+Held out by grouped cross-validation: 40 rows, 25 groups, 5 folds, 20 label shuffles per probe. The tables are the second report's.
 
 | Row | Kind | Accuracy | Balanced | Macro F1 | Execute P | Execute R | Hard negatives | Paraphrase agreement | Brier | ECE | Shuffled balanced, mean (max) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -180,10 +181,10 @@ Held out by grouped cross-validation: 40 rows, 25 groups, 5 folds, 20 label shuf
 | surface rule | baseline | 0.975 | **0.975** | 0.975 | 0.952 | 1.000 | 13/14 | 5/5 | n/a | n/a | n/a |
 | prompt length | baseline | 0.625 | 0.625 | 0.623 | 0.609 | 0.700 | 11/14 | 5/5 | 0.459 | 0.115 | n/a |
 | bag of words | baseline | 0.650 | 0.650 | 0.615 | 0.594 | 0.950 | 7/14 | 4/5 | 0.400 | 0.096 | n/a |
-| layer-10 | probe | 0.975 | 0.975 | 0.975 | 0.952 | 1.000 | 14/14 | 4/5 | 0.084 | 0.153 | 0.461 (0.675), chance 0.500 |
-| layer-25 | probe | 0.975 | 0.975 | 0.975 | 1.000 | 0.950 | 14/14 | 5/5 | 0.074 | 0.139 | 0.456 (0.700), chance 0.500 |
-| layer-40 | probe | 0.975 | 0.975 | 0.975 | 0.952 | 1.000 | 14/14 | 4/5 | 0.113 | 0.188 | 0.467 (0.725), chance 0.500 |
-| layer-50 | probe | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 14/14 | 5/5 | 0.141 | 0.242 | 0.454 (0.725), chance 0.500 |
+| layer-10 | probe | 0.975 | 0.975 | 0.975 | 0.952 | 1.000 | 14/14 | 4/5 | 0.084 | 0.153 | 0.463 (0.675), chance 0.500 |
+| layer-25 | probe | 0.975 | 0.975 | 0.975 | 1.000 | 0.950 | 14/14 | 5/5 | 0.074 | 0.139 | 0.423 (0.575), chance 0.500 |
+| layer-40 | probe | 0.975 | 0.975 | 0.975 | 0.952 | 1.000 | 14/14 | 4/5 | 0.113 | 0.188 | 0.469 (0.625), chance 0.500 |
+| layer-50 | probe | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 14/14 | 5/5 | 0.141 | 0.242 | 0.474 (0.650), chance 0.500 |
 
 ### Operation family (none, arithmetic, algorithm)
 
@@ -194,17 +195,43 @@ Held out by grouped cross-validation: 40 rows, 25 groups, 5 folds, 20 label shuf
 | surface rule | baseline | 0.975 | **0.967** | 0.967 | 14/14 | 5/5 | n/a | n/a | n/a |
 | prompt length | baseline | 0.575 | 0.483 | 0.418 | 14/14 | 5/5 | 0.580 | 0.048 | n/a |
 | bag of words | baseline | 0.550 | 0.450 | 0.448 | 13/14 | 5/5 | 0.547 | 0.167 | n/a |
-| layer-10 | probe | 0.825 | 0.767 | 0.769 | 14/14 | 4/5 | 0.270 | 0.197 | 0.301 (0.567), chance 0.333 |
-| layer-25 | probe | 0.800 | 0.733 | 0.736 | 14/14 | 4/5 | 0.267 | 0.138 | 0.290 (0.500), chance 0.333 |
-| layer-40 | probe | 0.925 | 0.900 | 0.914 | 14/14 | 5/5 | 0.224 | 0.276 | 0.305 (0.467), chance 0.333 |
-| layer-50 | probe | 0.825 | 0.767 | 0.779 | 14/14 | 5/5 | 0.292 | 0.228 | 0.300 (0.483), chance 0.333 |
+| layer-10 | probe | 0.825 | 0.767 | 0.769 | 14/14 | 4/5 | 0.270 | 0.197 | 0.287 (0.433), chance 0.333 |
+| layer-25 | probe | 0.800 | 0.733 | 0.736 | 14/14 | 4/5 | 0.267 | 0.138 | 0.297 (0.383), chance 0.333 |
+| layer-40 | probe | 0.925 | 0.900 | 0.914 | 14/14 | 5/5 | 0.224 | 0.276 | 0.312 (0.417), chance 0.333 |
+| layer-50 | probe | 0.825 | 0.767 | 0.779 | 14/14 | 5/5 | 0.292 | 0.228 | 0.310 (0.417), chance 0.333 |
+
+### The label shuffle moved after the capture
+
+**The rule is that definitions are committed before a real capture and don't move. This one moved after the capture and after its first report, and its new form was written with the old numbers in view. The conclusion didn't change, and the numbers below show why the lower highest values at 20 runs are no stronger support.**
+
+- **Used first.** The capture's report permuted the labels of single rows (`r.Shuffle` over all rows, up to `fc01ef1`). That report is kept as it was in `~/models/eval/layer-probe-20261107`.
+- **Why it was replaced.** The folds hold out a paraphrase group because its rows depend on each other. A row-level shuffle takes a group's labels apart while its activations stay close together, so it isn't a null for the task the probes are scored on. A review of this PR found this in the code, not in the scores.
+- **What changed.** Only which permutations run: whole groups' label blocks, among groups of one size. Blocks of two sizes can't swap, and the 25 groups here have sizes 1 and 2. Runs, seed, folds, L2, dataset and capture are the same, and between the two reports only the definitions sentence and the 8 shuffle cells differ.
+- **Why a block's order is drawn anew.** The dataset writes a computation before its refusal, so a block that keeps its row order lands on another such pair with the real labels. That was measured and rejected: its mean over 1000 runs is 0.532 to 0.601 on execute, above chance, which is the real signal leaking into the control.
+
+Balanced accuracy on shuffled labels, mean (highest), on the capture's activations. The 1000-run reports are deviations and are no definition of anything. Records: `~/models/eval/layer-probe-20261107-groupshuffle`, with the row-level runs from `fc01ef1` in `row-level-1000/` and the kept row order in `row-order-kept-1000/`, whose `built-from.txt` says how it was built.
+
+| Target | Layer | Real | Row by row, 20 runs (first report) | Whole groups, 20 runs (the tables above) | Row by row, 1000 runs | Whole groups, 1000 runs | Row order kept, 1000 runs |
+|---|---|---|---|---|---|---|---|
+| execute | 10 | 0.975 | 0.461 (0.675) | 0.463 (0.675) | 0.478 (0.750) | 0.483 (0.775) | 0.601 (0.875) |
+| execute | 25 | 0.975 | 0.456 (0.700) | 0.423 (0.575) | 0.474 (0.825) | 0.476 (0.775) | 0.595 (0.850) |
+| execute | 40 | 0.975 | 0.467 (0.725) | 0.469 (0.625) | 0.469 (0.850) | 0.475 (0.825) | 0.555 (0.850) |
+| execute | 50 | 1.000 | 0.454 (0.725) | 0.474 (0.650) | 0.465 (0.800) | 0.475 (0.800) | 0.532 (0.850) |
+| family | 10 | 0.767 | 0.301 (0.567) | 0.287 (0.433) | 0.308 (0.633) | 0.306 (0.550) | 0.360 (0.683) |
+| family | 25 | 0.733 | 0.290 (0.500) | 0.297 (0.383) | 0.308 (0.650) | 0.308 (0.600) | 0.355 (0.650) |
+| family | 40 | 0.900 | 0.305 (0.467) | 0.312 (0.417) | 0.307 (0.550) | 0.313 (0.533) | 0.343 (0.617) |
+| family | 50 | 0.767 | 0.300 (0.483) | 0.310 (0.417) | 0.305 (0.517) | 0.313 (0.550) | 0.324 (0.567) |
+
+- **The lower highest values at 20 runs are the luck of 20 draws.** Seven of the eight fell and one stayed. At 1000 runs the two schemes reach about the same: 0.750 to 0.850 against 0.775 to 0.825 on execute, 0.517 to 0.650 against 0.533 to 0.600 on family.
+- **The old control was barely harder on these rows.** Its means over 1000 runs are at most about 0.01 lower: 0.465 to 0.478 against 0.475 to 0.483 on execute, and on family 0.305 to 0.308 against 0.306 to 0.313. A run's spread didn't grow either on activations with a planted direction (M75's), about 0.10 on execute under both, probably because 10 of the 15 pairs hold both labels and their order is drawn anew. M75's bound therefore stayed at 0.05.
+- **The conclusion holds under all three.** No run in any column of this table reaches its real score. That still excludes chance only, not the text.
 
 ### What these scores say
 
 - **Against the surface rule, the bar.** No probe clears it in a way that counts. On execute, three layers tie it and layer 50 is above it by one row of 40. On operation family, where the bar is the gate plus the keyword list, all four are below it. The rule was written after seeing the rows, which favors it, and [clearing it wouldn't rule its cues out](#what-a-result-would-and-wouldnt-mean).
 - **Against the other baselines.** On execute all four probes are above the keyword rule, prompt length and bag of words. On operation family all four are above prompt length and bag of words, but by balanced accuracy only layer 40 is above the keyword rule's 0.783: layers 10 and 50 (0.767) and 25 (0.733) are below it. By plain accuracy all four are above its 0.700.
 - **Single rows.** All probes get the 14 execute hard negatives right, where the surface rule errs on A-011. Each of layers 10, 25 and 40 has one execute error of its own: layers 10 and 40 a false alarm outside the hard negatives, layer 25 a missed computation. `report.json` doesn't record which rows, and one row is no finding either way.
-- **Shuffled labels.** Each real score is above the highest of its 20 shuffles, and no shuffle reaches it. That excludes chance, not the text: random weights decode too.
+- **Shuffled labels.** Each real score is above the highest of its 20 shuffles, and no shuffle reaches it, under the scheme that [replaced the first](#the-label-shuffle-moved-after-the-capture) and under the first. That excludes chance, not the text: random weights decode too.
 - **Calibration.** Brier and ECE are as the report gives them. Layer 50, with the highest execute accuracy, has the worst Brier and ECE of the four execute probes. 40 rows don't make this meaningful.
 - **Pilot prompts.** All 32 predictions (4 prompts, 2 tasks, 4 layers) equal the label. This checks the pipeline.
 - **Nothing here compares layers.** The differences between them, layer 50's 1.000 and layer 40's 0.900 among them, are a few rows of 40. The report ranks no layer, and neither does this section. Nothing here tests whether the model uses this information, or whether injecting a result at any of these layers would change its behavior: no intervention ran.

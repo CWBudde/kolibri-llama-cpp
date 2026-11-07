@@ -170,7 +170,7 @@ func TestProbeFindsSignal(t *testing.T) {
 // bound is on the mean of 200 runs. A run here has a deviation of about 0.10 on execute and 0.04 on
 // family, the same with whole groups moving as with single rows, so the mean's standard error is
 // about 0.007 and 0.003. Both schemes sit below chance by more than that, 0.03 on execute and 0.02
-// on family: a fold's test rows take their class counts from the training rows. 0.05 holds that
+// on family, since the rows a fold holds out are missing from its training classes. 0.05 holds that
 // offset with margin and was not moved when the scheme changed.
 func TestM75ShuffledLabelsNearChance(t *testing.T) {
 	rows := smokeRows()
