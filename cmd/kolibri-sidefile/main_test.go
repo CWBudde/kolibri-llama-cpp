@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -327,5 +328,79 @@ func TestAlignedRead(t *testing.T) {
 	}
 	if end != p.FileSize || p.FileSize%alignment != 0 {
 		t.Errorf("file of %d bytes, extents end at %d", p.FileSize, end)
+	}
+}
+
+// A path naming the model itself, directly or through a link, must be refused
+// even with -force: the final rename would replace the model.
+func TestWriteRefusesTheModel(t *testing.T) {
+	dir := t.TempDir()
+	ggufPath, _ := writeGGUF(t, dir)
+	before, err := os.ReadFile(ggufPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.experts")
+	if err := os.Symlink(ggufPath, link); err != nil {
+		t.Fatal(err)
+	}
+	hard := filepath.Join(dir, "hard.experts")
+	if err := os.Link(ggufPath, hard); err != nil {
+		t.Fatal(err)
+	}
+	for _, side := range []string{ggufPath, link, hard} {
+		if _, err := write(ggufPath, side, true); err == nil || !strings.Contains(err.Error(), "is the model") {
+			t.Errorf("write to %s: %v, want a refusal", side, err)
+		}
+	}
+	after, err := os.ReadFile(ggufPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("the model changed")
+	}
+}
+
+// A failed rename of the side-file must leave the earlier manifest as it was,
+// and no manifest when there was none.
+func TestWriteKeepsTheManifestOnFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		old  []byte
+	}{{"earlier manifest", []byte("earlier\n")}, {"no manifest", nil}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			ggufPath, _ := writeGGUF(t, dir)
+			side := filepath.Join(dir, "m.experts")
+			// A non-empty directory cannot be renamed over.
+			if err := os.MkdirAll(filepath.Join(side, "keep"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.old != nil {
+				if err := os.WriteFile(side+manifestName, tc.old, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := write(ggufPath, side, true); err == nil {
+				t.Fatal("write succeeded over a non-empty directory")
+			}
+			got, err := os.ReadFile(side + manifestName)
+			switch {
+			case tc.old == nil && !errors.Is(err, os.ErrNotExist):
+				t.Errorf("manifest left behind: %q, %v", got, err)
+			case tc.old != nil && (err != nil || !bytes.Equal(got, tc.old)):
+				t.Errorf("manifest = %q, %v, want %q", got, err, tc.old)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range entries {
+				if strings.Contains(e.Name(), ".tmp") {
+					t.Errorf("left behind %s", e.Name())
+				}
+			}
+		})
 	}
 }

@@ -112,8 +112,13 @@ func (c copier) readExtent(il, e int, buf []byte) error {
 }
 
 // write writes the side-file and its manifest through temporary names, so a
-// failed run leaves neither.
+// failed run leaves the new ones nowhere and any earlier manifest as it was.
 func write(ggufPath, side string, force bool) (*manifest, error) {
+	if same, err := isSameFile(ggufPath, side); err != nil {
+		return nil, err
+	} else if same {
+		return nil, fmt.Errorf("%s is the model; name another side-file", side)
+	}
 	if !force {
 		for _, path := range []string{side, side + manifestName} {
 			if _, err := os.Stat(path); err == nil {
@@ -185,15 +190,62 @@ func write(ggufPath, side string, force bool) (*manifest, error) {
 	if err := os.WriteFile(tmp+manifestName, append(data, '\n'), 0o644); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tmp+manifestName, side+manifestName); err != nil {
-		os.Remove(tmp + manifestName)
-		return nil, err
-	}
-	if err := os.Rename(tmp, side); err != nil {
+	if err := install(tmp, side); err != nil {
 		return nil, err
 	}
 	done = true
 	return &m, nil
+}
+
+// isSameFile reports whether side already names the model, directly or
+// through a link. A side that does not exist yet is not the model.
+func isSameFile(ggufPath, side string) (bool, error) {
+	model, err := os.Stat(ggufPath)
+	if err != nil {
+		return false, err
+	}
+	target, err := os.Stat(side)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(model, target), nil
+}
+
+// install moves the finished manifest and side-file to their names. Two
+// renames cannot be one atomic step, so an earlier manifest is kept aside until
+// the side-file is in place, and put back if it cannot be.
+func install(tmp, side string) error {
+	newManifest, manifest, kept := tmp+manifestName, side+manifestName, tmp+manifestName+".old"
+	hadManifest := true
+	if err := os.Rename(manifest, kept); errors.Is(err, os.ErrNotExist) {
+		hadManifest = false
+	} else if err != nil {
+		os.Remove(newManifest)
+		return err
+	}
+	restore := func() {
+		os.Remove(newManifest)
+		if hadManifest {
+			os.Rename(kept, manifest)
+		} else {
+			os.Remove(manifest)
+		}
+	}
+	if err := os.Rename(newManifest, manifest); err != nil {
+		restore()
+		return err
+	}
+	if err := os.Rename(tmp, side); err != nil {
+		restore()
+		return err
+	}
+	if hadManifest {
+		return os.Remove(kept)
+	}
+	return nil
 }
 
 // loadManifest reads a manifest, refusing fields it does not know.
