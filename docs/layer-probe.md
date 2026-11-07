@@ -1,13 +1,13 @@
 # Layer probe (issue #63)
 
-**Result: the instrumentation for issue #63 exists and passes on tiny checkpoints. It has not read a real Kolibri weight, so nothing is known yet about any layer.** It observes only: no base weight changes and no coprocessor runs.
+**Result: the pipeline ran on the real weight and its checks held, but no probe shows more than the text's surface. On execute, layers 10, 25 and 40 tie the surface rule at 0.975 balanced accuracy, and layer 50 is one row of 40 above it at 1.000. On operation family all four are below it, 0.733 to 0.900 against 0.967. These are scores from 40 prompts: they validate the pipeline, select no layer, and show what can be decoded, not what the model uses.** The probe observes only: no base weight changes and no coprocessor runs.
 
 | Part | Where | State |
 |---|---|---|
 | 44 prompts with oracle validation | `testdata/probe/smoke.jsonl`, `internal/probe`, `go run ./cmd/kolibri-probe generate` or `verify` | done |
-| Activation capture | `tools/probe/capture.py`, through libllama's `cb_eval` | done on tiny; real run pending |
-| Probes, baselines, report | `go run ./cmd/kolibri-probe report`, `internal/probe` | done on synthetic and tiny activations; real run pending |
-| Readout of the real model | [Results pending](#results-pending) | **not run** |
+| Activation capture | `tools/probe/capture.py`, through libllama's `cb_eval` | done on tiny; one real run, Metal with the cache |
+| Probes, baselines, report | `go run ./cmd/kolibri-probe report`, `internal/probe` | done on synthetic and tiny activations and on that real run |
+| Readout of the real model | [Results](#results) | run once, pipeline validation only |
 
 ## What a layer number means
 
@@ -62,12 +62,12 @@ The callback only reads, and the check is exact: `np.array_equal`, no tolerance.
 | Path | On tiny (`check_capture.py`) | On the real model |
 |---|---|---|
 | CPU | passes | not run |
-| Metal | passes | not run |
-| Expert cache, CPU and Metal, ubatch capped at 3 | passes: exactly the logits of the cached model without a callback, and logits and activations exactly a resident run's at the same ubatch | not run |
+| Metal, resident | passes | not run |
+| Expert cache, CPU and Metal, ubatch capped at 3 on tiny, 21 on the real model | passes: exactly the logits of the cached model without a callback, and logits and activations exactly a resident run's at the same ubatch | Metal at 128 slots passes: exactly the logits of the cached model without a callback, and a repeat is exact. CPU and the comparison with a resident run were not run |
 
 - **The cache serves one context per model** ("the expert cache serves one context per model"), so the plain pass and the capture load the model apart, one after the other.
 - **The cache caps the ubatch** at the fewest slots divided by 6: 21 at `--expert-cache 128`. So a prompt spans several computations, and the numbers belong to that ubatch: the ubatch changes the order of the sums ([expert-streaming.md](expert-streaming.md)), and on Metal so does the number of outputs in the last block. `check_capture.py` shows the second on tiny: there the last block's row isn't bit-identical between a decode with one output and one with all outputs, while the CPU's is, and every layer below it is exact on both. A capture's numbers are reproducible for its recorded settings, and two captures compare only at equal settings.
-- **Overhead.** The structure is known: each read node ends a graph split, so 4 more splits per ubatch, a copy of `n_tokens x n_embd` floats per read node, and a Python call for each node the scheduler asks about. The real cost is pending: `capture.json` records `plain_decode_seconds` and `capture_decode_seconds`, and they aren't a benchmark.
+- **Overhead.** The structure is known: each read node ends a graph split, so 4 more splits per ubatch, a copy of `n_tokens x n_embd` floats per read node, and a Python call for each node the scheduler asks about. The real cost is unmeasured: `capture.json` records `plain_decode_seconds` and `capture_decode_seconds`, but the run wasn't set up as a timing run (nothing evicts the weight, and the plain pass always goes first), so this doc takes no figure from them.
 
 ## Probes and report
 
@@ -132,15 +132,81 @@ go run ./cmd/kolibri-models status                # the weight must be hot
 go run ./cmd/kolibri-probe report -capture ~/models/eval/layer-probe-<date>
 ```
 
-## Results pending
+## Results
 
-**No real capture has run, so this section has no numbers.** The real run fills in:
+**One capture and one report, 2026-11-07, from commit `4e35417`, with the committed definitions.** The report wrote `report.md` and no `report-deviation-*`. Everything is in `~/models/eval/layer-probe-20261107`.
 
-- [ ] the capture's `logits_check` and `repeatable` on the real model, Metal, with the cache;
-- [ ] the overhead from `plain_decode_seconds` and `capture_decode_seconds`;
-- [ ] the report's tables for layers 10, 25, 40 and 50 against the five baselines and the shuffled labels.
+- **Weight.** `/Users/christian/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, a real file on the internal drive (`model_realpath`), sha256 `93720b94a5a383f5bad07677ca05014bf0681a662e646ea3b1b196cda33c88bc`.
+- **Build.** `third_party/llama.cpp` at `90311e5a2`, on branch `feat/kolibri1-waves`, with waves off (the cache's stats file says `waves: false`).
+- **Settings.** `MTL0`, 10 threads, 128 cache slots, effective ubatch 21, `n_ctx` 512, reasoning mode `none`. Two captures compare only at equal settings.
+- **Dataset.** sha256 `e4681b761c1542876ab72c4db1f3d44e1de6c7b1190e2c532116496c00c2cc90`, as committed.
 
-## Next, once the pipeline has run
+### Capture checks
+
+| Check | Result |
+|---|---|
+| Logits against a context without a callback | equal, `np.array_equal`, on all 44 prompts |
+| Repeated decode | equal on the 4 pilot prompts, logits and activations |
+| Graph | `l_out-9`, `l_out-24`, `l_out-39`, `l_out-49` are each the residual add of `ffn_inp` and the post-FFN norm, read by `norm-10`, `norm-25`, `norm-40` and `norm`. The graph check refused nothing |
+| Last prompt token | 263, `\n\n`, on all 44 prompts |
+| Chat template | the released one, revision `7a8f290` |
+| Activations | `float32`, `[44, 2560]` per layer, all finite |
+| Solver | 0 unconverged folds in every row of the tables below |
+
+### Execute (no, execute)
+
+Held out by grouped cross-validation: 40 rows, 25 groups, 5 folds, 20 label shuffles per probe. The tables are the report's.
+
+| Row | Kind | Accuracy | Balanced | Macro F1 | Execute P | Execute R | Hard negatives | Paraphrase agreement | Brier | ECE | Shuffled balanced, mean (max) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| majority | baseline | 0.350 | 0.350 | 0.335 | 0.286 | 0.200 | 9/14 | 5/5 | n/a | n/a | n/a |
+| keyword rule | baseline | 0.725 | 0.725 | 0.703 | 0.645 | 1.000 | 3/14 | 5/5 | n/a | n/a | n/a |
+| surface rule | baseline | 0.975 | **0.975** | 0.975 | 0.952 | 1.000 | 13/14 | 5/5 | n/a | n/a | n/a |
+| prompt length | baseline | 0.625 | 0.625 | 0.623 | 0.609 | 0.700 | 11/14 | 5/5 | 0.459 | 0.115 | n/a |
+| bag of words | baseline | 0.650 | 0.650 | 0.615 | 0.594 | 0.950 | 7/14 | 4/5 | 0.400 | 0.096 | n/a |
+| layer-10 | probe | 0.975 | 0.975 | 0.975 | 0.952 | 1.000 | 14/14 | 4/5 | 0.084 | 0.153 | 0.461 (0.675), chance 0.500 |
+| layer-25 | probe | 0.975 | 0.975 | 0.975 | 1.000 | 0.950 | 14/14 | 5/5 | 0.074 | 0.139 | 0.456 (0.700), chance 0.500 |
+| layer-40 | probe | 0.975 | 0.975 | 0.975 | 0.952 | 1.000 | 14/14 | 4/5 | 0.113 | 0.188 | 0.467 (0.725), chance 0.500 |
+| layer-50 | probe | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 14/14 | 5/5 | 0.141 | 0.242 | 0.454 (0.725), chance 0.500 |
+
+### Operation family (none, arithmetic, algorithm)
+
+| Row | Kind | Accuracy | Balanced | Macro F1 | Hard negatives | Paraphrase agreement | Brier | ECE | Shuffled balanced, mean (max) |
+|---|---|---|---|---|---|---|---|---|---|
+| majority | baseline | 0.500 | 0.333 | 0.222 | 14/14 | 5/5 | n/a | n/a | n/a |
+| keyword rule | baseline | 0.700 | 0.783 | 0.704 | 3/14 | 5/5 | n/a | n/a | n/a |
+| surface rule | baseline | 0.975 | **0.967** | 0.967 | 14/14 | 5/5 | n/a | n/a | n/a |
+| prompt length | baseline | 0.575 | 0.483 | 0.418 | 14/14 | 5/5 | 0.580 | 0.048 | n/a |
+| bag of words | baseline | 0.550 | 0.450 | 0.448 | 13/14 | 5/5 | 0.547 | 0.167 | n/a |
+| layer-10 | probe | 0.825 | 0.767 | 0.769 | 14/14 | 4/5 | 0.270 | 0.197 | 0.301 (0.567), chance 0.333 |
+| layer-25 | probe | 0.800 | 0.733 | 0.736 | 14/14 | 4/5 | 0.267 | 0.138 | 0.290 (0.500), chance 0.333 |
+| layer-40 | probe | 0.925 | 0.900 | 0.914 | 14/14 | 5/5 | 0.224 | 0.276 | 0.305 (0.467), chance 0.333 |
+| layer-50 | probe | 0.825 | 0.767 | 0.779 | 14/14 | 5/5 | 0.292 | 0.228 | 0.300 (0.483), chance 0.333 |
+
+### What these scores say
+
+- **Against the surface rule, the bar.** No probe clears it in a way that counts. On execute, three layers tie it and layer 50 is above it by one row of 40. On operation family all four are below it. The rule was written after seeing the rows, which favors it, and [clearing it wouldn't rule its cues out](#what-a-result-would-and-wouldnt-mean).
+- **Against the other baselines.** On execute all four probes are above the keyword rule, prompt length and bag of words. On operation family all four are above prompt length and bag of words, but by balanced accuracy only layer 40 is above the keyword rule's 0.783: layers 10 and 50 (0.767) and 25 (0.733) are below it. By plain accuracy all four are above its 0.700.
+- **Single rows.** All probes get the 14 execute hard negatives right, where the surface rule errs on A-011. Each of layers 10, 25 and 40 has one execute error of its own: layers 10 and 40 a false alarm outside the hard negatives, layer 25 a missed computation. `report.json` doesn't record which rows, and one row is no finding either way.
+- **Shuffled labels.** Each real score is above the highest of its 20 shuffles, and no shuffle reaches it. That excludes chance, not the text: random weights decode too.
+- **Calibration.** Brier and ECE are as the report gives them. Layer 50, with the highest execute accuracy, has the worst Brier and ECE of the four execute probes. 40 rows don't make this meaningful.
+- **Pilot prompts.** All 32 predictions (4 prompts, 2 tasks, 4 layers) equal the label. This checks the pipeline.
+- **Nothing here compares layers.** The differences between them, layer 50's 1.000 and layer 40's 0.900 among them, are a few rows of 40. The report ranks no layer, and neither does this section. Nothing here tests whether the model uses this information, or whether injecting a result at any of these layers would change its behavior: no intervention ran.
+
+### The report's caveats
+
+- Small sample: this is pipeline validation, not evidence. With 40 rows in 25 groups a difference between layers is noise until shown otherwise, so no layer is selected here and no confidence interval is given: the sample does not support one. A choice needs hundreds to thousands of prompts with a held-out, template-disjoint test set.
+- Decodability is not causal usefulness: a linear probe that reads a label from an activation shows that the information is there at that layer, not that the model uses it there, nor that injecting a result at that layer would change its behavior correctly. Only an intervention can show that, and this report runs none.
+- Surface cues: on these rows a digit and the absence of the refusal words (aber, ohne, but, without) give the execute label on 39 of 40 smoke rows, and a refusal is longer than its partner. The surface rule and the prompt length are in the tables, and a probe that does not beat them has shown nothing the text's surface does not show. Beating the bag of words is not enough, and the rule was written after seeing the rows. These rows cannot separate a probe that reads what a prompt asks from one that reads those cues.
+- The labels are a policy (execute-when-exact-result-asked-v1): execute_expected says execution is helpful, not that it is strictly necessary; execution_need keeps the two apart.
+
+### Not run or not reported
+
+- The real weight on the CPU, resident on Metal, and compared with a resident run.
+- The other position, `--reasoning default`.
+- The capture's overhead: [no figure is taken](#metal-cpu-and-the-expert-cache) from these decodes, and this was not a timed run.
+
+## Next
 
 - **A larger, leakage-resistant evaluation.** Hundreds to thousands of prompts from more templates, with a held-out test set disjoint in templates, paraphrase groups and number templates, and confidence intervals over groups. This is where a layer choice can start. Then calibration and robustness to paraphrase become meaningful. It must break the surface cues: computations that say `aber` or `ohne` and long ones, refusals without those words and short ones, and many numbers that need no execution.
 - **The two-stage gate hypothesis.** An early execute gate and a later family controller: compare where each target's score rises, on that larger set.
