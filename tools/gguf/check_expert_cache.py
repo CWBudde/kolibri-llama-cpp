@@ -47,12 +47,34 @@ size.
   prompt's experts can exceed the slots, the graph's passes as built (as few as waves of up to
   slots - 6 experts take), the decode counts as without waves.
 
+Side-file (--expert-cache-sidefile): patch 0014. Against a checkout without it the side-file checks are
+skipped with a note. cmd/kolibri-sidefile writes and verifies the side-file of each fixture; then, next
+to every run of the GGUF path above, the same run reads its misses from the side-file (and so with
+prefetch and buffered reads):
+
+- logits: bit-identical to the same resident run, and to the GGUF path's run;
+- counters: every phase's loads are what the misses and prefetches read, at exactly 1 pread per expert
+  on the side-file and 3 on the GGUF path; the stats name the side-file (null on the GGUF path); without
+  prefetch, hits and misses are the GGUF path's;
+- the ranges: test-expert-cache --sidefile reads every expert on both paths, with the ranges taken from
+  the GGUF's own header by ggml's gguf API as the model's loader takes them, and compares the bytes;
+- refusals at load, each by name of what is wrong: a flipped table byte, a truncated file, no file (no
+  fallback), another GGUF's rows, another GGUF's header, a side-file without the cache; a flipped data
+  byte loads, since the load does not hash 31 GB, and kolibri-sidefile verify reports it.
+
+LoRA (patch 0011): an adapter on a stacked expert tensor is refused at load with the cache, for gate, up and
+down, since the matmuls read the slots and the delta would be left out. The same adapter loads without the
+cache and changes the text, and an adapter on the router's input weight, which the cache does not hold, gives
+the resident run's text with the cache.
+
 With --real GGUF it checks a real checkpoint on the GPU instead: the first 160 tokens of a
 locality workload (128 prefilled, 32 decoded), resident against the cache with 128 and 64 slots per
 layer, with and without prefetch, again bit-identical, with the same counter checks; with waves the
 128 prompt tokens run in one ubatch (4 and 7 waves per layer built), 6 tokens at 18 slots grow
 their waves, and 512 tokens at 128 slots check the benchmark's own ubatch. Its reads may come from
-the page cache, since the resident run maps the whole file first.
+the page cache, since the resident run maps the whole file first. With side-file support the side-file
+is <GGUF>.experts (or --sidefile) and must exist; the --real run checks the pair's bytes on 8 experts
+of each layer and not the whole file: kolibri-sidefile verify does that.
 
     check_expert_cache.py --llama-cpp third_party/llama.cpp
     check_expert_cache.py --llama-cpp third_party/llama.cpp --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
@@ -69,7 +91,7 @@ import tempfile
 from pathlib import Path
 
 from check_model import Runner
-from tiny import convert, generate_tiny
+from tiny import ROOT, convert, generate_tiny
 
 N_PROMPT, N_DECODE = 40, 60
 SLOTS = [6, 16, 64, 384]
@@ -78,6 +100,29 @@ WAVE_SLOTS = [16, 18, 24, 64, 384]
 N_GROWN = 4  # 4 tokens' 24 pairs at 18 slots: 2 waves built, and a union above 2 * 6 grows them
 N_GROWN_REAL = 6  # likewise on a real checkpoint: 36 pairs at 18 slots, 3 waves built
 N_BENCH_UBATCH = 512  # testdata/bench/e4.json's arms prefill in ubatches of the server's default
+
+
+def write_lora(llama_cpp: Path, path: Path, base: Path, targets: list[str], rank: int = 2, seed: int = 1) -> None:
+    """A rank-limited LoRA adapter of random weights for these tensors of the GGUF base."""
+    sys.path.insert(0, str(llama_cpp / "gguf-py"))
+    import gguf
+    import numpy as np
+
+    dims = {t.name: [int(d) for d in t.shape] for t in gguf.GGUFReader(base).tensors}
+    w = gguf.GGUFWriter(path, gguf.GGUFReader(base).fields["general.architecture"].contents())
+    w.add_type("adapter")
+    w.add_string("adapter.type", "lora")
+    rng = np.random.default_rng(seed)
+    for name in targets:
+        d = dims[name]  # ggml order; numpy's is the reverse
+        a = rng.standard_normal(tuple(([d[0], rank] + d[2:])[::-1]), dtype=np.float32) * 0.5
+        b = rng.standard_normal(tuple(([rank, d[1]] + d[2:])[::-1]), dtype=np.float32) * 0.5
+        w.add_tensor(f"{name}.lora_a", a)
+        w.add_tensor(f"{name}.lora_b", b)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
 
 
 def has_waves(r: Runner, llama_cpp: Path) -> bool:
@@ -95,6 +140,18 @@ def has_waves(r: Runner, llama_cpp: Path) -> bool:
     return header
 
 
+def has_sidefile(r: Runner, llama_cpp: Path) -> bool:
+    """Whether the checkout has --expert-cache-sidefile, by the same rule as has_waves: the header and
+    the built library must agree."""
+    header = any(name == "sidefile_path" for name, _ in r.ffi.typeof("struct llama_expert_cache_params").fields)
+    path = llama_cpp / "build" / "bin" / ("libllama.dylib" if sys.platform == "darwin" else "libllama.so")
+    library = b'"sidefile"' in path.read_bytes()
+    if header != library:
+        raise SystemExit(f"{llama_cpp}: include/llama.h {'has' if header else 'has no'} expert cache field sidefile_path, "
+                         f"but {path.name} was built {'without' if header else 'with'} it: rebuild the checkout")
+    return header
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llama-cpp", type=Path, required=True, help="llama.cpp checkout with a built libllama")
@@ -102,6 +159,7 @@ def main() -> None:
     ap.add_argument("--real", type=Path, help="a real Kolibri GGUF, checked on the GPU instead of the tiny checkpoint")
     ap.add_argument("--tokens", type=Path, default=Path.home() / "models/eval/locality/coding.tokens.npy",
                     help="the token IDs of a locality workload, for --real")
+    ap.add_argument("--sidefile", type=Path, help="the side-file of --real (default: <GGUF>.experts)")
     ap.add_argument("--waves-only", action="store_true", help="only the wave checks")
     args = ap.parse_args()
     import numpy as np
@@ -112,6 +170,9 @@ def main() -> None:
         ap.error(f"--waves-only: {args.llama_cpp} has no expert cache waves; they need a build of fork branch feat/kolibri1-waves")
     if not waves_on:
         print(f"note: {args.llama_cpp} has no expert cache waves (fork branch feat/kolibri1-waves): skipping check_waves", flush=True)
+    sidefile_on = has_sidefile(r, args.llama_cpp)
+    if not sidefile_on:
+        print(f"note: {args.llama_cpp} has no expert cache side-file (patch 0014): skipping the side-file checks", flush=True)
     failed = 0
 
     def report(ok: bool, msg: str) -> None:
@@ -127,8 +188,19 @@ def main() -> None:
         where the cache's CPU remap splits the graph."""
         return r.logits(gguf, dev, tokens, ub, no_repack=True, split_after=("ffn_moe_topk",) if on_gpu(dev) else (), **kw)
 
+    def reads_ok(s: dict, side: Path | None) -> bool:
+        """Every phase's loads are what its misses and prefetches read, at one pread per expert from
+        the side-file and three from the GGUF; the stats name the file they used."""
+        if not sidefile_on:
+            return True
+        eb, per = s["expert_cache"]["expert_bytes"], 1 if side else 3
+        ok = s["expert_cache"]["sidefile"] == (str(side) if side else None)
+        for c in (s["prefill"], s["decode"]):
+            ok = ok and c["loads"] * eb == c["demand_bytes"] + c["prefetch_bytes"] and c["preads"] == per * c["loads"]
+        return ok
+
     def check(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
-              n_layer: int, k: int, stats: Path, label: str) -> None:
+              n_layer: int, k: int, stats: Path, label: str, side: Path | None = None) -> None:
         chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
         for slots in slots_list:
             ub = min(n_prompt, max(1, slots // k))  # n_batch is the largest chunk, the prompt
@@ -182,6 +254,7 @@ def main() -> None:
                 ok = ok and (ran > 0) == (pf > 0) and pre["prefetch_issued"] + pre["prefetch_skipped"] == 0
                 ok = ok and tot["load_failures"] == 0
                 ok = ok and 0 <= tot["io_prefetch_seconds"] <= tot["io_seconds"] and (tot["prefetch_bytes"] > 0) == (tot["io_prefetch_seconds"] > 0)
+                ok = ok and reads_ok(s, None)
                 report(ok, f"{what}: counters consistent (prefill {pre['steps']} remaps, {pre['misses']} misses; "
                            f"decode {dec['steps']} remaps, {dec['misses']} misses, {dec['hits']} hits, "
                            f"{dec['hits_loading']} awaited, prefetch {dec['prefetch_used']}/{dec['prefetch_issued']} used, "
@@ -191,6 +264,95 @@ def main() -> None:
                            f"{1e3 * dec['remap_seconds'] / max(dec['tokens'], 1):.3f} ms remap, {dec['splits'] / max(dec['tokens'], 1):.2f} splits, "
                            f"{(dec['metal_commits'] or 0) / max(dec['tokens'], 1):.2f} Metal commits; "
                            f"{s['process']['disk_bytes_read']} bytes read from disk)")
+
+                if side is None:
+                    continue
+                gguf_pre, gguf_dec = pre, dec
+                stats.unlink(missing_ok=True)
+                on_side = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True,
+                                   expert_cache={"n_slots": slots, "prefetch_k": pf, "stats_path": str(stats), "buffered": buffered,
+                                                 "sidefile_path": str(side)})
+                same = np.array_equal(on_side, ref)
+                diff = "" if same else f", max |diff| {float(np.abs(on_side - ref).max()):.3g}"
+                report(same, f"{what}, side-file: logits of {len(tokens)} positions bit-identical to the resident run{diff}")
+                report(np.array_equal(on_side, got), f"{what}, side-file: logits bit-identical to the GGUF path")
+                s = json.loads(stats.read_text())
+                pre, dec = s["prefill"], s["decode"]
+                ok = reads_ok(s, side) and pre["load_failures"] + dec["load_failures"] == 0
+                ok = ok and s["expert_cache"]["buffered"] == (buffered or sys.platform != "darwin")
+                # prefetches race with the remaps, so only a run without them has the same hits and misses
+                if pf == 0:
+                    ok = ok and all(a[key] == b[key] for a, b in ((pre, gguf_pre), (dec, gguf_dec)) for key in ("needed", "hits", "misses", "demand_bytes", "evictions"))
+                report(ok, f"{what}, side-file: {pre['preads']} and {dec['preads']} preads for {pre['loads']} and {dec['loads']} experts in prefill and decode "
+                           f"({gguf_pre['preads']} and {gguf_dec['preads']} on the GGUF path); prefetch {dec['prefetch_used']}/{dec['prefetch_issued']} used")
+
+    def kolibri_sidefile(*cmd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["go", "run", "./cmd/kolibri-sidefile", *cmd], capture_output=True, text=True, cwd=ROOT)
+
+    def pair(gguf: Path, side: Path, label: str, per_layer: int = 0) -> None:
+        """Both read paths on the GGUF's own ranges, in test-expert-cache."""
+        run = subprocess.run([str(args.llama_cpp / "build" / "bin" / "test-expert-cache"), "--sidefile", str(gguf), str(side), str(per_layer)],
+                             capture_output=True, text=True)
+        report(run.returncode == 0 and " 0 differences" in run.stdout, f"{label}: {run.stdout.strip()}{run.stderr.strip()[-300:]}")
+
+    def write_sidefile(gguf: Path, label: str) -> Path:
+        """kolibri-sidefile write and verify on a fixture, then both read paths on its own ranges."""
+        side = gguf.with_name(gguf.name + ".experts")
+        run = kolibri_sidefile("write", "-gguf", str(gguf), "-force")
+        if run.returncode != 0:
+            raise SystemExit(f"kolibri-sidefile write {gguf}: {run.stderr.strip()[-600:]}")
+        run = kolibri_sidefile("verify", "-gguf", str(gguf))
+        report(run.returncode == 0, f"{label}: kolibri-sidefile verify: {(run.stdout + run.stderr).strip().splitlines()[0][:120]}")
+        pair(gguf, side, label)
+        return side
+
+    def refused(gguf: Path, side: Path, tokens: list[int], needle: str, what: str) -> None:
+        try:
+            r.logits(gguf, r.devices()[0][1], tokens[:4], 1, expert_cache={"n_slots": 16, "sidefile_path": str(side)})
+            report(False, f"{what}: loaded")
+        except RuntimeError:
+            log = "".join(r.log)
+            line = next((ln.strip() for ln in log.splitlines() if "side-file" in ln), log[-200:])
+            report(needle in log, f"{what}: refused at load: {line[:240]}")
+
+    def check_refusals(gguf: Path, other: Path | None, side: Path, tokens: list[int], outtype: str) -> None:
+        """What the load refuses, and the one fault it leaves to kolibri-sidefile verify."""
+        data = side.read_bytes()
+        bad = side.with_name(side.name + ".bad")
+        def corrupt(edit) -> Path:
+            bad.write_bytes(edit(bytearray(data)))
+            return bad
+        def flip(b: bytearray, at: int) -> bytearray:
+            b[at] ^= 1
+            return b
+        refused(gguf, corrupt(lambda b: flip(b, 200)), tokens, "table checksum", f"{outtype} side-file with a flipped table byte")
+        refused(gguf, corrupt(lambda b: b[:len(data) - 16384]), tokens, "file size", f"{outtype} truncated side-file")
+        refused(gguf, corrupt(lambda b: b[:100]), tokens, "too short", f"{outtype} side-file cut inside its header")
+        refused(gguf, side.with_name("no-such-file"), tokens, "no fallback", f"{outtype} missing side-file")
+        if other is not None:
+            refused(other, side, tokens, "row bytes", f"{outtype} side-file on a GGUF of another type")
+        # the same tensors, one metadata byte apart
+        header = bytearray(gguf.read_bytes())
+        at = header.index(b"general.name") + len(b"general.name") + 4 + 8
+        header[at] ^= 1
+        changed = gguf.with_name("other-header-" + gguf.name)
+        changed.write_bytes(header)
+        refused(changed, side, tokens, "another GGUF", f"{outtype} side-file on a GGUF with another header")
+        changed.unlink()
+        # a data byte: the load cannot know, the tool does
+        flipped = corrupt(lambda b: flip(b, len(data) - 16384 + 3))
+        shutil.copyfile(str(side) + ".manifest.json", str(flipped) + ".manifest.json")
+        run = kolibri_sidefile("verify", "-gguf", str(gguf), "-o", str(flipped))
+        loaded = True
+        try:
+            r.logits(gguf, r.devices()[0][1], tokens[:4], 1, expert_cache={"n_slots": 16, "sidefile_path": str(flipped)})
+        except RuntimeError:
+            loaded = False
+        report(loaded and run.returncode != 0 and "extent differs" in run.stderr,
+               f"{outtype} side-file with a flipped data byte: the load does not hash the data ({'loaded' if loaded else 'refused'}), "
+               f"kolibri-sidefile verify reports it: {run.stderr.strip()[:160]}")
+        Path(str(flipped) + ".manifest.json").unlink()
+        bad.unlink()
 
     def check_waves(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
                     n_layer: int, n_expert: int, k: int, stats: Path, label: str, grown: bool = False) -> None:
@@ -242,8 +404,14 @@ def main() -> None:
             workload = [int(t) for t in np.load(args.tokens)]
             tokens = workload[:160]
             gpu = [(n, d) for n, d in r.devices() if r.lib.ggml_backend_dev_type(d) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU]
+            side = None
+            if sidefile_on and not args.waves_only:
+                side = args.sidefile or args.real.with_name(args.real.name + ".experts")
+                if not side.exists():
+                    raise SystemExit(f"{side} does not exist: go run ./cmd/kolibri-sidefile write -gguf {args.real}")
+                pair(args.real, side, f"{args.real.stem} side-file", 8)
             if not args.waves_only:
-                check(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
+                check(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem, side)
             check_waves(args.real, *gpu[0], tokens, 128, [128, 64], 50, 384, 6, stats, args.real.stem)
             check_waves(args.real, *gpu[0], tokens[:40], N_GROWN_REAL, [18], 50, 384, 6, stats, f"{args.real.stem} grown waves", grown=True)
             # the benchmark's ubatch: on a real workload about a third of the layers' unions outgrow 4 waves of 61
@@ -266,10 +434,12 @@ def main() -> None:
             n_layer, k = cfg["num_hidden_layers"], cfg["num_experts_per_tok"]
             rng = random.Random(args.seed)
             tokens = [rng.randrange(1000, 100000) for _ in range(N_PROMPT + N_DECODE)]
+            sides = {}
             for outtype in ["f32", "q8_0"]:
                 gguf = convert(model, args.llama_cpp, outtype)
+                side = sides[outtype] = write_sidefile(gguf, f"{outtype} side-file") if sidefile_on else None
                 for dev_name, dev in r.devices():
-                    check(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
+                    check(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype, side)
                     check_waves(gguf, dev_name, dev, tokens, N_PROMPT, WAVE_SLOTS, n_layer, cfg["num_experts"], k, stats, outtype)
                     check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], n_layer, cfg["num_experts"], k, stats, f"{outtype} grown waves", grown=True)
 
@@ -291,6 +461,12 @@ def main() -> None:
                     s = json.loads(stats.read_text())["expert_cache"]
                     report(np.array_equal(got, ref) and (s["slots_min"], s["slots_max"]) == (min(per_layer), max(per_layer)),
                            f"{outtype} {dev_name}, slots per layer {per_layer}, ubatch {ub}: logits bit-identical to the resident run")
+                    if side is not None:
+                        stats.unlink(missing_ok=True)
+                        got = r.logits(gguf, dev, tokens, N_PROMPT, chunks=[N_PROMPT] + [1] * N_DECODE, no_repack=True,
+                                       expert_cache={"n_slots_layer": per_layer, "prefetch_k": 8, "stats_path": str(stats), "sidefile_path": str(side)})
+                        report(np.array_equal(got, ref) and reads_ok(json.loads(stats.read_text()), side),
+                               f"{outtype} {dev_name}, slots per layer {per_layer}, ubatch {ub}, side-file: logits bit-identical to the resident run, one pread per expert")
 
                 # half the layers on the GPU; and the CPU with repacking on, which the slots never use
                 gpu = [(n, d) for n, d in r.devices() if r.lib.ggml_backend_dev_type(d) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU]
@@ -307,6 +483,16 @@ def main() -> None:
                     report(np.array_equal(got, ref) and placed,
                            f"{outtype} {what}, 16 slots: logits bit-identical to the resident run without repacking"
                            + ("" if placed else f" (slots not on every layer's device: {[ln for ln in log.splitlines() if 'slots per layer' in ln]})"))
+                    if side is not None:
+                        stats.unlink(missing_ok=True)
+                        got = r.logits(gguf, dev, tokens, N_PROMPT, chunks=[N_PROMPT] + [1] * N_DECODE, no_repack=no_repack,
+                                       n_gpu_layers=ngl, expert_cache={"n_slots": 16, "stats_path": str(stats), "sidefile_path": str(side)})
+                        report(np.array_equal(got, ref) and reads_ok(json.loads(stats.read_text()), side),
+                               f"{outtype} {what}, 16 slots, side-file: logits bit-identical to the resident run without repacking, one pread per expert")
+
+                if side is not None:
+                    other = model.parent / f"{model.name}-f32.gguf" if outtype != "f32" else None
+                    check_refusals(gguf, other, side, tokens, outtype)
 
             # one context per model
             gguf = model.parent / f"{model.name}-q8_0.gguf"
@@ -354,18 +540,55 @@ def main() -> None:
                 rs, rok = str(e), False
             report(resident.returncode == 0 and rok and resident.stdout == plain.stdout,
                    f"llama-completion --expert-cache-stats without the cache: decode timing only, same text ({rs if not rok else rs['decode']})")
+            # the MoE cache would take over the same matmuls, and the graph has one slot map for them
+            both = subprocess.run(base + ["--expert-cache", "16", "--moe-cache-mib", "8"], capture_output=True, text=True, errors="replace")
+            report(both.returncode != 0 and both.stdout.strip() == "" and "cannot serve one model" in both.stderr,
+                   f"llama-completion with --expert-cache and --moe-cache-mib exits {both.returncode} without generating, refused by name, no abort ({both.stderr[-200:] if both.returncode < 0 else 'no signal'})")
+            # a LoRA on the experts the cache holds is refused; without the cache, or on what it does not hold, it applies
+            for kind in ("gate", "up", "down"):
+                lora = Path(tmp) / f"lora-{kind}.gguf"
+                write_lora(args.llama_cpp, lora, gguf, [f"blk.0.ffn_{kind}_exps.weight"])
+                refused_run = subprocess.run(base + ["--expert-cache", "16", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+                report(refused_run.returncode != 0 and refused_run.stdout.strip() == "" and "reads from its slots" in refused_run.stderr,
+                       f"LoRA on ffn_{kind}_exps with the cache: exits {refused_run.returncode} without generating, refused by name")
+                applied = subprocess.run(base + ["-ub", "2", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+                report(applied.returncode == 0 and applied.stdout.strip() != "" and applied.stdout != plain.stdout,
+                       f"LoRA on ffn_{kind}_exps without the cache: loads and changes the text ({applied.stdout.strip()[:40]!r})")
+            lora = Path(tmp) / "lora-router.gguf"
+            write_lora(args.llama_cpp, lora, gguf, ["blk.0.ffn_gate_inp.weight"])
+            on_resident = subprocess.run(base + ["-ub", "2", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+            on_cache = subprocess.run(base + ["--expert-cache", "16", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+            report(on_resident.returncode == 0 and on_cache.returncode == 0 and on_resident.stdout != plain.stdout and on_cache.stdout == on_resident.stdout,
+                   f"LoRA on the router's input with the cache: same text as without it, changed by the adapter ({on_cache.stdout.strip()[:40]!r}{'' if on_cache.returncode == 0 else ' ' + on_cache.stderr[-300:]})")
             odd = Path(tmp) / 'we"ird\\na\tme.gguf'
             shutil.copyfile(gguf, odd)
             stats.unlink(missing_ok=True)
             run = subprocess.run([str(bin_dir / "llama-completion"), "-m", str(odd), "-p", prompt, "-n", "4", "-no-cnv",
                                   "-c", "256", "--no-warmup", "--expert-cache", "16", "--expert-cache-stats", str(stats)],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True, errors="replace")  # no --temp 0: the tokens may not be UTF-8
             try:
                 named = json.loads(stats.read_text())["expert_cache"]["file"]
             except (OSError, ValueError) as e:
                 named = f"unreadable: {e}"
             report(run.returncode == 0 and Path(named).name == odd.name,
                    f"stats of a model named {odd.name!r} are valid JSON and name it ({named!r})")
+            if sidefile_on:
+                sf = sides["q8_0"]
+                stats.unlink(missing_ok=True)
+                on_side = subprocess.run(base + ["--expert-cache", "16", "--expert-cache-sidefile", str(sf), "--expert-prefetch", "8",
+                                                 "--expert-cache-threads", "2", "--expert-cache-stats", str(stats)], capture_output=True, text=True)
+                s = json.loads(stats.read_text()) if on_side.returncode == 0 and stats.exists() else None
+                report(s is not None and on_side.stdout == plain.stdout and reads_ok(s, sf) and s["expert_cache"]["io_threads"] == 2,
+                       f"llama-completion --expert-cache-sidefile: same text as without the cache, one pread per expert ({s['decode']['preads'] if s else on_side.stderr[-300:]} in decode)")
+                gone = subprocess.run(base + ["--expert-cache", "16", "--expert-cache-sidefile", str(sf) + ".gone"], capture_output=True, text=True)
+                report(gone.returncode != 0 and gone.stdout.strip() == "" and "no fallback" in gone.stderr,
+                       f"llama-completion with a missing side-file exits {gone.returncode} without generating, no fallback to the GGUF")
+                # refused before any tensor is created: on the real model the load would wire the weights first
+                alone = subprocess.run(base + ["--expert-cache-sidefile", str(sf), "-v"], capture_output=True, text=True, errors="replace")
+                loading = subprocess.run(base + ["-n", "1", "-v"], capture_output=True, text=True, errors="replace")
+                report(alone.returncode != 0 and alone.stdout.strip() == "" and "without the cache" in alone.stderr
+                       and "load_tensors:" not in alone.stderr and "load_tensors:" in loading.stderr,
+                       f"llama-completion with a side-file and no --expert-cache exits {alone.returncode} without generating or loading a tensor")
             report(ok and plain.stdout == cached.stdout and plain.stdout.strip() != "",
                    f"llama-completion --expert-cache-layers/--expert-prefetch/--expert-cache-buffered/--expert-cache-stats: as asked, same text as without the cache "
                    f"({plain.stdout.strip()[:60]!r})" + ("" if ok else f" rc {plain.returncode}/{cached.returncode}: {cached.stderr.strip()[-300:]}"))

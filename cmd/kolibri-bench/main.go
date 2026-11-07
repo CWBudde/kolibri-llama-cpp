@@ -12,11 +12,24 @@
 // (testdata/bench/e0.json, docs/upstream.md). Only the fork's server is asked
 // for --expert-cache-stats.
 //
+// An arm that names --expert-cache-sidefile FILE (Stage E3) reads its misses
+// from FILE. "~/" expands as in the model's path, and a relative path resolves
+// from the repository root, where the driver runs. A missing side-file stops
+// the driver before the first run, and later fails the load: nothing falls
+// back to the GGUF. A -server whose --help does not list the flag also stops the
+// driver before the first run, for every arm of such a matrix. The report fails
+// unless each such run's stats name that file and show one pread per expert (3
+// on the GGUF path), with experts loaded in both phases.
+//
 // Every run of a config, a ceiling and a repetition:
 //  1. waits until the machine is quiet: a 1-minute load below -quiet-load,
 //     swap growing by less than -quiet-swap MiB over the last minute, and
 //     AC power;
-//  2. evicts the GGUF from the page cache (cmd/kolibri-evict), for a cold start;
+//  2. evicts the GGUF and every side-file of the matrix from the page cache
+//     (cmd/kolibri-evict), for a cold start: reads of resident pages come from
+//     memory even with F_NOCACHE, and writing or verifying a side-file leaves
+//     it resident. A GGUF or a side-file that stays resident stops the
+//     benchmark: an idle Metal server left on the file is enough to keep it so;
 //  3. at a ceiling above 0, wires that much memory (cmd/kolibri-memhog);
 //  4. starts llama-server and times it until /health answers;
 //  5. sends the cold request, then the warm ones (cmd/kolibri-stream -tokens
@@ -34,13 +47,16 @@
 // result. A resident run whose wired weights and hog exceed the memory, or a
 // cache run whose slots do not fit beside the hog, is recorded as "does not
 // fit" without starting it (see fits). The report goes to stdout and
-// <out>/report.md; it exits 1 if an exact equivalence fails or a cache run
-// failed to load an expert.
+// <out>/report.md; it exits 1 if an exact equivalence fails, a cache run failed
+// to load an expert, or the runs of one build came from different binaries
+// (run.json records each run's server and its sha256: see serverBuild).
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -93,6 +109,19 @@ var gateMetrics = []string{"", "decode", "prefill", "ttft", "decode-not-slower"}
 
 // validate rejects what the report could not evaluate.
 func (m matrix) validate() error {
+	for _, c := range m.Configs {
+		if path, ok := sidefileArg(c.Args); ok {
+			if path == "" {
+				return fmt.Errorf("%s: %s without a file", c.Name, sidefileFlag)
+			}
+			if !usesCache(c.Args) {
+				return fmt.Errorf("%s: %s without --expert-cache", c.Name, sidefileFlag)
+			}
+			if c.Server != "" {
+				return fmt.Errorf("%s: %s is the fork's option, on server %q", c.Name, sidefileFlag, c.Server)
+			}
+		}
+	}
 	for _, g := range m.Gates {
 		if !slices.Contains(gateMetrics, g.Metric) {
 			return fmt.Errorf("gate %s at %g GiB: metric %q, want one of %q", g.Candidate, g.CeilingGiB, g.Metric, gateMetrics[1:])
@@ -167,6 +196,61 @@ func slotArg(args []string) (flag, arg string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+const sidefileFlag = "--expert-cache-sidefile"
+
+// sidefileArg finds an arm's side-file: its path, "" if the flag ends the args.
+func sidefileArg(args []string) (path string, ok bool) {
+	for i, a := range args {
+		if a == sidefileFlag {
+			if i+1 < len(args) {
+				path = args[i+1]
+			}
+			return path, true
+		}
+	}
+	return "", false
+}
+
+// sidefiles lists the side-files of the matrix's arms, each once.
+func (m matrix) sidefiles() []string {
+	var out []string
+	for _, c := range m.Configs {
+		if path, ok := sidefileArg(c.Args); ok && !slices.Contains(out, path) {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+// expandPaths expands "~/" in what the arms name: the model and the side-file.
+func (m matrix) expandPaths() {
+	for i := range m.Configs {
+		c := &m.Configs[i]
+		c.Model = expandHome(c.Model)
+		c.Args = slices.Clone(c.Args)
+		for j, a := range c.Args {
+			if a == sidefileFlag && j+1 < len(c.Args) {
+				c.Args[j+1] = expandHome(c.Args[j+1])
+			}
+		}
+	}
+}
+
+// checkSidefiles stops a benchmark before its first run if a side-file is
+// missing: it would otherwise cost one failed run per arm, ceiling and repetition.
+func (m matrix) checkSidefiles() error {
+	for _, path := range m.sidefiles() {
+		st, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("side-file: %w (go run ./cmd/kolibri-sidefile write writes it)", err)
+		}
+		if !st.Mode().IsRegular() || st.Size() == 0 {
+			return fmt.Errorf("side-file %s: not a regular file with data", path)
+		}
+	}
+	return nil
 }
 
 // weights is what fits needs from a GGUF.
@@ -299,6 +383,64 @@ func (m matrix) missingServers(servers map[string]string, only []string) []strin
 	return missing
 }
 
+// checkServer stops a benchmark before its first run if a matrix with a
+// side-file arm would run on a server without the flag. Such a server fails every
+// side-file run, and its GGUF runs would stay behind as a baseline from another
+// build, which a resume keeps.
+func (m matrix) checkServer(server string) error {
+	if len(m.sidefiles()) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, server, "--help").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s --help: %w: %s", server, err, out[max(0, len(out)-300):])
+	}
+	if !strings.Contains(string(out), sidefileFlag) {
+		return fmt.Errorf("%s: its --help does not list %s, so it is not a build with patch 0014 (-server)", server, sidefileFlag)
+	}
+	return nil
+}
+
+// serverBuild is the sha256 of a llama-server build: of the binary and of the
+// libraries beside it. The check is against the build, not only the binary:
+// with shared libraries (build/bin here) nearly all the code, the expert cache
+// included, is in libllama and the binary does not change when they are rebuilt.
+func serverBuild(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	entries, err := os.ReadDir(filepath.Dir(resolved))
+	if err != nil {
+		return "", err
+	}
+	files := []string{resolved}
+	for _, e := range entries {
+		// a library's other names are symlinks to the one regular file
+		lib := strings.HasSuffix(e.Name(), ".dylib") || strings.HasSuffix(e.Name(), ".so") || strings.Contains(e.Name(), ".so.")
+		if lib && e.Type().IsRegular() {
+			files = append(files, filepath.Join(filepath.Dir(resolved), e.Name()))
+		}
+	}
+	all := sha256.New()
+	for _, file := range files {
+		f, err := os.Open(file)
+		if err != nil {
+			return "", err
+		}
+		h := sha256.New()
+		_, err = io.Copy(h, f)
+		f.Close()
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(all, "%s %x\n", filepath.Base(file), h.Sum(nil))
+	}
+	return hex.EncodeToString(all.Sum(nil)), nil
+}
+
 const (
 	statusOK            = "ok"
 	statusLoadFailed    = "load failed"
@@ -314,20 +456,27 @@ type request struct {
 }
 
 type runResult struct {
-	Config      string    `json:"config"`
-	CeilingGiB  float64   `json:"ceiling_gib"`
-	Rep         int       `json:"rep"`
-	Started     time.Time `json:"started"`
-	Status      string    `json:"status"`
-	Error       string    `json:"error,omitempty"`
-	LogTail     string    `json:"log_tail,omitempty"`
-	QuietWaitS  float64   `json:"quiet_wait_seconds"`
-	Load1       float64   `json:"load1_at_start"`
-	SwapMiB     float64   `json:"swap_used_mib_at_start"`
-	Evict       string    `json:"evict"`
-	Hog         string    `json:"hog,omitempty"`
-	LoadSeconds float64   `json:"load_seconds"`
-	OthersCPU   struct {
+	Config     string    `json:"config"`
+	CeilingGiB float64   `json:"ceiling_gib"`
+	Rep        int       `json:"rep"`
+	Started    time.Time `json:"started"`
+	Status     string    `json:"status"`
+	Error      string    `json:"error,omitempty"`
+	LogTail    string    `json:"log_tail,omitempty"`
+	QuietWaitS float64   `json:"quiet_wait_seconds"`
+	Load1      float64   `json:"load1_at_start"`
+	SwapMiB    float64   `json:"swap_used_mib_at_start"`
+	Evict      string    `json:"evict"`
+	// the binary this run started and its build: see serverBuild
+	Server       string `json:"server,omitempty"`
+	ServerSHA256 string `json:"server_sha256,omitempty"`
+	// the side-files of the matrix, evicted like the GGUF in every run, so that
+	// no arm reads one from memory or runs beside another arm's cached pages
+	EvictSidefiles []string `json:"evict_sidefiles,omitempty"`
+	Sidefile       string   `json:"sidefile,omitempty"` // the one this arm reads its misses from
+	Hog            string   `json:"hog,omitempty"`
+	LoadSeconds    float64  `json:"load_seconds"`
+	OthersCPU      struct {
 		Mean float64 `json:"mean"`
 		Max  float64 `json:"max"`
 	} `json:"others_cpu_percent"` // the other processes' CPU while the server ran, in % of one core
@@ -335,10 +484,14 @@ type runResult struct {
 	PeakFootprintMiB float64 `json:"peak_footprint_mib"`
 	// the model file's pages in the page cache: the largest sample during the
 	// requests, and once after the server stopped (nil: not measured)
-	PeakPageCacheMiB *float64    `json:"peak_page_cache_mib,omitempty"`
-	EndPageCacheMiB  *float64    `json:"end_page_cache_mib,omitempty"`
-	Requests         []request   `json:"requests"`
-	Stats            *cacheStats `json:"stats,omitempty"`
+	PeakPageCacheMiB *float64 `json:"peak_page_cache_mib,omitempty"`
+	EndPageCacheMiB  *float64 `json:"end_page_cache_mib,omitempty"`
+	// of those, the matrix's side-files; the two above count them too, so that
+	// an arm that reads a side-file shows the same hidden tier as one that reads the GGUF
+	PeakSidefileCacheMiB *float64    `json:"peak_sidefile_cache_mib,omitempty"`
+	EndSidefileCacheMiB  *float64    `json:"end_sidefile_cache_mib,omitempty"`
+	Requests             []request   `json:"requests"`
+	Stats                *cacheStats `json:"stats,omitempty"`
 }
 
 func (r runResult) key() string { return runKey(r.Config, r.CeilingGiB, r.Rep) }
@@ -464,7 +617,62 @@ type bench struct {
 	every     time.Duration
 	reqTO     time.Duration
 	loadTO    time.Duration
-	memBytes  int64 // hw.memsize
+	memBytes  int64                              // hw.memsize
+	cached    func(path string) (float64, error) // pageCacheMiB; tests replace it
+}
+
+// residualEvicted is the share of a GGUF or a side-file that may stay in the page
+// cache after its eviction. Above it the cold reads would partly come from memory.
+const residualEvicted = 0.01
+
+// evict drops the run's model and every side-file of the matrix from the page
+// cache and records it. Every arm does the same, so that also the GGUF arm
+// starts without a side-file's pages in memory. An error is the driver's own:
+// a missing file, or a file that stayed resident, makes the benchmark invalid.
+// kolibri-evict exits 0 whatever stays: pages another process wired or locked
+// (a stray Metal server, a --mlock) survive it, so the limit is checked here. It
+// holds for both arms: without it only the GGUF arm could read from memory.
+func (b *bench) evict(spec runSpec, res *runResult) error {
+	line := func(path string) (string, error) {
+		out, err := exec.Command(filepath.Join(b.bin, "kolibri-evict"), path).CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("kolibri-evict: %v: %s", err, out)
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+	gone := func(what, path, evicted string) error {
+		st, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		mib, err := b.cached(path)
+		if err != nil {
+			return fmt.Errorf("%s %s: %w", what, path, err)
+		}
+		if limit := residualEvicted * float64(st.Size()) / (1 << 20); mib > limit {
+			return fmt.Errorf("%s %s: %.0f MiB stay in the page cache after eviction, above %.0f MiB: its reads would come from memory; does another process hold it, such as a stray llama-server? (%s)",
+				what, path, mib, limit, evicted)
+		}
+		return nil
+	}
+	var err error
+	if res.Evict, err = line(spec.Config.Model); err != nil {
+		return err
+	}
+	if err := gone("model", spec.Config.Model, res.Evict); err != nil {
+		return err
+	}
+	for _, path := range b.m.sidefiles() {
+		l, err := line(path)
+		if err != nil {
+			return err
+		}
+		res.EvictSidefiles = append(res.EvictSidefiles, l)
+		if err := gone("side-file", path, l); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *bench) logf(format string, args ...any) {
@@ -562,11 +770,16 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 	res.QuietWaitS, res.Load1, res.SwapMiB = wait.Seconds(), m.Load1, m.SwapMiB
 	res.Started = time.Now()
 
-	ev, err := exec.Command(filepath.Join(b.bin, "kolibri-evict"), spec.Config.Model).CombinedOutput()
-	if err != nil {
-		return res, fmt.Errorf("kolibri-evict: %v: %s", err, ev)
+	// per run, not per driver: a rebuild while the driver waits or between
+	// resumes must show
+	res.Server = b.servers[spec.Config.Server]
+	if res.ServerSHA256, err = serverBuild(res.Server); err != nil {
+		return res, err
 	}
-	res.Evict = strings.TrimSpace(string(ev))
+	if err := b.evict(spec, &res); err != nil {
+		return res, err
+	}
+	res.Sidefile, _ = sidefileArg(spec.Config.Args)
 
 	var hogPids []int
 	if spec.Ceiling > 0 {
@@ -588,7 +801,7 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 		return res, err
 	}
 	defer lf.Close()
-	srv := exec.Command(b.servers[spec.Config.Server], b.m.serverArgs(spec.Config, b.port, filepath.Join(dir, "stats.json"))...)
+	srv := exec.Command(res.Server, b.m.serverArgs(spec.Config, b.port, filepath.Join(dir, "stats.json"))...)
 	srv.Stdout, srv.Stderr = lf, lf
 	t0 := time.Now()
 	if err := srv.Start(); err != nil {
@@ -604,7 +817,17 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 		// what the page cache keeps of the file once the server is gone: a
 		// hidden tier that phys_footprint does not show
 		if v, err := pageCacheMiB(spec.Config.Model); err == nil {
-			res.EndPageCacheMiB = &v
+			var side float64
+			for _, path := range b.m.sidefiles() {
+				if u, err := pageCacheMiB(path); err == nil {
+					side += u
+				}
+			}
+			total := v + side
+			res.EndPageCacheMiB = &total
+			if len(b.m.sidefiles()) > 0 {
+				res.EndSidefileCacheMiB = &side
+			}
 		}
 		if data, err := os.ReadFile(filepath.Join(dir, "stats.json")); err == nil {
 			var st cacheStats
@@ -672,12 +895,15 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 	for _, q := range phases {
 		rdir := filepath.Join(dir, q.Phase+"-"+q.Workload)
 		ctx, cancel := context.WithTimeout(context.Background(), b.reqTO)
-		cmd := exec.CommandContext(ctx, filepath.Join(b.bin, "kolibri-stream"),
-			"-url", fmt.Sprintf("http://127.0.0.1:%d/completion", b.port),
+		streamArgs := []string{"-url", fmt.Sprintf("http://127.0.0.1:%d/completion", b.port),
 			"-tokens", filepath.Join(b.workloads, q.Workload+".tokens.npy"), "-first", strconv.Itoa(b.m.PromptFirst),
 			"-manifest", b.manifest, "-n", strconv.Itoa(b.m.NPredict),
 			"-pid", strconv.Itoa(srv.Process.Pid), "-model", spec.Config.Model, "-every", "2s", "-window", "1000000",
-			"-out", rdir, "-summary", filepath.Join(rdir, "summary.json"))
+			"-out", rdir, "-summary", filepath.Join(rdir, "summary.json")}
+		for _, path := range b.m.sidefiles() {
+			streamArgs = append(streamArgs, "-sidefile", path)
+		}
+		cmd := exec.CommandContext(ctx, filepath.Join(b.bin, "kolibri-stream"), streamArgs...)
 		out, err := cmd.CombinedOutput()
 		cancel()
 		if werr := os.WriteFile(filepath.Join(rdir+".txt"), out, 0o644); werr != nil {
@@ -704,6 +930,9 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 			res.PeakRSSMiB, res.PeakFootprintMiB = max(res.PeakRSSMiB, pk.RSS), max(res.PeakFootprintMiB, pk.Footprint)
 			if pk.PageCache >= 0 && (res.PeakPageCacheMiB == nil || pk.PageCache > *res.PeakPageCacheMiB) {
 				res.PeakPageCacheMiB = &pk.PageCache
+			}
+			if pk.Sidefile >= 0 && (res.PeakSidefileCacheMiB == nil || pk.Sidefile > *res.PeakSidefileCacheMiB) {
+				res.PeakSidefileCacheMiB = &pk.Sidefile
 			}
 			f.Close()
 		}
@@ -750,9 +979,7 @@ func main() {
 	if err := m.validate(); err != nil {
 		log.Fatalf("%s: %v", *matrixPath, err)
 	}
-	for i := range m.Configs {
-		m.Configs[i].Model = expandHome(m.Configs[i].Model)
-	}
+	m.expandPaths()
 	dir := expandHome(*out)
 
 	if !*reportOnly {
@@ -777,10 +1004,16 @@ func main() {
 		for name, path := range servers {
 			servers[name] = abs(path)
 		}
+		if err := m.checkSidefiles(); err != nil {
+			log.Fatalf("%s: %v", *matrixPath, err)
+		}
 		servers[""] = abs(*server)
+		if err := m.checkServer(servers[""]); err != nil {
+			log.Fatalf("%s: %v", *matrixPath, err)
+		}
 		b := &bench{m: m, out: dir, bin: filepath.Join(dir, "bin"), servers: servers, manifest: abs(*manifest),
 			workloads: abs(*workloads), port: *port, quiet: quietRule{*quietLoad, *quietSwap, 2},
-			every: 30 * time.Second, reqTO: 30 * time.Minute, loadTO: 20 * time.Minute}
+			every: 30 * time.Second, reqTO: 30 * time.Minute, loadTO: 20 * time.Minute, cached: pageCacheMiB}
 		// rates timed across a sleep are meaningless; on 2026-10-16 idle
 		// sleep spread four runs over hours
 		awake := exec.Command("caffeinate", "-i", "-s", "-w", strconv.Itoa(os.Getpid()))

@@ -406,7 +406,7 @@ func TestReportRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	run := runRecord{Kind: "run", Date: "2026-10-22T10:00:00Z", Command: "kolibri-ssd -expert", File: "x.gguf", FileBytes: 1234567,
-		Layer0:  [3]expertTensor{{"IQ3_XXS", 1, 501760}, {"IQ3_XXS", 2, 501760}, {"IQ4_XS", 3, 696320}},
+		Layer0:  [3]expertTensor{{Type: "IQ3_XXS", Offset: 1, Slice: 501760}, {Type: "IQ3_XXS", Offset: 2, Slice: 501760}, {Type: "IQ4_XS", Offset: 3, Slice: 696320}},
 		Machine: map[string]string{"cpu": "Apple M5 Pro", "ssd": "APPLE SSD AP1024Z"}, Power: "Now drawing from 'AC Power'"}
 	c := cellRecord{Kind: "cell", Test: "expert-three", Mode: "nocache", Chunk: 1_699_840, QD: 4, Ops: 10, Bytes: 16_998_400, Seconds: 0.01,
 		stats: stats{MBps: 1699.84, IOPS: 1000, P50Us: 1500, P99Us: 4000, MaxUs: 5000, MeanUs: 1600}, Pages: 100, ResidentAfter: 3}

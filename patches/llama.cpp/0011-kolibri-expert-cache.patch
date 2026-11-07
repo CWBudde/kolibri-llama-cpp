@@ -132,6 +132,22 @@ index 70d6a671f..d1d140e46 100644
      bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
      std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
  
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 5a0b5b512..6d6e6cf5e 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2580,6 +2580,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
+     result.embedding    = false;
+     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+ 
++    // [EXPERIMENTAL] the expert cache is the target's: Kolibri only, and one context per model
++    result.expert_cache = 0;
++    result.expert_cache_layers.clear();
++    result.expert_cache_stats.clear();
++
+     if (has_draft) {
+         // default to global devices value
+         if (!params_spec.devices.empty()) {
 diff --git a/include/llama.h b/include/llama.h
 index 3af6e2223..7dd4378c9 100644
 --- a/include/llama.h
@@ -188,8 +204,30 @@ index 97250c2e8..03b4efa10 100644
      llama-grammar.cpp
      llama-graph.cpp
      llama-hparams.cpp
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index 824601ed6..a18dac9c3 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-adapter.h"
+ 
++#include "llama-expert-cache.h"
+ #include "llama-impl.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+@@ -339,6 +340,10 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
+         if (model.hdmd.inverse_blocks.count(name)) {
+             throw std::runtime_error("LoRA tensor '" + name + "' targets a prism.hadamard latent lookup table, which is not supported");
+         }
++        // the expert cache's matmuls read its slot tensors under the slots' ids: the delta would be silently left out
++        if (model.expert_cache && model.expert_cache->holds(model_tensor)) {
++            throw std::runtime_error("LoRA tensor '" + name + "' targets a routed expert, which the expert cache reads from its slots: not supported");
++        }
+ 
+         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+ 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ca84fc405..3c994ad91 100644
+index ca84fc405..a2c43ea30 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,5 @@
@@ -198,12 +236,16 @@ index ca84fc405..3c994ad91 100644
  
  #include "ggml.h"
  #include "llama-arch.h"
-@@ -343,6 +344,19 @@ llama_context::llama_context(
+@@ -343,6 +344,23 @@ llama_context::llama_context(
  
      cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
  
 +    // [EXPERIMENTAL] with the expert cache, the experts of every ubatch must fit its slots
 +    if (model.expert_cache) {
++        // both would take over the same matmuls: the graph has one slot map for an expert tensor
++        if (params.moe_cache_size > 0) {
++            throw std::runtime_error("the expert cache and the MoE cache cannot serve one model: drop --moe-cache-mib");
++        }
 +        // refused early, before buffers are allocated; attach() below decides
 +        if (model.expert_cache->in_use()) {
 +            throw std::runtime_error("the expert cache serves one context per model, and it has one");
@@ -218,7 +260,7 @@ index ca84fc405..3c994ad91 100644
      cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
      cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
-@@ -580,12 +594,25 @@ llama_context::llama_context(
+@@ -580,12 +598,25 @@ llama_context::llama_context(
              sampling.token_ids_full_vocab[i] = i;
          }
      }
@@ -244,6 +286,19 @@ index ca84fc405..3c994ad91 100644
      // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
      if (!model.hparams.no_alloc && !opt_ctx) {
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+@@ -1521,6 +1552,12 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    // [EXPERIMENTAL] graph_compute is async, and the next ubatch's remap and prefetch can evict a slot
++    // the last graph's matmuls still read
++    if (model.expert_cache) {
++        ggml_backend_sched_synchronize(sched.get());
++    }
++
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
 diff --git a/src/llama-context.h b/src/llama-context.h
 index 6938fb103..5d5a0e842 100644
 --- a/src/llama-context.h
@@ -260,10 +315,10 @@ index 6938fb103..5d5a0e842 100644
  
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 000000000..2a328401d
+index 000000000..a1f9fad9b
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,456 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -277,16 +332,22 @@ index 000000000..2a328401d
 +#include <stdexcept>
 +
 +#if defined(__APPLE__)
++#include <TargetConditionals.h>
 +#include <fcntl.h>
-+#include <libproc.h>
++#if TARGET_OS_OSX
++#include <libproc.h> // macOS only: iOS, tvOS and visionOS do not ship it
++#define LLAMA_EXPERT_CACHE_PROC_RUSAGE
++#endif
 +#include <sys/mman.h>
 +#include <sys/param.h>
 +#include <sys/resource.h>
++#include <sys/stat.h>
 +#include <unistd.h>
 +#elif defined(__linux__)
 +#include <fcntl.h>
 +#include <sys/mman.h>
 +#include <sys/resource.h>
++#include <sys/stat.h>
 +#include <unistd.h>
 +#endif
 +
@@ -298,7 +359,7 @@ index 000000000..2a328401d
 +    uint64_t pageins   = 0;
 +    uint64_t faults    = 0;
 +    uint64_t max_phys_footprint = 0;
-+#if defined(__APPLE__)
++#if defined(LLAMA_EXPERT_CACHE_PROC_RUSAGE)
 +    static constexpr bool has_io     = true; // disk_read, pageins, max_phys_footprint
 +#else
 +    static constexpr bool has_io     = false;
@@ -337,7 +398,7 @@ index 000000000..2a328401d
 +
 +process_counts process_now() {
 +    process_counts c;
-+#if defined(__APPLE__)
++#if defined(LLAMA_EXPERT_CACHE_PROC_RUSAGE)
 +    rusage_info_v4 ri = {};
 +    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *) &ri) == 0) {
 +        c.disk_read          = ri.ri_diskio_bytesread;
@@ -448,6 +509,17 @@ index 000000000..2a328401d
 +        n += gr.buf ? ggml_backend_buffer_get_size(gr.buf) : 0;
 +    }
 +    return n;
++}
++
++bool llama_expert_cache::holds(const ggml_tensor * t) const {
++    for (const auto & layer : stacked) {
++        for (const ggml_tensor * s : layer.t) {
++            if (s == t) {
++                return true;
++            }
++        }
++    }
++    return false;
 +}
 +
 +void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std::vector<ggml_backend_dev_t> & devs, int fd_loader) {
@@ -564,6 +636,18 @@ index 000000000..2a328401d
 +#else
 +    GGML_UNUSED(fd_loader);
 +    throw std::runtime_error("expert cache: not supported on this platform");
++#endif
++#if defined(__APPLE__) || defined(__linux__)
++    // the cache has its own open file, since F_NOCACHE would reach the loader's through a dup. A path
++    // can name another file by now, and the offsets would read wrong weights without an error
++    struct stat st_loader = {};
++    struct stat st_own = {};
++    if (fstat(fd_loader, &st_loader) != 0 || fstat(fd, &st_own) != 0) {
++        throw std::runtime_error(format("expert cache: fstat of %s: %s", path.c_str(), strerror(errno)));
++    }
++    if (st_loader.st_dev != st_own.st_dev || st_loader.st_ino != st_own.st_ino) {
++        throw std::runtime_error(format("expert cache: %s was replaced while the model loaded", path.c_str()));
++    }
 +#endif
 +
 +    ud.resize(n_layer);
@@ -693,10 +777,10 @@ index 000000000..2a328401d
 +}
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
 new file mode 100644
-index 000000000..ec772aeaf
+index 000000000..571f876c9
 --- /dev/null
 +++ b/src/llama-expert-cache.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,111 @@
 +#pragma once
 +
 +// [EXPERIMENTAL] A bounded cache of routed experts (Kolibri only).
@@ -740,6 +824,9 @@ index 000000000..ec772aeaf
 +    // starts the I/O threads; it throws on failure. The slots are host memory, which pread writes:
 +    // a CPU buffer, or host memory the device uses in place (buffer_from_host_ptr, e.g. Metal).
 +    void init(const std::vector<tensors> & stacked, const std::vector<ggml_backend_dev_t> & devs, int fd);
++
++    // whether t is one of the stacked expert tensors this cache reads in place of the model's
++    bool holds(const ggml_tensor * t) const;
 +
 +    // the largest ubatch whose experts always fit: the fewest slots of a layer over n_expert_used
 +    uint32_t max_ubatch() const;
@@ -1642,10 +1729,10 @@ index 815cc15a3..c475ae12c 100644
      target_link_libraries(test-chat PRIVATE server-context)
 diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
 new file mode 100644
-index 000000000..157750c17
+index 000000000..aaba048a9
 --- /dev/null
 +++ b/tests/test-expert-cache.cpp
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,386 @@
 +// Tests of the expert cache's bookkeeping (src/llama-expert-slots.*) with a fake loader, and of its
 +// Markov predictor against the predictions of the Go original:
 +//
@@ -1655,6 +1742,8 @@ index 000000000..157750c17
 +// it the predictor check is skipped.
 +
 +#include "../src/llama-expert-slots.h"
++#include "common.h"
++#include "speculative.h"
 +
 +#include <nlohmann/json.hpp>
 +
@@ -1993,6 +2082,19 @@ index 000000000..157750c17
 +    printf("markov fixture: %zu steps, %zu predictions over %zu parameter sets, as the Go predictor\n", steps.size(), n_pred, j["params"].size());
 +}
 +
++// a draft model gets the target's params except its expert cache: Kolibri only, one context per model
++static void test_draft_params() {
++    common_params target;
++    target.expert_cache        = 128;
++    target.expert_cache_layers = { 128, 64 };
++    target.expert_cache_stats  = "stats.json";
++    const common_params draft = common_base_params_to_speculative(target);
++    CHECK(draft.expert_cache == 0);
++    CHECK(draft.expert_cache_layers.empty());
++    CHECK(draft.expert_cache_stats.empty());
++    CHECK(target.expert_cache == 128);
++}
++
 +int main(int argc, char ** argv) {
 +    test_lru();
 +    test_pinned();
@@ -2004,6 +2106,7 @@ index 000000000..157750c17
 +    test_failures();
 +    test_stress();
 +    test_top_k();
++    test_draft_params();
 +    if (argc > 1) {
 +        test_markov_fixture(argv[1]);
 +    } else {
