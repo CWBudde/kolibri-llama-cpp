@@ -1,23 +1,16 @@
 package main
 
 import (
-	"fmt"
 	"slices"
 
 	"kolibri-llm/internal/gguf"
 )
 
 // kinds are the stacked expert tensors in the order patch 0011 reads them.
-var kinds = [3]string{"gate", "up", "down"}
+var kinds = gguf.ExpertKinds
 
-// expertTensor is one layer's blk.L.ffn_<kind>_exps.weight: expert e's rows
-// are the contiguous slice [Offset + e*Slice, Offset + (e+1)*Slice), the
-// stacked tensor's nb[2] (llama_expert_cache::load in patch 0011).
-type expertTensor struct {
-	Type   string `json:"type"`
-	Offset int64  `json:"offset"` // absolute file offset of expert 0
-	Slice  int64  `json:"slice"`  // bytes per expert
-}
+// expertTensor is one layer's blk.L.ffn_<kind>_exps.weight.
+type expertTensor = gguf.ExpertTensor
 
 // layout is where a GGUF keeps its routed experts.
 type layout struct {
@@ -32,46 +25,18 @@ type extent struct{ Start, End int64 }
 
 func (e extent) len() int64 { return e.End - e.Start }
 
-// expertLayout finds the stacked expert tensors of every layer; each must
-// have ne[2] equal to the expert count and split into equal slices.
+// expertLayout finds the stacked expert tensors of every layer.
 func expertLayout(f *gguf.File) (*layout, error) {
-	arch, ok := f.String("general.architecture")
-	if !ok {
-		return nil, fmt.Errorf("no general.architecture")
+	arch, ne, layers, err := f.ExpertLayers()
+	if err != nil {
+		return nil, err
 	}
-	nl, ok := f.Uint(arch + ".block_count")
-	if !ok {
-		return nil, fmt.Errorf("no %s.block_count", arch)
-	}
-	ne, ok := f.Uint(arch + ".expert_count")
-	if !ok || ne == 0 {
-		return nil, fmt.Errorf("no %s.expert_count", arch)
-	}
-	l := &layout{Arch: arch, Experts: int(ne)}
+	l := &layout{Arch: arch, Experts: ne, Layers: layers}
 	var ext []extent
-	for il := range int(nl) {
-		var lt [3]expertTensor
-		for k, kind := range kinds {
-			name := fmt.Sprintf("blk.%d.ffn_%s_exps.weight", il, kind)
-			t, ok := f.Tensor(name)
-			if !ok {
-				return nil, fmt.Errorf("no tensor %s", name)
-			}
-			if len(t.Dims) != 3 || t.Dims[2] != ne {
-				return nil, fmt.Errorf("%s: dims %v, want %d experts on the outermost axis", name, t.Dims, ne)
-			}
-			n, err := t.Bytes()
-			if err != nil {
-				return nil, err
-			}
-			if n%int64(ne) != 0 {
-				return nil, fmt.Errorf("%s: %d bytes do not split into %d experts", name, n, ne)
-			}
-			off := f.FileOffset(t)
-			lt[k] = expertTensor{Type: t.Type.String(), Offset: off, Slice: n / int64(ne)}
-			ext = append(ext, extent{off, off + n})
+	for _, lt := range layers {
+		for _, t := range lt {
+			ext = append(ext, extent{t.Offset, t.Offset + int64(ne)*t.Slice})
 		}
-		l.Layers = append(l.Layers, lt)
 	}
 	l.Extents = mergeExtents(ext)
 	return l, nil
