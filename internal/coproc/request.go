@@ -10,8 +10,10 @@ import (
 )
 
 // Generator stands in for the inference context of a request: its decode position, KV cache and
-// prompt. Phase 5 puts llama.cpp behind it. The scheduler never calls it while the request is
-// BLOCKED and never calls both methods at once.
+// prompt. Phase 5 puts llama.cpp behind it. A generator belongs to one request. The scheduler never
+// calls it while the request is BLOCKED and never calls both methods at once. It stays in use until
+// the Apply or Run that called it has returned, or until Shutdown has returned nil, even if its
+// request was closed earlier: Close doesn't wait for a call.
 type Generator interface {
 	// Step generates one token and returns at a boundary between tokens.
 	Step(ctx context.Context) (string, error)
@@ -166,6 +168,8 @@ func (r *Request) useInference(ctx context.Context) (context.Context, func() err
 		return nil, nil, fmt.Errorf("%w: %s", ErrNotReady, r.state)
 	}
 	r.state = Generating
+	claim := make(chan struct{})
+	r.s.claims[r] = claim
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(r.ctx, cancel)
 	return ctx, func() error {
@@ -173,6 +177,8 @@ func (r *Request) useInference(ctx context.Context) (context.Context, func() err
 		cancel()
 		r.s.mu.Lock()
 		defer r.s.mu.Unlock()
+		delete(r.s.claims, r)
+		close(claim)
 		if r.state == Closed {
 			return ErrRequestClosed
 		}
@@ -413,7 +419,8 @@ func (r *Request) Cancel(id JobID) error {
 // Close tears the request down: its jobs without an outcome are cancelled, a waiter is released
 // with ErrRequestClosed, a running generator call is cancelled and its token discarded. Later
 // events for the request are dropped, also if a new request reuses the ID. Close can be called
-// again.
+// again. It doesn't wait for a generator call, which can outlast it if it doesn't honor its context:
+// before freeing the inference context, a caller joins its Apply or Run, or calls Shutdown.
 func (r *Request) Close() {
 	s := r.s
 	s.update(func() {

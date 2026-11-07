@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -72,6 +73,7 @@ type Scheduler struct {
 	lastGen  Generation
 	stopped  bool
 	stats    Stats
+	claims   map[*Request]chan struct{} // running generator calls, also of closed requests
 }
 
 // NewScheduler starts a scheduler. Shutdown ends it.
@@ -89,6 +91,7 @@ func NewScheduler(cp Coprocessor, cfg Config) (*Scheduler, error) {
 		stop:     make(chan struct{}),
 		loopDone: make(chan struct{}),
 		requests: make(map[RequestID]*Request),
+		claims:   make(map[*Request]chan struct{}),
 	}
 	go s.loop()
 	return s, nil
@@ -119,7 +122,9 @@ func (s *Scheduler) Stats() Stats {
 
 // Shutdown closes every request, which cancels their jobs and releases their waiters, and stops
 // consuming events. Events still queued refer to closed requests and are dropped. It returns once
-// the consumer has ended or ctx is done, and can be called again.
+// the consumer has ended and every generator call has returned, or ctx is done, and can be called
+// again. After a nil return no generator is in use. A generator or an emit callback that calls it
+// must pass a context that ends, since Shutdown then waits for its caller.
 func (s *Scheduler) Shutdown(ctx context.Context) error {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
@@ -136,10 +141,21 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 	})
 	select {
 	case <-s.loopDone:
-		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// No claim can start now: every request is closed and Open is refused.
+	s.mu.Lock()
+	claims := slices.Collect(maps.Values(s.claims))
+	s.mu.Unlock()
+	for _, claim := range claims {
+		select {
+		case <-claim:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // loop is the only consumer of the channel. It blocks until an event arrives.
