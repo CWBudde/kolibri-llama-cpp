@@ -398,10 +398,10 @@ reached `feat/kolibri1`. At that date the next patch was 0014, and the series
 is in the next paragraph.
 
 **Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on fork branch
-`feat/kolibri1-sidefile` (`ca32334bb`), not on `feat/kolibri1` yet. The patch is
+`feat/kolibri1-sidefile` (`bf7bf16b6`), not on `feat/kolibri1` yet. The patch is
 the plain diff of that branch against `feat/kolibri1`. The series 0008, 0010,
 0011, 0012 and 0014 applied to a clean `184f6536` equals that branch's tree
-(`153d82bd`), and without 0014 it equals `feat/kolibri1`'s (`5b35743d`, both by
+(`6bc64819`), and without 0014 it equals `feat/kolibri1`'s (`7e901295`, both by
 `git write-tree`). Its gates passed, so the number stays in the series. The
 benchmark ran on `dd2040eaf`, whose tree (`53739515`) is what the same series
 gave at `0b19754`, before the review fixes below.
@@ -467,6 +467,13 @@ branches, which do not merge.
 |---|---|
 | M89: the MoE cache refusal off (`if (false && params.moe_cache_size > 0)`) | `check_expert_cache.py`: "FAIL llama-completion with --expert-cache and --moe-cache-mib exits -6", "FAIL: 1 failures", rc 1 |
 | M90: the draft's cache params not cleared | `test-expert-cache`: "FAIL draft.expert_cache == 0", the same for the layers and the stats, "3 checks failed" |
+
+**iOS, tvOS and visionOS did not build (fork CI, 2026-11-07).** `llama-expert-cache.cpp`
+included `libproc.h`, which those SDKs do not ship, so `CI (apple)` failed on every
+branch with the cache. `ba4bd5bbc` (0011) limits it to macOS; the three counters that
+need `proc_pid_rusage` stay `null` elsewhere, as on Linux. It is merged into the
+side-file branch as `bf7bf16b6`. This machine has no iOS, tvOS or visionOS SDK. Locally
+the other path was only compiled against the macOS SDK with `TARGET_OS_OSX` forced to 0.
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's

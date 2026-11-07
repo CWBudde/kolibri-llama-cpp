@@ -75,10 +75,10 @@ index 03b4efa10..bf6d6c35f 100644
      llama-grammar.cpp
      llama-graph.cpp
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 52acfbcd5..d7bd82490 100644
+index 2900ed6b9..6c1ef80fe 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
-@@ -107,14 +107,14 @@ std::string counts_json(const llama_expert_cache_counts & c, const std::string &
+@@ -111,14 +111,14 @@ std::string counts_json(const llama_expert_cache_counts & c, const std::string &
          "\"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
          "\"prefetch_used\": %llu, \"prefetch_wasted\": %llu, \"prefetch_cancelled\": %llu, "
          "\"prefetch_skipped\": %llu, \"load_failures\": %llu, \"wait_seconds\": %.6f, \"io_seconds\": %.6f, "
@@ -95,7 +95,7 @@ index 52acfbcd5..d7bd82490 100644
  }
  
  std::string process_json(const process_counts & pc, uint64_t disk_read0, uint64_t pageins0, uint64_t faults0) {
-@@ -170,7 +170,7 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int
+@@ -174,7 +174,7 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int
      : n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used),
        n_threads(std::max(p.n_threads, 1)), prefetch_k(std::max(p.prefetch_k, 0)),
        prefetch_half_life(std::max(p.prefetch_half_life, 1)), prefetch_mix(p.prefetch_mix),
@@ -104,7 +104,7 @@ index 52acfbcd5..d7bd82490 100644
      if (p.n_slots_layer && p.n_layer_slots > 0) {
          if (p.n_layer_slots != n_layer) {
              throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
-@@ -377,12 +377,23 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -381,12 +381,23 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      }
  #endif
  
@@ -129,7 +129,7 @@ index 52acfbcd5..d7bd82490 100644
      if (prefetch_k > 0) {
          markov = std::make_unique<llama_expert_markov>(n_layer, n_expert, prefetch_half_life, prefetch_mix);
      }
-@@ -401,7 +412,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -405,7 +416,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      }
      LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s%s\n",
          __func__, *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
@@ -138,7 +138,7 @@ index 52acfbcd5..d7bd82490 100644
  }
  
  uint32_t llama_expert_cache::max_ubatch() const {
-@@ -442,7 +453,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -446,7 +457,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
          int l = -1;
          int e = -1;
          if (slots->failure(l, e)) {
@@ -147,7 +147,7 @@ index 52acfbcd5..d7bd82490 100644
          }
          GGML_ABORT("expert cache: layer %d needs more distinct experts in one ubatch of %d tokens than its %d slots",
              il, n_tokens, n_slots[il]);
-@@ -459,34 +470,16 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -463,34 +474,16 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
      op_seconds[decode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
  }
  
@@ -189,7 +189,7 @@ index 52acfbcd5..d7bd82490 100644
  }
  
  std::string llama_expert_cache::stats_json() const {
-@@ -501,10 +494,11 @@ std::string llama_expert_cache::stats_json() const {
+@@ -505,10 +498,11 @@ std::string llama_expert_cache::stats_json() const {
      const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + (diag ? ", " + diag->json_fields() : std::string());
      return format(
          "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "

@@ -319,7 +319,7 @@ index 5d5a0e842..b99f0abe8 100644
      bool graph_reuse_disable = false;
  
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
-index 1398087a0..52acfbcd5 100644
+index a1f9fad9b..2900ed6b9 100644
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
 @@ -5,6 +5,7 @@
@@ -330,7 +330,7 @@ index 1398087a0..52acfbcd5 100644
  #include <cerrno>
  #include <cstring>
  #include <fstream>
-@@ -99,29 +100,77 @@ void remap_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+@@ -103,29 +104,77 @@ void remap_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
      ud->cache->remap(ud->il, dst->src[0], dst);
  }
  
@@ -412,7 +412,7 @@ index 1398087a0..52acfbcd5 100644
      if (p.n_slots_layer && p.n_layer_slots > 0) {
          if (p.n_layer_slots != n_layer) {
              throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
-@@ -300,9 +349,12 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -304,9 +353,12 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      if (fd < 0) {
          throw std::runtime_error(format("expert cache: open %s: %s", p, strerror(errno)));
      }
@@ -427,7 +427,7 @@ index 1398087a0..52acfbcd5 100644
      path = format("/proc/self/fd/%d", fd_loader);
      fd = open(path.c_str(), O_RDONLY);
      if (fd < 0) {
-@@ -347,9 +399,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+@@ -351,9 +403,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
      for (const auto & gr : groups) {
          where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
      }
@@ -439,7 +439,7 @@ index 1398087a0..52acfbcd5 100644
  }
  
  uint32_t llama_expert_cache::max_ubatch() const {
-@@ -375,6 +427,7 @@ ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor *
+@@ -379,6 +431,7 @@ ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor *
  
  void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * dst) {
      GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
@@ -447,7 +447,7 @@ index 1398087a0..52acfbcd5 100644
      const int n_tokens = (int) ids->ne[1];
  
      // a graph runs its layers in order; layer 0 starts the next ubatch (the last layer may see
-@@ -403,6 +456,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+@@ -407,6 +460,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
              slots->prefetch(target, pred.data(), (int) pred.size(), decode);
          }
      }
@@ -455,7 +455,7 @@ index 1398087a0..52acfbcd5 100644
  }
  
  bool llama_expert_cache::load(int il, int e, int s) {
-@@ -439,14 +493,18 @@ std::string llama_expert_cache::stats_json() const {
+@@ -443,14 +497,18 @@ std::string llama_expert_cache::stats_json() const {
      const auto pc = process_now();
      const int s_min = *std::min_element(n_slots.begin(), n_slots.end());
      const int s_max = *std::max_element(n_slots.begin(), n_slots.end());
