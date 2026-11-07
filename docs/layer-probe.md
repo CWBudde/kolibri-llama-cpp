@@ -137,9 +137,25 @@ go run ./cmd/kolibri-probe report -capture ~/models/eval/layer-probe-<date>
 **One capture and one report, 2026-11-07, from commit `4e35417`, with the committed definitions.** The report wrote `report.md` and no `report-deviation-*`. Everything is in `~/models/eval/layer-probe-20261107`.
 
 - **Weight.** `/Users/christian/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, a real file on the internal drive (`model_realpath`), sha256 `93720b94a5a383f5bad07677ca05014bf0681a662e646ea3b1b196cda33c88bc`.
-- **Build.** `third_party/llama.cpp` at `90311e5a2`, on fork branch `feat/kolibri1-waves`, with waves off (the cache's stats file says `waves: false`). That branch is outside the patch series: `feat/kolibri1` without its last commit, plus the Stage E4 waves code ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)), which changes `src/llama-graph.cpp`, the file that builds the graph this capture reads. Waves off is a runtime flag. Whether a build without that code gives the same activations has not been measured. `check_capture.py`'s tiny runs used the same build.
+- **Build.** `third_party/llama.cpp` at `90311e5a2`, on fork branch `feat/kolibri1-waves`, with waves off (the cache's stats file says `waves: false`). That branch is outside the patch series: `feat/kolibri1` without its last commit, plus the Stage E4 waves code ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)), which changes `src/llama-graph.cpp`, the file that builds the graph this capture reads. Waves off is a runtime flag. A build without that code gave byte-identical activations and logits at these settings: see [On the patch series](#on-the-patch-series). `check_capture.py`'s tiny runs used this build and have not been repeated on the series.
 - **Settings.** `MTL0`, 10 threads, 128 cache slots, effective ubatch 21, `n_ctx` 512, reasoning mode `none`. Two captures compare only at equal settings.
 - **Dataset.** sha256 `e4681b761c1542876ab72c4db1f3d44e1de6c7b1190e2c532116496c00c2cc90`, as committed.
+
+### On the patch series
+
+The same capture was repeated on `feat/kolibri1` at `634e34bb4` (build 11839), which has no Stage E4 code. It was built Release with Metal in a worktree of its own, with the same `LLAMA_` and `GGML_` options as the other worktrees, and run with the commands in [Reproduce](#reproduce) from `ef27468`, whose only changes after `4e35417` are docs. Same weight, dataset, device, threads, slots and effective ubatch. Records: `~/models/eval/layer-probe-20261107-series`.
+
+| Compared with the run above | Result |
+|---|---|
+| `layer-10`, `-25`, `-40`, `-50` `.npy` | byte-identical, and `np.array_equal` holds, on all 44 rows and 2560 dimensions |
+| Logits at each prompt's last token | byte-identical on all 44 prompts, `[44, 128000]` `float32`, sha256 `78f0bdb1…` on both builds |
+| Prompt tokens per row, template, graph check, logits check, repeat | equal in `capture.json` |
+| `report.md` | byte-identical |
+| `report.json` | differs only in the capture's provenance: `server`, `server_sha256`, `backend_sha256`, `llama_cpp_head` and three timing fields |
+
+`capture.json` keeps no logits, only the verdict of each run's own check, so the waves run's logits weren't on disk. Both builds were therefore run once more with `dump_logits.py`, which repeats the capture's plain pass (no callback, same settings) and writes the logits. The waves dump loaded `libllama` `f5801cb0…`, the same file the capture above records. Script, arrays and logs: `~/models/eval/layer-probe-20261107-logits`.
+
+**This reaches these settings only: this weight, Metal, 128 slots, ubatch 21, the last row of 44 prompts, the four layers and the logits.** It doesn't say that the two builds agree on the CPU, resident, or at another ubatch.
 
 ### Capture checks
 
@@ -203,7 +219,7 @@ Held out by grouped cross-validation: 40 rows, 25 groups, 5 folds, 20 label shuf
 ### Not run or not reported
 
 - The real weight on the CPU, resident on Metal, and compared with a resident run.
-- A build without the Stage E4 code, such as `feat/kolibri1`: see [Build](#results).
+- A build without the Stage E4 code, on the CPU, resident or on tiny. On Metal with the cache it [gave the same bytes](#on-the-patch-series).
 - The other position, `--reasoning default`.
 - The capture's overhead: [no figure is taken](#metal-cpu-and-the-expert-cache) from these decodes, and this was not a timed run.
 
