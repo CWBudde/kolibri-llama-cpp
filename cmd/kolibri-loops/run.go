@@ -438,11 +438,8 @@ func startServer(ctx context.Context, cfg runConfig, port int, log io.Writer) (*
 			return nil, nil, ctx.Err()
 		default:
 		}
-		if resp, err := http.Get(health); err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return cmd, done, nil
-			}
+		if healthy(ctx, health, deadline) {
+			return cmd, done, nil
 		}
 		if time.Now().After(deadline) {
 			stopServer(cmd, done)
@@ -450,6 +447,29 @@ func startServer(ctx context.Context, cfg runConfig, port int, log io.Writer) (*
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// healthProbeTimeout bounds one /health request: a server that accepts the
+// connection and never answers must not outlast the load timeout.
+const healthProbeTimeout = 5 * time.Second
+
+// healthy reports whether url answers 200, within the probe's own bound and the
+// deadline, whichever comes first.
+func healthy(ctx context.Context, url string, deadline time.Time) bool {
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	ctx, cancelProbe := context.WithTimeout(ctx, healthProbeTimeout)
+	defer cancelProbe()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 func stopServer(cmd *exec.Cmd, done <-chan error) {
@@ -474,11 +494,19 @@ func freePort() (int, error) {
 // forbiddenServerArgs are the flags the tool sets itself.
 var forbiddenServerArgs = []string{"-m", "--model", "--host", "--port"}
 
+// serverFlagName is a pass-through argument's flag, also when it is written
+// --name=value. llama-server refuses that form today, which the guard should not
+// depend on, since these arguments come after the tool's own and would win.
+func serverFlagName(arg string) string {
+	name, _, _ := strings.Cut(arg, "=")
+	return name
+}
+
 // run drives the server through the corpus, one prompt at a time, and leaves
 // one record per finished prompt. It returns ctx's error when interrupted.
 func run(ctx context.Context, cfg runConfig) error {
 	for _, a := range cfg.ServerArgs {
-		if slices.Contains(forbiddenServerArgs, a) {
+		if slices.Contains(forbiddenServerArgs, serverFlagName(a)) {
 			return fmt.Errorf("server flag %s is set by the tool", a)
 		}
 	}
@@ -662,20 +690,25 @@ func runItem(ctx context.Context, c *client, it Item, pins Pins) (*Record, error
 	return r, nil
 }
 
-// checkResolved refuses a response that did not run what was asked for.
+// checkResolved refuses a response that did not run what was asked for. It cannot
+// hold cache_prompt: llama-server does not report it in generation_settings.
 func checkResolved(req completionRequest, resp completionResponse) error {
 	var s struct {
-		Seed          int      `json:"seed"`
-		Temperature   float64  `json:"temperature"`
-		RepeatPenalty float64  `json:"repeat_penalty"`
-		NProbs        int      `json:"n_probs"`
-		Samplers      []string `json:"samplers"`
+		Seed              int      `json:"seed"`
+		Temperature       float64  `json:"temperature"`
+		RepeatPenalty     float64  `json:"repeat_penalty"`
+		NProbs            int      `json:"n_probs"`
+		PostSamplingProbs *bool    `json:"post_sampling_probs"`
+		Samplers          []string `json:"samplers"`
 	}
 	if err := json.Unmarshal(resp.GenerationSettings, &s); err != nil {
 		return fmt.Errorf("generation_settings: %v", err)
 	}
 	if s.Seed != req.Seed || s.Temperature != req.Temperature || s.RepeatPenalty != req.RepeatPenalty || s.NProbs != req.NProbs || !slices.Equal(s.Samplers, req.Samplers) {
 		return fmt.Errorf("the server resolved other settings than requested: %s", resp.GenerationSettings)
+	}
+	if s.PostSamplingProbs == nil || *s.PostSamplingProbs != req.PostSamplingProbs {
+		return fmt.Errorf("the server resolved other settings than requested: post_sampling_probs in %s", resp.GenerationSettings)
 	}
 	if resp.Truncated {
 		return fmt.Errorf("the server truncated the prompt")

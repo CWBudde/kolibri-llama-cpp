@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1463,5 +1465,72 @@ func TestWholeCorpusAgainstFake(t *testing.T) {
 	}
 	if strings.Contains(out.String(), fmt.Sprintf("| %s |", formText)) {
 		t.Error("a text in a form table")
+	}
+}
+
+// Pass-through flags cannot take over what the tool sets, in either spelling.
+func TestServerFlagGuard(t *testing.T) {
+	for _, arg := range []string{"-m", "--model", "--host", "--port", "-m=x", "--model=x", "--host=0.0.0.0", "--port=1"} {
+		cfg := runConfig{Server: "unused", Model: "unused", ServerArgs: []string{arg}}
+		if err := run(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "is set by the tool") {
+			t.Errorf("%s: %v", arg, err)
+		}
+	}
+	for _, arg := range []string{"-ngl", "--expert-cache=128", "--host-name=x"} {
+		if slices.Contains(forbiddenServerArgs, serverFlagName(arg)) {
+			t.Errorf("%s is refused", arg)
+		}
+	}
+}
+
+// A server that accepts the health request and never answers does not hold the
+// load past its deadline.
+func TestHealthyEndsAtTheDeadline(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer srv.Close()
+	defer close(release)
+	start := time.Now()
+	if healthy(context.Background(), srv.URL, start.Add(100*time.Millisecond)) {
+		t.Fatal("a server that never answers is healthy")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("took %v", d)
+	}
+}
+
+func TestCheckResolvedHoldsPostSamplingProbs(t *testing.T) {
+	req := greedyRequest([]int{1}, 1, 42, 2)
+	for _, c := range []struct {
+		field string
+		want  bool
+	}{
+		{`"post_sampling_probs":false,`, true},
+		{`"post_sampling_probs":true,`, false},
+		{``, false},
+	} {
+		settings := fmt.Sprintf(`{%s"seed":%d,"temperature":%v,"repeat_penalty":%v,"n_probs":%d,"samplers":["temperature"]}`,
+			c.field, req.Seed, req.Temperature, req.RepeatPenalty, req.NProbs)
+		resp := completionResponse{GenerationSettings: json.RawMessage(settings), TokensEvaluated: 1}
+		if err := checkResolved(req, resp); (err == nil) != c.want {
+			t.Errorf("%q: %v", c.field, err)
+		}
+	}
+}
+
+func TestLoadCorpusRefusesASecondValueOnALine(t *testing.T) {
+	data, err := os.ReadFile(realCorpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, _, _ := bytes.Cut(data, []byte("\n"))
+	for _, tail := range []string{` {"unseen":1}`, ` garbage`, ` {}`} {
+		path := filepath.Join(t.TempDir(), "corpus.jsonl")
+		if err := os.WriteFile(path, append(append(slices.Clone(line), tail...), '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadCorpus(path); err == nil || !strings.Contains(err.Error(), "more than one JSON value") {
+			t.Errorf("%q: %v", tail, err)
+		}
 	}
 }

@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"slices"
@@ -96,6 +98,10 @@ func loadCorpus(path string) (*Corpus, error) {
 		var it Item
 		if err := dec.Decode(&it); err != nil {
 			return nil, fmt.Errorf("%s:%d: %v", path, line, err)
+		}
+		// the corpus hash covers the whole line, so all of it must be the item
+		if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%s:%d: more than one JSON value on the line", path, line)
 		}
 		items = append(items, it)
 	}

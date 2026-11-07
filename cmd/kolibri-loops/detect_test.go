@@ -220,7 +220,8 @@ func TestAnswerMentioned(t *testing.T) {
 		{"after a wrong first answer", wall, formRaw, " 1961. Sie wurde 1961 gebaut und erst 1989 geöffnet.", true},
 		{"not at all", wall, formRaw, " 1961.", false},
 		{"nothing generated", wall, formRaw, " ", false},
-		{"a rejected term first", canberra, formRaw, "Sydney. Canberra.", false},
+		{"a rejected term first", canberra, formRaw, "Sydney. Canberra.", true},
+		{"only a rejected term", canberra, formRaw, "Sydney.", false},
 		{"only in the reasoning", wall, formChatThink, "<think>1989</think>1961", false},
 		{"reasoning never closed", wall, formChatThink, "<think>1989", false},
 	} {

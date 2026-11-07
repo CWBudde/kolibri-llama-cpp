@@ -168,7 +168,7 @@ func (f *fakeServer) complete(q completionRequest) map[string]any {
 		}
 		return v
 	}
-	settings := map[string]any{"seed": seed, "temperature": q.Temperature, "repeat_penalty": q.RepeatPenalty, "n_probs": q.NProbs, "samplers": q.Samplers}
+	settings := map[string]any{"seed": seed, "temperature": q.Temperature, "repeat_penalty": q.RepeatPenalty, "n_probs": q.NProbs, "post_sampling_probs": q.PostSamplingProbs, "samplers": q.Samplers}
 	var tokens []int
 	var probs []map[string]any
 	stop := "limit"

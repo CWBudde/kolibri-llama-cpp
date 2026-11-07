@@ -135,7 +135,7 @@ Only items with a known answer are scored. A term matches as a whole word, ignor
 - **wrong:** a rejected term comes first, or no term occurs;
 - **unanswered:** nothing was generated; with thinking on, also when `</think>` never comes.
 
-**The report's "Mentioned" column is the same terms over the whole answer.** It is an occurrence rate and not an accuracy. Only `capital-australia` has rejected terms, so " 1961. Sie wurde 1961 gebaut und erst 1989 geöffnet." counts as mentioned though the first answer is wrong, and it gets likelier the longer a generation runs. Reporting both shows that gap, and an intervention that only changes length moves "Mentioned" and not accuracy, as long as the first sentence stays the same.
+**The report's "Mentioned" column looks for an accepted term in the whole answer.** It is an occurrence rate and not an accuracy, and rejected terms play no part in it: "Sydney. Canberra." counts as mentioned and scores wrong. So " 1961. Sie wurde 1961 gebaut und erst 1989 geöffnet." counts as mentioned though the first answer is wrong, and it gets likelier the longer a generation runs. Reporting both shows that gap, and an intervention that only changes length moves "Mentioned" and not accuracy, as long as the first sentence stays the same.
 
 **Accuracy errs the other way.** An answer after a preface or in a list counts as wrong: "Natürlich! Die Hauptstadt ist Berlin." or "1. Berlin". So does "ca. 100 Grad", where the abbreviation ends the sentence. Read the two columns together, and read `per_record` before quoting a low number.
 

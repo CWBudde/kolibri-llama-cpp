@@ -138,15 +138,16 @@ func ScoreAnswer(a *Answer, form, content string) string {
 	return scoreTerms(a, firstSentence(region))
 }
 
-// AnswerMentioned applies the same terms to all of the answer. It is an
+// AnswerMentioned looks for an accepted term in all of the answer. It is an
 // occurrence rate, not an accuracy: an accepted term after a wrong first answer
-// counts, and the longer the generation the likelier that is.
+// counts, and the longer the generation the likelier that is. So rejected terms
+// play no part here, only in ScoreAnswer's order.
 func AnswerMentioned(a *Answer, form, content string) bool {
 	if a == nil {
 		return false
 	}
 	region, ok := answerRegion(form, content)
-	return ok && scoreTerms(a, region) == scoreCorrect
+	return ok && firstTerm(region, a.Accept) >= 0
 }
 
 // firstTerm returns the byte offset of the first whole-word match of any term
