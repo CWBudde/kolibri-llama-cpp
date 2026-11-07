@@ -156,3 +156,49 @@ func TestSharedFits(t *testing.T) {
 		t.Fatal("experts of two sizes pass")
 	}
 }
+
+func TestCheckHeldOut(t *testing.T) {
+	counts := func(miss int64, evictions int) Runs {
+		c := locality.Counts{MissBytes: miss, StepEvictions: evictions}
+		r := locality.Result{Decode: c}
+		return Runs{Policy: "p", Runs: []Run{{ExpertsPerLayer: 8, Replayed: Replayed{Online: r, Split: Split{Test: r}}}}}
+	}
+	base := func() ([]Runs, []Runs, []Runs) {
+		runs := make([]Runs, sharedOracle+1)
+		for i := range runs {
+			runs[i] = counts(100, 0)
+		}
+		pinned := []Runs{counts(110, 0), counts(110, 0)}
+		return runs, pinned, []Runs{counts(80, 0), counts(70, 0), counts(90, 0), counts(90, 0)}
+	}
+	runs, pinned, held := base()
+	if _, err := checkHeldOut(runs, pinned, held); err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(runs, held []Runs){
+		"a cache below the shared bound": func(runs, _ []Runs) { runs[sharedLRU] = counts(60, 0) },
+		"the slice below the shared bound": func(runs, _ []Runs) {
+			runs[sharedOracle] = counts(60, 0)
+		},
+		"the pinned one below the shared bound": func(_, held []Runs) {
+			held[heldOutPinnedSharedOracle] = counts(60, 0)
+		},
+		"the per-layer bound below the shared one": func(_, held []Runs) { held[heldOutLayerOracle] = counts(60, 0) },
+		"a layer LRU below the per-layer bound":    func(runs, _ []Runs) { runs[layerLRU] = counts(75, 0) },
+		"the pinned one below the per-layer bound": func(_, held []Runs) {
+			held[heldOutPinnedLayerOracle] = counts(75, 0)
+		},
+		"step evictions": func(_, held []Runs) { held[heldOutPinnedSharedOracle] = counts(90, 1) },
+	} {
+		runs, pinned, held := base()
+		change(runs, held)
+		if _, err := checkHeldOut(runs, pinned, held); err == nil {
+			t.Fatalf("%s passes", name)
+		}
+	}
+	runs, pinned, held = base()
+	pinned[pinnedSharedOracle] = counts(85, 0)
+	if msg, err := checkHeldOut(runs, pinned, held); err != nil || !strings.Contains(msg, "at 1 of 1 sizes") {
+		t.Fatalf("%q, %v", msg, err)
+	}
+}

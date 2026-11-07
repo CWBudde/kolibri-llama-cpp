@@ -113,6 +113,78 @@ func pinnedBaselines(sel locality.Selections, spans []locality.Span, m Model) []
 	}
 }
 
+const (
+	heldOutLayerOracle = iota
+	heldOutSharedOracle
+	heldOutPinnedLayerOracle
+	heldOutPinnedSharedOracle
+)
+
+// heldOutBaselines are the oracles of a test suffix's decode alone, replayed apart from baselines.
+func heldOutBaselines(sel locality.Selections, spans []locality.Span, cut int, m Model) []baseline {
+	b := m.bytes()
+	return []baseline{
+		heldOutLayerOracle: {"oracle, per layer, held-out decode", true, func(c int) (locality.Policy, error) {
+			return locality.NewHeldOutLayerOracle(sel, spans, cut, m.NExpert, b, c), nil
+		}},
+		heldOutSharedOracle: {"oracle, shared, held-out decode", true, func(c int) (locality.Policy, error) {
+			return locality.NewHeldOutOracle(sel, spans, cut, m.NExpert, b, m.budget(c)), nil
+		}},
+		heldOutPinnedLayerOracle: {"oracle, per layer, held-out decode, step-pinned", true,
+			func(c int) (locality.Policy, error) {
+				return locality.NewPinnedHeldOutLayerOracle(sel, spans, cut, m.NExpert, b, c), nil
+			}},
+		heldOutPinnedSharedOracle: {"oracle, shared, held-out decode, step-pinned", true,
+			func(c int) (locality.Policy, error) {
+				return locality.NewPinnedHeldOutOracle(sel, spans, cut, m.NExpert, b, m.budget(c)), nil
+			}},
+	}
+}
+
+// checkHeldOut fails unless, at every size, the shared held-out oracle's decode bytes in the test
+// suffix are no more than any cache policy's, the whole-trace oracle's and its pinned twin's, and
+// the per-layer one's no more than a layer budget's; and the pinned ones have no step evictions. It
+// reports at how many sizes each pinned one loads more than the pinned whole-trace oracle's slice,
+// which is a schedule as well and so also bounds the event-atomic optimum from above.
+func checkHeldOut(runs, pinned, held []Runs) (string, error) {
+	test := func(r Runs, s int) int64 { return loadedBytes(r.Runs[s].Split.Test.Decode) }
+	above := 0
+	for s := range held[0].Runs {
+		c := held[0].Runs[s].ExpertsPerLayer
+		bound := test(held[heldOutSharedOracle], s)
+		for _, r := range runs {
+			if !r.Oracle && test(r, s) < bound {
+				return "", fmt.Errorf("%d experts per layer: %s loads %d decode bytes in the test suffix, below the "+
+					"shared held-out oracle's %d", c, r.Policy, test(r, s), bound)
+			}
+		}
+		for _, r := range []Runs{runs[sharedOracle], held[heldOutPinnedSharedOracle], held[heldOutLayerOracle]} {
+			if test(r, s) < bound {
+				return "", fmt.Errorf("%d experts per layer: %s loads %d decode bytes in the test suffix, below the "+
+					"shared held-out oracle's %d", c, r.Policy, test(r, s), bound)
+			}
+		}
+		bound = test(held[heldOutLayerOracle], s)
+		for _, r := range []Runs{runs[layerOracle], runs[layerLRU], runs[layerLRUPinned], held[heldOutPinnedLayerOracle]} {
+			if test(r, s) < bound {
+				return "", fmt.Errorf("%d experts per layer: %s loads %d decode bytes in the test suffix, below the "+
+					"per-layer held-out oracle's %d", c, r.Policy, test(r, s), bound)
+			}
+		}
+		for _, i := range []int{heldOutPinnedLayerOracle, heldOutPinnedSharedOracle} {
+			x := held[i].Runs[s].Online
+			if n := x.Prefill.StepEvictions + x.Decode.StepEvictions; n != 0 {
+				return "", fmt.Errorf("%d experts per layer: %s has %d step evictions", c, held[i].Policy, n)
+			}
+		}
+		if test(held[heldOutPinnedSharedOracle], s) > test(pinned[pinnedSharedOracle], s) {
+			above++
+		}
+	}
+	return fmt.Sprintf("the pinned shared held-out oracle loads more than the pinned whole-trace oracle's slice at %d "+
+		"of %d sizes", above, len(held[0].Runs)), nil
+}
+
 func allLoaded(r locality.Result) int64 { return loadedBytes(r.Prefill) + loadedBytes(r.Decode) }
 
 // checkPinned fails unless the pinned oracles have no step evictions at any size, and load no less
@@ -278,24 +350,26 @@ func heldOutDecode(rs []result, pick func(w Workload) Runs, s int) tally {
 	return t
 }
 
-// writeBelady is one table of the gap to both oracles on the held-out decode of rs together.
+// writeBelady is one table of the gap to the held-out oracles on the held-out decode of rs together.
 func writeBelady(w io.Writer, rs []result, sizes []int) {
-	fmt.Fprintf(w, "| Experts per layer | Best causal | MB/token (hit) | Oracle, shared † | Pinned, shared † | Best / "+
-		"oracle | Best / pinned | Oracle, per layer † | Pinned, per layer † |\n|--:|---|--:|--:|--:|--:|--:|--:|--:|\n")
+	fmt.Fprintf(w, "| Experts per layer | Best causal | MB/token (hit) | Bound, shared † | Pinned, shared † | Best / "+
+		"bound | Best / pinned | Bound, per layer † | Pinned, per layer † | Whole-trace oracle's slice, shared † | "+
+		"Best / slice |\n|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n")
 	policy := func(i int) func(Workload) Runs { return func(x Workload) Runs { return x.Policies[i] } }
-	pin := func(i int) func(Workload) Runs { return func(x Workload) Runs { return x.PinnedOracles[i] } }
+	held := func(i int) func(Workload) Runs { return func(x Workload) Runs { return x.HeldOutOracles[i] } }
 	for s, c := range sizes {
 		name, best := bestCausal(rs, s)
-		o, p := heldOutDecode(rs, policy(sharedOracle), s), heldOutDecode(rs, pin(pinnedSharedOracle), s)
-		lo, lp := heldOutDecode(rs, policy(layerOracle), s), heldOutDecode(rs, pin(pinnedLayerOracle), s)
-		fmt.Fprintf(w, "| %d | %s | %s | %s | %s | %s | %s | %s | %s |\n", c, name, best.cell(), o.cell(), p.cell(),
-			best.ratio(o), best.ratio(p), lo.cell(), lp.cell())
+		o, p := heldOutDecode(rs, held(heldOutSharedOracle), s), heldOutDecode(rs, held(heldOutPinnedSharedOracle), s)
+		lo, lp := heldOutDecode(rs, held(heldOutLayerOracle), s), heldOutDecode(rs, held(heldOutPinnedLayerOracle), s)
+		slice := heldOutDecode(rs, policy(sharedOracle), s)
+		fmt.Fprintf(w, "| %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", c, name, best.cell(), o.cell(), p.cell(),
+			best.ratio(o), best.ratio(p), lo.cell(), lp.cell(), slice.cell(), best.ratio(slice))
 	}
 }
 
 // writeChecklist is the report's Stage E7 sections.
 func writeChecklist(w io.Writer, sizes []int, results []result, gatesP map[string]Gate) {
-	if len(results) == 0 || len(results[0].w.PinnedOracles) == 0 {
+	if len(results) == 0 || len(results[0].w.PinnedOracles) == 0 || len(results[0].w.HeldOutOracles) == 0 {
 		return
 	}
 	models := modelsOf(results)
@@ -358,11 +432,20 @@ func writeChecklist(w io.Writer, sizes []int, results []result, gatesP map[strin
 		}
 	}
 
-	fmt.Fprintf(w, "\n### The Belady gap on held-out decode, at every budget\n\nThe gap to both oracles on the test "+
-		"suffixes, warm from the training prefix. An oracle is built per workload from its whole trace, so the "+
-		"pooled table sums per-workload oracles: it is not one oracle over the joined traces. Best causal is the "+
-		"cache policy with the fewest bytes among those of this report, and in the pooled table it is one policy "+
-		"over all workloads. Ratios are from unrounded bytes.\n")
+	fmt.Fprintf(w, "\n### The Belady gap on held-out decode, at every budget\n\nThe gap to the oracles of the test "+
+		"suffixes' decode, warm from the training prefix. A held-out oracle counts a decoded token's misses after the "+
+		"cut and nothing else, so its training prefix and every prefill only fill the cache, and it drops an expert "+
+		"whose next use is free. With one expert size no demand cache of the budget misses less in that decode, the "+
+		"bound of these tables, by `TestHeldOutOracleOptimal` on small random traces: a test, not a proof. It is "+
+		"unattainable twice over: it knows the future, and it pays nothing for the rest of the trace, as no server "+
+		"does, which makes it loosest at large budgets, where free prefills fill the cache. A cache that prefetches in a prefill is not bound by it. The pinned one holds a step's experts together, "+
+		"and where every step fits it is a schedule a server could run if the rest were free, so it bounds the "+
+		"event-atomic optimum from above, as the bound does from below. Whole-trace oracle's slice is what the oracle "+
+		"of the sections above, which minimizes the bytes of the whole trace, loads in this decode: one schedule's "+
+		"bytes and no bound, but it pays for its prefix and prefills, so Best / slice is the gap to a schedule that "+
+		"pays for everything, though not necessarily the one with the least decode. An oracle is built per workload, so the pooled table sums per-workload oracles: it is "+
+		"not one oracle over the joined traces. Best causal is the cache policy with the fewest bytes among those of "+
+		"this report, and in the pooled table it is one policy over all workloads. Ratios are from unrounded bytes.\n")
 	for _, m := range models {
 		rs := ofModel(results, m)
 		fmt.Fprintf(w, "\n%s, all test suffixes together:\n\n", m)

@@ -65,6 +65,8 @@
 //     oracle none more than the layer LRU;
 //   - at every size, the step-pinned oracles have no step evictions and load no less than the oracles
 //     they pin, and the references of Stage B's pinned gate have no step evictions in a test suffix;
+//   - at every size, the held-out oracles load no more decode bytes in a test suffix than the cache
+//     policies and the whole-trace oracle, and the pinned ones have no step evictions;
 //   - at every size, the layer miss curves give the uniform layer LRU's per-layer decode misses, in
 //     the training prefix and in the test suffix;
 //   - for each horizon, the predictor as an online policy, learning from Use alone, replays exactly
@@ -176,8 +178,10 @@ type Workload struct {
 	Markov        []HorizonGrid `json:"markov"`
 	Linear        []LinearGrid  `json:"linear,omitempty"`
 	// PinnedOracles and Unions are Stage E7's, in checklist.go.
-	PinnedOracles []Runs       `json:"pinned_oracles,omitempty"`
-	Unions        []UnionStats `json:"prefill_unions,omitempty"`
+	PinnedOracles []Runs `json:"pinned_oracles,omitempty"`
+	// HeldOutOracles bound a test suffix's decode alone, in checklist.go.
+	HeldOutOracles []Runs       `json:"held_out_oracles,omitempty"`
+	Unions         []UnionStats `json:"prefill_unions,omitempty"`
 }
 
 // Assumptions are the declared, unmeasured inputs of the replays.
@@ -520,7 +524,8 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 	fmt.Fprintf(w, "- **oracle †:** Belady's MIN, per layer and shared: it knows every future step and drops the "+
 		"expert needed furthest ahead, the incoming one included. **It uses future knowledge and is an "+
 		"unattainable upper bound, not a policy a server can run.** With equal expert sizes no cache of the "+
-		"budget, prefetching or not, loads fewer bytes.\n\n")
+		"budget, prefetching or not, loads fewer bytes over the whole replay. A row for one phase or one test suffix "+
+		"is what that one schedule loads there and bounds nothing: \"Stage E7\" has the bound on held-out decode.\n\n")
 	writeE1Note(w)
 	var bw []string
 	for _, l := range links {
@@ -537,7 +542,8 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 		"(`testdata/locality/splits.json`): %s A test suffix is replayed "+
 		"warm, after its prefix, with whatever state the prefix's causal replay left behind, and only its own steps "+
 		"are counted. A policy at test time knows only the steps before it; the answers fix only the order of the "+
-		"spans. The oracle † is still built from the whole trace.\n\n", a.SplitRule)
+		"spans. The oracle † is still built from the whole trace, so its test-suffix rows are a slice of a schedule "+
+		"chosen for the whole trace.\n\n", a.SplitRule)
 	fmt.Fprintf(w, "| Workload | Answers | Training answers | First test token | Training decode tokens | "+
 		"Test decode tokens | Test prefill tokens |\n|---|--:|--:|--:|--:|--:|--:|\n")
 	listed := map[string]bool{}
@@ -965,6 +971,16 @@ func main() {
 			}
 			fmt.Printf("PASS %s %s: the pinned oracles have no step evictions and load no less than the oracles at "+
 				"%d sizes; %s\n", short(name), wl, len(sizes), pinnedNote)
+			heldOut, err := replayAll(sel, spans, cut, m, sizes, heldOutBaselines(sel, spans, cut, m), timing)
+			if err != nil {
+				log.Fatalf("%s %s: %v", name, wl, err)
+			}
+			heldOutNote, err := checkHeldOut(runs, pinned, heldOut)
+			if err != nil {
+				log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
+			}
+			fmt.Printf("PASS %s %s: the held-out oracles load no more decode bytes in the test suffix than the cache "+
+				"policies and the whole-trace oracle at %d sizes; %s\n", short(name), wl, len(sizes), heldOutNote)
 			var unions []UnionStats
 			for _, ub := range unionUbatches(*ubatch) {
 				s, err := locality.OnlineSpans(sel.Tokens, answers, ended, ub)
@@ -1003,7 +1019,7 @@ func main() {
 			}
 			w := Workload{Tokens: sel.Tokens, Answers: len(answers), Split: d, NoCache: noCache, Policies: runs,
 				TraceOrder: tr, LFUGrid: grid, HotnessGrid: hotGrid, LastN: lastN, Markov: markov, Linear: linear,
-				PinnedOracles: pinned, Unions: unions}
+				PinnedOracles: pinned, HeldOutOracles: heldOut, Unions: unions}
 			for _, s := range spans {
 				if s.Phase == locality.Prefill {
 					w.Ubatches++
