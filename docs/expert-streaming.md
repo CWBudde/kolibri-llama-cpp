@@ -1,6 +1,6 @@
 # Expert streaming: the runtime expert cache
 
-Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose deciding gates passed, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill".
+Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose deciding gates passed, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill". Stage E2's GPU remap was benchmarked, its deciding gate failed at 16 GiB and passed at 0 GiB, and its code also stays out of the patch series; it is in "Stage E2: GPU remap".
 
 ## How it works
 
@@ -573,6 +573,282 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4.json -out ~/models/eval/exp
   -servers pr25294=third_party/llama.cpp-pr25294/build/bin/llama-server
 .venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only
 ```
+
+## Stage E2: GPU remap
+
+Phase 11, Stage E2. `--expert-cache-gpu-remap` removes the scheduler split and CPU sync at every expert layer that hits. **The option exists only on fork branch `feat/kolibri1-gpu-remap` (commit `0bb0f5444`, fork PR [#16](https://github.com/CWBudde/llama.cpp/pull/16), draft, open and not merged). It is not in the patch series and not on `feat/kolibri1`.**
+
+### Verdict
+
+**The deciding gate failed at 16 GiB and passed at 0 GiB (2026-11-07), so patch 0015 is removed and its number is retired.**
+
+- **The rule.** Stage D's, in `evalGate`: the candidate wins a ceiling if its slowest repetition beats the best baseline's fastest repetition on decode, or if its highest p95 is below the baseline's lowest. The baseline is whichever of `iq3-cache128` and `iq3-cache128-prefetch12` has the better median decode at that ceiling. The gates in `testdata/bench/e2.json` were last changed in `4dca7b2` (03:41), before the first timed run (04:23), and they were not moved after the results.
+- **At 16 GiB: not passed on either metric.** Against `iq3-cache128-prefetch12`, decode is 18.94 against 19.00 t/s, 0.054 t/s (0.29%) short. p95 is 79.33 against 78.58 ms, 0.75 ms over.
+- **At 0 GiB: passed on both.** Against `iq3-cache128`, decode is 19.02 against 18.91 t/s, 0.110 t/s (0.58%) ahead. p95 is 79.67 against 80.75 ms, 1.08 ms under.
+- **The stop rule** ([PLAN.md](../PLAN.md), Phase 11): a stage whose gate fails is documented, and its code stays out of the patch set. Both ceilings are deciding, so one passing does not save the other, and the margin does not enter the rule. Patch 0015 is removed, the number 0015 is retired, and the code stays on the fork branch.
+- **Lossless: holds.** 30 of 30 benchmark requests generate the token IDs of `iq3-resident-ub21`, and `check_expert_cache.py --real --gpu-remap-only` says "PASS: 0 failures", with logits bit-identical to the unsplit resident run.
+- **Splits: as designed.** 2 per token against 102 for the two CPU remap arms, in every run.
+- **The earlier estimate was not met.** It was unmeasured: about 44 ms/token and 23 t/s. The run measured 52.10 ms/token at both ceilings and a warm decode of 19.61 and 19.96 t/s (medians). See "Estimate and measurement".
+- **Not run: a stack benchmark of E2 and E3.** It was conditional on E2 passing.
+- This document does not recommend adopting the code.
+
+### Results
+
+`testdata/bench/e2.json`, `~/models/eval/expert-bench-e2/report.md`, finished at 05:42 on 2026-11-07. All 19 runs have status ok, with 0 restarts and 0 expert load failures in the 18 cache runs.
+
+Per run, from `run.json` and `stats.json`. Decode and p95 are the median over the 4 warm requests. The bold rows set the 16 GiB result.
+
+| Run | Decode t/s | p95 ms | others_cpu mean/max % | Splits/token | Commits/token | Wall ms/token | Wait | Remap | Other |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| cache128/0g/r1 | 17.50 | 84.3 | 60/126 | 102 | 103 | 58.28 | 14.69 | 0.703 | 42.89 |
+| cache128/0g/r2 | 17.78 | 80.7 | 46/123 | 102 | 103 | 56.82 | 14.39 | 0.674 | 41.76 |
+| cache128/0g/r3 | 18.91 | 84.6 | 36/85 | 102 | 103 | 52.98 | 14.10 | 0.600 | 38.27 |
+| cache128/16g/r1 | 18.46 | 80.6 | 46/131 | 102 | 103 | 54.31 | 14.56 | 0.676 | 39.08 |
+| cache128/16g/r2 | 17.32 | 84.7 | 32/91 | 102 | 103 | 56.66 | 14.35 | 0.669 | 41.63 |
+| cache128/16g/r3 | 19.49 | 76.4 | 40/87 | 102 | 103 | 52.59 | 14.16 | 0.646 | 37.78 |
+| gpuremap/0g/r1 | 19.02 | 78.5 | 66/127 | 2 | 33.97 | 52.84 | 15.35 | 0.197 | 37.30 |
+| gpuremap/0g/r2 | 20.29 | 78.6 | 28/75 | 2 | 33.97 | 52.10 | 15.11 | 0.192 | 36.79 |
+| gpuremap/0g/r3 | 19.61 | 79.7 | 40/92 | 2 | 33.97 | 51.51 | 15.15 | 0.190 | 36.17 |
+| **gpuremap/16g/r1** | **18.94** | **79.3** | **50/123** | 2 | 33.97 | 52.82 | 15.41 | 0.197 | 37.21 |
+| gpuremap/16g/r2 | 19.96 | 78.2 | 44/164 | 2 | 33.97 | 52.10 | 15.28 | 0.192 | 36.63 |
+| gpuremap/16g/r3 | 21.69 | 71.4 | 34/85 | 2 | 33.97 | 49.17 | 15.18 | 0.187 | 33.81 |
+| prefetch12/0g/r1 | 16.26 | 85.7 | 52/172 | 102 | 103 | 60.81 | 14.54 | 0.990 | 45.28 |
+| prefetch12/0g/r2 | 17.33 | 80.4 | 46/130 | 102 | 103 | 58.13 | 14.29 | 1.045 | 42.79 |
+| prefetch12/0g/r3 | 17.42 | 83.5 | 40/123 | 102 | 103 | 56.39 | 14.33 | 1.057 | 41.00 |
+| **prefetch12/16g/r1** | 18.47 | **78.6** | **41/94** | 102 | 103 | 56.70 | 14.56 | 0.999 | 41.14 |
+| prefetch12/16g/r2 | 18.54 | 82.6 | 46/132 | 102 | 103 | 56.10 | 14.25 | 1.011 | 40.84 |
+| **prefetch12/16g/r3** | **19.00** | 78.8 | **42/255** | 102 | 103 | 53.90 | 14.37 | 0.999 | 38.53 |
+| resident-ub21/0g/r1 | 60.41 | 17.0 | 40/128 | 2 | 3 | 16.54 | 0.00 | 0.000 | 16.54 |
+
+Wall, wait, remap and other are ms per decoded token. Other is the remainder, so on a cache arm it holds compute as well as overhead.
+
+Gates, by the rule above. The 16 GiB row for `iq3-cache128` is a counterfactual; that baseline was not selected.
+
+| Ceiling | Best baseline (median decode) | Decode: candidate min against baseline max | p95: candidate max against baseline min | Verdict |
+|---|---|--:|--:|---|
+| 0 GiB | `iq3-cache128` (17.7759; prefetch12 17.3259) | 19.0199 against 18.9098, win (+0.1102) | 79.670 against 80.746, win (1.076 ms under) | passed on both |
+| 16 GiB | `iq3-cache128-prefetch12` (18.5366; cache128 18.4633) | 18.9427 against 18.9972, no (−0.0544) | 79.330 against 78.584, no (0.746 ms over) | **not passed on either** |
+| 16 GiB, against `iq3-cache128` instead | not selected | 18.9427 against 19.4866, no | 79.330 against 76.416, no | also not passed |
+
+As the report prints them:
+
+- GATE iq3-cache128-gpuremap at 0 GiB against the best of iq3-cache128, iq3-cache128-prefetch12: passed: decode 19.61 (19.02–20.29) against iq3-cache128's 17.78 (17.50–18.91) t/s (win true), p95 78.6 (78.5–79.7) against 84.3 (80.7–84.6) ms (win true)
+- GATE iq3-cache128-gpuremap at 16 GiB against the best of iq3-cache128, iq3-cache128-prefetch12: not passed: decode 19.96 (18.94–21.69) against iq3-cache128-prefetch12's 18.54 (18.47–19.00) t/s (win false), p95 78.2 (71.4–79.3) against 78.8 (78.6–82.6) ms (win false)
+- PASS equivalence iq3-cache128-gpuremap against iq3-resident-ub21: 30 of 30 requests generate the same token IDs
+
+The other columns, median (min–max) over 3 repetitions from the report. Decode hits are 91.0% on both CPU remap arms and 90.0% on the GPU arm, in all their runs. Peak footprint is 11.0 GiB on every cache arm.
+
+| Config | Ceiling | Cold TTFT s | Warm prompt t/s | Disk GB read |
+|---|--:|--:|--:|--:|
+| iq3-cache128 | 0 GiB | 33.03 (32.30–33.49) | 85.8 (83.9–86.2) | 448.68 (448.68–448.68) |
+| iq3-cache128 | 16 GiB | 33.77 (32.74–33.78) | 84.8 (83.6–86.3) | 448.68 (448.68–448.68) |
+| iq3-cache128-gpuremap | 0 GiB | 31.95 (31.83–32.00) | 86.6 (86.3–88.4) | 451.73 (451.73–451.73) |
+| iq3-cache128-gpuremap | 16 GiB | 31.92 (31.43–32.39) | 85.7 (85.6–86.7) | 451.73 (451.72–451.73) |
+| iq3-cache128-prefetch12 | 0 GiB | 32.67 (32.54–33.64) | 84.8 (84.2–85.8) | 454.82 (454.81–454.83) |
+| iq3-cache128-prefetch12 | 16 GiB | 33.69 (33.31–34.27) | 84.0 (83.8–85.4) | 454.83 (454.81–454.83) |
+| iq3-resident-ub21 | 0 GiB | 10.23 | 200.3 | 0.06 |
+
+Prefill and TTFT are not gates of this stage. Phase 11's decode target of 30 t/s at 128 slots is not met.
+
+**Token IDs.** `iq3-cache128-gpuremap` matches `iq3-resident-ub21` in 30 of 30 requests, by the report's rule and again by exact phase and workload. The two CPU remap arms match resident in 6 of 30, as `iq3-cache128-gpuremap` matches `iq3-cache128` in 6 of 30 (INFO): their splits round differently from the unsplit graph (E0.1). IDs do not vary across runs within any arm.
+
+**Splits and commits,** exact integers from `stats.json`: the GPU arm has 1270 splits per 635 tokens in all 6 runs, and the CPU remap arms 64770 in all 12. Commits are 21573 of 635 (33.97) on the GPU arm, 65405 (103) on the CPU remap arms and 1905 (3) on resident. Resident also has 2 splits per token, as expected.
+
+### Estimate and measurement
+
+The estimate below, "Estimate, not a result", was written before any real run and was never measured. On the GPU arm (`stats.json`, per decoded token):
+
+| | Estimate | Measured |
+|---|--:|--:|
+| Misses | about 30 | 30.14 |
+| Stops | at most about 23.5 | 20.64 |
+| Command buffers | about 25 | 32.97 |
+| Commits | about 26 | 33.97 |
+| Saved against the CPU remap | about 13.5 ms of 57.8 | 4.72 ms at 0 GiB (56.82 to 52.10), 2.21 ms at 16 GiB (54.31 to 52.10) |
+| Decode | about 44 ms/token | 52.10 ms/token at both ceilings (49.17–52.84) |
+| Warm decode | about 23 t/s | 19.61 and 19.96 t/s |
+
+- **Stops are below the estimate's bound and command buffers above the estimate.** Tiny's pattern of stops + 2 does not hold at this size. Why was not measured.
+- **Commits alone do not carry E1's overhead.** "Other" falls by 4.97 and 2.45 ms for 69.03 fewer commits, about 0.072 and 0.035 ms per commit, against the 0.176 ms per commit that E1's 17.6 ms over 100 commits implies. These are differences of the report's medians.
+- **What remains of the gap to resident:** 35.56 ms/token (52.10 against 16.54). The wait is about 15.2 ms, "other" above resident's 16.54 is 20.1 to 20.25 ms, and the remap 0.19 ms. Stream time per token (the `tokens.log` span) is 0.09 to 0.16 ms above `stats.json`'s wall in every run.
+- **The GPU arm has a lower decode hit rate:** 90.0% against 91.0%, 30.14 against 27.11 misses per token. Its wait rises about 0.8 to 0.9 ms/token and its remap falls from 0.67 to 0.19 ms/token. The extra wait offsets part of the fall in "other". The arms differ in 24 of 30 requests' tokens, but the records do not say why the hit rate differs.
+
+**E6's condition, stated and not decided.** PLAN says E6 runs "only if E2 and E3 leave the load wait as the largest remaining cost". On the GPU arm the wait is 15.15 and 15.28 ms of 52.10 (29.1% and 29.3%), and "other" is 36.79 and 36.63 ms (70.6% and 70.3%). Taking resident's 16.54 ms out of "other" leaves 20.25 and 20.09 ms, still above the wait. E3's write-up ("Stage E3") gives, on the side-file, 8.85 ms of 49.48 at 0 GiB and 8.86 of 52.17 at 16 GiB. "Other" is a remainder, not one measured cost, and no run has both E2 and E3. E6 is not started.
+
+### Validity
+
+- **Sleep and power.** 0 of the 257 true Sleep, Wake or DarkWake events in `pmset -g log` fall inside the span 04:23:23 to 05:42:08 or any run's window. The last before it is the Wake at 2026-11-05 22:17:13. The driver's `caffeinate` lived exactly that span. Power is not recorded per run: AC rests on the driver's gate, the final status ("AC Power") and the absence of any event in the span other than assertions and the display's notification.
+- **Location and eviction.** Every `evict` record says home volume, and all 19 left 0 of 2170182 pages resident. Before eviction the page cache held 8.22% in 17 runs, 72.18% in run 1 and 99.79% in run 8, the run after the resident arm. On 16 GiB runs the hog wired 16.00 GiB.
+- **Build.** All 19 runs carry one `server_sha256`, `40cec522…ad86356`, which recomputes from the files on disk now. The newest of those files is from 03:56:36, before the first run. Fork worktree HEAD is `0bb0f5444`, clean and equal to the pushed branch.
+- **The driver is not from this branch.** The runner's `kolibri-bench` reports `vcs.revision` `0b19754` (E3's branch, not modified), and `kolibri-stream`, `kolibri-evict` and `kolibri-memhog` report `b451cd6` (also E3's). This branch's own driver cannot print the report's "PASS build" line. The verdicts should not depend on it: `evalGate`, `gateValues`, `perRep` and `median` are byte-identical between this branch and `0b19754`, and an independent recomputation gives the same report. The `kolibri-bench` `main.go` diff of 303 changed lines was only skimmed, by grep for arguments, eviction and quiet-gate lines. Its side-file code is keyed to flags this matrix does not use, and its new eviction guard only stops a run.
+- **Repetition 1 is not like 2 and 3.** The display was on from 2026-11-06 23:30:21 to 04:38:44, so through runs 1 to 3 and part of run 4. Run 4 is `gpuremap/16g/r1`, the repetition that decides the 16 GiB result. Its warm coding and research requests finished before 04:38:44, and warm hr was running then. Its median mixes hr (18.93) and coding (18.96). Others' CPU is also highest in repetition 1: the mean over runs is 50.7% against 40.2% and 38.8%. No record shows that either factor slowed decode. This is a confound, not a cause, and the rule stands.
+- **The margins are small, and the two verdicts are not symmetric.** `evalGate` passes a ceiling on one win, decode or p95. At 16 GiB neither won, so either metric alone would flip the failure: decode by 0.29% (0.054 of 19.00 t/s) or p95 by 0.95% (0.746 of 78.584 ms). At 0 GiB both won, so flipping the pass would take losing both: decode by 0.58% (0.110 of 18.91 t/s) and p95 by 1.33% (1.076 of 80.746 ms). The spread within one arm is far larger: `gpuremap/16g` runs from 18.94 to 21.69 t/s. Three repetitions cannot resolve margins this small. The rule was fixed before the runs, and this changes neither verdict.
+- **The fastest baseline repetition at 16 GiB,** `prefetch12/16g/r3`, has the highest others' CPU maximum of the benchmark (255%, mean 42%). Only the mean and the maximum are recorded, so when that peak fell relative to decode is unknown. `others_cpu` is a 5 s `ps` sample over the server's lifetime, prefill included, and says nothing about the decode phase on its own. The `coreaudiod` release under "Other activity" falls in this run's cold prefill, and no record connects the two.
+- **Other activity.** `pmset -g log` has these events in the span, apart from the driver's own `caffeinate`, the periodic summaries and the display's end above. 5 `cloudd` assertions of 3 to 4 s (04:26:03, 04:36:14 twice, 04:42:18 twice). 3 `apsd` push tasks timing out at each of 04:45:28 (run 6's cold prefill), 05:00:38 (run 10's wait) and 05:30:09 (run 17's wait). `AddressBookSourceSync` releasing an assertion of 30 s at 05:07:01, in run 11 (`gpuremap/16g/r2`), which spans warm research's decode and warm hr's prefill. Foreign `caffeinate`s that died at 04:23:33 (run 1's wait) and 05:21:49 (run 15's wait). `coreaudiod` releasing 5 audio contexts (10 assertions, held 12:51 to 14:42 in hours and minutes) at 05:39:33, in the cold prefill of run 19, `prefetch12/16g/r3`, before that request's first token at 05:39:46. The gate's values come from warm requests. No record shows that any of these changed decode, and none is taken as a cause. Swap stayed flat within every run (4008 or 4016 MiB), and memory pressure stayed at level 1. Quiet waits were 60 to 120 s.
+- **Recomputation.** A separate program regenerated `report.md` from `run.json` and `stats.json`, byte for byte. The 95 requests were also recomputed from `tokens.log`: the largest deviation is 0.0142 t/s on decode and 0.935 ms on p95, because its stamps are whole milliseconds, and both verdicts come out the same. TTFT, load time, prompt t/s and page-ins come only from `run.json` and `summary.json`.
+
+### Observations
+
+These change no gate.
+
+- **The rule compares extremes, so single repetitions decide it.** At 16 GiB only `gpuremap/16g/r1` decides on the candidate's side, on both metrics. On decode it loses to `prefetch12/16g/r3` alone (18.94 against 19.00). On p95 it loses to `prefetch12/16g/r1` and `r3` (79.33 against 78.58 and 78.79). `r2` and `r3` of the candidate lie beyond every baseline repetition on both metrics. Choosing `iq3-cache128` as the baseline also fails, so the verdict does not depend on which baseline was selected.
+- **At 0 GiB** decode is decided by `gpuremap/0g/r1` (19.02, others' CPU 66/127) against `cache128/0g/r3` (18.91, 36/85), and p95 by `gpuremap/0g/r3` (79.67) against `cache128/0g/r2` (80.75). It would also pass against `iq3-cache128-prefetch12`.
+
+### Open decisions
+
+These are the owner's. None of them is planned, and merging this write-up decides none of them.
+
+- Whether to repeat E2 with a new matrix, pre-registered before its first timed run. This result stands either way.
+- Whether to benchmark E2 merged with E3. The fork branches' conflicts (Known limits) are not resolved, and no such build exists.
+- Whether E6 starts, against its condition above.
+- Whether fork PR #16 stays open. It is left open and draft, as a place for the code.
+
+### The problem
+
+E1 measured it: with all 384 experts cached, decode takes 35.6 ms/token against 16.8 resident, with 102 splits per token against 2; 17.6 ms of the gap comes with those splits ([expert-diagnostics.md](expert-diagnostics.md)).
+
+### The decision
+
+PLAN names two candidates and says a measured prototype decides. Measuring needs a quiet machine, so this choice rests on split and commit counts on tiny checkpoints and on reasoning.
+
+- **Fewer, larger splits is out, by count.** The scheduler already puts a layer's attention and the next layer's router in one Metal split: 2 + 2 per layer is what one CPU op per layer costs at least, so the candidate has nothing left to fuse. It also keeps the split the requirement forbids: the logits would still differ from the unsplit resident run (0.134 on tiny Q8_0, 3.23 on IQ3).
+- **GPU remap, but not with an `MTLSharedEvent` wait per layer.** A shader cannot signal or skip an encoded wait, so a wait at every layer is a CPU round trip at every layer, hit or miss. That is a lighter form of what E2 is meant to remove.
+- **Chosen: a gate per layer that stops the command buffer on a miss.** A hit takes no CPU at all.
+
+### How it works
+
+- **The graph is the resident run's, node for node.** No CPU op, no extra node: the three `MUL_MAT_ID` get two extra sources, the layer's slot ids and its table. They reorder and fuse as in the unsplit run, which is why the logits are bit-identical to it.
+- **Fusion stays intact.** The fusion table has no pattern with a `MUL_MAT_ID`, so a command buffer may end before a gate without cutting a fused group. The plain path's own encoder boundary (`n_nodes_0`) stays too, because a pattern across it does not fuse there.
+- **The table.** Per layer, one `int32` per expert: its slot, or -1. It lives in the same shared host memory as the slots.
+- **The gate.** Before a layer's first matmul, `kernel_expert_gate` maps the router's ids through the table into the slot ids, which the three matmuls read, and logs the router's ids for the CPU.
+- **A stop.** On an id without a slot, the gate sets a flag and zeroes the threadgroup counts of every later dispatch of the command buffer: after a command buffer's first gate, all its dispatches are indirect. So nothing after the gate runs, including that layer's matmuls.
+- **The miss path is the old one.** The backend waits for the buffer and calls the same `llama_expert_slots::remap` the CPU op uses: pins, LRU, loads, waits, the abort on a failed read. It then copies the layer's table and resumes at that gate.
+- **Hits' bookkeeping is deferred, not dropped.** When a buffer has completed (or stopped), `remap` runs for each layer that passed, in layer order. LRU is per layer, so the order within a layer is what it was.
+- **Command buffers.** Two gates per buffer after a stop, doubling while no gate stops, so a stop wastes little encoding and a run of hits costs few commits.
+
+### What replaces the sync guarantee
+
+Before, the scheduler's sync before each CPU split guaranteed that the previous layer's matmuls were done when the next remap ran, and a layer was in flight from its remap to the next one, so no prefetch replaced its slots. Now:
+
+1. **The table and the slots' bytes change only while the GPU is idle:** in the remap of a stopped layer, after `waitUntilCompleted` of the only command buffer running for the graph.
+2. **A stopped gate has run nothing after it.** That layer's matmuls did not start, and no later node has overwritten a tensor the resumed run reads. (M62 shows what happens otherwise: NaN.)
+3. **The layers before it are complete:** their matmuls precede the gate in a completed buffer.
+4. **There is no asynchronous writer.** The cache refuses `--expert-prefetch` in this mode, so all loads are demand loads, and the remap returns only when its layer's loads are done. The table holds only `READY` slots (`copy_table`), so a gate cannot pass an unread expert.
+5. **Resuming must make progress:** a gate that stops again after its loads aborts (`stopped again after its loads`) rather than loop.
+
+Pin, cancel and fall back: `remap` is unchanged, so `test-expert-cache`'s checks still hold it to them. Cancelling and the prefetch fallback have nothing to do in this mode, since it has no prefetch.
+
+### No silent fallback
+
+The model fails to load, and says why, when the option is asked for without a cache (no `--expert-cache` or `--expert-cache-layers`, where it would otherwise load fully resident, the hazardous memory case on this machine), with `--expert-prefetch`, with an expert layer not on Metal (the CPU, `-ngl 0`, part of the layers), or without a Metal backend. The process aborts, and says why, on a `cb_eval` that stops between a layer's matmuls and on the wider ids of `llama_set_warmup` (Known limits). After each ubatch, every layer must have been through its gate, or the process aborts. `expert_cache.gpu_remap` in the stats records the mode, and `prefill` and `decode` gain `gpu_runs` and `gpu_stops`. Off by default; the default path builds the same graph as before and its stats differ by that one key.
+
+### Counts
+
+On the tiny router checkpoint (6 layers, top 6), Metal, per decoded token, 40 prompt and 60 decoded tokens:
+
+| Slots | Mode | Scheduler splits | Metal commits | Stops |
+|--:|---|--:|--:|--:|
+| any | resident | 2 | 3 | |
+| any | CPU remap | 14 | 15 | |
+| 6 | GPU remap | 2 | 8.99 | 5.99 |
+| 16 | GPU remap | 2 | 7.43 | 3.90 |
+| 64 | GPU remap | 2 | 4.73 | 1.15 |
+| 384 | GPU remap | 2 | 4.73 | 1.15 |
+| all hits (M61) | GPU remap | 2 | 3 | 0 |
+
+The figures are F32; Q8_0's commits are within 0.07 and its stops within 0.12. The last row repeats a pass after clearing the KV cache, so the routing repeats and every expert has a slot: exactly 2 splits, 2 command buffers and 3 commits per token, as resident. **The expected decode split count is 2 per token for every model, whatever its layers,** and M61 is the control for it, as M42 is for the CPU remap's 2 + 2 per layer. At 64 and 384 slots tiny's stops are first uses: its 100 tokens do not fill the slots, so nothing is evicted, and both rows are the same.
+
+### Estimate, not a result
+
+Kept as written before the run; "Estimate and measurement" above has what the run measured. For IQ3 at 128 slots, Stage D's hit rate (8634 of 9600) means about 30 misses per token, so at most about 23.5 of 50 layers stop (independent misses: 1 - 0.9^6 = 47%). Tiny's pattern (6 stops, 8 command buffers) gives about 25 command buffers, or about 26 commits against 103. If E1's 17.6 ms scale with commits alone, that saves about 13.5 ms of 57.8: about 44 ms/token, or 23 tokens/s against 17.6. If all of it goes with 384 slots, about 18 ms/token against 35.6.
+
+Evidence this estimate lacked: what one indirect dispatch costs on the GPU, since most dispatches of a token become indirect; how much of E1's 0.18 ms per split is the scheduler and how much is commit and wait; the encoding a stop wastes (one layer per stop); and whether the 7.5 ms that E1 could attribute only to misses stays. The benchmark did not separate these, so they stay unmeasured. An event wait per layer stays untested: no re-encoding, but a CPU round trip at every layer.
+
+### Checks
+
+| Check | Result |
+|---|---|
+| `test-expert-cache` | "all expert cache tests passed"; new: the table holds exactly the `READY` slots, and the gate's deferred bookkeeping gives the same counters as a remap per layer over 400 tokens, with no load while the "GPU" runs |
+| fork `ctest` | 63 of 64, before the refusals below; not rerun since. `test-tokenizers-ggml-vocabs` fails: the `.gguf` files of the vocabulary repo it clones are git-lfs pointers here. It fails on the E3 build as well (reason not read there) |
+| `check_expert_cache.py`, tiny, all | "PASS: 0 failures", 270 checks |
+| `check_expert_cache.py --gpu-remap-only`, tiny | "PASS: 0 failures", 103 checks, plus 118 under `GGML_METAL_FUSION_DISABLE=1` |
+| `check_expert_cache.py --real --gpu-remap-only`, IQ3, Metal | "PASS: 0 failures", 21 checks (`real-attempt2.log`): 128 slots at ubatch 21 and 64 slots at ubatch 10, `F_NOCACHE` and buffered, logits of 160 positions bit-identical to the UNSPLIT resident run, and also with only 33 output positions; 2 splits per token; the load refusals with prefetch and with some layers off Metal; all hits cost 2 splits, 2 command buffers and 3 commits per token. A first attempt (`real-attempt1.log`) ends after 8 PASS lines with no failure and no summary, and the log does not say why |
+| `go test ./cmd/... ./internal/...` | 21 packages ok, with `/bin` first in `PATH` for `kolibri-rekey` |
+
+- **Bit identity is against the UNSPLIT resident run,** `np.array_equal`, F32 and Q8_0, 6, 16, 64 and 384 slots, `F_NOCACHE` and buffered, as PLAN requires. It passed on the first build. On the CPU the option fails to load, by design, so the CPU has no second arm to compare.
+- **A server's shape of decode found a bug.** The last layer keeps only the output rows, so a prefill ubatch with no output has no matmuls there and no gate; the first version aborted on it. The check now also runs with only the last positions as outputs, and `llama-completion` with its warmup decode. `llama-server` on tiny, three requests with `cache_prompt`, gave the same text as resident `-ub 10`, with 2 splits per decoded token. That run is by hand, not in the check, and no log was kept.
+- **Counters.** With fusion on, the CPU remap can route an expert differently, because its splits round differently: on tiny Q8_0 one hit in 1,762 at 6 slots. So the check holds it to the GPU remap's counters exactly only where its logits equal the unsplit run's, and runs again under `GGML_METAL_FUSION_DISABLE=1`, where they do: hits, misses, evictions and bytes are then equal in every configuration.
+
+### Negative controls
+
+Each was applied, recorded and reverted; then a forced rebuild and a rerun of the checks. Logs: `~/models/eval/expert-bench-e2.runner/checks/`.
+
+| Control | `test-expert-cache` | Tiny `--gpu-remap-only` |
+|---|---|---|
+| **M60:** `copy_table` swaps the slot of every odd expert: a wrong slot id in the GPU table | fails: 4667 checks failed | fails: "FAIL: 37 failures", max \|diff\| 1.11 |
+| **M61:** a CPU op per layer back in the GPU arm's graph, as the CPU remap has | passes | fails: "FAIL: 75 failures": 14 scheduler splits per token instead of 2, and bit identity, max \|diff\| 0.134 |
+| **M62:** the gate stops but leaves the later dispatches on: the invariant's second point | passes | fails: logits NaN on the first configurations, then the guard aborts ("gate 3 stopped again after its loads") |
+| **M63:** `copy_table` never writes -1, so an evicted expert stays in the table | fails: 7891 checks failed | fails: "FAIL: 17 failures", max \|diff\| 1.11 |
+| **M64:** the run resumes one node after the stopped gate | passes | fails: "FAIL: 37 failures", max \|diff\| 2.23 |
+| **M65:** the remap does not wait for loads, the table lists loading slots, and a load takes 2 ms longer: the invariant's fourth point | fails: 5680 checks failed | fails: "FAIL: 34 failures", max \|diff\| 1.26 |
+| **M67:** the plain path's `n_nodes_0` encoder boundary is dropped | passes | fails: "FAIL: 27 failures", max \|diff\| 0.134 |
+| **M69:** cb_eval splits the GPU arm's computation after each `ffn_moe_topk` | passes | fails: "FAIL: 33 failures": bit identity, max \|diff\| 0.134, and the command buffer bound. The split count stays 2, because the scheduler does not count these |
+
+Two more controls change what a run costs or counts, not what it computes, so bit identity holds under them by design. They do not meet the rule that a control fails bit identity; they guard the counts:
+
+| Control | `test-expert-cache` | Tiny `--gpu-remap-only` |
+|---|---|---|
+| **M66:** command buffers never grow past two gates | passes | fails: "FAIL: 3 failures", the all-hits cost (and its run under fusion off); bit identity holds |
+| **M68:** a layer that hits skips its bookkeeping | passes | fails: "FAIL: 17 failures", `steps` and the other counters; bit identity holds |
+
+Five more guard the refusals. M69 was rerun after them and still fails as above, "FAIL: 33 failures": a `cb_eval` that stops outside the matmuls runs and changes the logits, and it is not refused.
+
+| Control | `test-expert-cache` | Tiny `--gpu-remap-only` |
+|---|---|---|
+| **M82:** the model does not refuse the option without a cache | passes | fails: "FAIL: 9 failures": it loads on the CPU and on Metal, and `llama-completion` exits 0 |
+| **M83:** `common` builds no params for the option alone | passes | fails: "FAIL: 3 failures": `llama-completion --expert-cache-gpu-remap` exits 0. With `--expert-cache-stats` the model still refuses |
+| **M84:** a layer's second gate is not refused | passes | fails: "FAIL: 5 failures": a `cb_eval` after `ffn_moe_up` or `ffn_moe_gate` exits -6 without saying why. The old message was "11 of 6 expert layers went through the Metal gate" |
+| **M85:** the slot ids' width is not checked | passes | fails: "FAIL: 5 failures": at 384 slots `llama_set_warmup` exits 0, with the gate writing past the tensor; at 64 it exits -6 without the width message |
+| **M86:** the gate state is not reset after a graph that did not complete | passes | **passes:** "PASS: 0 failures" |
+
+M86 shows a gap, not a guard: **the reset after an aborted graph has no check.** The check ends a decode at each call of the abort callback, and each next decode still works without the reset. `llama_set_abort_callback` reaches only backends that register `ggml_backend_set_abort_callback`, and Metal does not, so the callback runs in the CPU backend. The 4 calls and M86's result fit a CPU split before the gates; the split order was not read directly. The reset stays because a graph that ends past a gate would otherwise refuse the next one.
+
+Commit `4397b54`'s subject calls these five M70 to M74, and their logs keep those names (`m70.log` to `m74.log` and `m74-rerun.log`, in `~/models/eval/expert-bench-e2.runner/checks/`). They moved to M82 to M86 because PR #77 uses M72 to M74e, and PR #72's `docs/upstream.md` gives M70 and M71 as the old numbers of its M80 and M81.
+
+M67 is more than a control. Dropping that one boundary moves tiny Q8_0's logits by the same maximum, 0.134, that the CPU remap's splits do, so a resident run's own numbers depend on where its encoder boundary falls. The GPU remap computes the boundary by the same formula, on the same node count. Why the two maxima agree was not investigated.
+
+### Reproduce
+
+`testdata/bench/e2.json` stays as the record, and its GPU arm needs a build of fork branch `feat/kolibri1-gpu-remap` (`0bb0f5444`). The real-weight phase, on a quiet machine, nothing else holding the weights. The server is `third_party/llama.cpp-e2/build/bin/llama-server`, which serves both arms:
+
+```sh
+go run ./cmd/kolibri-models check testdata/bench/e2.json
+.venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp-e2 \
+  --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf --gpu-remap-only
+# from a checkout of feat/phase11-e3-sidefile, with -matrix naming this branch's file
+go run ./cmd/kolibri-bench -matrix /path/to/this/branch/testdata/bench/e2.json -out ~/models/eval/expert-bench-e2 \
+  -server third_party/llama.cpp-e2/build/bin/llama-server
+```
+
+The benchmark used the driver of E3's branch (`feat/phase11-e3-sidefile`, `0b19754`), not this branch's: it has the eviction limit and the server digest. Its validation accepts this matrix, as a test against that branch's package showed; the matrix has no side-file arm, so the side-file guards do nothing here. `--real` covers the load refusals with prefetch and with some layers off Metal. The other refusal checks run on tiny only: without a cache, on the CPU, on the command line, and the `cb_eval` and warmup aborts. So does the abort-callback check.
+
+The check must say "PASS: 0 failures". `e2.json` is 19 runs: 3 arms × 2 ceilings × 3 repetitions, and one resident reference.
+
+- **Gates:** decode by the Stage D rule at 0 and 16 GiB, against the best of `iq3-cache128` and `iq3-cache128-prefetch12`, since that rule names the best other arm at that ceiling. Resident at 0 GiB is the token reference, not a baseline: Stage D's deciding gate was at 16 GiB, where resident does not fit, and E2's bar is beating Stage D's cache.
+- **Token IDs:** `iq3-cache128-gpuremap` must generate exactly those of `iq3-resident-ub21`, the same ubatches, or the driver exits 1. The comparison with `iq3-cache128` stays INFO: the CPU remap's splits round differently from the unsplit graph (E0.1).
+- **Splits:** the report's decode table must show 2 per token for `iq3-cache128-gpuremap` and 102 for the two CPU remap arms; otherwise the arms did not compare what they claim to.
+
+A server without the option exits with "error: invalid argument: --expert-cache-gpu-remap", and the gates then give no verdict.
+
+### Known limits
+
+- No prefetch in this mode. Same-token prefetch would need its own policy, since a hit layer no longer reaches the CPU in time to predict the layers after it. Stage D's prefetch did not earn its reads either.
+- Metal only.
+- A `cb_eval` may stop outside a layer's matmuls, as M69 does after `ffn_moe_topk`, and that changes the logits like any split. It may not stop between them: each graph compute finds its own gates, so the layer would get two, and the process aborts ("reached its Metal gate again"). So capturing `ffn_moe_up` or `ffn_moe_gate` needs the CPU remap or a resident run.
+- `llama_set_warmup` makes the router's ids `n_expert` wide, and the slot ids tensor is `n_expert_used` wide, so the gate asserts. `common`'s warmup decode does not call it.
+- `kolibri-bench`'s equivalence with the CPU remap arm is not exact, since its rounding differs from the unsplit graph (E0.1).
+- Merging with E3: 0014 is on `feat/kolibri1` (fork PR #15), and the fork branch here has no side-file. `git merge-tree` of the fork branches reports conflicts in `common/arg.cpp`, `common/common.cpp`, `common/common.h`, `include/llama.h`, `src/llama-expert-cache.cpp`, `src/llama-expert-cache.h`, `src/llama-model.cpp` and `tests/test-expert-cache.cpp`. They include `llama_expert_cache_params` and `stats_json`. They were not resolved or read one by one, so this does not say whether any logic overlaps. The main repo holds both stages: `check_expert_cache.py` skips each stage's checks on a build without its option.
+- The removed patch 0015 was the plain diff of the fork branch against `feat/kolibri1` at `634e34bb4`, so `git diff 634e34bb4 0bb0f5444` in the fork gives it again. Applied to that tree it gave the branch's tree, `cabe6384f`, checked again before the removal. The branch merged `feat/kolibri1` for that: it had gained the refusal of a LoRA on the cache's experts, which the diff would otherwise have taken out.
 
 ## Limits
 
