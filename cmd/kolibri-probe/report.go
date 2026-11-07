@@ -44,7 +44,7 @@ func report(args []string) error {
 	for _, l := range layers {
 		named = append(named, probe.NamedMatrix{Name: fmt.Sprintf("layer-%d", l.Layer.OneBased), Matrix: l.Matrix})
 	}
-	opt := probe.Options{Folds: *folds, L2: *l2, Shuffles: *shuffles, Seed: probe.Seed}
+	opt := probe.Options{Folds: *folds, L2: *l2, Shuffles: *shuffles, Seed: probe.Seed, DatasetSHA256: probe.SHA256Hex(data)}
 	dir := *out
 	if dir == "" {
 		dir = *capture

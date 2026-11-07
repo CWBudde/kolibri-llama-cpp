@@ -142,3 +142,67 @@ func TestReportKeepsCommittedDefinitions(t *testing.T) {
 		t.Errorf("a new output directory: %v", err)
 	}
 }
+
+// A dataset that passes every check but isn't the committed one reads as what it is: its report
+// takes neither report.md's name nor its claim, and its name follows the dataset's bytes.
+func TestReportNamesAnotherDataset(t *testing.T) {
+	committed := filepath.Join("..", "..", defaultDataset)
+	dir := t.TempDir()
+	other := filepath.Join(dir, "other.jsonl")
+	if err := generate([]string{"-seed", "64", "-out", other}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestCapture(t, dir, other)
+	if err := report([]string{"-capture", dir, "-dataset", other, "-shuffles", "20"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); !os.IsNotExist(err) {
+		t.Fatalf("another dataset wrote report.md: %v", err)
+	}
+	sum := probe.SHA256Hex(data)
+	base := filepath.Join(dir, "report-deviation-folds5-l20.01-shuffles20-seed63-dataset"+sum[:12])
+	md, err := os.ReadFile(base + ".md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "These are not the committed definitions: dataset sha256 " + sum + " (committed " + probe.CommittedDatasetSHA256 + ")."
+	if !strings.Contains(string(md), want) {
+		t.Errorf("the report does not say so, want %q:\n%s", want, md)
+	}
+	js, err := os.ReadFile(base + ".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep struct {
+		Options    probe.Options `json:"options"`
+		Deviations []string      `json:"deviations"`
+	}
+	if err := json.Unmarshal(js, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Options.DatasetSHA256 != sum || len(rep.Deviations) != 1 {
+		t.Errorf("report.json: %+v", rep)
+	}
+
+	// the committed bytes under another path are the committed dataset
+	copied := filepath.Join(t.TempDir(), "copy.jsonl")
+	bytesOf, err := os.ReadFile(committed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(copied, bytesOf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	same := t.TempDir()
+	writeTestCapture(t, same, copied)
+	if err := report([]string{"-capture", same, "-dataset", copied}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(same, "report.md")); err != nil {
+		t.Errorf("the committed bytes under another path: %v", err)
+	}
+}

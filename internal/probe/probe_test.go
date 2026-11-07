@@ -354,7 +354,7 @@ func TestDeviationsAndReportName(t *testing.T) {
 	if o.ReportName() == "report" {
 		t.Error("a moved option gets the committed report's name")
 	}
-	for _, edit := range []func(*Options){func(o *Options) { o.Folds = 4 }, func(o *Options) { o.Shuffles = 1 }, func(o *Options) { o.Seed = 1 }} {
+	for _, edit := range []func(*Options){func(o *Options) { o.Folds = 4 }, func(o *Options) { o.Shuffles = 1 }, func(o *Options) { o.Seed = 1 }, func(o *Options) { o.DatasetSHA256 = "abc" }} {
 		o := DefaultOptions
 		edit(&o)
 		if len(o.Deviations()) != 1 || o.ReportName() == "report" {
@@ -390,7 +390,7 @@ func writeCapture(t *testing.T, dir string, items []Item, dataset []byte, layers
 			t.Fatal(err)
 		}
 		ls = append(ls, `{"one_based":`+strconv.Itoa(n)+`,"zero_based":`+strconv.Itoa(n-1)+`,"node":"l_out-`+strconv.Itoa(n-1)+
-			`","file":"`+file+`","sha256":"`+sha256Hex(b.Bytes())+`","dtype":"float32","shape":[`+strconv.Itoa(len(items))+`,`+strconv.Itoa(dim)+`]}`)
+			`","file":"`+file+`","sha256":"`+SHA256Hex(b.Bytes())+`","dtype":"float32","shape":[`+strconv.Itoa(len(items))+`,`+strconv.Itoa(dim)+`]}`)
 		il := strconv.Itoa(n - 1)
 		readBy := "norm-" + strconv.Itoa(n)
 		if n == nLayer {
@@ -403,7 +403,7 @@ func writeCapture(t *testing.T, dir string, items []Item, dataset []byte, layers
 	for _, it := range items {
 		rows = append(rows, `{"id":"`+it.ID+`","n_tokens":10,"last_token":108}`)
 	}
-	js := `{"schema":"` + CaptureSchema + `","dataset_sha256":"` + sha256Hex(dataset) + `","logits_check":"equal","repeatable":true,"model_sha256":"abc",` +
+	js := `{"schema":"` + CaptureSchema + `","dataset_sha256":"` + SHA256Hex(dataset) + `","logits_check":"equal","repeatable":true,"model_sha256":"abc",` +
 		`"n_layer":` + strconv.Itoa(nLayer) + `,"last_tokens":[108],"template_is_released":true,"reasoning":"none","device":"CPU","n_ubatch_effective":21,"expert_cache_slots":128,` +
 		`"graph_check":{` + strings.Join(gs, ",") + `},"rows":[` + strings.Join(rows, ",") + `],"layers":[` + strings.Join(ls, ",") + `]}`
 	if err := os.WriteFile(filepath.Join(dir, "capture.json"), []byte(js), 0o644); err != nil {

@@ -256,6 +256,10 @@ func shuffled(fk []foldKernels, items []Item, labels []int, task Task, l2 float6
 	return s, nil
 }
 
+// CommittedDatasetSHA256 is the sha256 of testdata/probe/smoke.jsonl, the dataset the definitions
+// were committed with. TestRegenerateBytes and TestCommittedDatasetHash hold the file to it.
+const CommittedDatasetSHA256 = "e4681b761c1542876ab72c4db1f3d44e1de6c7b1190e2c532116496c00c2cc90"
+
 // Options fix the readout. The values in DefaultOptions are definitions: they are committed before
 // a real capture and must not move afterwards.
 type Options struct {
@@ -263,10 +267,12 @@ type Options struct {
 	L2       float64 `json:"l2"`
 	Shuffles int     `json:"shuffles"`
 	Seed     uint64  `json:"seed"`
+	// DatasetSHA256 is the sha256 of the bytes of the dataset the report reads.
+	DatasetSHA256 string `json:"dataset_sha256"`
 }
 
 // DefaultOptions are the definitions of the smoke readout.
-var DefaultOptions = Options{Folds: 5, L2: 0.01, Shuffles: 20, Seed: Seed}
+var DefaultOptions = Options{Folds: 5, L2: 0.01, Shuffles: 20, Seed: Seed, DatasetSHA256: CommittedDatasetSHA256}
 
 // Deviations says how these options differ from the committed definitions; empty if they do not.
 func (o Options) Deviations() []string {
@@ -284,6 +290,9 @@ func (o Options) Deviations() []string {
 	if o.Seed != d.Seed {
 		out = append(out, fmt.Sprintf("seed %d (committed %d)", o.Seed, d.Seed))
 	}
+	if o.DatasetSHA256 != d.DatasetSHA256 {
+		out = append(out, fmt.Sprintf("dataset sha256 %s (committed %s)", o.DatasetSHA256, d.DatasetSHA256))
+	}
 	return out
 }
 
@@ -293,7 +302,11 @@ func (o Options) ReportName() string {
 	if len(o.Deviations()) == 0 {
 		return "report"
 	}
-	return fmt.Sprintf("report-deviation-folds%d-l2%g-shuffles%d-seed%d", o.Folds, o.L2, o.Shuffles, o.Seed)
+	name := fmt.Sprintf("report-deviation-folds%d-l2%g-shuffles%d-seed%d", o.Folds, o.L2, o.Shuffles, o.Seed)
+	if o.DatasetSHA256 != DefaultOptions.DatasetSHA256 {
+		name += "-dataset" + o.DatasetSHA256[:min(12, len(o.DatasetSHA256))]
+	}
+	return name
 }
 
 // Row is one line of a task's table.

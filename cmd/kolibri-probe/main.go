@@ -7,8 +7,9 @@
 //
 // tools/probe/capture.py writes the capture directory. report refuses a capture whose dataset,
 // activations or shape do not match its capture.json, or that was not checked: see ReadCapture. It
-// never replaces a report. Flags that move a committed definition write report-deviation-*, which
-// says so at its top; only the committed definitions write report.md.
+// never replaces a report. Flags that move a committed definition, and a -dataset whose bytes are
+// not the committed dataset's, write report-deviation-*, which says so at its top; only the committed
+// definitions write report.md.
 package main
 
 import (

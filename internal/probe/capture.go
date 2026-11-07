@@ -142,7 +142,7 @@ func ReadCapture(dir string, datasetBytes []byte, items []Item) (Capture, []Laye
 	if c.Schema != CaptureSchema {
 		return c, nil, fmt.Errorf("capture.json: schema %q, want %q", c.Schema, CaptureSchema)
 	}
-	if got := sha256Hex(datasetBytes); c.DatasetSHA256 != got {
+	if got := SHA256Hex(datasetBytes); c.DatasetSHA256 != got {
 		return c, nil, fmt.Errorf("capture read dataset %s, this one is %s", c.DatasetSHA256, got)
 	}
 	switch c.LogitsCheck {
@@ -187,7 +187,7 @@ func ReadCapture(dir string, datasetBytes []byte, items []Item) (Capture, []Laye
 		if err != nil {
 			return c, nil, err
 		}
-		if got := sha256Hex(data); got != l.SHA256 {
+		if got := SHA256Hex(data); got != l.SHA256 {
 			return c, nil, fmt.Errorf("%s: sha256 %s, capture.json says %s", l.File, got, l.SHA256)
 		}
 		m, err := ReadNpy(bytes.NewReader(data))
@@ -202,7 +202,8 @@ func ReadCapture(dir string, datasetBytes []byte, items []Item) (Capture, []Laye
 	return c, out, nil
 }
 
-func sha256Hex(b []byte) string {
+// SHA256Hex is the hex digest of b, as capture.json and Options hold it.
+func SHA256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

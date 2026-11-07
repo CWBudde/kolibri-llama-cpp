@@ -10,6 +10,16 @@ import (
 
 const smokePath = "../../testdata/probe/smoke.jsonl"
 
+func TestCommittedDatasetHash(t *testing.T) {
+	data, err := os.ReadFile(smokePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := SHA256Hex(data); got != CommittedDatasetSHA256 {
+		t.Fatalf("%s has sha256 %s, the definitions say %s", smokePath, got, CommittedDatasetSHA256)
+	}
+}
+
 func TestRegenerateBytes(t *testing.T) {
 	want, err := os.ReadFile(smokePath)
 	if err != nil {
