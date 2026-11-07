@@ -51,7 +51,7 @@ type LayerActivations struct {
 
 // ReadCapture reads a capture directory and refuses one that does not belong to the dataset's
 // bytes, whose files differ from what capture.json records, whose row order is not the dataset's,
-// or whose capture changed the logits.
+// whose capture changed the logits, or whose repeated decode differed.
 func ReadCapture(dir string, datasetBytes []byte, items []Item) (Capture, []LayerActivations, error) {
 	var c Capture
 	raw, err := os.ReadFile(filepath.Join(dir, "capture.json"))
@@ -72,6 +72,9 @@ func ReadCapture(dir string, datasetBytes []byte, items []Item) (Capture, []Laye
 	}
 	if c.LogitsCheck != "equal" && c.LogitsCheck != "skipped" {
 		return c, nil, fmt.Errorf("capture.json: logits_check %q: the capture changed the logits", c.LogitsCheck)
+	}
+	if c.Repeatable != nil && !*c.Repeatable {
+		return c, nil, fmt.Errorf("capture.json: a repeated decode differed: the capture is not reproducible")
 	}
 	if len(c.Rows) != len(items) {
 		return c, nil, fmt.Errorf("capture has %d rows, the dataset %d", len(c.Rows), len(items))

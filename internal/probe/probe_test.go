@@ -384,6 +384,11 @@ func TestReadCaptureRefuses(t *testing.T) {
 			b, _ := os.ReadFile(p)
 			os.WriteFile(p, bytes.Replace(b, []byte(`"logits_check":"equal"`), []byte(`"logits_check":"differ"`), 1), 0o644)
 		}, dataset},
+		"not repeatable": {func(dir string) {
+			p := filepath.Join(dir, "capture.json")
+			b, _ := os.ReadFile(p)
+			os.WriteFile(p, bytes.Replace(b, []byte(`"repeatable":true`), []byte(`"repeatable":false`), 1), 0o644)
+		}, dataset},
 		"numbering": {func(dir string) {
 			p := filepath.Join(dir, "capture.json")
 			b, _ := os.ReadFile(p)
