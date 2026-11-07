@@ -485,7 +485,7 @@ def main() -> None:
                 print(f"info {what}: max |diff| to the CPU remap {float(np.abs(got - cpu_arm).max()):.3g}")
                 s = json.loads(stats.read_text())
                 pre, dec = s["prefill"], s["decode"]
-                diffs = [f"{ph} {key} {x[key]} != {y[key]}" for ph, x, y in (("prefill", pre, c["prefill"]), ("decode", dec, c["decode"]))
+                diffs = [f"{ph} {key} {x.get(key)} != {y.get(key)}" for ph, x, y in (("prefill", pre, c["prefill"]), ("decode", dec, c["decode"]))
                          for key in same_fields if x[key] != y[key]]
                 # The CPU remap's splits round differently, and that can route an expert differently
                 # (E0.1), so its counters can only be held to these where its logits equal the
@@ -568,7 +568,7 @@ def main() -> None:
                 pre, dec = s["prefill"], s["decode"]
                 report(reads_ok(s, side) and s["expert_cache"]["gpu_remap"] is True,
                        f"{what}: the stats name the side-file and the GPU remap; {pre['preads']} and {dec['preads']} preads for {pre['loads']} and {dec['loads']} experts in prefill and decode")
-                diffs = [f"{ph} {key} {x[key]} != {y[key]}" for ph, x, y in (("prefill", pre, g["prefill"]), ("decode", dec, g["decode"]))
+                diffs = [f"{ph} {key} {x.get(key)} != {y.get(key)}" for ph, x, y in (("prefill", pre, g["prefill"]), ("decode", dec, g["decode"]))
                          for key in same_fields if x.get(key) != y.get(key)]
                 report(not diffs, f"{what}: the counters equal the GPU remap's on the GGUF path (decode {dec['hits']} hits, {dec['misses']} misses, "
                                   f"{dec.get('gpu_stops')} stops)" + (f": {diffs}" if diffs else ""))
