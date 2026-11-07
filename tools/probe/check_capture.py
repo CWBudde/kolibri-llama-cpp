@@ -231,10 +231,22 @@ def main() -> int:
             report(False, "a second capture overwrote the first")
         except SystemExit:
             report(True, "a capture refuses a directory that holds one: results may exist nowhere else")
+        partial = tmpdir / "partial"
+        partial.mkdir()
+        kept = {name: f"results of {name}".encode() for name in ("layer-2.npy", "expert-cache-stats.json")}
+        for name, data in kept.items():
+            (partial / name).write_bytes(data)
+        try:
+            cap.run(namespace(partial))
+            report(False, "a capture wrote into a directory that holds results without a capture.json")
+        except SystemExit:
+            report({p.name: p.read_bytes() for p in partial.iterdir()} == kept,
+                   "a capture refuses a directory with anything in it and leaves it as it was")
 
         # the real command's shape: the cache on the GPU where there is one, the capped ubatch, the report
         device = next((d for d in devices if d != "CPU"), "CPU")
         cached = tmpdir / "capture-cached"
+        cached.mkdir()  # an empty directory is as good as a new one
         report(cap.run(namespace(cached, expert_cache=SLOTS, device=device)) == 0 and (cached / "expert-cache-stats.json").exists(),
                f"the command line captures the dataset with --expert-cache {SLOTS} on {device}")
         m = json.loads((cached / "capture.json").read_text())

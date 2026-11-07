@@ -319,12 +319,19 @@ def released_template_sha() -> tuple[str | None, str | None]:
     return hashlib.sha256(text.encode()).hexdigest(), pinned_source()[1]
 
 
+def refuse_used_output(out: Path) -> None:
+    """Only a new or empty directory: np.save and the cache's stats replace what they find, and results may exist nowhere else."""
+    if out.is_symlink() or (out.exists() and not out.is_dir()):
+        raise SystemExit(f"{out} is not a directory: choose a new or empty one")
+    if out.is_dir() and any(out.iterdir()):
+        raise SystemExit(f"{out} is not empty, and results may exist nowhere else: choose a new or empty directory")
+
+
 def run(args, mutate_node: str | None = None) -> int:
     """mutate_node is control M77 only: tools/probe/check_capture.py passes it, the command line cannot."""
     import numpy as np
 
-    if (args.out / "capture.json").exists():
-        raise SystemExit(f"{args.out} already holds a capture, and results may exist nowhere else: choose a new directory")
+    refuse_used_output(args.out)
     dataset_bytes = args.dataset.read_bytes()
     rows = [json.loads(line) for line in dataset_bytes.decode().splitlines()]
     args.out.mkdir(parents=True, exist_ok=True)
@@ -451,7 +458,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llama-cpp", type=Path, required=True, help="llama.cpp checkout with a built libllama")
     ap.add_argument("--model", type=Path, required=True)
-    ap.add_argument("--out", type=Path, required=True, help="new directory for the activations and capture.json")
+    ap.add_argument("--out", type=Path, required=True, help="new or empty directory for the activations and capture.json")
     ap.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     ap.add_argument("--layers", default=DEFAULT_LAYERS, help="one-based layers, as in the issue; scale them on a smaller model")
     ap.add_argument("--device", help="CPU or MTL0 (default: the GPU if there is one)")
