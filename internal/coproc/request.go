@@ -244,6 +244,7 @@ func (r *Request) register(a Execute) (j *job, existing bool, err error) {
 	}
 	slices.SortFunc(deps, func(x, y *job) int { return cmp.Compare(x.id, y.id) })
 	deps = slices.Compact(deps)
+	depNames := slices.Compact(slices.Sorted(slices.Values(a.Dependencies)))
 
 	byID, hasID := r.jobs[a.Job]
 	byKey, hasKey := r.byKey[a.IdempotencyKey]
@@ -267,7 +268,7 @@ func (r *Request) register(a Execute) (j *job, existing bool, err error) {
 
 	j = &job{
 		req: r, id: a.Job, key: a.IdempotencyKey, program: a.Program,
-		args: slices.Clone(a.Args), timeout: a.Timeout, deps: deps,
+		args: slices.Clone(a.Args), timeout: a.Timeout, deps: deps, depNames: depNames,
 	}
 	r.jobs[a.Job] = j
 	r.byKey[a.IdempotencyKey] = j
@@ -431,7 +432,8 @@ type job struct {
 	program    string
 	args       []string
 	timeout    time.Duration
-	deps       []*job // sorted by ID
+	deps       []*job  // sorted by ID
+	depNames   []JobID // the names the Execute gave them, which may be aliases
 	dependents []*job
 	pending    int // dependencies not yet DONE
 
