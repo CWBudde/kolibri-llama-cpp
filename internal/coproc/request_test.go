@@ -3,6 +3,7 @@ package coproc
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -328,5 +329,82 @@ func TestWaitReportsAClosedRequest(t *testing.T) {
 		r.Close()
 		wantErr(t, r.applyWait(ctx, Wait{Job: "a"}).Err, ErrRequestClosed)
 		wantErr(t, r.applyWait(ctx, Wait{Job: "nope"}).Err, ErrRequestClosed)
+	})
+}
+
+// Run emits a token inside the GENERATING claim, so it can't go out after a second driver has moved
+// the request on.
+func TestRunEmitsInsideTheGeneratingClaim(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		r, _ := openChecked(t, s, "r", "a", "b")
+		must(t, r, Execute{Job: "j", Program: "manual"})
+		synctest.Wait()
+		var emitted []string
+		sc := &Script{Actions: []Action{Continue{}, Continue{}}}
+		err := r.Run(context.Background(), sc, func(tok string) {
+			emitted = append(emitted, tok)
+			wantState(t, r, Generating)
+			wantErr(t, r.Apply(context.Background(), Wait{Job: "j"}).Err, ErrNotReady)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(emitted, []string{"a", "b"}) {
+			t.Fatalf("emitted %v", emitted)
+		}
+		wantState(t, r, Ready)
+	})
+}
+
+// The token of a request that closed during its Step is discarded, by Run as by Apply.
+func TestRunDoesNotEmitTheTokenOfAClosedRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		g := &blockingGen{release: make(chan struct{}), entered: make(chan struct{})}
+		r := open(t, s, "r", g)
+		finished := make(chan error, 1)
+		go func() {
+			finished <- r.Run(context.Background(), &Script{Actions: []Action{Continue{}}}, func(tok string) {
+				t.Errorf("emitted %q from a closed request", tok)
+			})
+		}()
+		<-g.entered
+		r.Close()
+		close(g.release)
+		wantErr(t, <-finished, ErrRequestClosed)
+	})
+}
+
+// cancellingGen ends a context right after generating a token.
+type cancellingGen struct {
+	*MockGenerator
+	cancel context.CancelFunc
+	after  int
+}
+
+func (g *cancellingGen) Step(ctx context.Context) (string, error) {
+	tok, err := g.MockGenerator.Step(ctx)
+	if g.Decoded() == g.after {
+		g.cancel()
+	}
+	return tok, err
+}
+
+// A token that was generated goes out even if ctx ends right after it, so the answer doesn't fall
+// behind the decode position.
+func TestRunEmitsATokenGeneratedBeforeCtxEnded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g := &cancellingGen{MockGenerator: &MockGenerator{Preamble: []string{"a", "b", "c"}}, cancel: cancel, after: 2}
+		r := open(t, s, "r", g)
+		var emitted []string
+		sc := &Script{Actions: []Action{Continue{}, Continue{}, Continue{}}}
+		wantErr(t, r.Run(ctx, sc, func(tok string) { emitted = append(emitted, tok) }), context.Canceled)
+		if g.Decoded() != 2 || !slices.Equal(emitted, []string{"a", "b"}) {
+			t.Fatalf("decoded %d, emitted %v", g.Decoded(), emitted)
+		}
 	})
 }
