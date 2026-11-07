@@ -373,6 +373,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0010 continuation tests | no | tests on top of 0008 |
 | 0011, 0012 expert cache | no | the fork's own work, rebased (below) |
 | 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
+| 0014 expert cache side-file | no | the fork's own work, Stage E3; its four deciding gates passed on 2026-11-07, merged by fork PR #15 ([expert-streaming.md](expert-streaming.md#stage-e3-one-read-per-expert)) |
 | 0015 expert cache GPU remap | no | retired 2026-11-07, the fork's own work: Stage E2's gate failed at 16 GiB and passed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e2-gpu-remap)) |
 
 ### Controls
@@ -393,20 +394,99 @@ applied to a clean `184f6536` gives exactly the fork's tree (`7ade40f0`).
 **Patch 0013 is retired (Phase 11, Stage E4, 2026-11-06).** Its gates failed at
 0 GiB, so the number is kept and the code stays on fork branch
 `feat/kolibri1-waves` (`90311e5a2`, fork PR #14, open and not merged). It never
-reached `feat/kolibri1`. The next patch is 0014. The series 0008, 0010, 0011
-and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
-(`7ade40f0`, `git diff --quiet` rc 0).
+reached `feat/kolibri1`. At that date the next patch was 0014, and the series
+0008, 0010, 0011 and 0012 applied to a clean `184f6536` equalled
+`feat/kolibri1`'s tree (`7ade40f0`, `git diff --quiet` rc 0). The current tree
+is in the next paragraph.
+
+**Patch 0014 (Phase 11, Stage E3, 2026-11-07)** is on `feat/kolibri1` as
+`c0b2de9be`, the squash of fork PR #15. The patch is that commit's plain diff. The
+series 0008, 0010, 0011, 0012 and 0014 applied to a clean `184f6536` equals its
+tree (`db0c6d55`), and without 0014 it equals its parent's, `ba4bd5bbc` (`7e901295`,
+both by `git write-tree`). Its gates passed, so the number stays in the series. The
+benchmark ran on `dd2040eaf`, whose tree (`53739515`) is what the same series
+gave at `0b19754`, before the review fixes below.
+
+**Merge order: fork PR #15 into `feat/kolibri1`, then PR #72.** The README's option
+A (the patches by glob) and option B (the fork branch) give the same tree.
+
+**Review fixes (fork PRs #13 and #15, 2026-11-07).** Two findings were real; the
+fixes are `634e34bb4` on `feat/kolibri1`, merged into the side-file branch, and
+`1f6ce476c` there. The first is in 0011, the second in 0014.
+- **A LoRA on the routed experts was left out silently.** The matmuls read the
+  slots, and an adapter's weight is looked up by tensor name. Such an adapter now
+  fails to load, by name.
+- **The side-file's table sized an allocation.** Its GGUF header length was
+  checked only against the GGUF's size. The hash now reads in pieces of 1 MiB, and
+  a length past the first expert row is refused.
+
+Both act at load, and neither changes the code that reads a miss. E3's benchmark
+ran on `dd2040eaf` before these commits, so they were not timed, and nothing here
+asks to repeat it.
+
+Three findings were declined, with the reasons on the PRs: the Kolibri-only
+options in `common/arg.cpp` (twice, on #13 and #14), since this checklist is
+upstream's and a slot count is the machine's memory budget, not model metadata;
+and experts spread over several GGUF files, a stated limit that fails with an
+error.
+
+| Mutation | Result |
+|---|---|
+| M80: the LoRA refusal off (`if (false && ...)`) | `check_expert_cache.py`: "FAIL LoRA on ffn_gate_exps with the cache: exits 0 without generating, refused by name", the same for up and down, "FAIL: 3 failures", rc 1 |
+| M81: the bound on the GGUF header off (`if (false && gguf_head > first_row)`) | `test-expert-cache`: "FAIL a GGUF header as long as the GGUF", "FAIL a GGUF header one byte into the experts", "2 checks failed", rc 1. Rerun on an export of `1f6ce476c`: `~/models/eval/expert-bench-e3.runner/review-controls.log` |
+
+Commit `da2f581`'s message calls these two M70 and M71. PR #77 uses those numbers
+for the loop baseline, so they moved to M80 and M81.
+
+**Second review (fork PRs #13 to #16, 2026-11-07).** Four findings on `feat/kolibri1`
+were real, all in 0011: `4a4661220`, merged into the side-file branch as `fcd9271a5`.
+- **A draft model inherited the target's cache.** It would fail the architecture
+  check at load. `common_base_params_to_speculative` now clears the cache's params.
+- **`--expert-cache` with `--moe-cache-mib` aborted.** The graph's `GGML_ASSERT` fired
+  on the tiny checkpoint. The context now refuses the pair by name.
+- **A reopened model could be another file.** macOS reopens by path, and the offsets
+  would read wrong weights without an error. A dup would share `F_NOCACHE` with the
+  loader, so the cache compares device and inode and refuses a replaced file. Nothing
+  tests the race itself.
+- **A remap could evict a slot the last graph still read.** `graph_compute` is
+  async. Metal waits for the last graph at its next split, which comes first when
+  layer 0 is on the GPU, but a prefetch on a layer before that split could still
+  evict. `process_ubatch` now synchronizes first when a cache is present. Nothing
+  tests the race itself, and no benchmark ran with this: a decode is already
+  synchronized before its next call, a prefill's wait moves ahead of its first split.
+
+**Third review (PR #72, 2026-11-07).** `19001f2e0` on the side-file branch, in 0014.
+A draft model inherited the target's side-file, and it would fail to load.
+`common_base_params_to_speculative` now clears that option too, and `test-arg-parser`
+checks all four cache options on the draft params. The test failed before the fix.
+It acts only when params are derived for a draft, so nothing in the timed path
+changes.
+
+`ca32334bb` adds a test that an alignment of zero is refused. A review read the
+division as coming before the check, and the check comes first. The other findings
+were declined, with the reasons on the PRs: `llama.h` and the CLI options (upstream's
+rules), `gguf_head`'s lower bound ("Limits" in
+[expert-streaming.md](expert-streaming.md)), and everything on the waves and GPU remap
+branches, which do not merge.
+
+| Mutation | Result |
+|---|---|
+| M89: the MoE cache refusal off (`if (false && params.moe_cache_size > 0)`) | `check_expert_cache.py`: "FAIL llama-completion with --expert-cache and --moe-cache-mib exits -6", "FAIL: 1 failures", rc 1 |
+| M90: the draft's cache params not cleared | `test-expert-cache`: "FAIL draft.expert_cache == 0", the same for the layers and the stats, "3 checks failed" |
+
+**iOS, tvOS and visionOS did not build (fork CI, 2026-11-07).** `llama-expert-cache.cpp`
+included `libproc.h`, which those SDKs do not ship, so `CI (apple)` failed on every
+branch with the cache. `ba4bd5bbc` (0011) limits it to macOS; the three counters that
+need `proc_pid_rusage` stay `null` elsewhere, as on Linux. It is merged into the
+side-file branch as `bf7bf16b6`. This machine has no iOS, tvOS or visionOS SDK. Locally
+the other path was only compiled against the macOS SDK with `TARGET_OS_OSX` forced to 0.
 
 **Patch 0015 is retired (Phase 11, Stage E2, 2026-11-07).** Its deciding gate
 failed at 16 GiB and passed at 0 GiB, so the number is kept and the code stays
 on fork branch `feat/kolibri1-gpu-remap` (`0bb0f5444`, fork PR #16, draft, open
-and not merged). It never reached `feat/kolibri1` or, at this date, `main`. The
-series' glob matched it only on Stage E2's branch, from `35b6ee2` until `5c40670`
-moved it to `pending/`. The next patch is 0016. At this date `main` does not
-have PR #72: its 0008, 0010, 0011 and 0012 applied to a clean `184f6536` give
-`7ade40f0`, while `feat/kolibri1`
-has moved to `e4937d7a`, because `634e34bb4` added the refusal of a LoRA on the
-cache's experts. PR #72's series without 0014 gives `e4937d7a`.
+and not merged). It never reached `feat/kolibri1`. The series' glob matched it only on Stage E2's
+branch, from `35b6ee2` until `5c40670` moved it to `pending/`, and the patch is not
+in this PR's merge. The next patch is 0016.
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's
