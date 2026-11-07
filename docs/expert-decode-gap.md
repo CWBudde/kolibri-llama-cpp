@@ -67,7 +67,7 @@ The next table holds the same 32 tokens, except `cpu128-n32`, whose 32 tokens ar
 
 **First touch and page-ins: ruled out as a decode cost.**
 - The slots fill during prefill: of 20961 decode misses in the first `gpu128` run, 116 went to an empty slot, the others evicted.
-- In a separate test on the cache's read pattern, a first write of a slot takes 628 µs per expert and a rewrite 597 µs (`standalone/touch.txt`, one thread, 800 experts). So 116 first touches cost about 3.6 ms over 767 tokens, under 0.01 ms per token.
+- In a separate test on the cache's read pattern, a first write of a slot takes 628 µs per expert and a rewrite 597 µs (`standalone/touch.txt`, one thread, 800 experts). So the 116 first touches cost about 3.6 ms more than rewrites would have (116 × 31 µs) over 767 tokens, under 0.01 ms per token. The reads themselves, about 73 ms at 628 µs each, happen for a rewrite too.
 - The `gpu128` process had 42 page-ins in the whole first run.
 
 **Bytes copied into slots: nothing is copied.** A miss reads 1.70 MB from the SSD straight into the slot. At 26.2 misses that is 44.5 MB per token. That read takes 597 µs on one thread, and a `memcpy` of the same bytes 52.6 µs. The wait grows by about 0.345 ms per miss (fits per run, R² 0.82 to 0.87), and it is already counted as load wait, not in the 20 ms.
