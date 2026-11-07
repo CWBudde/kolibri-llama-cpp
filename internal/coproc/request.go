@@ -86,8 +86,10 @@ func (r *Request) Job(id JobID) (JobInfo, bool) {
 }
 
 // Run drives the request with a controller until the controller finishes, the request closes, its
-// actions run out or ctx ends. emit, which may be nil, gets the user-visible answer tokens. Run
-// doesn't close the request.
+// actions run out or ctx ends. emit, which may be nil, gets the user-visible answer tokens. It runs
+// before the request leaves GENERATING, so a token can't go out after a second driver has moved the
+// request on, and a token that was generated goes out even if ctx ends right after it. Actions from
+// inside emit are rejected as not READY. Run doesn't close the request.
 func (r *Request) Run(ctx context.Context, c Controller, emit func(string)) error {
 	var obs Observation
 	for {
@@ -95,15 +97,12 @@ func (r *Request) Run(ctx context.Context, c Controller, emit func(string)) erro
 		if !ok {
 			return nil
 		}
-		obs = r.Apply(ctx, a)
+		obs = r.apply(ctx, a, emit)
 		if obs.Err != nil && (errors.Is(obs.Err, ErrRequestClosed) || errors.Is(obs.Err, ErrActionLimit)) {
 			return obs.Err
 		}
 		if err := ctx.Err(); err != nil {
 			return err
-		}
-		if _, isToken := a.(Continue); isToken && obs.Err == nil && emit != nil {
-			emit(obs.Token)
 		}
 	}
 }
@@ -112,13 +111,17 @@ func (r *Request) Run(ctx context.Context, c Controller, emit func(string)) erro
 // job has its outcome. If ctx ends during a Wait, the awaited job is cancelled, as nothing is left
 // to wait for it. Failures are reported in the observation, never by leaving the request stuck.
 func (r *Request) Apply(ctx context.Context, a Action) Observation {
+	return r.apply(ctx, a, nil)
+}
+
+func (r *Request) apply(ctx context.Context, a Action, emit func(string)) Observation {
 	if err := r.admit(); err != nil {
 		return Observation{Action: a, Err: err}
 	}
 	var obs Observation
 	switch a := a.(type) {
 	case Continue:
-		obs = r.applyContinue(ctx)
+		obs = r.applyContinue(ctx, emit)
 	case Execute:
 		obs = r.applyExecute(a)
 	case Wait:
@@ -176,7 +179,7 @@ func (r *Request) useInference(ctx context.Context) (context.Context, func() err
 	}, nil
 }
 
-func (r *Request) applyContinue(ctx context.Context) Observation {
+func (r *Request) applyContinue(ctx context.Context, emit func(string)) Observation {
 	var obs Observation
 	ctx, release, err := r.useInference(ctx)
 	if err != nil {
@@ -184,6 +187,9 @@ func (r *Request) applyContinue(ctx context.Context) Observation {
 		return obs
 	}
 	obs.Token, obs.Err = r.gen.Step(ctx)
+	if obs.Err == nil && emit != nil && r.State() != Closed {
+		emit(obs.Token)
+	}
 	if err := release(); err != nil {
 		return Observation{Err: err} // the token of a closed request is not an answer
 	}
