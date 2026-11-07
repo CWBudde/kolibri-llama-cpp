@@ -311,10 +311,10 @@ func (s *Scheduler) dispatch() []start {
 
 		spec := JobSpec{
 			RequestID: j.req.id, ID: j.id, IdempotencyKey: j.key, Generation: j.generation,
-			Program: j.program, Args: j.args, DepResults: make(map[JobID]string, len(j.deps)),
+			Program: j.program, Args: j.args, DepResults: make(map[JobID]string, len(j.depNames)),
 		}
-		for _, d := range j.deps {
-			spec.DepResults[d.id] = d.result
+		for _, name := range j.depNames {
+			spec.DepResults[name] = j.req.jobs[name].result
 		}
 		starts = append(starts, start{job: j, ctx: ctx, spec: spec})
 	}

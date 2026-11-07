@@ -102,7 +102,7 @@ type JobSpec struct {
 	Generation     Generation
 	Program        string
 	Args           []string
-	DepResults     map[JobID]string // the result of every dependency
+	DepResults     map[JobID]string // the result of every dependency, under the name its Execute gave it
 }
 
 // CompletionEvent is a worker's report of a job's outcome. Result is set for JobDone, Error for
