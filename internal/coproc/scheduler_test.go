@@ -434,7 +434,7 @@ func TestShutdown(t *testing.T) {
 	})
 }
 
-// A worker stuck on a full queue gets out when the scheduler stops. So does its deadline timer.
+// A worker stuck on a full queue gets out when the scheduler stops.
 func TestShutdownReleasesBlockedPublishers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, _ := setup(t, func(c *Config) { c.EventBuffer = 1 })
@@ -798,4 +798,81 @@ func TestShutdownWaitsForARunningGeneratorCall(t *testing.T) {
 			})
 		})
 	}
+}
+
+// A settled job's deadline is off: nothing fires later, and nothing stays armed up to MaxTimeout.
+func TestDeadlineOfASettledJobDoesNotFire(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		r, _ := openChecked(t, s, "r")
+		must(t, r, Execute{Job: "a", Program: "sum", Timeout: time.Second})
+		must(t, r, Wait{Job: "a"})
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		wantJob(t, r, "a", JobDone)
+		if got, want := s.Stats(), (Stats{Accepted: 1}); got != want {
+			t.Fatalf("stats %+v, want %+v", got, want)
+		}
+	})
+}
+
+// gateCoprocessor holds the Start of one job, the state in which a later job of the same dispatch
+// is RUNNING and not yet started.
+type gateCoprocessor struct {
+	*Mock
+	hold    JobID
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c gateCoprocessor) Start(ctx context.Context, job JobSpec, publish func(CompletionEvent) error) error {
+	if job.ID == c.hold {
+		close(c.entered)
+		<-c.release
+	}
+	return c.Mock.Start(ctx, job, publish)
+}
+
+// A job settled between its dispatch and its Start is not started: its side effect would come after
+// its CANCELLED.
+func TestJobSettledBeforeItsStartDoesNotStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := &Mock{Programs: programs()}
+		gate := gateCoprocessor{Mock: m, hold: "a", entered: make(chan struct{}), release: make(chan struct{})}
+		s, err := NewScheduler(gate, DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := s.Shutdown(context.Background()); err != nil {
+				t.Error(err)
+			}
+			m.Wait()
+		})
+		r, _ := openChecked(t, s, "r")
+		must(t, r, Execute{Job: "p", Program: "manual"})
+		synctest.Wait()
+		must(t, r, Execute{Job: "a", Program: "manual", Dependencies: []JobID{"p"}})
+		must(t, r, Execute{Job: "b", Program: "manual", Dependencies: []JobID{"p"}})
+
+		// p's completion dispatches a and b at once, and Start holds on a.
+		if err := s.Publish(done(t, r, "p", "1")); err != nil {
+			t.Fatal(err)
+		}
+		<-gate.entered
+		wantJob(t, r, "b", JobRunning)
+		if err := r.Cancel("b"); err != nil {
+			t.Fatal(err)
+		}
+		close(gate.release)
+		synctest.Wait()
+
+		wantJob(t, r, "b", JobCancelled)
+		if n := m.StartCount("b"); n != 0 {
+			t.Fatalf("job b started %d times after its CANCELLED", n)
+		}
+		if n := m.StartCount("a"); n != 1 {
+			t.Fatalf("job a started %d times", n)
+		}
+	})
 }
