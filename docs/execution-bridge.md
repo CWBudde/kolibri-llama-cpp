@@ -124,7 +124,7 @@ These came from llama-server on the `cmd/kolibri-tiny` checkpoint, and they shap
 | A turn out of tokens returns a complete-looking call and a second one that is only `{`, with `finish_reason: "length"` | Only `"tool_calls"` runs anything | `TestCapturedCutTurnExecutesNothing` |
 | Text the parser can't read is an error event after a 200, without `[DONE]`. A repeated `<tool_call>` token comes back as plain content | `upstream_error`, `unparsed_call` | `TestCapturedParseErrorMidStream`, `TestAnAnswerCutOrWithAnUnparsedCall` |
 | `tool_choice: "required"` allows free text before the first call: the grammar's root has a free-text rule (`until-182?`) ahead of `tool-calls`. It doesn't make a call come first | The bridge uses `auto`. Only the tiny test uses `required`, with a prefilled `<tool_call>` | No test: observed on tiny weights. `forceCall` uses `required` and asserts nothing about this. `TestClientRequestsThatAreRefused` holds that a client can't ask for `required` |
-| Under `required`, `parallel_tool_calls: false` didn't stop several calls in one turn | The limits count every call, and the bridge doesn't send the field by itself | No test of the server's behavior: observed on tiny weights. `TestCallLimits` holds the bridge's own limits, on the fake |
+| Under `required`, `parallel_tool_calls: false` didn't stop several calls in one turn | The limits count every call, and the bridge doesn't send the field by itself. A client that sends `false` gets at most one call per turn: a turn with more stops the request with `call_limit`, and none of it runs | No test of the server's behavior: observed on tiny weights. `TestCallLimits` holds the bridge's own limits, on the fake |
 | The tools cost prompt tokens: 51 without tools, 605 with the four of the acceptance task, 1931 with all 15, on llama.cpp `90311e5a2` | `-allow` matters. The tiny checkpoint's 2048-token context barely fits them all | No test: `TestTinyCheckpointCompilesEverySchema` logs the figure for all 15 and asserts none of these |
 
 `testdata/bridge` holds the captured bytes. `TestCaptureFixtures` regenerates them, and `TestFakeHasTheCapturedShapes` holds the test server to their key paths.
@@ -138,6 +138,7 @@ These came from llama-server on the `cmd/kolibri-tiny` checkpoint, and they shap
 | Time of an operation | 5 s | the model reads `timeout` |
 | Time of a turn, of a request | 15 min, 1 h | `turn_timeout`, `request_timeout` |
 | Time of one write to a client | 30 s | `cancelled`: the client went away, and its slot is free |
+| Time to read a client's request body | 30 s | HTTP 408, `request_timeout`. The deadline ends with the read, so it doesn't limit a turn |
 | Bytes of a turn's response, of a client's request | 8 MiB, 16 MiB | `response_too_large`, HTTP 413 |
 | `max_tokens` of a turn | 4096 | refused |
 | Arguments, array length, integer, result | 256 KiB, 4096, 4096 bits, 1 MiB | the model reads the error |
@@ -189,7 +190,7 @@ All seven tests pass. A random model called `array_sum`, `int_div` and `hash_sha
 
 Issue #59's criterion is that unmodified Kolibri completes a deterministic multi-step program task, and it names no task. This one, its prompt and its four allowed operations were written with the test (`e41f652`), before the real run.
 
-`TestAcceptanceRealModel` asks the model to multiply `987654321987654321` by `123456789123456789`, add 1, and take the SHA-256 of the sum's digits. The prompt asks for the digest only, and a model can't work that out in its head. The test passes only with `stop` = `completed`, the three calls in order with exact operands, each result exact, and exactly the expected digest in the answer. The expected values are literals computed outside this repo's code. A mistake the model repairs doesn't fail the test but shows up in the trace. `TestAcceptanceJudge` shows on the fake that a wrong digest, a miscopied number, a skipped step, an answer without tools, steps out of order and a truncated end all fail.
+`TestAcceptanceRealModel` asks the model to multiply `987654321987654321` by `123456789123456789`, add 1, and take the SHA-256 of the sum's digits. The prompt asks for the digest only, and a model can't work that out in its head. The test passes only with `stop` = `completed`, the three calls in order with exact operands, each result exact, and an answer that is exactly the expected digest, apart from surrounding whitespace. The expected values are literals computed outside this repo's code. A mistake the model repairs doesn't fail the test but shows up in the trace. `TestAcceptanceJudge` shows on the fake that a wrong digest, text around the digest, a miscopied number, a skipped step, an answer without tools, steps out of order and a truncated end all fail.
 
 It needs a real weight, llama-server built from the fork, and the machine to itself: **a resident run wires about 33 GiB, so two would wire about 66 GiB on this 48 GiB Mac. One resident run with a 16 GiB `mlock` hog has already panicked it ([expert-streaming.md](expert-streaming.md)), so check that no other run holds a weight.**
 

@@ -65,6 +65,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, ready fun
 	fs.DurationVar(&lim.TurnTimeout, "turn-timeout", lim.TurnTimeout, "one completion, prompt processing included")
 	fs.DurationVar(&lim.RequestTimeout, "request-timeout", lim.RequestTimeout, "the whole request")
 	fs.DurationVar(&lim.WriteTimeout, "write-timeout", lim.WriteTimeout, "one write to a client; one that stops reading for this long loses its request")
+	fs.DurationVar(&lim.BodyTimeout, "body-timeout", lim.BodyTimeout, "reading a client's request body")
 	fs.IntVar(&opLim.MaxArgBytes, "max-arg-bytes", opLim.MaxArgBytes, "bytes of an operation's arguments")
 	fs.IntVar(&opLim.MaxIntBits, "max-int-bits", opLim.MaxIntBits, "bits of an integer input or result")
 	fs.IntVar(&opLim.MaxArrayLen, "max-array-len", opLim.MaxArrayLen, "elements of an array input")

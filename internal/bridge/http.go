@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -67,10 +68,40 @@ func errorBody(status int, kind, message string) map[string]any {
 	return map[string]any{"error": map[string]any{"code": status, "type": kind, "message": message}}
 }
 
+// readBody reads a request's body within BodyTimeout, which a client that drips it would otherwise
+// not be bound by: it holds a connection before it counts toward MaxRequests. The deadline is only
+// for this read. A server-wide ReadTimeout would go on running during a long turn, and end its
+// request's context through net/http's background read.
+func (b *Bridge) readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(b.cfg.Limits.BodyTimeout))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	// An expired deadline stays: after the handler net/http reads what is left of a body, and the
+	// client that dripped it would hold the connection there.
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		_ = rc.SetReadDeadline(time.Time{})
+	}
+	return body, err
+}
+
+// bodyTooSlow answers a client whose body didn't arrive in time, and reports whether it was one.
+func (b *Bridge) bodyTooSlow(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		return false
+	}
+	w.Header().Set("Connection", "close")
+	writeJSON(w, http.StatusRequestTimeout, errorBody(http.StatusRequestTimeout, "request_timeout",
+		fmt.Sprintf("the body didn't arrive within %v", b.cfg.Limits.BodyTimeout)))
+	return true
+}
+
 func (b *Bridge) handleChat(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, b.cfg.Limits.MaxRequestBytes))
+	body, err := b.readBody(w, r, b.cfg.Limits.MaxRequestBytes)
 	b.extendWriteDeadline(w)
 	if err != nil {
+		if b.bodyTooSlow(w, err) {
+			return
+		}
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeJSON(w, http.StatusRequestEntityTooLarge, errorBody(http.StatusRequestEntityTooLarge, "request_too_large",
@@ -233,8 +264,11 @@ func (b *Bridge) handleCancel(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CallID json.RawMessage `json:"call_id"`
 	}
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
+	raw, err := b.readBody(w, r, 4<<10)
 	if err != nil {
+		if b.bodyTooSlow(w, err) {
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, errorBody(http.StatusBadRequest, "invalid_request_error", err.Error()))
 		return
 	}
@@ -276,10 +310,12 @@ func (b *Bridge) Manifest() map[string]any {
 		"protocol": ops.Version,
 		"limits": map[string]any{
 			"max_turns": lim.MaxTurns, "max_calls": lim.MaxCalls, "max_calls_per_turn": lim.MaxCallsPerTurn,
-			"max_turn_tokens": lim.MaxTurnTokens, "max_turn_bytes": lim.MaxTurnBytes,
+			"max_requests": lim.MaxRequests, "max_running_ops": lim.MaxRunningOps,
+			"max_turn_tokens": lim.MaxTurnTokens, "max_turn_bytes": lim.MaxTurnBytes, "max_request_bytes": lim.MaxRequestBytes,
 			"op_timeout_ms": lim.OpTimeout.Milliseconds(), "turn_timeout_ms": lim.TurnTimeout.Milliseconds(),
 			"request_timeout_ms": lim.RequestTimeout.Milliseconds(), "write_timeout_ms": lim.WriteTimeout.Milliseconds(),
-			"max_arg_bytes": b.cfg.OpLimits.MaxArgBytes, "max_int_bits": b.cfg.OpLimits.MaxIntBits,
+			"body_timeout_ms": lim.BodyTimeout.Milliseconds(),
+			"max_arg_bytes":   b.cfg.OpLimits.MaxArgBytes, "max_depth": b.cfg.OpLimits.MaxDepth, "max_int_bits": b.cfg.OpLimits.MaxIntBits,
 			"max_array_len": b.cfg.OpLimits.MaxArrayLen, "max_result_bytes": b.cfg.OpLimits.MaxResultBytes,
 		},
 		"ops": list,

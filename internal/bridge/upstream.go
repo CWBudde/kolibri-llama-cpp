@@ -144,7 +144,8 @@ func (c *client) complete(ctx context.Context, body []byte, lim Limits, onDelta 
 }
 
 // limitedBody ends a response past the limit with an error of its own, which io.LimitReader's plain
-// EOF would hide: it would read as a stream that broke.
+// EOF would hide: it would read as a stream that broke. A response of exactly the limit is not past
+// it, so at the limit one more byte decides.
 type limitedBody struct {
 	r    io.Reader
 	left int64
@@ -154,7 +155,12 @@ var errTooLarge = errors.New("response too large")
 
 func (l *limitedBody) Read(p []byte) (int, error) {
 	if l.left <= 0 {
-		return 0, errTooLarge
+		var probe [1]byte
+		n, err := l.r.Read(probe[:])
+		if n > 0 {
+			return 0, errTooLarge
+		}
+		return 0, err
 	}
 	if int64(len(p)) > l.left {
 		p = p[:l.left]

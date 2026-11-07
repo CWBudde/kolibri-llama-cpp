@@ -33,6 +33,7 @@ type Limits struct {
 	TurnTimeout     time.Duration // one completion, prompt processing included
 	RequestTimeout  time.Duration // the whole request
 	WriteTimeout    time.Duration // one write to an HTTP client: one that stops reading can't hold a request
+	BodyTimeout     time.Duration // reading an HTTP client's request body: it doesn't count as open yet
 }
 
 // DefaultLimits returns the limits of a default bridge. The durations leave room for the real model
@@ -51,13 +52,14 @@ func DefaultLimits() Limits {
 		TurnTimeout:     15 * time.Minute,
 		RequestTimeout:  time.Hour,
 		WriteTimeout:    30 * time.Second,
+		BodyTimeout:     30 * time.Second,
 	}
 }
 
 func (l Limits) validate() error {
 	if l.MaxTurns <= 0 || l.MaxCalls <= 0 || l.MaxCallsPerTurn <= 0 || l.MaxRequests <= 0 || l.MaxRunningOps <= 0 ||
 		l.MaxTurnTokens <= 0 || l.MaxTurnBytes <= 0 || l.MaxRequestBytes <= 0 || l.OpTimeout <= 0 ||
-		l.TurnTimeout <= 0 || l.RequestTimeout <= 0 || l.WriteTimeout <= 0 {
+		l.TurnTimeout <= 0 || l.RequestTimeout <= 0 || l.WriteTimeout <= 0 || l.BodyTimeout <= 0 {
 		return fmt.Errorf("bridge: every limit must be positive: %+v", l)
 	}
 	return nil
@@ -218,6 +220,7 @@ type chat struct {
 	fields   map[string]json.RawMessage // what passes through to the server unchanged
 	messages []json.RawMessage
 	stream   bool
+	oneCall  bool // parallel_tool_calls is false: a turn may hold one call
 }
 
 func (b *Bridge) parseChat(raw []byte) (*chat, *RequestError) {
@@ -254,6 +257,13 @@ func (b *Bridge) parseChat(raw []byte) (*chat, *RequestError) {
 		if err := json.Unmarshal(raw, &choice); err != nil || choice != "auto" {
 			return nil, invalid(`tool_choice can only be "auto"`)
 		}
+	}
+	if raw, ok := fields["parallel_tool_calls"]; ok {
+		var parallel bool
+		if err := json.Unmarshal(raw, &parallel); err != nil {
+			return nil, invalid("parallel_tool_calls must be a boolean")
+		}
+		c.oneCall = !parallel
 	}
 	if raw, ok := fields["n"]; ok {
 		var n int
@@ -318,7 +328,7 @@ func (b *Bridge) start(ctx context.Context, id string, c *chat, cb Callbacks) (*
 	defer stopTimeout()
 
 	r := &run{
-		b: b, id: id, cancel: cancel, cb: cb, fields: c.fields, messages: c.messages, began: time.Now(),
+		b: b, id: id, cancel: cancel, cb: cb, fields: c.fields, oneCall: c.oneCall, messages: c.messages, began: time.Now(),
 		calls: map[coproc.JobID]*call{},
 	}
 	var req *coproc.Request
@@ -414,13 +424,14 @@ type call struct {
 // run is one request. It is the coproc.Generator: a Step is a whole turn, the boundary the scheduler
 // resumes at, and a Deliver appends a tool message.
 type run struct {
-	b      *Bridge
-	id     string
-	req    *coproc.Request
-	cancel context.CancelCauseFunc
-	cb     Callbacks
-	fields map[string]json.RawMessage
-	began  time.Time
+	b       *Bridge
+	id      string
+	req     *coproc.Request
+	cancel  context.CancelCauseFunc
+	cb      Callbacks
+	fields  map[string]json.RawMessage
+	oneCall bool
+	began   time.Time
 
 	// Used by the goroutine in Run, which also runs Step and Deliver. The scheduler never calls
 	// those two at once.
@@ -490,7 +501,12 @@ func (r *run) Step(ctx context.Context) (string, error) {
 	if onDelta != nil {
 		onDelta = func(d Delta) { d.RequestID = r.id; r.cb.Delta(d) }
 	}
-	turn, f := r.b.client.complete(turnCtx, body, r.b.cfg.Limits, onDelta)
+	// The server may not hold to parallel_tool_calls: under tool_choice "required" it didn't.
+	lim := r.b.cfg.Limits
+	if r.oneCall {
+		lim.MaxCallsPerTurn = 1
+	}
+	turn, f := r.b.client.complete(turnCtx, body, lim, onDelta)
 	if f != nil {
 		// A cut connection reads as a broken stream. Say what really cut it.
 		if cause := r.causeFailure(context.Cause(turnCtx)); cause != nil {

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"kolibri-llm/internal/bridge/ops"
@@ -706,6 +707,24 @@ func TestCallLimits(t *testing.T) {
 			t.Fatalf("%d calls", res.Calls)
 		}
 	})
+	t.Run("one per turn when parallel_tool_calls is false", func(t *testing.T) {
+		const oneAtATime = `{"messages":[{"role":"user","content":"x"}],"parallel_tool_calls":false}`
+		f := newFake(t, fakeTurn{calls: []fakeCall{call}}, fakeTurn{calls: []fakeCall{call, call}})
+		res := runBody(t, newBridge(t, f), oneAtATime)
+		wantStop(t, res, StopCallLimit)
+		if res.Calls != 1 {
+			t.Fatalf("%d calls ran", res.Calls)
+		}
+	})
+	t.Run("several per turn when parallel_tool_calls is true", func(t *testing.T) {
+		const parallel = `{"messages":[{"role":"user","content":"x"}],"parallel_tool_calls":true}`
+		f := newFake(t, fakeTurn{calls: []fakeCall{call, call}}, fakeTurn{content: "done"})
+		res := runBody(t, newBridge(t, f), parallel)
+		wantStop(t, res, StopCompleted)
+		if res.Calls != 2 {
+			t.Fatalf("%d calls ran", res.Calls)
+		}
+	})
 	t.Run("per turn", func(t *testing.T) {
 		f := newFake(t, fakeTurn{calls: []fakeCall{call, call, call, call, call}})
 		res := runBody(t, newBridge(t, f), userBody)
@@ -980,6 +999,7 @@ func TestClientRequestsThatAreRefused(t *testing.T) {
 		`{"messages":[{"role":"user","content":"x"}],"tool_choice":"required"}`,
 		`{"messages":[{"role":"user","content":"x"}],"tool_choice":"none"}`,
 		`{"messages":[{"role":"user","content":"x"}],"tool_choice":{"type":"function"}}`,
+		`{"messages":[{"role":"user","content":"x"}],"parallel_tool_calls":"no"}`,
 		`{"messages":[{"role":"user","content":"x"}],"n":2}`,
 		`{"messages":[{"role":"user","content":"x"}],"max_tokens":0}`,
 		`{"messages":[{"role":"user","content":"x"}],"max_tokens":999999}`,
@@ -1952,5 +1972,103 @@ func TestHTTPManifestAndHealth(t *testing.T) {
 	defer health.Body.Close()
 	if health.StatusCode != http.StatusOK {
 		t.Errorf("health %d", health.StatusCode)
+	}
+}
+
+// A response of exactly the limit is complete. Only a byte past it is too large.
+func TestLimitedBodyAtTheLimit(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		body  string
+		limit int64
+		want  error
+	}{
+		{"under", "abc", 4, nil},
+		{"exactly", "abcd", 4, nil},
+		{"one past", "abcde", 4, errTooLarge},
+	} {
+		for name, wrap := range map[string]func(io.Reader) io.Reader{
+			"whole":         func(r io.Reader) io.Reader { return r },
+			"byte by byte":  iotest.OneByteReader,
+			"eof with data": iotest.DataErrReader,
+		} {
+			t.Run(c.name+"/"+name, func(t *testing.T) {
+				got, err := io.ReadAll(&limitedBody{r: wrap(strings.NewReader(c.body)), left: c.limit})
+				if !errors.Is(err, c.want) {
+					t.Fatalf("error %v, want %v", err, c.want)
+				}
+				if c.want == nil && string(got) != c.body {
+					t.Fatalf("read %q", got)
+				}
+			})
+		}
+	}
+	t.Run("a whole response of exactly the limit", func(t *testing.T) {
+		raw := `{"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}]}`
+		f := newFake(t, fakeTurn{raw: raw, rawCT: "application/json"})
+		b := newBridge(t, f, func(c *Config) { c.Limits.MaxTurnBytes = int64(len(raw)) })
+		wantStop(t, runBody(t, b, userBody), StopCompleted)
+	})
+}
+
+// A client that drips its body loses the connection, and the deadline ends with the read: a turn
+// may run far longer than BodyTimeout.
+func TestBodyTimeout(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+	dialDrip := func(t *testing.T, url, request string) string {
+		t.Helper()
+		conn, err := net.Dial("tcp", strings.TrimPrefix(url, "http://"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := io.WriteString(conn, request); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		got, err := io.ReadAll(conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(got)
+	}
+	for _, path := range []string{"/v1/chat/completions", "/v1/executions/x/cancel"} {
+		t.Run(path, func(t *testing.T) {
+			b := newBridge(t, newFake(t), func(c *Config) { c.Limits.BodyTimeout = timeout })
+			srv := httptest.NewServer(b.Handler())
+			defer srv.Close()
+			got := dialDrip(t, srv.URL, "POST "+path+" HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n{")
+			if !strings.HasPrefix(got, "HTTP/1.1 408") || !strings.Contains(got, "request_timeout") {
+				t.Fatalf("got %q", got)
+			}
+		})
+	}
+	t.Run("a turn past the timeout finishes", func(t *testing.T) {
+		f := newFakeFunc(t, func(int, []byte) fakeTurn {
+			time.Sleep(3 * timeout)
+			return fakeTurn{content: "done"}
+		})
+		b := newBridge(t, f, func(c *Config) { c.Limits.BodyTimeout = timeout })
+		srv := httptest.NewServer(b.Handler())
+		defer srv.Close()
+		resp, body := post(t, srv.URL+"/v1/chat/completions", userBody)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "done") {
+			t.Fatalf("%d %s", resp.StatusCode, body)
+		}
+	})
+}
+
+// A client can read every bound the bridge holds it to.
+func TestManifestListsTheLimits(t *testing.T) {
+	b := newBridge(t, newFake(t))
+	limits := b.Manifest()["limits"].(map[string]any)
+	for _, name := range []string{
+		"max_turns", "max_calls", "max_calls_per_turn", "max_requests", "max_running_ops", "max_turn_tokens",
+		"max_turn_bytes", "max_request_bytes", "op_timeout_ms", "turn_timeout_ms", "request_timeout_ms",
+		"write_timeout_ms", "body_timeout_ms", "max_arg_bytes", "max_depth", "max_int_bits", "max_array_len", "max_result_bytes",
+	} {
+		if _, ok := limits[name]; !ok {
+			t.Errorf("the manifest has no %s", name)
+		}
 	}
 }

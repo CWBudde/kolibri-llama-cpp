@@ -118,9 +118,8 @@ func checkAcceptance(res *Result) []string {
 	if step != len(acceptSteps) {
 		fail("the model reached " + strconv.Itoa(step) + " of " + strconv.Itoa(len(acceptSteps)) + " steps")
 	}
-	digests := regexp.MustCompile(`\b[0-9a-f]{64}\b`).FindAllString(res.Content, -1)
-	if len(digests) != 1 || digests[0] != acceptDigest {
-		fail("the answer doesn't hold exactly the digest: " + strconv.Quote(clipText(res.Content)))
+	if strings.TrimSpace(res.Content) != acceptDigest {
+		fail("the answer isn't exactly the digest: " + strconv.Quote(clipText(res.Content)))
 	}
 	return problems
 }
@@ -149,6 +148,8 @@ func TestAcceptanceJudge(t *testing.T) {
 		{"a wrong digest", replace(3, fakeTurn{content: strings.Repeat("0", 64)}), false},
 		{"two digests", replace(3, fakeTurn{content: acceptDigest + " " + strings.Repeat("0", 64)}), false},
 		{"no digest", replace(3, fakeTurn{content: "done"}), false},
+		{"text around the digest", replace(3, fakeTurn{content: "The digest is " + acceptDigest}), false},
+		{"space around the digest", replace(3, fakeTurn{content: "\n" + acceptDigest + " \n"}), true},
 		{"a miscopied number", replace(1, fakeTurn{calls: []fakeCall{{"int_add", `{"a":"121932631356500531347203169112635268","b":"1"}`}}}), false},
 		{"a skipped step", []fakeTurn{good[0], good[2], good[3]}, false},
 		{"no tool at all", []fakeTurn{{content: acceptDigest}}, false},
