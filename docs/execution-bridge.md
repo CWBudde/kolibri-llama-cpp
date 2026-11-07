@@ -204,7 +204,7 @@ It refuses a server whose template isn't the released one (sha256 `9ba35d4b…`)
 
 #### The real run, 2026-11-07
 
-One attempt. Its settings were written down before the server started: `KOLIBRI_BRIDGE_ACCEPT_RUNS=2`, the effort at its default `low`. The test passed with exit status 0. No bridge bug came up, so no code changed and nothing was rerun. The records are in `~/models/eval/bridge-acceptance/attempt-1/`: `plan.txt`, `test.log`, `server.log`, `expert-cache-stats.json` and `trace.jsonl` (sha256 `39e4e0d7…`).
+One attempt. Its settings were written down before the server started: `KOLIBRI_BRIDGE_ACCEPT_RUNS=2`, the effort at its default `low`. The test passed with exit status 0. No bridge bug came up, so no code changed, and the only rerun is [the one on the patch series](#on-the-patch-series). The records are in `~/models/eval/bridge-acceptance/attempt-1/`: `plan.txt`, `test.log`, `server.log`, `expert-cache-stats.json` and `trace.jsonl` (sha256 `39e4e0d7…`).
 
 | | |
 |---|---|
@@ -231,9 +231,23 @@ Every call succeeded the first time. Each run took 4276 prompt tokens over its f
 - **Failure recovery.** No call failed, so a real model has not read an error and repaired a call. That path has run on the fake and on tiny weights only.
 - **The HTTP API.** The client side ran in process. `kolibri-bridge`, a streaming client and parallel calls haven't met a real model.
 - **Other weights and modes.** Only this quantization ran, under the expert cache. BF16 and a resident server did not run.
-- **Another build.** The server was fork branch `feat/kolibri1-waves`, which is outside the patch series: `feat/kolibri1` without its last commit, plus the Stage E4 waves code ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)). The run didn't pass `--expert-cache-waves`, and the stats file reports waves off, but that is a runtime flag. Whether a build without that code gives the same trace has not been measured. `TestTinyCheckpoint` ran on the same build.
-- **The weight's hash, in this run's own records.** `attempt-1` names the file and holds no hash of it, and the test's check doesn't identify it. The file at that path is `93720b94…` in `~/models/eval/layer-probe-20261107/capture.json`, written about five minutes after the test ended, and its modification time is 2026-10-23. A later run should put the weight's SHA-256 in `plan.txt`.
+- **The patch series, in this attempt.** The server was fork branch `feat/kolibri1-waves`, which is outside the patch series: `feat/kolibri1` without its last commit, plus the Stage E4 waves code ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)). The run didn't pass `--expert-cache-waves`, and the stats file reports waves off, but that is a runtime flag. A build without that code gave [the same canonical trace](#on-the-patch-series). `TestTinyCheckpoint` ran on the waves build and has not been repeated on the series.
+- **The weight's hash, in this run's own records.** `attempt-1` names the file and holds no hash of it, and the test's check doesn't identify it. The file at that path is `93720b94…` in `~/models/eval/layer-probe-20261107/capture.json`, written about five minutes after the test ended, and its modification time is 2026-10-23. [Attempt 2](#on-the-patch-series) has it in its `plan.txt`, and it is the same hash.
 - **Speed or overhead.** The run wasn't timed, and it has no baseline without tools. PLAN's benchmark is still open.
+
+#### On the patch series
+
+Attempt 2 ran the same test on `feat/kolibri1` at `634e34bb4`, which has no Stage E4 code, with attempt 1's settings: two runs, default effort, `--expert-cache 128`, the same server flags. It used bridge commit `5a9a7d1`, whose changes to the bridge's code after `aacc096` are comments in the test. `TestAcceptanceRealModel` passed with exit status 0. The records are in `~/models/eval/bridge-acceptance/attempt-2-series/`. Its `plan.txt`, written before the server started, holds the weight's sha256 `93720b94a5a383f5bad07677ca05014bf0681a662e646ea3b1b196cda33c88bc`.
+
+| Compared with attempt 1 | Result |
+|---|---|
+| Canonical trace, with the repo's `Canonical` and `reflect.DeepEqual` over all 32 events | equal, including every reasoning text, call, result and the answer |
+| Within attempt 2, run 1 against run 2 | equal |
+| Token counts of each run | equal: 4276 prompt, 492 completion, 3253 and 3970 cached |
+| Raw `trace.jsonl` | differs, and only in what `Canonical` leaves out: the elapsed time in 28 events and the upstream ID in 6. Usage and request IDs are equal |
+| The cache's prefill counters | equal: 3979 steps, 157900 needed, 125877 hits, 32023 misses, 0 load failures |
+
+**This reaches one task, this weight, the cache at 128 slots and temperature 0.** It adds no independent sample to the task's result, and the other limits above stay as they are. The comparison test is next to the records, as `cmp_trace_test.go.txt`.
 
 ## Do the tests catch regressions?
 
