@@ -96,6 +96,13 @@ of each layer and not the whole file: kolibri-sidefile verify does that.
     check_expert_cache.py --llama-cpp third_party/llama.cpp --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
     check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only   # the wave checks alone, on a waves build
     check_expert_cache.py --llama-cpp third_party/llama.cpp-e2 --gpu-remap-only   # the GPU remap checks alone
+    check_expert_cache.py --llama-cpp third_party/llama.cpp-e2e3 --stack-only     # the side-file and the GPU remap together
+
+The stack (--expert-cache-sidefile with --expert-cache-gpu-remap): only on fork branch
+feat/kolibri1-e2-e3, a build to benchmark them together, not in the patch series. On a build with both
+options the logits must be bit-identical to the UNSPLIT resident run and to the GPU remap on the GGUF
+path, with its counters, one pread per expert and 2 scheduler splits per decoded token. --real checks
+the same on the real weight.
 """
 
 import argparse
@@ -242,6 +249,7 @@ def main() -> None:
     ap.add_argument("--sidefile", type=Path, help="the side-file of --real (default: <GGUF>.experts)")
     ap.add_argument("--waves-only", action="store_true", help="only the wave checks")
     ap.add_argument("--gpu-remap-only", action="store_true", help="only the GPU remap checks")
+    ap.add_argument("--stack-only", action="store_true", help="only the checks of the side-file and the GPU remap together")
     args = ap.parse_args()
     import numpy as np
 
@@ -259,6 +267,8 @@ def main() -> None:
     sidefile_on = has_sidefile(r, args.llama_cpp)
     if not sidefile_on:
         print(f"note: {args.llama_cpp} has no expert cache side-file (patch 0014): skipping the side-file checks", flush=True)
+    if args.stack_only and not (gpu_remap_on and sidefile_on):
+        ap.error(f"--stack-only: {args.llama_cpp} lacks the GPU remap or the side-file; it needs a build of fork branch feat/kolibri1-e2-e3")
     fusion_disabled = bool(os.environ.get("GGML_METAL_FUSION_DISABLE"))
     failed = 0
 
@@ -521,6 +531,62 @@ def main() -> None:
         except RuntimeError:
             report("needs every expert layer on Metal" in "".join(r.log), f"{label} {dev_name}: GPU remap with some layers off Metal fails to load, and says why")
 
+    def check_stack(gguf: Path, dev_name: str, dev, side: Path | None, tokens: list[int], n_prompt: int, slots_list: list[int],
+                    n_layer: int, k: int, stats: Path, label: str) -> None:
+        """The side-file and the GPU remap together: where a build has both, a miss reads the side-file
+        and a hit takes no CPU, and neither changes a logit or what the other one counts."""
+        if not (gpu_remap_on and side):
+            return
+        if not on_gpu(dev):
+            try:
+                r.logits(gguf, dev, tokens[:n_prompt], k, no_repack=True, expert_cache={"n_slots": 64, "gpu_remap": True, "sidefile_path": str(side)})
+                report(False, f"{label} {dev_name}: the stack loaded on the CPU")
+            except RuntimeError:
+                report("needs every expert layer on Metal" in "".join(r.log), f"{label} {dev_name}: the stack fails to load, and says why")
+            return
+        chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
+        same_fields = ("steps", "needed", "hits", "hits_loading", "misses", "evictions", "demand_bytes", "load_failures", "gpu_runs", "gpu_stops")
+        for slots in slots_list:
+            ub = min(n_prompt, max(1, slots // k))
+            sizes = [ub] * (n_prompt // ub) + ([n_prompt % ub] if n_prompt % ub else [])
+            n_dec = len(tokens) - n_prompt + sum(n == 1 for n in sizes)
+            ref = r.logits(gguf, dev, tokens, ub, chunks=chunks, no_repack=True)
+            stats.unlink(missing_ok=True)
+            on_gguf = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, expert_cache={"n_slots": slots, "stats_path": str(stats), "gpu_remap": True})
+            g = json.loads(stats.read_text())
+            report(reads_ok(g, None) and g["expert_cache"]["gpu_remap"] is True, f"{label} {dev_name}, stack, {slots} slots: the GPU remap on the GGUF path takes 3 preads per expert")
+            for buffered in (False, True):
+                what = f"{label} {dev_name}, stack, {slots} slots, ubatch {ub}" + (", buffered" if buffered else "")
+                stats.unlink(missing_ok=True)
+                got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True,
+                               expert_cache={"n_slots": slots, "stats_path": str(stats), "buffered": buffered, "gpu_remap": True, "sidefile_path": str(side)})
+                same = np.array_equal(got, ref)
+                diff = "" if same else f", max |diff| {float(np.abs(got - ref).max()):.3g}"
+                report(same, f"{what}: logits of {len(tokens)} positions bit-identical to the UNSPLIT resident run{diff}")
+                report(np.array_equal(got, on_gguf), f"{what}: logits bit-identical to the GPU remap on the GGUF path")
+                s = json.loads(stats.read_text())
+                pre, dec = s["prefill"], s["decode"]
+                report(reads_ok(s, side) and s["expert_cache"]["gpu_remap"] is True,
+                       f"{what}: the stats name the side-file and the GPU remap; {pre['preads']} and {dec['preads']} preads for {pre['loads']} and {dec['loads']} experts in prefill and decode")
+                diffs = [f"{ph} {key} {x[key]} != {y[key]}" for ph, x, y in (("prefill", pre, g["prefill"]), ("decode", dec, g["decode"]))
+                         for key in same_fields if x.get(key) != y.get(key)]
+                report(not diffs, f"{what}: the counters equal the GPU remap's on the GGUF path (decode {dec['hits']} hits, {dec['misses']} misses, "
+                                  f"{dec.get('gpu_stops')} stops)" + (f": {diffs}" if diffs else ""))
+                report(dec["tokens"] == n_dec and dec["splits"] == 2 * n_dec,
+                       f"{what}: {dec['splits'] / max(dec['tokens'], 1):.2f} scheduler splits per decoded token, want 2")
+            # as a server decodes: the last layer of a prefill ubatch sees only the output rows
+            outs = list(range(n_prompt - 1, len(tokens)))
+            want = r.logits(gguf, dev, tokens, ub, chunks=chunks, no_repack=True, outputs=outs)
+            got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, outputs=outs,
+                           expert_cache={"n_slots": slots, "gpu_remap": True, "sidefile_path": str(side)})
+            report(np.array_equal(got, want), f"{label} {dev_name}, stack, {slots} slots, ubatch {ub}, only {len(outs)} output positions: logits bit-identical to the UNSPLIT resident run")
+        # what cannot work with the GPU remap still fails to load with a side-file
+        try:
+            r.logits(gguf, dev, tokens[:n_prompt], k, no_repack=True, expert_cache={"n_slots": 64, "gpu_remap": True, "prefetch_k": 8, "sidefile_path": str(side)})
+            report(False, f"{label} {dev_name}: the stack with prefetch loaded")
+        except RuntimeError:
+            report("does not work with --expert-prefetch" in "".join(r.log), f"{label} {dev_name}: the stack with prefetch fails to load, and says why")
+
     def check_gpu_remap_refusals(gguf: Path, dev_name: str, dev, stats: Path, label: str) -> None:
         """What the mode cannot load or run says so. Tiny checkpoints only: the refused run without a
         cache would load the model fully resident if the refusal failed."""
@@ -686,6 +752,14 @@ def main() -> None:
                 check_gpu_remap_hits(args.real, *gpu[0], tokens[:16], 6, stats, args.real.stem, n_slots=128)
                 print(f"{'FAIL' if failed else 'PASS'}: {failed} failures")
                 sys.exit(1 if failed else 0)
+            if args.stack_only:
+                side = args.sidefile or args.real.with_name(args.real.name + ".experts")
+                if not side.exists():
+                    raise SystemExit(f"{side} does not exist: go run ./cmd/kolibri-sidefile write -gguf {args.real}")
+                pair(args.real, side, f"{args.real.stem} side-file", 8)
+                check_stack(args.real, *gpu[0], side, tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
+                print(f"{'FAIL' if failed else 'PASS'}: {failed} failures")
+                sys.exit(1 if failed else 0)
             side = None
             if sidefile_on and not args.waves_only:
                 side = args.sidefile or args.real.with_name(args.real.name + ".experts")
@@ -696,6 +770,7 @@ def main() -> None:
                 check(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem, side)
                 check_gpu_remap(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
                 check_gpu_remap_hits(args.real, *gpu[0], tokens[:16], 6, stats, args.real.stem, n_slots=128)
+                check_stack(args.real, *gpu[0], side, tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
             check_waves(args.real, *gpu[0], tokens, 128, [128, 64], 50, 384, 6, stats, args.real.stem)
             check_waves(args.real, *gpu[0], tokens[:40], N_GROWN_REAL, [18], 50, 384, 6, stats, f"{args.real.stem} grown waves", grown=True)
             # the benchmark's ubatch: on a real workload about a third of the layers' unions outgrow 4 waves of 61
@@ -713,6 +788,17 @@ def main() -> None:
                     check_gpu_remap_hits(gguf, dev_name, dev, tokens[:N_PROMPT], cfg["num_experts_per_tok"], stats, outtype)
                     check_gpu_remap_refusals(gguf, dev_name, dev, stats, outtype)
             check_gpu_remap_exact()
+        elif args.stack_only:
+            model = generate_tiny(Path(tmp), args.seed, "router")
+            cfg = json.loads((model / "config.json").read_text())
+            rng = random.Random(args.seed)
+            tokens = [rng.randrange(1000, 100000) for _ in range(N_PROMPT + N_DECODE)]
+            for outtype in ["f32", "q8_0"]:
+                gguf = convert(model, args.llama_cpp, outtype)
+                side = write_sidefile(gguf, f"{outtype} side-file")
+                for dev_name, dev in r.devices():
+                    check_stack(gguf, dev_name, dev, side, tokens, N_PROMPT, SLOTS, cfg["num_hidden_layers"],
+                                cfg["num_experts_per_tok"], stats, outtype)
         elif args.waves_only:
             model = generate_tiny(Path(tmp), args.seed, "router")
             cfg = json.loads((model / "config.json").read_text())
@@ -742,6 +828,7 @@ def main() -> None:
                     check_gpu_remap(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
                     check_gpu_remap_hits(gguf, dev_name, dev, tokens[:N_PROMPT], k, stats, outtype)
                     check_gpu_remap_refusals(gguf, dev_name, dev, stats, outtype)
+                    check_stack(gguf, dev_name, dev, side, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
 
                 # fewer slots than one token's experts cannot work
                 try:
