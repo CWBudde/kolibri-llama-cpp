@@ -410,7 +410,8 @@ def run(args, mutate_node: str | None = None) -> int:
         "n_layer": c.n_layer, "n_embd": c.n_embd,
         # libllama does what a server would; there is no server process in this path
         "server": str(lib.resolve()), "server_sha256": sha256_file(lib.resolve()),
-        "backend_sha256": {p.name: sha256_file(p) for p in sorted(lib_dir.glob("libggml*.dylib")) if not p.is_symlink()},
+        "backend_sha256": {p.name: sha256_file(p) for p in sorted(lib_dir.glob("libggml*"))
+                           if not p.is_symlink() and (p.suffix in (".dylib", ".so") or ".so." in p.name)},
         "llama_cpp_head": git_head(args.llama_cpp),
         "template_source": "tokenizer.chat_template of the model",
         "template_sha256": template_sha,

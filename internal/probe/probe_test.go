@@ -544,3 +544,45 @@ func TestNpyRefuses(t *testing.T) {
 		t.Error("trailing data passed")
 	}
 }
+
+// fitSoftmax's momentum needs a positive L2, or it is NaN and the report looks fine with invalid scores.
+func TestEvaluateRefusesAnL2ThatIsNotPositive(t *testing.T) {
+	for _, l2 := range []float64{0, -0.01, math.NaN(), math.Inf(1)} {
+		_, err := Evaluate(nil, nil, Options{Folds: 5, L2: l2, Shuffles: 2, Seed: Seed})
+		if err == nil || !strings.Contains(err.Error(), "L2 must be positive") {
+			t.Errorf("L2 %g: %v", l2, err)
+		}
+	}
+}
+
+// The gradient in alpha's coordinates is the primal gradient in w: an alpha step with r/n + l2 a is a
+// step on w = X'a with X'(r/n) + l2 w. So at the fit's optimum the primal objective's gradient
+// vanishes in the weights, and l2 regularizes |w|^2 as documented.
+func TestFitIsThePrimalOptimum(t *testing.T) {
+	x := [][]float64{{1, 0, 3}, {0, 2, 0}, {1, 1, 0}, {4, 0, 1}, {0, 1, 2}, {2, 2, 2}}
+	y := []int{0, 1, 2, 0, 1, 2}
+	const k, l2 = 3, 0.01
+	n, d := len(x), len(x[0])
+	kern := kernel(x, x)
+	m := fitSoftmax(kern, y, k, l2)
+	if !m.converged {
+		t.Fatal("not converged")
+	}
+	probs := m.predict(kern, n, n, k)
+	for c := range k {
+		for f := range d {
+			var grad, w float64
+			for i := range n {
+				r := probs[i*k+c]
+				if y[i] == c {
+					r--
+				}
+				grad += x[i][f] * r / float64(n)
+				w += x[i][f] * m.alpha[i*k+c]
+			}
+			if g := grad + l2*w; math.Abs(g) > 1e-6 {
+				t.Fatalf("class %d feature %d: primal gradient %g", c, f, g)
+			}
+		}
+	}
+}

@@ -348,6 +348,10 @@ var (
 // layers maps names to one matrix per dataset row of items; rows outside split smoke are the
 // pilot, held out of the folds.
 func Evaluate(items []Item, layers []NamedMatrix, opt Options) (*Report, error) {
+	// fitSoftmax's momentum divides by l2: at 0 it is NaN, and the scores with it
+	if !(opt.L2 > 0) || math.IsInf(opt.L2, 1) {
+		return nil, fmt.Errorf("L2 must be positive and finite, got %g", opt.L2)
+	}
 	var smoke, pilot []int
 	for i, it := range items {
 		if it.Split == SplitSmoke {
