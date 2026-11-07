@@ -711,7 +711,8 @@ Collected 2026-11-07 from what is recorded on `main`, for the user to write from
 **State of the evidence:**
 - **E0 and E1:** recorded.
 - **E4 (waves):** recorded. Its gates failed at 0 GiB, so its code is not in the patch series.
-- **E3 (one read per expert) and E2 (no per-layer CPU sync):** pending. PLAN has both unchecked and `main` holds no result, so neither can be cited yet. Add their results here once they are recorded, since both aim at the slot path's cost and may change its numbers.
+- **E3 (one read per expert):** recorded. Its four deciding gates passed, and patch 0014 is in the series.
+- **E2 (no per-layer CPU sync):** recorded. Its gate failed at 16 GiB and passed at 0 GiB, so its code is not in the patch series. See ["The slot path after E3 and E2"](#the-slot-path-after-e3-and-e2).
 - **Upstream's side:** the PR states are as of this repo's checks of 2026-10-22 and 2026-10-23. They were not rechecked for this section. Check them, and both threads, before filing.
 
 ### Machine and builds
@@ -723,8 +724,9 @@ Collected 2026-11-07 from what is recorded on `main`, for the user to write from
 | Master used | `184f6536` (2026-10-23) |
 | #25294 | PR head `1248fd8fa` did not merge on master as of 2026-10-23. All numbers come from the port on `184f6536`, fork branch `ref/pr25294-on-184f6536` (`8a8ddf827`), with the PR's logic unchanged and only API changes, listed in its merge commit. **No number here comes from the PR head itself.** |
 | #29887 | as merged in `184f6536` |
-| Fork | `feat/kolibri1`: series 0008, 0010, 0011, 0012 (`patches/llama.cpp/`) |
+| Fork | `feat/kolibri1`: series 0008, 0010, 0011, 0012 for E0 to E2's baselines; 0014 was added by E3 (`patches/llama.cpp/`) |
 | Waves | `feat/kolibri1-waves` (`90311e5a2`), fork PR #14, open, not in the series |
+| GPU remap | `feat/kolibri1-gpu-remap` (`0bb0f5444`), fork PR #16, draft, not in the series |
 | GGUF | `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, 35.6 GB, this repo's own quantization mix, header rewritten by `cmd/kolibri-rekey` |
 
 This repo (`CWBudde/kolibri-llama-cpp`) is public, so its files can be linked. The benchmark's raw `run.json` and `report.md` are under `~/models/eval/`, outside the repo, and would need attaching.
@@ -844,6 +846,45 @@ So 17.6 ms/token of the slot path is neither waiting nor remapping and comes wit
 **Limits** ([expert-streaming.md](expert-streaming.md#limits)): Kolibri only, no LoRA on the routed experts, experts in one file, one context per model, devices without `buffer_from_host_ptr` rejected at load, `-fit` does not know the slot buffer, and the ubatch is capped at slots / 6 without waves. On macOS, cached pages are served from the page cache despite `F_NOCACHE`. On Linux, reads go through the page cache.
 
 **Not measured:** zero-copy against a copying slot pool in isolation. No arm has the same cache with a copy, so the saving is not a number here. The comparison with #29887 mixes it with a different problem (experts in host RAM, not on SSD). #25294 copies once on a load, but it differs in ubatch, eviction and waves, so it does not isolate zero-copy either.
+
+### The slot path after E3 and E2
+
+Both stages aim at the cost in the table above. Every number is from the fork's own cache at 128 IQ3 slots, as medians over 3 repetitions. Each stage has its own matrix and session, so compare only within a stage. **Neither matrix has a #25294 or #29887 arm, so no gate compares them with upstream, and no run has E2 and E3 together.** Sources, with ranges: [E3](expert-streaming.md#stage-e3-one-read-per-expert) and [E2](expert-streaming.md#stage-e2-gpu-remap).
+
+**E3: one `pread` per expert from a side-file, against three from the GGUF.** Gates passed, including on 30 of 30 identical token ID sequences.
+
+| Metric | GGUF 0 GiB | Side-file 0 GiB | GGUF 16 GiB | Side-file 16 GiB |
+|---|--:|--:|--:|--:|
+| Warm decode t/s | 17.30 | 20.30 | 17.08 | 19.75 |
+| Warm p95 ms | 86.1 | 70.6 | 79.7 | 71.4 |
+| Warm prompt t/s | 88.4 | 106.5 | 87.0 | 106.8 |
+| Cold TTFT s | 33.16 | 26.68 | 33.13 | 26.75 |
+| Load wait ms/token | 14.48 | 8.85 | 14.63 | 8.86 |
+
+The 16 GiB p95 did not win by the rule, so that decode gate passes on tokens/s alone. The side-file takes another 30.5 GiB. The benchmark ran on `dd2040eaf`, and the review fixes in the series after it were not timed.
+
+**E2: a GPU remap with no scheduler split at a layer that hits, against the CPU remap.** The gate failed at 16 GiB and passed at 0 GiB, by small margins that three repetitions cannot resolve. Lossless: logits bit-identical to the unsplit resident run on real IQ3, and 30 of 30 token ID sequences equal.
+
+| Metric | CPU remap 0 GiB | GPU remap 0 GiB | CPU remap 16 GiB | GPU remap 16 GiB |
+|---|--:|--:|--:|--:|
+| Warm decode t/s | 17.78 | 19.61 | 18.46 | 19.96 |
+| Decode ms/token | 56.82 | 52.10 | 54.31 | 52.10 |
+| Splits per token | 102 | 2 | 102 | 2 |
+| Commits per token | 103 | 33.97 | 103 | 33.97 |
+
+At 16 GiB the gate's baseline was the CPU remap with `--expert-prefetch 12`, not this column: slowest 18.94 against fastest 19.00 t/s, highest p95 79.33 against lowest 78.58 ms. So removing 100 splits saved 4.72 and 2.21 ms/token here, well under the 17.6 ms that came with those splits at all hits.
+
+**Where the rest of the gap goes** ([expert-decode-gap.md](expert-decode-gap.md)). This is a diagnosis on a replay pattern with private timers. It passes no gate, and its arms have one to three runs. On the GPU remap a token took 49.31 ms against 16.46 resident, including 13.33 ms of load wait. One ordering of the arms splits the remaining 19.5 ms as follows, and another order would change the sizes:
+
+| Cause | ms/token | How it was separated |
+|---|--:|---|
+| The thread waiting for loads sleeps | 9.45 | same misses, with that thread spinning instead |
+| Extra command buffers and stops | 7.38 | forced stops with no load and no idle |
+| The gated path at all hits | 2.91 | tokens with no miss against resident |
+
+Spinning that thread took 49.31 to 38.90 ms/token. It is an experiment, not a design: energy, heat and sustained runs were not measured. No clock or power figure was observed, so the explanation that the chip drops to a lower performance state is an inference.
+
+**Not recorded:** whether any of this carries over to #25294 or #29887, whose slot paths differ.
 
 ### The equivalence and ceiling method
 
