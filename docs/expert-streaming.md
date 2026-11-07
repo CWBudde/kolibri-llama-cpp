@@ -1,6 +1,6 @@
 # Expert streaming: the runtime expert cache
 
-Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose benchmark has not run yet, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill".
+Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose deciding gates passed, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill".
 
 ## How it works
 
@@ -207,7 +207,128 @@ The `-ub 21` control differs from resident IQ3 at the default ubatch (512) from 
 
 ## Stage E3: one read per expert
 
-Phase 11, Stage E3. A side-file next to the GGUF holds each expert's gate, up and down rows in one aligned extent, and a miss reads it with one `pread`. **The code and the checks exist. The benchmark has not run, so nothing here says whether it is faster.** Patch 0014 is on fork branch `feat/kolibri1-sidefile` (fork PR #15, open), not yet on `feat/kolibri1`. By the plan's stop rule it stays in the series only if the gates pass. E3 is not built on waves.
+Phase 11, Stage E3. A side-file next to the GGUF holds each expert's gate, up and down rows in one aligned extent, and a miss reads it with one `pread`. E3 is not built on waves.
+
+### Verdict
+
+**All four deciding gates passed (2026-11-07), so patch 0014 stays in the series.** The gates were committed before the first timed run, and they were not moved after the results.
+
+- **Decode at 0 GiB:** 20.30 (18.90–20.79) against 17.30 (16.94–17.42) t/s, and warm p95 70.6 (67.6–72.0) against 86.1 (80.0–88.9) ms. Both win.
+- **Decode at 16 GiB:** 19.75 (18.99–21.14) against 17.08 (16.55–18.38) t/s, a win. **Warm p95 71.4 (66.9–79.3) against 79.7 (77.6–84.2) ms did not win by the rule.** The gate passes on tokens/s alone, because the decode rule takes either metric.
+- **Prefill:** 106.5 against 88.4 t/s at 0 GiB, and 106.8 against 87.0 at 16 GiB.
+- **Cold TTFT, not deciding:** 26.68 against 33.16 s, and 26.75 against 33.13 s.
+- **The same output:** 30 of 30 side-file requests generate the token IDs of the GGUF path.
+- **One read per expert:** 1,539,444 preads for 1,539,444 experts on the side-file, 3 per expert on the GGUF path. 0 load failures, and one build in all 12 runs.
+- **Phase 11's targets are still far.** They are decode of at least 30 t/s, warm prefill above 273 t/s and cold TTFT under 10 s. E3's matrix has no #25294 arm, so no gate compares the two. E4's #25294 runs, a few hours earlier in another matrix, gave 351.3 and 226.7 t/s of prefill and 7.44 and 10.95 s of TTFT at 0 and 16 GiB.
+
+**Merging is the owner's call. The order is fork PR #15 into `feat/kolibri1` first, then PR #72.** Fork PR #15 is not merged, so `feat/kolibri1` does not have 0014 until it is. Until then the README's option A (the patches by glob, with this branch's patches) and option B (the fork branch) differ by 0014.
+
+**The runs did not use the series' current code.** They ran on `dd2040eaf` (tree `53739515`, build digest `e5dcda2e6e56`). The series now gives `1f6ce476c` (tree `d8ee53b6`), which adds two review fixes after the runs: a refused LoRA on the routed experts, and a bound on the GGUF header length that the table claims. Both act at load, and the diff does not change the path that reads a miss. They were not timed: see "Limits".
+
+### Results
+
+`testdata/bench/e3.json`, `~/models/eval/expert-bench-e3/report.md`. All 12 runs have status ok. "GGUF" is `iq3-cache128`, "Side-file" is `iq3-cache128-sidefile`, and every other flag is the same. A cell is the median (min–max) over 3 repetitions, and a warm value is first the median of a run's 4 warm requests, as in Stage D. The 12 `run.json` files were recomputed independently of the report, and all 88 table cells and all GATE, INFO and PASS lines match.
+
+| Metric | GGUF 0 GiB | GGUF 16 GiB | Side-file 0 GiB | Side-file 16 GiB |
+|---|--:|--:|--:|--:|
+| Load failures (decode+prefill) | 0 | 0 | 0 | 0 |
+| Warm prompt t/s | 88.4 (85.0–88.8) | 87.0 (82.6–87.9) | 106.5 (105.4–107.1) | 106.8 (96.7–107.4) |
+| Cold TTFT s | 33.16 (33.08–33.24) | 33.13 (33.07–33.34) | 26.68 (26.61–28.31) | 26.75 (26.62–28.36) |
+| Cold decode t/s | 16.37 (15.98–17.52) | 16.42 (15.69–17.35) | 18.71 (18.13–25.17) | 17.16 (16.45–20.36) |
+| Warm decode t/s | 17.30 (16.94–17.42) | 17.08 (16.55–18.38) | 20.30 (18.90–20.79) | 19.75 (18.99–21.14) |
+| Warm p50 ms | 55.3 (54.5–56.5) | 56.2 (53.6–56.2) | 48.0 (47.8–51.2) | 50.3 (45.5–50.4) |
+| Warm p95 ms | 86.1 (80.0–88.9) | 79.7 (77.6–84.2) | 70.6 (67.6–72.0) | 71.4 (66.9–79.3) |
+| Decode ms/token | 57.84 (57.07–59.59) | 58.07 (54.69–60.99) | 49.48 (47.16–53.38) | 52.17 (51.16–54.16) |
+| Wait ms/token | 14.48 (14.47–14.75) | 14.63 (14.50–15.64) | 8.85 (8.79–8.85) | 8.86 (8.84–10.51) |
+| Remap ms/token | 0.683 (0.664–0.719) | 0.653 (0.640–0.675) | 0.631 (0.631–0.647) | 0.658 (0.591–0.698) |
+| Other ms/token | 42.65 (41.93–44.16) | 42.76 (39.54–44.70) | 39.98 (37.75–43.90) | 42.66 (41.63–43.06) |
+| Splits/token | 102.0 | 102.0 | 102.0 | 102.0 |
+| Commits/token | 103.0 | 103.0 | 103.0 | 103.0 |
+| Disk GB read | 448.68 (448.68–448.68) | 448.68 (448.68–448.69) | 437.19 (437.19–437.19) | 437.19 (437.19–437.23) |
+| Others CPU mean % | 72.1 (61.3–86.8) | 75.5 (74.5–86.5) | 73.6 (66.1–82.1) | 65.8 (65.2–145.6) |
+| Others CPU max % | 143 (117–794) | 167 (132–355) | 160 (139–222) | 140 (136–777) |
+| Quiet wait s | 90.1 (60.1–90.1) | 90.1 (60.1–90.1) | 120.1 (60.1–150.1) | 90.1 (90.1–90.1) |
+| Peak RSS GiB | 13.6 (13.6–13.6) | 13.6 (13.5–13.6) | 13.6 (13.6–13.6) | 13.6 (13.4–13.6) |
+| Peak footprint GiB | 11.0 | 11.0 | 11.0 | 11.0 |
+| Max footprint GiB | 10.9 | 10.9 | 10.9 | 10.9 |
+| Page cache peak GiB | 2.7 | 2.7 | 2.7 | 2.7 |
+| Page cache end GiB | 2.7 (2.7–2.7) | 2.7 (2.6–2.7) | 2.7 (2.7–2.7) | 2.7 (2.4–2.7) |
+| Page-ins MiB/token | 0.064 (0.062–0.069) | 0.059 (0.059–0.265) | 0.048 (0.042–0.059) | 0.058 (0.056–0.262) |
+| Decode hits | 91.0% | 91.0% | 91.0% | 91.0% |
+
+**Gates.** Every side-file repetition must beat the GGUF path's fastest repetition, and the decode gate passes on either metric:
+
+| Gate | Slowest side-file rep | GGUF's fastest rep | Result |
+|---|--:|--:|---|
+| Decode 0 GiB, t/s | 18.899 | 17.424 | win |
+| Decode 0 GiB, p95 ms | 72.018 | 79.997 | win |
+| Decode 16 GiB, t/s | 18.990 | 18.377 | win; the gate passes on this alone |
+| Decode 16 GiB, p95 ms | 79.319 | 77.579 | no win |
+| Prefill 0 GiB, t/s | 105.429 | 88.770 | win |
+| Prefill 16 GiB, t/s | 96.727 | 87.886 | win |
+| TTFT 0 GiB, s (info) | 28.307 | 33.076 | win |
+| TTFT 16 GiB, s (info) | 28.355 | 33.072 | win |
+
+**The 16 GiB decode pass is narrow.** Its margin is 0.61 t/s (3.3%), and the GGUF path's fastest repetition there is r1, which has that arm's lowest "other" (39.54 ms). The p95 no-win comes from one repetition, `sidefile/16g/r3` at 79.32 ms. r1 and r2 (71.39 and 66.93 ms) are below the baseline's 77.58. That repetition is also the most disturbed run (others' CPU mean 145.6, max 777). The prefill gate at 16 GiB still passes with its 96.7 t/s. No run was excluded.
+
+### What the numbers show
+
+These are observations. Each says what it does not establish.
+
+**In decode, the wait fell and nothing else clearly moved.**
+
+| Gain, ms/token | Total | Wait | Remap | Other |
+|---|--:|--:|--:|--:|
+| 0 GiB | 8.36 | 5.63 (67%) | 0.05 (1%) | 2.66 (32%) |
+| 16 GiB | 5.90 | 5.78 (98%) | -0.01 | 0.10 (2%) |
+
+- The columns are differences of medians, so they need not add up exactly.
+- The wait's change is stable in every same-repetition pair: 5.69, 5.63 and 5.90 at 0 GiB, and 5.65, 5.80 and 5.13 at 16 GiB.
+- The change in "other" is not separated from its spread. At 0 GiB the ranges overlap (41.93–44.16 against 37.75–43.90), and 2.66 is less than the side-file's own spread of 6.16. At 16 GiB the side-file's range lies inside the baseline's. Same-repetition changes are +4.18, +2.66 and +0.26, and -3.11, +1.13 and +1.64. So the data establish the wait's gain and do not establish an effect on "other".
+- The plan expected up to the 14 ms wait. 8.85 ms of it remain.
+- `run.json` has no prefill wait field, so prefill's load wait was not measured, and the prefill gain is not split up.
+
+**The disk bytes fit whole 16 KiB pages on the GGUF path, as arithmetic only.**
+
+- The work is the same: 256,574 loads in every run (17,213 decode, 239,361 prefill), 190,500 needed, 173,287 hits, 1,699,840 bytes per load by the three rows' sizes.
+- Side-file: 256,574 × 1,703,936 (the padded extent) is 437,185,675,264 bytes. The counter exceeds that by 0 to 43.5 MB, and by exactly 0 in `sidefile/0g/r2`.
+- GGUF path: 256,574 × 1,699,840 is 436,134,748,160 bytes. The counter exceeds that by 12.547 to 12.551 GB, which is 48,902 to 48,918 bytes per load.
+- From the manifest's offsets, widening each of an expert's three rows to 16 KiB page bounds adds a mean of 49,152 bytes per expert over all 19,200 experts (36,864–69,632). Widening to 4 KiB adds 12,288, far too little. So the numbers fit unaligned GGUF preads that transfer whole 16 KiB pages. The side-file's padding costs 4,096 bytes per expert against about 48,900.
+- **This is a fit, not a measured mechanism.** There is no per-pread trace, and `run.json` has no per-expert load counts, so 48.9 KB can only be compared with a whole-file mean. The counter is `ri_diskio_bytesread` minus a baseline taken in the cache code, and when that baseline is taken relative to the load was not checked.
+
+**The side-file's decode rate spreads more per request, and the cause is not shown.**
+
+- The 25.17 t/s in the cold decode row is `sidefile/0g/r1`, whose other repetitions give 18.71 and 18.13. Next widest is `sidefile/16g`: 20.36, 17.16 and 16.45.
+- The data show no position effect. Cold is always a run's first request. r1 is the fastest cold repetition in 3 of 4 cells, by only 1.15 and 0.93 t/s on the baseline, and `sidefile/16g`'s fastest is r3.
+- The same token IDs in the same run differ widely: run 3's warm coding is 16.79 against its cold 25.17, while `sidefile/16g/r1` goes 17.16 cold to 21.98 warm. The 5 requests with a p50 under 42 ms are all on the side-file arm, at different positions. The GGUF arm's lowest p50 is 46.3 ms.
+- Same-workload decode SD is 2.81, 3.11, 3.17 and 1.16 on the side-file (coding, research, hr, medtech) against 0.84, 0.75, 1.02 and 1.33 on the GGUF path. Wait and "other" are recorded per run, not per request, so the requests cannot be split. Page-ins correlate with decode rate at -0.42 on requests under 1,000 page-ins, which establishes nothing.
+
+**The baseline did not move beyond its run-to-run range, with small differences.**
+
+| `iq3-cache128`, 0 / 16 GiB | E3 | E4 | E0 |
+|---|--:|--:|--:|
+| Warm prompt t/s | 88.4 / 87.0 | 86.0 / 85.9 | 81.5 / 79.0 |
+| Cold TTFT s | 33.16 / 33.13 | 32.53 / 32.84 | 35.05 / 35.50 |
+| Warm decode t/s | 17.30 / 17.08 | 17.39 / 18.07 | 17.71 / 17.96 |
+| Decode ms/token | 57.84 / 58.07 | 55.77 / 56.16 | 56.50 / 56.22 |
+| Wait ms/token | 14.48 / 14.63 | 14.65 / 14.35 | 15.05 / 16.09 |
+| Other ms/token | 42.65 / 42.76 | 41.07 / 41.28 | 40.90 / 39.57 |
+
+E3's fastest warm prompt at 0 GiB (88.77) is above E4's (86.7) by 2.4%. Disk is about 448.7 GB in all three, and the token IDs of this arm in E4 and E0 equal E3's in all 5 requests of every repetition. E4's undisturbed repetitions ran with others' CPU mean 36–52, against 61–87 here. E4's and E0's `run.json` have no `server_sha256`, server path, loads or preads, so builds and load counts cannot be compared across stages from these files.
+
+**E3's and E4's prefill gains cannot be added.** 106 and 300 t/s (waves) are the same kind of number on the same matrix args and workloads, with similar baselines, but not the same work. The side-file arm has its baseline's loads, hits and token IDs. E4's waves arms have decode hits of 92.3%, 25.0 GB of demand and 299.96 GB of disk, and token IDs equal to E3's in 0 of 5 requests in every repetition. No run combines the two, and waves' code is not in E3's build. The ratios to each stage's own baseline are 1.2× (E3) and about 3.5× (E4, 301.4 against 86.0). For reference, E0's buffered arm gave 110.0 t/s at 0 GiB but 53.8 at 16 GiB, and the side-file gives 106.5 and 106.8.
+
+**For E6's condition, the facts only.** On the side-file at 0 GiB, decode takes 49.48 ms/token: wait 8.85 (17.9%), remap 0.63 (1.3%), other 39.98 (80.8%). At 16 GiB: 52.17, wait 8.86 (17.0%), remap 0.66 (1.3%), other 42.66 (81.8%). On the GGUF path the wait is 25.0% and 25.2%. So the wait is smaller than "other" by a factor of about 4.5 to 4.8, but "other" is a remainder, not one measured cost. This build still has 102 splits per token, so it does not contain E2's change, and there are no timed E2 results here. These are E3's facts alone, not "E2 and E3". E6's decision is left open.
+
+### Limits
+
+- **The review fixes were not timed.** The 12 runs ran on `dd2040eaf`. `1f6ce476c` and `634e34bb4` came after them. In `git diff dd2040eaf 1f6ce476c`, `llama_expert_read_rows` and the remap's reads do not change, but no run measures that.
+- **The fork branch is not squashed.** The force-push that would have squashed `dbac35709` and `dd2040eaf` into one commit was denied, so both stayed. Merge `26a059be8` and `1f6ce476c` followed them, so the branch now has four commits over `feat/kolibri1`. The patch is the branch's plain diff, so the series is unaffected.
+- **The alignment rationale for `F_NOCACHE` is unmeasured.** What XNU's cluster layer wants comes from its source as remembered. No arm isolates alignment: the benchmark measures one aligned read against three unaligned ones as a whole.
+- **Reads take the padded extent.** That is 4,096 bytes per expert more than the rows hold, on every miss.
+- **The load's identity check is no security boundary.** The reviewer's finding on `gguf_head`, that a table with a valid checksum could claim the whole model and force an allocation of tens of GB, was fixed in `1f6ce476c` after the runs (control M71, [upstream.md](upstream.md)). The table's checksum has no key, and `gguf_head` has no lower bound, so a crafted table can still pass the identity check. That stays as it is, because the side-file is a local file the user wrote.
+- **The decode rule passes on either metric, and the 16 GiB pass rests on tokens/s, not p95.** Whether to set a stricter bar is the owner's call.
+- **One machine, 3 repetitions, a busy background.** All 12 runs started with a load average of 1.65 to 2.91 and about 4.1 GiB of swap. All r3 repetitions are the slowest block for decode ms/token and have the highest others' CPU mean, in all 4 cells. Time order and background load cannot be separated. The arms are interleaved, so both are affected.
 
 ### The side-file
 
@@ -223,9 +344,9 @@ Phase 11, Stage E3. A side-file next to the GGUF holds each expert's gate, up an
 
 **Concurrency needed no change.** A remap queues all of a layer's misses, and the I/O threads (default 4, as E1's curve advises) take them from one queue. `test-expert-cache` holds a load until all four threads are inside one remap's loads. Prefetch uses the same load path, so it works on both paths.
 
-### Correctness so far
+### Lossless evidence
 
-Bit identity with `np.array_equal` against a resident run at the same ubatch and, on the GPU, the same split (`check_expert_cache.py`), never loosened:
+Bit identity with `np.array_equal` against a resident run at the same ubatch and, on the GPU, the same split (`check_expert_cache.py`), never loosened. The timed runs add token IDs: 30 of 30 side-file requests equal the reference, and all 60 requests of both arms are equal, compared on the IDs themselves. The check counts below are from before the review fixes. After them the tiny check gives "PASS: 0 failures", `test-expert-cache` passes, and the real IQ3 pair has 0 differences on 8 experts per layer (commit `da2f581`). The 40 real checks are not recorded as repeated on `1f6ce476c`.
 
 | Check | Result |
 |---|---|
@@ -260,11 +381,23 @@ The page cache serves resident pages even with `F_NOCACHE`, and reading the file
 - **The report proves one build:** every run records `server` and `server_sha256`, and the report fails if the completed runs of one build differ, or, with a side-file arm, if a run has no digest. The digest covers the binary and the libraries beside it, because the expert cache lives in `libllama` and a rebuild can leave the binary unchanged. So a resume after a rebuild or with another `-server` fails the report.
 - **The driver refuses a server without the flag:** with a side-file arm in the matrix it stops before the first run if the server's `--help` does not list `--expert-cache-sidefile`, as the default `-server` does not. This holds with `-only` too, so no baseline runs on the wrong build.
 - **`fits` and the quiet rule do not special-case the arm.** Its `--expert-cache 128` counts as the GGUF arm's does (a test holds them equal).
-- **No timing yet.** A smoke run of the exact flags with 8 generated tokens gave 5,117 and 219 preads for 5,117 and 219 experts on the side-file, 15,351 and 657 on the GGUF path, the same token IDs, and at most the table's 10 pages of the side-file in the page cache. Its speed was not read.
+- **A smoke run came before the timing.** The exact flags with 8 generated tokens gave 5,117 and 219 preads for 5,117 and 219 experts on the side-file, 15,351 and 657 on the GGUF path, the same token IDs, and at most the table's 10 pages of the side-file in the page cache. Its speed was not read.
+
+**What the 12 runs show about these guards:**
+
+- **Status and sleep:** all 12 are ok, from 02:35:57 to 03:27:17 on 2026-11-07, under a `caffeinate` assertion, on AC power. `pmset -g log` has no Sleep, Wake or DarkWake inside any run's window, and the last true event is a Wake about 28 hours before the first run. Wall time from start to "ok" exceeds load plus request time by only 3.0 to 8.4 s per run, so no gap suggests a clock jump.
+- **Eviction:** in all 12 runs the GGUF and the side-file show 0 pages resident after eviction. Before it, the GGUF had 576 to 178,332 of 2,170,182 pages and the side-file 0 or 10 of 1,996,810. Every location reads "(home volume)".
+- **The hidden tier:** `peak_sidefile_cache_mib` is 0 everywhere. `end_sidefile_cache_mib` is 0.156 MiB (10 pages) on 5 of 6 side-file runs and 0 on `sidefile/16g/r3`.
+- **The build:** all 12 runs carry `server_sha256` `e5dcda2e6e56...` and one server path, and the build on disk still gives that digest after the runs.
+- **The side-file:** after the runs its streamed sha256 and its size equal the manifest's. It was hashed with `F_NOCACHE`, and residency was not checked afterwards. Every benchmark run evicts it anyway.
+- **Disturbance stays in the results.** Peak others' CPU is 117 to 222 in 9 runs. The other three: `sidefile/16g/r3` (145.6 mean, 777 max; warm hr decode 13.46 t/s, p95 158.1 ms, 138,796 page-ins; 43.5 MB extra read), `iq3-cache128/0g/r3` (86.8, 794; warm research 3,369 page-ins) and `iq3-cache128/16g/r3` (86.5, 355; warm hr 18,502 and medtech 3,705 page-ins). `iq3-cache128/16g/r2` also has 3,005 page-ins in warm coding, with normal others' CPU.
+- **Activity during the runs is in the log, its effect is not.** `pmset` shows a user-activity assertion and a 3 s `cloudd` network task at 03:12:47–50 (run 9), HID input near 02:59 and 03:12, and three other `caffeinate` clients that ended at 03:19:18, 03:20:26 and 03:24:21 (runs 11 and 12). What those clients ran is not in the log, so no link to a specific slowdown is established.
 
 ### Reproduce
 
 The matrix `testdata/bench/e3.json` holds 12 runs: `iq3-cache128` and `iq3-cache128-sidefile`, with every other flag the same, at 0 and 16 GiB, 3 repetitions each. Decode and prefill of the side-file against the GGUF path decide at both ceilings, by `kolibri-bench`'s existing rule. The decode gate is the Stage D rule, so a warm p95 win alone passes it, even with a lower median decode rate, and the report's "(win true)" and "(win false)" show which one it was. TTFT is info only. Token IDs must be exactly equal.
+
+The result above came from `third_party/llama.cpp-e3` at `dd2040eaf`. A build of today's `feat/kolibri1-sidefile` has another digest, so its runs are a new result directory, not a resume: the report fails on two builds.
 
 ```sh
 go run ./cmd/kolibri-sidefile verify -gguf ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
