@@ -49,6 +49,18 @@ index 03f4fe46e..d239d2450 100644
      llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
  
      bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 6d6e6cf5e..2fc8b46f0 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2584,6 +2584,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
+     result.expert_cache = 0;
+     result.expert_cache_layers.clear();
+     result.expert_cache_stats.clear();
++    result.expert_cache_sidefile.clear();
+ 
+     if (has_draft) {
+         // default to global devices value
 diff --git a/include/llama.h b/include/llama.h
 index 2435d5ebd..2fbe12b57 100644
 --- a/include/llama.h
@@ -873,6 +885,30 @@ index 746dd66cb..3952741b4 100644
      };
  
      return result;
+diff --git a/tests/test-arg-parser.cpp b/tests/test-arg-parser.cpp
+index 543da2aed..e75b00745 100644
+--- a/tests/test-arg-parser.cpp
++++ b/tests/test-arg-parser.cpp
+@@ -109,6 +109,19 @@ static void test(void) {
+             const auto draft = common_base_params_to_speculative(base);
+             assert(draft.n_ubatch == 8);
+         }
++
++        // [EXPERIMENTAL] the expert cache is the target's: an option left on the draft would be refused
++        base.expert_cache = 128;
++        base.expert_cache_layers = {128};
++        base.expert_cache_stats = "stats.json";
++        base.expert_cache_sidefile = "experts.side";
++        {
++            const auto draft = common_base_params_to_speculative(base);
++            assert(draft.expert_cache == 0);
++            assert(draft.expert_cache_layers.empty());
++            assert(draft.expert_cache_stats.empty());
++            assert(draft.expert_cache_sidefile.empty());
++        }
+     }
+ 
+     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
 diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
 index aaba048a9..2900fb100 100644
 --- a/tests/test-expert-cache.cpp
