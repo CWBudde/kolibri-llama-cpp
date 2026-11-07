@@ -1013,7 +1013,7 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
 
 ## Phase 11 --- Expert streaming on par with other offloaders (proposed)
 
-**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 done (2026-10-23). **Phase 11's stop rule fired at 0 GiB** (E0.2: #25294 matches the fork's decode there and prefills 2.6× faster; the fork still wins decode at 16 GiB). Whether E2 continues on the fork or the work moves onto #25294's design is the user's decision. (2026-11-06) — **E4's waves failed their deciding gates at 0 GiB** and passed at 16 GiB; patch 0013 left the series, and the code stays on fork branch `feat/kolibri1-waves`. Layer streaming and prefill admission stay open ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E4: waves for prefill"). (2026-11-07) — **E3's side-file passed its four deciding gates** against the GGUF path, and patch 0014 stays in the series, not yet merged ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E3").
+**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 done (2026-10-23). **Phase 11's stop rule fired at 0 GiB** (E0.2: #25294 matches the fork's decode there and prefills 2.6× faster; the fork still wins decode at 16 GiB). Whether E2 continues on the fork or the work moves onto #25294's design is the user's decision. (2026-11-06) — **E4's waves failed their deciding gates at 0 GiB** and passed at 16 GiB; patch 0013 left the series, and the code stays on fork branch `feat/kolibri1-waves`. Layer streaming and prefill admission stay open ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E4: waves for prefill"). (2026-11-07) — **E3's side-file passed its four deciding gates** against the GGUF path, and patch 0014 stays in the series, not yet merged ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E3"). (2026-11-07) — E7's documents exist, from recorded numbers only: the upstream evidence is collected, and the predictor write-up stays open on the measurements it lists as missing. E2 is pending.
 
 ### Where Stage D stands against other work
 
@@ -1188,11 +1188,20 @@ Only if E2 and E3 leave the load wait as the largest remaining cost.
 
 - [ ] Write the negative predictor result up as a document, using Zhang's reporting checklist: per-event replay, decode-only hit rate, per-step union against capacity, and the Belady gap.
   - No public study covers 384 experts with Top-6 sigmoid routing on unified memory.
-- [ ] For #25294 and #29887, collect what upstream can use in `docs/upstream.md`, for the user to file by hand. That includes:
+  - (2026-11-07) — partial: [docs/expert-predictor-result.md](docs/expert-predictor-result.md), from numbers already in the repo; nothing was rerun. 0 of 24 Stage B gate rows are retained. On held-out decode at 128 experts per layer the best causal policy loads about 2.1–2.6× the shared oracle's bytes (PLAN's earlier 2.4–2.5× is whole-trace and predates Stage E1's policies). **It stays open because the checklist is not filled:**
+    - prefill's union per ubatch is not measured as a distribution (decode's is exact: 6 per layer);
+    - the oracle is not step-pinned, so the gap to an event-atomic optimum is not measured, and the Stage B gate was not rerun with step-pinned references;
+    - no oracle is pooled over the test suffixes, and held-out oracle values exist only at 128;
+    - a predictor's decode hit rate, MB/token and step evictions are not in the tables.
+    - The document's "Not measured" section has the full list. All but the eviction predictor can be computed from the selection files without a real weight.
+- [x] For #25294 and #29887, collect what upstream can use in `docs/upstream.md`, for the user to file by hand. That includes:
   - the Top-6 auto-size abort, if E0 confirms it;
   - the zero-copy Metal slot path;
   - the equivalence and ceiling methodology;
   - the Kolibri benchmark matrix.
+  - (2026-11-07) — [docs/upstream.md](docs/upstream.md), "What upstream could use": facts, numbers and file references, no text to paste, nothing posted. E0 confirmed the abort (rc 134; M46: `17s` aborts, `18s` starts). E4's result is included as recorded. **Add E2's and E3's results when they exist;** neither can be cited yet.
+    - **E4 does not repeat E0's decode win at 16 GiB** (`F_NOCACHE` 18.07 against #25294's 18.52, overlapping ranges, no gate on it; E0: 17.96 against 12.69). The status line above and E0's text still describe E0's run.
+    - **Gaps in the evidence:** M46 has no recorded command line and no `repro.py` check, and the tiny fixture was not tried. #25294 writes no stats. There is no #29887 arm at 16 GiB, no Q8_0 arm for either, and no arm that isolates zero-copy from a copying slot pool.
 
 **Stop condition:** a stage whose gate fails is documented, and its code stays out of the patch set. If E0 shows #25294 matching or beating the fork's cache on Kolibri, move the remaining work onto #25294's design instead of extending patch 0011.
 - (2026-11-06) — Applied to E4: patch 0013 is out of the series, and the next patch is 0014.

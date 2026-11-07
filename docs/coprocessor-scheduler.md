@@ -32,18 +32,18 @@ IDLE --> ERROR (a dependency failed) | CANCELLED
 
 A worker publishes `CompletionEvent{RequestID, JobID, Generation, Status, Result, Error}` to a bounded channel, and one goroutine consumes it. It looks up the request and the job, compares the generation, and rejects a status that isn't terminal. Then, in one critical section, it settles the job, frees the slot, moves a request blocked on exactly this job to READY and passes the outcome to the dependents. A job's deadline is an ordinary event on the same channel, so a timeout and a completion race in one place. Nothing polls: the waiter sits on a channel and the controller isn't called while its request is BLOCKED.
 
-The safe boundary is the next `Apply`. A completion during a token updates only its job, and the request keeps GENERATING until the token is finished. WAIT reports only the outcome. The result becomes visible to the model in READ_RESULT, through `Generator.Deliver`.
+The safe boundary is the next `Apply`. A completion during a token updates only its job, and the request keeps GENERATING until the token is finished. `Run` emits the token before the request leaves GENERATING, so it can't go out after a second driver has moved the request on, and a token that was generated goes out even if `ctx` ends right after it. WAIT reports only the outcome. The result becomes visible to the model in READ_RESULT, through `Generator.Deliver`.
 
 | Invariant | How it holds |
 |---|---|
-| No token while BLOCKED | every action is gated on READY, under the mutex |
+| No token while BLOCKED | every action is gated on READY, under the mutex, and `Run` emits inside the GENERATING claim |
 | A job starts at most once per key | a retry gets the first job back, also under a new job ID and after a failure; IDLE to RUNNING happens once |
 | WAIT unblocks only on its job | the transition compares the waited job with the settled one |
 | Duplicates are harmless | a job's first terminal state stands, including its result |
 | Stale events can't resurrect a request | a closed request is gone, and a generation is unique in a scheduler even if the request and job IDs come back |
 | No lost wakeup | WAIT checks the registry under the mutex that the completion is recorded under |
 | No job runs on an unknown or failed dependency | a dependency must be declared first; a failure ends its dependents in ERROR unstarted |
-| Bounded resources | `Config`: requests, job IDs per request, running jobs, result bytes, queued events, actions per request, timeout |
+| Bounded resources | `Config`: requests, job IDs per request, running jobs, result bytes, queued events, actions per request, timeout. The job queue holds only IDLE jobs of open requests, so at most `MaxRequests` times `MaxJobsPerRequest`; settling a queued job takes it out at once |
 
 ## Decisions and limits
 
@@ -52,14 +52,17 @@ The safe boundary is the next `Apply`. A completion during a token updates only 
 - **Retrying a failed job needs a new key.** The same key returns the same failure, because the first run's side effects may have happened.
 - **Idempotency keys are per request and in memory.** They don't survive a teardown or a restart.
 - **A worker must honor its context.** After a timeout or cancellation its slot is free and its events are ignored, but the scheduler can't stop a worker that keeps running, so `MaxRunning` doesn't bound such workers.
-- **A job's timeout counts its run time, not its time in the queue.** The queue stays bounded because every running job has a deadline.
+- **A job's timeout counts its run time, not its time in the queue.** A queued job waits for as long as the running jobs keep the slots, at most `MaxTimeout` per job ahead of it.
+- **A worker finds a dependency's result under the name its `Execute` declared.** That name can be an idempotency alias. `DepResults` has no second entry under the canonical ID, because a program that adds up its dependencies would count that result twice. `JobInfo.Dependencies` lists canonical IDs.
+- **A context that has ended starts no job, but ending one doesn't stop a job.** `Run` doesn't close the request, so a job it started keeps running until its outcome or the request's `Close`.
+- **`Close` doesn't wait for a generator call, `Shutdown` does.** A call that ignores its context can outlast `Close`, so a generator belongs to one request, and the inference context stays in use until the `Apply` or `Run` has returned. After `Shutdown` returns nil, no generator is in use. This is a rule for phase 5's caller, and nothing in the package enforces it.
 - **`MaxResultBytes` doesn't cover error values.** A worker can still report an arbitrarily long error.
 - **WAIT takes one job and one mutex guards the whole scheduler.** The registry already holds several jobs per request, so a wait-any fits later. The mutex hasn't been measured under load.
 - **Publishing isn't authenticated.** Validation protects against stale and misrouted events, not against a worker forging another job's ID and generation. That is for the sandbox boundary to solve.
 
 ## Do the tests catch regressions?
 
-Each of these was applied alone to the code and reverted. Every one failed `go test -race -count=1`. A deadlock ends a run at its first failing test, so those two rows list only that test.
+Each of these was applied alone to the code and reverted. Every one failed `go test -race -count=1`. A deadlock ends a run at its first failing test, so those rows list only that test. The rows from "Settled jobs stay in the queue" on were measured on the code as it stands now. The rows above them were measured before those fixes and not run again.
 
 | Mutation | Failed tests |
 |---|---|
@@ -77,3 +80,17 @@ Each of these was applied alone to the code and reverted. Every one failed `go t
 | Settling leaves the worker running | `TestCancelWakesTheWaiterAndStopsTheWorker`, `TestShutdown` |
 | No limit on running jobs | `TestLimits`, `TestShutdown`, `TestCancelBeforeStart` |
 | READ_RESULT doesn't deliver | 9 tests, among them `TestAcceptanceOneSecondOperation` and `TestReadResultDeliversToTheModelAndCanRepeat` |
+| Settled jobs stay in the queue | `TestQueueDropsSettledJobs`, `TestClosedRequestIsNotRetained`, `TestCancelBeforeStart` |
+| Queue's head slot not cleared | `TestClosedRequestIsNotRetained` |
+| WAIT doesn't tell CLOSED from other states | `TestWaitReportsAClosedRequest` |
+| `DepResults` under canonical IDs only | `TestDependencyNamedByAnAlias` |
+| `DepResults` under canonical IDs as well | `TestDependencyNamedByAnAlias` |
+| Token emitted after the claim ends | `TestRunEmitsInsideTheGeneratingClaim` |
+| Token of a closed request emitted | `TestRunDoesNotEmitTheTokenOfAClosedRequest` |
+| Execute ignores its context | `TestDeadContextStartsNoJob` |
+| Run looks at `ctx` only after an action | `TestDeadContextStartsNoJob` |
+| Worker shares the registry's `Args` | `TestWorkerChangingItsArgsDoesNotChangeTheJob` |
+| Shutdown doesn't wait for generator calls | deadlock in `TestShutdownWaitsForARunningGeneratorCall` |
+| Close doesn't abort a generator call | deadlock in `TestCloseAbortsARunningGeneratorCall` |
+| Settling leaves the deadline timer armed | `TestDeadlineOfASettledJobDoesNotFire` |
+| A settled job's Start isn't skipped | `TestJobSettledBeforeItsStartDoesNotStart` |

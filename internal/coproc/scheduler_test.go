@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
+	"weak"
 )
 
 // WAIT unblocks only on its own job's outcome. Every event that doesn't match is counted and
@@ -432,7 +434,7 @@ func TestShutdown(t *testing.T) {
 	})
 }
 
-// A worker stuck on a full queue gets out when the scheduler stops. So does its deadline timer.
+// A worker stuck on a full queue gets out when the scheduler stops.
 func TestShutdownReleasesBlockedPublishers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, _ := setup(t, func(c *Config) { c.EventBuffer = 1 })
@@ -668,5 +670,218 @@ func TestLimits(t *testing.T) {
 				t.Fatalf("stats %+v", got)
 			}
 		})
+	})
+}
+
+// The queue holds only jobs that can still start. Closing a request or cancelling a job takes its
+// entries out at once, however long the running jobs keep the slots.
+func TestQueueDropsSettledJobs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, func(c *Config) { c.MaxRunning, c.MaxRequests, c.MaxJobsPerRequest = 1, 2, 4 })
+		queued := func() int {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return len(s.queue)
+		}
+		holder := open(t, s, "holder", &MockGenerator{})
+		must(t, holder, Execute{Job: "hold", Program: "manual"})
+		synctest.Wait()
+
+		for range 10 {
+			r := open(t, s, "r", &MockGenerator{})
+			for i := range 4 {
+				must(t, r, Execute{Job: JobID(strconv.Itoa(i)), Program: "sum"})
+			}
+			if got := queued(); got != 4 {
+				t.Fatalf("%d jobs queued, want 4", got)
+			}
+			r.Close()
+			if got := queued(); got != 0 {
+				t.Fatalf("%d jobs queued after Close, want 0", got)
+			}
+		}
+
+		r := open(t, s, "r", &MockGenerator{})
+		must(t, r, Execute{Job: "cancelled", Program: "sum"})
+		must(t, r, Execute{Job: "left", Program: "sum", Args: []string{"3"}})
+		if err := r.Cancel("cancelled"); err != nil {
+			t.Fatal(err)
+		}
+		if got := queued(); got != 1 {
+			t.Fatalf("%d jobs queued after Cancel, want 1", got)
+		}
+
+		// The job that is left still runs when the slot frees.
+		publish(t, s, synctest.Wait, done(t, holder, "hold", "x"))
+		wantJob(t, r, "left", JobDone)
+		wantJob(t, r, "cancelled", JobCancelled)
+	})
+}
+
+// A closed request must be collectable while the scheduler lives on. The queue could keep it in two
+// ways: as an entry, or in the slot a job was taken from, which stays behind the slice for as long
+// as later entries keep the backing array in use.
+func TestClosedRequestIsNotRetained(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, func(c *Config) { c.MaxRunning = 1 })
+		other := open(t, s, "other", &MockGenerator{})
+		must(t, other, Execute{Job: "hold", Program: "manual"})
+		synctest.Wait()
+
+		ref := func() weak.Pointer[Request] {
+			r := open(t, s, "r", &MockGenerator{})
+			must(t, r, Execute{Job: "dispatched", Program: "manual"})
+			must(t, other, Execute{Job: "next", Program: "manual"})
+			must(t, other, Execute{Job: "last", Program: "manual"})
+			publish(t, s, synctest.Wait, done(t, other, "hold", "x")) // takes "dispatched" off the head
+			wantJob(t, r, "dispatched", JobRunning)
+			must(t, r, Execute{Job: "queued", Program: "manual"})
+			r.Close() // frees the slot for "next"
+			return weak.Make(r)
+		}()
+		synctest.Wait()
+		wantJob(t, other, "next", JobRunning)
+		s.mu.Lock()
+		left := len(s.queue)
+		s.mu.Unlock()
+		if left != 1 {
+			t.Fatalf("%d jobs queued, want \"last\" alone, which keeps the backing array in use", left)
+		}
+		runtime.GC()
+		if ref.Value() != nil {
+			t.Fatal("the scheduler still holds a closed request")
+		}
+	})
+}
+
+// A worker owns the Args it gets. Changing them mustn't change the registry's record, or an
+// identical retry reads as a conflict and a controller answering that with a new key runs the side
+// effect twice.
+func TestWorkerChangingItsArgsDoesNotChangeTheJob(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, m := setup(t, nil)
+		m.Programs["scribble"] = MockProgram{Run: func(args []string, _ map[JobID]string) (string, error) {
+			args[0] = "changed"
+			return "ok", nil
+		}}
+		r, _ := openChecked(t, s, "r")
+		a := Execute{Job: "a", Program: "scribble", Args: []string{"1"}}
+		must(t, r, a)
+		must(t, r, Wait{Job: "a"})
+		if obs := must(t, r, a); !obs.Existing {
+			t.Fatalf("retry: %+v", obs)
+		}
+		if n := m.StartCount("a"); n != 1 {
+			t.Fatalf("started %d times", n)
+		}
+	})
+}
+
+// Once Shutdown has returned nil no generator call is running, so the caller can free the inference
+// contexts. A generator that doesn't return on its context holds Shutdown up to Shutdown's own
+// context, whether the request was still open or had been closed before.
+func TestShutdownWaitsForARunningGeneratorCall(t *testing.T) {
+	for name, closeFirst := range map[string]bool{"open": false, "closed": true} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, _ := setup(t, nil)
+				g := &blockingGen{release: make(chan struct{}), entered: make(chan struct{})}
+				r := open(t, s, "r", g)
+				token := make(chan Observation, 1)
+				go func() { token <- r.Apply(context.Background(), Continue{}) }()
+				<-g.entered
+				if closeFirst {
+					r.Close() // returns during the call
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				wantErr(t, s.Shutdown(ctx), context.DeadlineExceeded)
+				wantState(t, r, Closed)
+
+				close(g.release)
+				wantErr(t, (<-token).Err, ErrRequestClosed)
+				if err := s.Shutdown(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			})
+		})
+	}
+}
+
+// A settled job's deadline is off: nothing fires later, and nothing stays armed up to MaxTimeout.
+func TestDeadlineOfASettledJobDoesNotFire(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := setup(t, nil)
+		r, _ := openChecked(t, s, "r")
+		must(t, r, Execute{Job: "a", Program: "sum", Timeout: time.Second})
+		must(t, r, Wait{Job: "a"})
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		wantJob(t, r, "a", JobDone)
+		if got, want := s.Stats(), (Stats{Accepted: 1}); got != want {
+			t.Fatalf("stats %+v, want %+v", got, want)
+		}
+	})
+}
+
+// gateCoprocessor holds the Start of one job, the state in which a later job of the same dispatch
+// is RUNNING and not yet started.
+type gateCoprocessor struct {
+	*Mock
+	hold    JobID
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c gateCoprocessor) Start(ctx context.Context, job JobSpec, publish func(CompletionEvent) error) error {
+	if job.ID == c.hold {
+		close(c.entered)
+		<-c.release
+	}
+	return c.Mock.Start(ctx, job, publish)
+}
+
+// A job settled between its dispatch and its Start is not started: its side effect would come after
+// its CANCELLED.
+func TestJobSettledBeforeItsStartDoesNotStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := &Mock{Programs: programs()}
+		gate := gateCoprocessor{Mock: m, hold: "a", entered: make(chan struct{}), release: make(chan struct{})}
+		s, err := NewScheduler(gate, DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := s.Shutdown(context.Background()); err != nil {
+				t.Error(err)
+			}
+			m.Wait()
+		})
+		r, _ := openChecked(t, s, "r")
+		must(t, r, Execute{Job: "p", Program: "manual"})
+		synctest.Wait()
+		must(t, r, Execute{Job: "a", Program: "manual", Dependencies: []JobID{"p"}})
+		must(t, r, Execute{Job: "b", Program: "manual", Dependencies: []JobID{"p"}})
+
+		// p's completion dispatches a and b at once, and Start holds on a.
+		if err := s.Publish(done(t, r, "p", "1")); err != nil {
+			t.Fatal(err)
+		}
+		<-gate.entered
+		wantJob(t, r, "b", JobRunning)
+		if err := r.Cancel("b"); err != nil {
+			t.Fatal(err)
+		}
+		close(gate.release)
+		synctest.Wait()
+
+		wantJob(t, r, "b", JobCancelled)
+		if n := m.StartCount("b"); n != 0 {
+			t.Fatalf("job b started %d times after its CANCELLED", n)
+		}
+		if n := m.StartCount("a"); n != 1 {
+			t.Fatalf("job a started %d times", n)
+		}
 	})
 }
