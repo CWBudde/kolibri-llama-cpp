@@ -372,7 +372,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0010 continuation tests | no | tests on top of 0008 |
 | 0011, 0012 expert cache | no | the fork's own work, rebased (below) |
 | 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
-| 0014 expert cache side-file | no | the fork's own work, Stage E3; its benchmark has not run ([expert-streaming.md](expert-streaming.md#stage-e3-one-read-per-expert)) |
+| 0014 expert cache side-file | no | the fork's own work, Stage E3; its four deciding gates passed on 2026-11-07, and fork PR #15 is not merged ([expert-streaming.md](expert-streaming.md#stage-e3-one-read-per-expert)) |
 
 ### Controls
 
@@ -401,7 +401,14 @@ and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
 the plain diff of that branch against `feat/kolibri1`. The series 0008, 0010,
 0011, 0012 and 0014 applied to a clean `184f6536` equals that branch's tree
 (`d8ee53b6`), and without 0014 it equals `feat/kolibri1`'s (`e4937d7a`, both by
-`git write-tree`). If its gates fail, the number is retired as 0013's was.
+`git write-tree`). Its gates passed, so the number stays in the series. The
+benchmark ran on `dd2040eaf`, whose tree (`53739515`) is what the same series
+gave at `0b19754`, before the review fixes below.
+
+**Merge order: fork PR #15 into `feat/kolibri1` first, then PR #72.** Fork PR #15
+is not merged, so the README's option A (the patches by glob) and option B (the
+fork branch) only match once it is merged too. Number 0015 is taken by Stage E2's
+draft PR #76.
 
 **Review fixes (fork PRs #13 and #15, 2026-11-07).** Two findings were real; the
 fixes are `634e34bb4` on `feat/kolibri1`, merged into the side-file branch, and
@@ -413,8 +420,9 @@ fixes are `634e34bb4` on `feat/kolibri1`, merged into the side-file branch, and
   checked only against the GGUF's size. The hash now reads in pieces of 1 MiB, and
   a length past the first expert row is refused.
 
-Neither touches what a read returns or how long it takes. E3's benchmark ran on
-`dd2040eaf` before these commits, and nothing here asks to repeat it.
+Both act at load, and neither changes the code that reads a miss. E3's benchmark
+ran on `dd2040eaf` before these commits, so they were not timed, and nothing here
+asks to repeat it.
 
 Three findings were declined, with the reasons on the PRs: the Kolibri-only
 options in `common/arg.cpp` (twice, on #13 and #14), since this checklist is
