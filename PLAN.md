@@ -1013,7 +1013,7 @@ No predictor passed the offline gates (Stages A and B). The user decided on 2026
 
 ## Phase 11 --- Expert streaming on par with other offloaders (proposed)
 
-**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 done (2026-10-23). **Phase 11's stop rule fired at 0 GiB** (E0.2: #25294 matches the fork's decode there and prefills 2.6× faster; the fork still wins decode at 16 GiB). Whether E2 continues on the fork or the work moves onto #25294's design is the user's decision. (2026-11-06) — **E4's waves failed their deciding gates at 0 GiB** and passed at 16 GiB; patch 0013 left the series, and the code stays on fork branch `feat/kolibri1-waves`. Layer streaming and prefill admission stay open ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E4: waves for prefill").
+**Status:** proposed (2026-10-22), from the survey in [docs/offloading-survey.md](docs/offloading-survey.md). E1 done (2026-10-23); E0 done (2026-10-23). **Phase 11's stop rule fired at 0 GiB** (E0.2: #25294 matches the fork's decode there and prefills 2.6× faster; the fork still wins decode at 16 GiB). Whether E2 continues on the fork or the work moves onto #25294's design is the user's decision. (2026-11-06) — **E4's waves failed their deciding gates at 0 GiB** and passed at 16 GiB; patch 0013 left the series, and the code stays on fork branch `feat/kolibri1-waves`. Layer streaming and prefill admission stay open ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E4: waves for prefill"). (2026-11-07) — **E3's side-file passed its four deciding gates** against the GGUF path, and patch 0014 stays in the series, not yet merged ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E3").
 
 ### Where Stage D stands against other work
 
@@ -1122,15 +1122,25 @@ Only if E1's overhead control shows the overhead.
 - [ ] Gate: lossless as above. Decode tokens/s and p95 at both ceilings must beat Stage D by the Stage D rule. The miss path must still pin, cancel and fall back as `test-expert-cache` requires. Controls from M40, including a wrong slot id in the GPU table.
 - [ ] Without the CPU split, require bit identity to the unsplit resident run on Metal again (`check_expert_cache.py` drops its same-split reference). Until then `kolibri-bench`'s exact equivalence of `iq3-cache128` against `iq3-resident-ub21` compares two differently fused graphs on master (E0.1).
 
-### Stage E3 --- One read per expert
+### Stage E3 --- One read per expert — ✅ GATES PASSED (2026-11-07), not merged
 
 - [x] A repacked side-file next to the GGUF, written by a tool and verified by a manifest with sha256.
   - Each expert's gate, up and down rows, scales included, sit in one aligned extent.
   - The loader reads a miss with one `pread`. An option names the file; without it, the GGUF path stays.
   - A layer's misses are issued concurrently, with the thread count taken from E1's curve.
   - (2026-11-07) — `cmd/kolibri-sidefile`, patch 0014 on fork branch `feat/kolibri1-sidefile` (`1f6ce476c`, fork PR #15, not on `feat/kolibri1`), `--expert-cache-sidefile`: [docs/expert-streaming.md](docs/expert-streaming.md), "Stage E3". The IQ3 side-file is 30.5 GiB, and `verify` finds every extent byte-identical to the GGUF. Misses were already concurrent over 4 I/O threads; a unit test now holds that.
-- [ ] Gate: the bytes in the slots are identical to the GGUF path (a unit check, plus `check_expert_cache.py` on both paths). Decode and prefill must beat the GGUF path at the same ceiling. The decode gate is the Stage D rule, so a warm p95 win alone passes it, even with a lower median decode rate. Expected upside: about the 14 ms load wait in decode, and more in prefill, where loads waited 51.6 s per run.
-  - (2026-11-07) — **The benchmark has not run, so this gate is open and nothing is known about speed.** The byte identity holds: tiny "PASS: 0 failures" (336 checks), real IQ3 "PASS: 0 failures" (40 checks), both with the side-file bit-identical to the same resident run and to the GGUF path; the unit check too. Controls M50 to M54. The matrix `testdata/bench/e3.json` (12 runs) was committed and pushed before any timed run: decode and prefill against the GGUF path decide at 0 and 16 GiB.
+- [x] Gate: the bytes in the slots are identical to the GGUF path (a unit check, plus `check_expert_cache.py` on both paths). Decode and prefill must beat the GGUF path at the same ceiling. The decode gate is the Stage D rule, so a warm p95 win alone passes it, even with a lower median decode rate. Expected upside: about the 14 ms load wait in decode, and more in prefill, where loads waited 51.6 s per run.
+  - (2026-11-07) — **All four deciding gates passed, so patch 0014 stays in the series:** [docs/expert-streaming.md](docs/expert-streaming.md), "Stage E3". The matrix `testdata/bench/e3.json` (12 runs) was committed and pushed before any timed run.
+    - **Decode, 0 GiB:** 20.30 (18.90–20.79) against 17.30 (16.94–17.42) t/s, p95 70.6 (67.6–72.0) against 86.1 (80.0–88.9) ms. Both win.
+    - **Decode, 16 GiB:** 19.75 (18.99–21.14) against 17.08 (16.55–18.38) t/s, a win. **p95 71.4 (66.9–79.3) against 79.7 (77.6–84.2) ms did not win by the rule,** so the gate passes on tokens/s alone. Whether to set a stricter bar is the owner's call.
+    - **Prefill:** 106.5 against 88.4 t/s at 0 GiB, 106.8 against 87.0 at 16 GiB. Not deciding, cold TTFT: 26.68 against 33.16 s, 26.75 against 33.13 s.
+    - **Byte identity:** tiny "PASS: 0 failures" (336 checks) and real IQ3 "PASS: 0 failures" (40 checks), both with the side-file bit-identical to the same resident run and to the GGUF path; the unit check too. In the timed runs, 30 of 30 requests have identical token IDs. Controls M50 to M59.
+    - **Path and validity:** 1,539,444 preads for 1,539,444 experts on the side-file, 3 per expert on the GGUF path. 0 load failures, one build, all 12 runs ok, no sleep inside a run, 0 pages resident after every eviction.
+    - **Decode's gain is the wait's:** 14.48 to 8.85 ms/token at 0 GiB, 14.63 to 8.86 at 16 GiB, stable in every same-repetition pair. An effect on "other" is not established. Prefill's load wait was not measured.
+    - **Code:** the runs used `dd2040eaf` (tree `53739515`). The series is now `1f6ce476c` (tree `d8ee53b6`), with two load-time review fixes that were not timed.
+    - **Not on par:** Phase 11's targets (30 t/s decode, 273 t/s prefill, 10 s TTFT) stay unmet, and E3's matrix has no #25294 arm.
+    - **Fact for E6's condition, no decision:** on the side-file the wait is 8.85 ms of 49.48 (17.9%) at 0 GiB and 8.86 of 52.17 (17.0%) at 16 GiB, and "other" is 80.8% and 81.8%. "Other" is a remainder, not one measured cost. This build still has 102 splits per token, so these are E3's facts alone, and E2 has no timed result here. E6 is not started.
+- [ ] Merge: fork PR #15 into `feat/kolibri1` first, then PR #72. Fork PR #15 is not merged, so `feat/kolibri1` does not have 0014 until it is, and the README's two source options only match after both. The owner's call.
 
 ### Stage E4 --- Prefill without the ubatch cap — ❌ GATE FAILED at 0 GiB (2026-11-06)
 
