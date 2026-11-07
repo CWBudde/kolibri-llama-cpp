@@ -2,7 +2,7 @@
 
 The reproducible baseline of Kolibri-1's repetition loops, step 1 of issue #66. It is a measurement: no weight is edited, and nothing here suggests a fix. Steps 2 to 5 of the issue (activation patching, weight edits) are not started.
 
-**Status: the corpus, the tool and the definitions are committed, and one run on the quantized IQ3 weight is reported under [Results](#results). BF16 and reference logits remain open.**
+**Status: the corpus, the tool and the definitions are committed, and two runs on the quantized IQ3 weight, one per build, are reported under [Results](#results). BF16 and reference logits remain open.**
 
 | Issue metric | State |
 |---|---|
