@@ -22,7 +22,7 @@ The issue's layers 10, 25, 40 and 50 are **one-based**: they count the blocks, 1
 
 **Normalization.** `l_out-il` is the block's residual sum, `post_ffw_norm(routed + shared experts) + ffn_inp`, and `build_cvec` passes it through with no control vector loaded. So the post-FFN norm sits inside the sum, and nothing normalizes the sum itself. It is read **before** the next block's input norm and, at layer 50, **before `output_norm`** (`result_norm`). Layer 50 is therefore not the embedding that `llama_get_embeddings` would return.
 
-Reading this from the source doesn't prove it for a given build, so the capture reads it from the model's graph on its first decode (`Capture.check_graph`) and refuses to go on otherwise: `l_out-il` must have the sources `(post-FFN norm, ffn_inp-il)`, `norm-(il+1)` must read it, and the last one must feed `norm`. `capture.json` keeps what it found under `graph_check`.
+Reading this from the source doesn't prove it for a given build, so the capture reads it from the model's graph on its first decode (`Capture.check_graph`) and refuses to go on otherwise. `l_out-il` must have the sources `(post-FFN norm, ffn_inp-il)`, and the first one is checked by walking down from it, since those nodes have no names of their own: a `MUL` by `blk.il.post_ffw_norm.weight`, over the `RMS_NORM` `norm-il`, over the `ADD` of `ffn_moe_out-il` and `ffn_shexp_out-il`. `norm-(il+1)` must read `l_out-il`, and the last one must feed `norm`. `capture.json` keeps what it found under `graph_check`, and `kolibri-probe report` checks that again. So the `normalization` string each layer records is written only after this check passed. The check reads what the graph is wired from, not what the numbers mean: a wrong RMS epsilon, say, would pass.
 
 ## The prompts
 
@@ -36,11 +36,11 @@ Reading this from the source doesn't prove it for a given build, so the capture 
 | D `explicit_non_execution` | no | `none` | the numbers of a B or C partner in the same group, with the instruction not to compute |
 
 - **Schema.** The issue's eight fields come first, in its order, then `language`, `template_id`, `numeric_seed`, `prompt_length`, `explicit_execution_constraint` and `expected_answer_or_oracle`. Added are `operation`, `execution_need`, `label_policy`, `hard_negative` and `varied_axis`. The metadata of a capture (model and template revision, layer index, dtype) is in its `capture.json`, since it isn't a property of a prompt.
-- **Labels are a policy.** `execute_expected` follows `label_policy` (`execute-when-exact-result-asked-v1`) and means execution is helpful. `execution_need` separates `helpful` from `necessary`: an exact result is necessary when a number involved reaches 100,000, so that 5 numbers to sort stay `helpful`. A D prompt has family `none`, because it needs nothing; `operation` keeps what it mentions.
-- **Pairs.** 10 groups hold a computation and its refusal on the same numbers, so that a keyword can't separate them. They differ in the instruction only (`varied_axis`), and other rows differ in language or wording only.
+- **Labels are a policy.** `execute_expected` follows `label_policy` (`execute-when-exact-result-asked-v1`) and means execution is helpful. `execution_need` separates `helpful` from `necessary`: an exact result is necessary when a number of the prompt or of the answer reaches 100,000, so that 5 numbers to sort stay `helpful`. The oracle works this out again from the prompt and its own answer. A D prompt has family `none`, because it needs nothing; `operation` keeps what it mentions.
+- **Pairs.** 10 groups hold a computation and its refusal on the same operation and the same numbers (`verifyPairs` compares them), so that a word for the operation can't separate them. **Other surface cues can**, and the pairs don't remove them: see [What the text alone gives](#what-the-text-alone-gives). A refusal is also a longer sentence with other wording: B-002 is `Was ist 36 mal 49?` (18 characters), D-002 is `Erkläre das schriftliche Multiplizieren am Beispiel 36 mal 49, aber rechne das Ergebnis nicht aus.` (98). `varied_axis` names the axis the template varies, not the only difference in characters. Other rows of a group differ in language or wording.
 - **Determinism.** `kolibri-probe generate` draws from PCG with a fixed seed (63) and a per-group stream. `TestRegenerateBytes` regenerates the file and compares bytes.
-- **Oracle.** `internal/probe/oracle.go` shares no code with the generator. It reads a row's numbers from the prompt's text and computes the answer by other algorithms: `math/big`'s `Mul`, `Exp`, `MulRange`, `GCD` and `ProbablyPrime`, fast doubling, an insertion sort. Facts come from its own table. A D prompt must carry words that forbid execution.
-- **Leak checks.** `VerifyStructure` refuses a template or a numeric seed in two groups, and two prompts of different groups with a masked word overlap of 0.8 or more. The pilot's groups are in no smoke row.
+- **Oracle.** `internal/probe/oracle.go` shares no code with the generator. It reads a row's operation and numbers from the prompt's text, so a row's `operation` field can't choose what it computes and must agree with the text, and computes the answer by other algorithms: `math/big`'s `Mul`, `Exp`, `MulRange`, `GCD` and `ProbablyPrime`, fast doubling, an insertion sort. Facts come from its own table. A D prompt must carry words that forbid execution.
+- **Leak checks.** `VerifyStructure` refuses a template or a numeric seed in two groups, and two prompts of different groups with a masked word overlap of 0.6 or more, which is what a sentence frame shared by two groups reaches: the frames that differ in a word or two scored 0.67 to 0.75, and 5 smoke prompts were reworded for it. The highest pair left is 0.50 (`What is the capital of Spain?`, `What is the factorial of 12?`). Folds keep groups whole, so this holds for every fold. It compares words, not topics: A-001 and A-002 both still ask for a capital, in other words (0.33). The pilot's groups are in no smoke row.
 
 ## Capture
 
@@ -53,7 +53,7 @@ The issue's activations are read through `cb_eval`, the callback route `cmd/koli
 
 ### Non-mutating
 
-The callback only reads, and the check is exact: `np.array_equal`, no tolerance. All prompts are first decoded by a model and context that never had a callback, and the capturing decode must give the same logits. A capture run does this itself and records `logits_check`, and `kolibri-probe report` refuses a capture whose logits differ.
+The callback only reads, and the check is exact: `np.array_equal`, no tolerance. All prompts are first decoded by a model and context that never had a callback, and the capturing decode must give the same logits. A capture run does this itself and records `logits_check`. `kolibri-probe report` refuses a capture whose logits differ, and also one where the check didn't run, since nothing then shows that it left the logits alone: `--skip-logits-check` and `--no-repeat` are for debugging the capture, and their output gets no report. The report also refuses a capture without a `graph_check` that holds, or whose prompts don't all end in one token. It shows these facts and whether the template is the released one, under "Capture".
 
 `tools/probe/check_capture.py` shows the same on tiny checkpoints, with F32 and BF16 weights, on the CPU and on Metal, reading 4 layers and all layers. `--layers` scales the indices: the 6-layer tiny model reads 2,3,5,6, and the 50-layer `-pattern` model reads the real 10,25,40,50.
 
@@ -73,19 +73,35 @@ The callback only reads, and the check is exact: `np.array_equal`, no tolerance.
 
 `kolibri-probe report -capture DIR` trains on activations alone and scores only held-out rows. The options below are **definitions, committed before any real capture, and they must not move afterwards**: `DefaultOptions` in `internal/probe/report.go`, the dataset, and the capture defaults in `tools/probe/capture.py`.
 
+The report enforces this where it can. It never replaces a report, and only `DefaultOptions` write `report.md`. `-l2`, `-folds` or `-shuffles` at another value write `report-deviation-*`, which says at its top what moved, so trying values leaves every try on disk under a name that says so.
+
 - **Probes.** One multinomial logistic regression per layer and target: execute or not, and operation family (`none`, `arithmetic`, `algorithm`). L2 strength 0.01, features standardized with the training rows' mean and deviation and scaled to unit expected squared norm, no feature selection. The solver is deterministic (Nesterov's method from zero) and stays in the span of the training rows, since there are far more dimensions than rows.
 - **Folds.** 5 folds by `paraphrase_group`, over the smoke split. `CheckFolds` runs before any training and refuses a group, template or numeric seed in train and test of a fold, whoever made the split.
-- **Baselines**, on the same folds: majority of the training rows, a fixed keyword rule, and a learned bag of words with the same classifier and regularization. The rule's lists were written by the hand that wrote the prompts, which favors it. Words see what the probe does not, so a probe that doesn't beat them has shown nothing the text doesn't show.
+- **Baselines**, on the same folds: majority of the training rows, a fixed keyword rule, a fixed surface rule, the prompt's length through the same classifier, and a learned bag of words with the same classifier and regularization. The two rules' lists were written by the hand that wrote the prompts, which favors them.
 - **Scores.** Accuracy, balanced accuracy, macro F1, precision and recall of execute, hard negatives right, agreement of same-label rows within a group, Brier score and a 5-bin calibration error.
 - **Shuffled labels.** 20 runs per probe, same folds. A probe must beat them by more than their spread.
 - **No confidence intervals.** The issue asks for them only where the sample supports them, and 40 rows in 25 groups doesn't. The report says so and gives none.
 - **Pilot prompts.** Trained on all smoke rows and read on the 4 pilot prompts, whose groups the smoke split doesn't share. One prompt per category: a pipeline check.
 
+### What the text alone gives
+
+**On the committed rows the text's surface gives the execute label on 39 of 40 smoke rows, so the bag of words is far below what the text shows.** The words `aber`, `ohne`, `but` and `without` are in all 10 refusals and in none of the other 30 rows, and of those 30 only the 20 computations and A-011 hold a digit. The surface rule, "a digit and none of those words", errs only on A-011 (`warum die 7 als Glückszahl gilt`). It was written after seeing the rows. These scores need no weight, and `TestBaselines` and `TestSurfaceCues` hold the rule's:
+
+| Baseline | Execute, balanced | Family, balanced |
+|---|---|---|
+| majority | 0.350 | 0.333 |
+| keyword rule | 0.725 | 0.783 |
+| surface rule | **0.975** | **0.967** |
+| prompt length | 0.625 | 0.483 |
+| bag of words | 0.650 | 0.450 |
+
+So a probe at 0.90 beats the bag of words, and the keyword rule, and still reads less than the surface rule. And a probe at or above 0.975 doesn't show more than these two cues either: these rows can't separate reading what a prompt asks from reading a digit and a conjunction. The dataset keeps this on purpose rather than hide it by rewording a few rows: 40 prompts validate the pipeline, and the larger set below is where the cues have to be broken.
+
 ### What a result would and wouldn't mean
 
 - **Small sample.** 40 prompts validate the pipeline. They don't select a layer, and the report ranks none.
 - **Decodable isn't useful.** A probe that reads a label from an activation shows that the information is there at that layer. It doesn't show that the model uses it there, or that injecting a result there would change behavior correctly. Only an intervention can show that, and that comes later, with a frozen base model and a trainable adapter (#61).
-- **Random weights decode too.** A random-weight tiny model's activations score above chance on these labels, probably because prompts that share words stay close through random projections too. A score on the real model therefore means little by itself, whatever the shuffled-label control says: that control excludes chance, not the text. The bag of words is the bar.
+- **Random weights decode too.** A random-weight tiny model's activations score above chance on these labels, probably because prompts that share words stay close through random projections too. A score on the real model therefore means little by itself, whatever the shuffled-label control says: that control excludes chance, not the text. The surface rule is the bar, and clearing it wouldn't rule those cues out.
 - **Labels are a policy.** A different policy gives different labels.
 
 ### Controls
@@ -95,8 +111,10 @@ The callback only reads, and the check is exact: `np.array_equal`, no tolerance.
 | M75 | shuffled labels | the same probe on the same activations scores near chance, and no shuffle reaches the real score | `TestM75ShuffledLabelsNearChance` |
 | M76 | a split that breaks the groups | refused with `ErrGroupLeak`; on group-fingerprint activations it would score near 1, grouped folds near chance | `TestM76LeakingSplitRefused` |
 | M77 | a capture that writes into a node | logits differ, the capture exits 1, the report refuses it | `check_capture.py` |
-| M78 | a wrong answer or a changed operand | the oracle fails the row | `TestM78OracleCatchesCorruption` |
+| M78 | a wrong answer, a changed operand, a wrong operation or `execution_need`, a refusal with other numbers | the oracle fails the row | `TestM78OracleCatchesCorruption`, `TestOracleReadsTheOperation`, `TestPairsAndNeed` |
 | M79 | the issue's numbers taken as zero-based | refused by the graph check and, at the last layer, by the missing node | `check_capture.py` |
+| M87 | a graph whose `l_out` lacks the post-FFN norm, has another block's or has only the routed experts | refused by the graph check, and by the report from `capture.json`. On the real tiny graph's record with those parts changed, since no fork build has that wiring | `check_capture.py`, `TestReadCaptureRefuses` |
+| M88 | a capture that wasn't checked: `--skip-logits-check`, also with a write into a node, or `--no-repeat` | the capture says UNCHECKED, the report refuses it | `check_capture.py`, `TestReadCaptureRefuses` |
 
 ## Reproduce
 
@@ -120,10 +138,10 @@ go run ./cmd/kolibri-probe report -capture ~/models/eval/layer-probe-<date>
 
 - [ ] the capture's `logits_check` and `repeatable` on the real model, Metal, with the cache;
 - [ ] the overhead from `plain_decode_seconds` and `capture_decode_seconds`;
-- [ ] the report's tables for layers 10, 25, 40 and 50 against the three baselines and the shuffled labels.
+- [ ] the report's tables for layers 10, 25, 40 and 50 against the five baselines and the shuffled labels.
 
 ## Next, once the pipeline has run
 
-- **A larger, leakage-resistant evaluation.** Hundreds to thousands of prompts from more templates, with a held-out test set disjoint in templates, paraphrase groups and number templates, and confidence intervals over groups. This is where a layer choice can start. Then calibration and robustness to paraphrase become meaningful.
+- **A larger, leakage-resistant evaluation.** Hundreds to thousands of prompts from more templates, with a held-out test set disjoint in templates, paraphrase groups and number templates, and confidence intervals over groups. This is where a layer choice can start. Then calibration and robustness to paraphrase become meaningful. It must break the surface cues: computations that say `aber` or `ohne` and long ones, refusals without those words and short ones, and many numbers that need no execution.
 - **The two-stage gate hypothesis.** An early execute gate and a later family controller: compare where each target's score rises, on that larger set.
 - **Intervention.** Only after the readout: a frozen base model, a trainable adapter, and whether an injected result changes downstream behavior correctly.
