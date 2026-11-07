@@ -399,9 +399,11 @@ and 0012 applied to a clean `184f6536` still equals `feat/kolibri1`'s tree
 **Patch 0015 is retired (Phase 11, Stage E2, 2026-11-07).** Its deciding gate
 failed at 16 GiB and passed at 0 GiB, so the number is kept and the code stays
 on fork branch `feat/kolibri1-gpu-remap` (`0bb0f5444`, fork PR #16, draft, open
-and not merged). It never reached `feat/kolibri1` or the series' glob. The next
-patch is 0016. At this date `main` does not have PR #72: its 0008, 0010, 0011
-and 0012 applied to a clean `184f6536` give `7ade40f0`, while `feat/kolibri1`
+and not merged). It never reached `feat/kolibri1` or, at this date, `main`. The
+series' glob matched it only on Stage E2's branch, from `35b6ee2` until `5c40670`
+moved it to `pending/`. The next patch is 0016. At this date `main` does not
+have PR #72: its 0008, 0010, 0011 and 0012 applied to a clean `184f6536` give
+`7ade40f0`, while `feat/kolibri1`
 has moved to `e4937d7a`, because `634e34bb4` added the refusal of a LoRA on the
 cache's experts. PR #72's series without 0014 gives `e4937d7a`.
 
