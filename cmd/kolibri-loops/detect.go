@@ -72,36 +72,81 @@ type Answer struct {
 // Scores of a generation against a known answer.
 const (
 	scoreNone       = ""           // the item has no known answer
-	scoreCorrect    = "correct"    // an accepted term comes first
-	scoreWrong      = "wrong"      // a rejected term comes first, or no term at all
+	scoreCorrect    = "correct"    // in the first sentence, an accepted term comes first
+	scoreWrong      = "wrong"      // in the first sentence, a rejected term comes first, or no term at all
 	scoreUnanswered = "unanswered" // nothing was generated after the reasoning, or reasoning never closed
 )
 
 // thinkEnd closes the reasoning block. llama-server keeps it in content.
 const thinkEnd = "</think>"
 
-// ScoreAnswer scores content. With thinking on, only the text after the last
-// closing think tag counts.
-func ScoreAnswer(a *Answer, form, content string) string {
-	if a == nil {
-		return scoreNone
-	}
+// answerRegion is the text that can hold an answer: with thinking on, what comes
+// after the last closing think tag. It is false if there is no such text.
+func answerRegion(form, content string) (string, bool) {
 	region := content
 	if form == formChatThink {
 		i := strings.LastIndex(content, thinkEnd)
 		if i < 0 {
-			return scoreUnanswered
+			return "", false
 		}
 		region = content[i+len(thinkEnd):]
 	}
-	if strings.TrimSpace(region) == "" {
-		return scoreUnanswered
+	region = strings.TrimSpace(region)
+	return region, region != ""
+}
+
+// answerWindow caps the first sentence, in runes, for text that never ends one,
+// so that a generation's length does not move the score.
+const answerWindow = 200
+
+// firstSentence is the text up to the first line break, or the first . ! ? that
+// a space or the end follows, at most answerWindow runes.
+func firstSentence(text string) string {
+	runes := []rune(text)
+	for i, r := range runes {
+		if i == answerWindow {
+			return string(runes[:i])
+		}
+		if r == '\n' {
+			return string(runes[:i])
+		}
+		if (r == '.' || r == '!' || r == '?') && (i+1 == len(runes) || unicode.IsSpace(runes[i+1])) {
+			return string(runes[:i+1])
+		}
 	}
-	accept, reject := firstTerm(region, a.Accept), firstTerm(region, a.Reject)
+	return text
+}
+
+func scoreTerms(a *Answer, text string) string {
+	accept, reject := firstTerm(text, a.Accept), firstTerm(text, a.Reject)
 	if accept >= 0 && (reject < 0 || accept < reject) {
 		return scoreCorrect
 	}
 	return scoreWrong
+}
+
+// ScoreAnswer scores the first sentence of the answer, so what a generation goes
+// on to say later does not count, and neither does how long it runs.
+func ScoreAnswer(a *Answer, form, content string) string {
+	if a == nil {
+		return scoreNone
+	}
+	region, ok := answerRegion(form, content)
+	if !ok {
+		return scoreUnanswered
+	}
+	return scoreTerms(a, firstSentence(region))
+}
+
+// AnswerMentioned applies the same terms to all of the answer. It is an
+// occurrence rate, not an accuracy: an accepted term after a wrong first answer
+// counts, and the longer the generation the likelier that is.
+func AnswerMentioned(a *Answer, form, content string) bool {
+	if a == nil {
+		return false
+	}
+	region, ok := answerRegion(form, content)
+	return ok && scoreTerms(a, region) == scoreCorrect
 }
 
 // firstTerm returns the byte offset of the first whole-word match of any term

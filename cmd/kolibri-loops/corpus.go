@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 )
 
 // Forms of a corpus item. They are never pooled in a report: raw and chat
@@ -46,12 +47,15 @@ const (
 
 // splitSalt versions the split rule. Changing it, or anything else in the
 // corpus, moves the pinned corpus hash in main_test.go.
-const splitSalt = "kolibri-loops/split/v1/"
+const splitSalt = "kolibri-loops/split/v2/"
 
 // Item is one line of the corpus.
 type Item struct {
-	ID      string `json:"id"`
-	Pair    string `json:"pair"`
+	ID   string `json:"id"`
+	Pair string `json:"pair"`
+	// Group holds every pair that shares a fact, a prompt or an answer with
+	// another. The split assigns groups, so none of that crosses it.
+	Group   string `json:"group"`
 	Lang    string `json:"lang"`
 	Form    string `json:"form"`
 	Stratum string `json:"stratum"`
@@ -126,6 +130,7 @@ func validateCorpus(items []Item) error {
 	seen := map[string]bool{}
 	pairCells := map[string][]string{}
 	pairStratum := map[string]string{}
+	pairGroup := map[string]string{}
 	for _, it := range items {
 		if !idPattern.MatchString(it.ID) {
 			return fmt.Errorf("bad id %q", it.ID)
@@ -147,6 +152,13 @@ func validateCorpus(items []Item) error {
 			return fmt.Errorf("%s: pair %s has strata %s and %s", it.ID, it.Pair, s, it.Stratum)
 		}
 		pairStratum[it.Pair] = it.Stratum
+		if it.Group == "" {
+			return fmt.Errorf("%s: no group", it.ID)
+		}
+		if g, ok := pairGroup[it.Pair]; ok && g != it.Group {
+			return fmt.Errorf("%s: pair %s has groups %s and %s", it.ID, it.Pair, g, it.Group)
+		}
+		pairGroup[it.Pair] = it.Group
 		pairCells[it.Pair] = append(pairCells[it.Pair], it.Lang+"/"+it.Form)
 		if it.Control != "" && it.Control != controlLoop && it.Control != controlNonLoop {
 			return fmt.Errorf("%s: unknown control %q", it.ID, it.Control)
@@ -171,39 +183,81 @@ func validateCorpus(items []Item) error {
 			return fmt.Errorf("pair %s: has %v, a %s pair needs %v", pair, cells, pairStratum[pair], want)
 		}
 	}
+	if err := checkGroups(items); err != nil {
+		return err
+	}
 	splits := assignSplits(items)
 	for _, it := range items {
-		if it.Split != splits[it.Pair] {
-			return fmt.Errorf("%s: split is %q, the rule says %q", it.ID, it.Split, splits[it.Pair])
+		if it.Split != splits[it.Group] {
+			return fmt.Errorf("%s: split is %q, the rule says %q", it.ID, it.Split, splits[it.Group])
 		}
 	}
 	return nil
 }
 
-// assignSplits is the split rule. A whole pair goes to one split, so a fact
-// never sits on both sides. Within a stratum the pairs are ordered by the
-// SHA-256 of salt and name and take turns, tuning first.
-func assignSplits(items []Item) map[string]string {
-	byStratum := map[string][]string{}
-	seen := map[string]bool{}
-	for _, it := range items {
-		if !seen[it.Pair] {
-			seen[it.Pair] = true
-			byStratum[it.Stratum] = append(byStratum[it.Stratum], it.Pair)
+// checkGroups refuses what would leak across a split: items of different groups
+// that share a prompt, or where one prompt contains the other, that accept the
+// same term, or where one prompt holds the other's accepted term. It cannot see
+// a fact restated in other words; the groups in the corpus handle those.
+func checkGroups(items []Item) error {
+	bare := func(it Item) string {
+		return strings.ToLower(strings.ReplaceAll(it.Prompt, "<|endoftext|>", ""))
+	}
+	for _, a := range items {
+		for _, b := range items {
+			if a.Group == b.Group {
+				continue
+			}
+			if strings.Contains(bare(a), bare(b)) {
+				return fmt.Errorf("%s holds the prompt of %s, so they need one group", a.ID, b.ID)
+			}
+			if a.Answer == nil {
+				continue
+			}
+			if firstTerm(b.Prompt, a.Answer.Accept) >= 0 {
+				return fmt.Errorf("the prompt of %s holds the answer of %s, so they need one group", b.ID, a.ID)
+			}
+			if b.Answer != nil && slices.ContainsFunc(a.Answer.Accept, func(t string) bool {
+				return slices.ContainsFunc(b.Answer.Accept, func(u string) bool { return strings.EqualFold(t, u) })
+			}) {
+				return fmt.Errorf("%s and %s accept the same answer, so they need one group", a.ID, b.ID)
+			}
 		}
 	}
+	return nil
+}
+
+// strataOrder ranks the strata: a group belongs to the first one its pairs have.
+var strataOrder = []string{stratumLoop, stratumNonLoop, stratumAnswer, stratumOpen, stratumThink, stratumText}
+
+// assignSplits is the split rule, from group to split. A whole group goes to one
+// split, so a fact, a prompt or an answer never sits on both sides. Within a
+// stratum the groups are ordered by the SHA-256 of salt and name and take turns,
+// tuning first. With two groups holding documented loops, each split gets one.
+func assignSplits(items []Item) map[string]string {
+	stratum := map[string]string{}
+	for _, it := range items {
+		s, ok := stratum[it.Group]
+		if !ok || rank(strataOrder, it.Stratum) < rank(strataOrder, s) {
+			stratum[it.Group] = it.Stratum
+		}
+	}
+	byStratum := map[string][]string{}
+	for g, s := range stratum {
+		byStratum[s] = append(byStratum[s], g)
+	}
 	out := map[string]string{}
-	for _, pairs := range byStratum {
-		key := func(p string) string {
-			h := sha256.Sum256([]byte(splitSalt + p))
+	for _, groups := range byStratum {
+		key := func(g string) string {
+			h := sha256.Sum256([]byte(splitSalt + g))
 			return hex.EncodeToString(h[:])
 		}
-		sort.Slice(pairs, func(i, j int) bool { return key(pairs[i]) < key(pairs[j]) })
-		for i, p := range pairs {
+		sort.Slice(groups, func(i, j int) bool { return key(groups[i]) < key(groups[j]) })
+		for i, g := range groups {
 			if i%2 == 0 {
-				out[p] = splitTuning
+				out[g] = splitTuning
 			} else {
-				out[p] = splitHeldOut
+				out[g] = splitHeldOut
 			}
 		}
 	}

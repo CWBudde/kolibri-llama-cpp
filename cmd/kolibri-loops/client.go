@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -170,6 +171,44 @@ type topEntry struct {
 	Logprob float64 `json:"logprob"`
 }
 
+// maxLogprob allows for float32 rounding of a probability at 1, which a greedy
+// loop reaches. Anything above it is not a log probability.
+const maxLogprob = 1e-4
+
+// checkLogprob refuses what cannot be a log probability.
+func checkLogprob(v float64) error {
+	if math.IsNaN(v) || v > maxLogprob {
+		return fmt.Errorf("log probability %g", v)
+	}
+	return nil
+}
+
+// decodeLogprob refuses a null or missing value. llama-server's JSON library
+// writes NaN as null, and Go would decode null into a float as 0, which reads as
+// probability 1. A NaN decode must stop a run, not score perfectly.
+func decodeLogprob(v *float64) (float64, error) {
+	if v == nil {
+		return 0, fmt.Errorf("log probability is null or missing, as the server writes NaN")
+	}
+	return *v, checkLogprob(*v)
+}
+
+func (e *topEntry) UnmarshalJSON(data []byte) error {
+	var a struct {
+		ID      int      `json:"id"`
+		Logprob *float64 `json:"logprob"`
+	}
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	lp, err := decodeLogprob(a.Logprob)
+	if err != nil {
+		return fmt.Errorf("candidate %d: %w", a.ID, err)
+	}
+	e.ID, e.Logprob = a.ID, lp
+	return nil
+}
+
 // tokenProb is one generated token with its log probability and the candidates
 // the server returned, most likely first. llama-server lists no entry for a
 // token that ends in an incomplete UTF-8 sequence, in `tokens` it does.
@@ -177,6 +216,23 @@ type tokenProb struct {
 	ID      int        `json:"id"`
 	Logprob float64    `json:"logprob"`
 	Top     []topEntry `json:"top_logprobs"`
+}
+
+func (p *tokenProb) UnmarshalJSON(data []byte) error {
+	var a struct {
+		ID      int        `json:"id"`
+		Logprob *float64   `json:"logprob"`
+		Top     []topEntry `json:"top_logprobs"`
+	}
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	lp, err := decodeLogprob(a.Logprob)
+	if err != nil {
+		return fmt.Errorf("token %d: %w", a.ID, err)
+	}
+	p.ID, p.Logprob, p.Top = a.ID, lp, a.Top
+	return nil
 }
 
 // completionResponse is what is kept of a /completion response.

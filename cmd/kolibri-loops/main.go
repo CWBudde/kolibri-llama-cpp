@@ -8,7 +8,9 @@
 // at a time, greedy with fixed settings and a seed, and writes one record per
 // prompt. It starts the server itself, or attaches to one with -url. A second
 // run with the same -out continues where the first stopped, and refuses if the
-// weight, the server binary, the chat template, the corpus or a setting moved.
+// weight, the server's code, its flags or environment, the chat template, the
+// corpus or a setting moved. A server attached with -url does not report its
+// flags, so its run resumes only with -attached-resume.
 //
 // report recomputes every number from the records alone. No weight is edited,
 // and no timing is taken.
@@ -65,6 +67,7 @@ func runMain(args []string) error {
 	fs.StringVar(&cfg.Model, "model", "", "the weight; hashed, and checked against the server's")
 	fs.StringVar(&cfg.Server, "server", "", "llama-server; started unless -url is set, always hashed")
 	fs.StringVar(&cfg.URL, "url", "", "a running llama-server, instead of starting -server")
+	fs.BoolVar(&cfg.AttachedResume, "attached-resume", false, "continue a -url run on the same server process; its flags cannot be compared")
 	fs.IntVar(&cfg.Port, "port", 0, "port of a started server; 0 picks a free one")
 	fs.IntVar(&cfg.Settings.NPredict, "n-predict", defaultNPredict, "tokens per prompt")
 	fs.IntVar(&cfg.Settings.NPredictThink, "n-predict-think", defaultNPredictThink, "tokens per prompt with thinking on")

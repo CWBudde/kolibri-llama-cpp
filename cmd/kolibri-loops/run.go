@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const recordSchema = 1
+const recordSchema = 2
 
 // Fixed settings of a baseline run. n_predict is longer with thinking on,
 // because the reasoning has to close before an answer can be scored.
@@ -49,18 +49,25 @@ type Settings struct {
 // Pins identify a run. Every record carries them, and a resume refuses a
 // directory whose pins differ in any field.
 type Pins struct {
-	Schema         int      `json:"schema"`
-	CorpusSHA256   string   `json:"corpus_sha256"`
-	CorpusItems    int      `json:"corpus_items"`
-	WeightPath     string   `json:"weight_path"`
-	WeightRealpath string   `json:"weight_realpath"`
-	WeightSize     int64    `json:"weight_size"`
-	WeightSHA256   string   `json:"weight_sha256"`
-	ServerRealpath string   `json:"server_realpath"`
-	ServerSHA256   string   `json:"server_sha256"`
-	ServerArgs     []string `json:"server_args"`
+	Schema         int    `json:"schema"`
+	CorpusSHA256   string `json:"corpus_sha256"`
+	CorpusItems    int    `json:"corpus_items"`
+	WeightPath     string `json:"weight_path"`
+	WeightRealpath string `json:"weight_realpath"`
+	WeightSize     int64  `json:"weight_size"`
+	WeightSHA256   string `json:"weight_sha256"`
+	ServerRealpath string `json:"server_realpath"`
+	ServerSHA256   string `json:"server_sha256"`
+	// ServerLibs maps each shared library next to the binary to its SHA-256. The
+	// llama-server binary is a small stub: the code is in these (serverLibs).
+	ServerLibs map[string]string `json:"server_libs"`
+	ServerArgs []string          `json:"server_args"`
+	// ServerEnv is what a started server inherits and reads as settings: the
+	// LLAMA_ and GGML_ variables, for example LLAMA_ARG_UBATCH.
+	ServerEnv []string `json:"server_env"`
 	// Attached means the server was already running: its binary is what -server
-	// named, which the tool cannot verify.
+	// named, and its flags and environment are unknown. The tool cannot verify
+	// either, and the server's API does not report the ubatch.
 	Attached bool     `json:"attached"`
 	Settings Settings `json:"settings"`
 
@@ -111,9 +118,29 @@ type LossPosition struct {
 	Target  int     `json:"target"`
 	Logprob float64 `json:"logprob"`
 	TopID   int     `json:"top_id"`
+	// Candidates is how many the server listed: the whole vocabulary, or no loss.
+	Candidates int `json:"candidates"`
 	// Bans is how many tokens had to be banned before the server listed a
 	// distribution (measureLoss).
 	Bans int `json:"bans,omitempty"`
+}
+
+func (p *LossPosition) UnmarshalJSON(data []byte) error {
+	type plain LossPosition
+	a := struct {
+		plain
+		Logprob *float64 `json:"logprob"`
+	}{}
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	lp, err := decodeLogprob(a.Logprob)
+	if err != nil {
+		return fmt.Errorf("target %d: %w", a.Target, err)
+	}
+	*p = LossPosition(a.plain)
+	p.Logprob = lp
+	return nil
 }
 
 // Record is one prompt's result. Everything a report states is computed from
@@ -135,7 +162,9 @@ type Record struct {
 	GeneratedTokens  []int           `json:"generated_tokens,omitempty"`
 	Content          string          `json:"content,omitempty"`
 	StopType         string          `json:"stop_type,omitempty"`
+	Truncated        bool            `json:"truncated"`
 	TokensEvaluated  int             `json:"tokens_evaluated,omitempty"`
+	TokensPredicted  int             `json:"tokens_predicted,omitempty"`
 	// Probs has one entry per generated token, null where the server listed none.
 	Probs     []*tokenProb   `json:"probs,omitempty"`
 	Positions []LossPosition `json:"positions,omitempty"`
@@ -149,7 +178,10 @@ type runConfig struct {
 	Server     string
 	ServerArgs []string
 	// URL is a running server's address; empty starts Server.
-	URL            string
+	URL string
+	// AttachedResume continues a -url run although the tool cannot compare the
+	// server's flags with the first part's.
+	AttachedResume bool
 	Port           int
 	Settings       Settings
 	Limit          int // stop after this many new records; 0 is no limit
@@ -185,7 +217,73 @@ func sha256String(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// staticPins hashes the weight and the server binary, so a mismatch is refused
+// isServerLib says whether a file next to the binary holds code the server can
+// load: a shared library, or the Metal library of a build that does not embed it.
+func isServerLib(name string) bool {
+	for _, suffix := range []string{".dylib", ".so", ".dll", ".metallib"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return strings.Contains(name, ".so.")
+}
+
+// serverLibs hashes the code next to the server binary, where a llama.cpp build
+// keeps its libraries and its rpath points. It takes every library there, because
+// a build's stub links most of them and a backend can load others at run time; a
+// rebuild that changes a library the server does not load therefore refuses a
+// resume too, which errs the right way. A link to a file in the same directory is
+// a build's versioned name, and its target is hashed under its own name. A link
+// that leaves the directory is hashed under the link's name, or that code would
+// not be pinned at all. A library loaded from any other path is not covered.
+func serverLibs(binary string) (map[string]string, error) {
+	dir, err := filepath.EvalSymlinks(filepath.Dir(binary))
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	libs := map[string]string{}
+	for _, e := range entries {
+		name := e.Name()
+		if !isServerLib(name) {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		switch {
+		case e.Type()&os.ModeSymlink != 0:
+			target, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return nil, fmt.Errorf("library link %s: %v", name, err)
+			}
+			if filepath.Dir(target) == dir {
+				continue
+			}
+		case !e.Type().IsRegular():
+			continue
+		}
+		if libs[name], err = hashFile(path); err != nil {
+			return nil, err
+		}
+	}
+	return libs, nil
+}
+
+// serverEnv lists the variables a started server reads as settings.
+func serverEnv() []string {
+	env := []string{}
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "LLAMA_") || strings.HasPrefix(kv, "GGML_") {
+			env = append(env, kv)
+		}
+	}
+	slices.Sort(env)
+	return env
+}
+
+// staticPins hashes the weight and the server's code, so a mismatch is refused
 // before any server starts.
 func staticPins(cfg runConfig, c *Corpus) (Pins, error) {
 	p := Pins{Schema: recordSchema, CorpusSHA256: c.SHA256, CorpusItems: len(c.Items), WeightPath: cfg.Model, ServerArgs: cfg.ServerArgs, Attached: cfg.URL != "", Settings: cfg.Settings}
@@ -210,6 +308,13 @@ func staticPins(cfg runConfig, c *Corpus) (Pins, error) {
 	}
 	if p.ServerSHA256, err = hashFile(p.ServerRealpath); err != nil {
 		return p, err
+	}
+	if p.ServerLibs, err = serverLibs(p.ServerRealpath); err != nil {
+		return p, err
+	}
+	p.ServerEnv = []string{}
+	if !p.Attached {
+		p.ServerEnv = serverEnv()
 	}
 	return p, nil
 }
@@ -409,6 +514,9 @@ func run(ctx context.Context, cfg runConfig) error {
 		if err := refuseMismatch(runPath(cfg.Out), *previous, pins, true); err != nil {
 			return err
 		}
+		if cfg.URL != "" && !cfg.AttachedResume {
+			return fmt.Errorf("refusing to resume: a server attached with -url does not report its flags, so a restarted one with another ubatch would pass; start the server with -server, or pass -attached-resume if this is the same server process")
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -550,7 +658,7 @@ func runItem(ctx context.Context, c *client, it Item, pins Pins) (*Record, error
 		return nil, err
 	}
 	r.ResolvedSettings, r.GeneratedTokens, r.Content, r.StopType = resp.GenerationSettings, resp.Tokens, resp.Content, resp.StopType
-	r.TokensEvaluated, r.Probs = resp.TokensEvaluated, aligned
+	r.Truncated, r.TokensEvaluated, r.TokensPredicted, r.Probs = resp.Truncated, resp.TokensEvaluated, resp.TokensPredicted, aligned
 	return r, nil
 }
 
@@ -628,6 +736,14 @@ func checkCompletion(req completionRequest, resp completionResponse) ([]*tokenPr
 		if len(p.Top) == 0 {
 			return nil, fmt.Errorf("token %d: no candidates", i)
 		}
+		if err := checkLogprob(p.Logprob); err != nil {
+			return nil, fmt.Errorf("token %d: %w", i, err)
+		}
+		for _, e := range p.Top {
+			if err := checkLogprob(e.Logprob); err != nil {
+				return nil, fmt.Errorf("token %d, candidate %d: %w", i, e.ID, err)
+			}
+		}
 		// A tie may list another token first, but then lists the generated one too.
 		tied := slices.ContainsFunc(p.Top, func(e topEntry) bool { return e.ID == p.ID && e.Logprob == p.Top[0].Logprob })
 		if t := p.Top[0]; t.ID != p.ID && !tied {
@@ -667,7 +783,7 @@ func measureLoss(ctx context.Context, c *client, r *Record) error {
 			if err := checkResolved(req, resp); err != nil {
 				return fmt.Errorf("position %d: %w", i, err)
 			}
-			r.Request, r.ResolvedSettings = body, resp.GenerationSettings
+			r.Request, r.ResolvedSettings, r.Truncated, r.TokensEvaluated = body, resp.GenerationSettings, resp.Truncated, resp.TokensEvaluated
 			if len(resp.Probs) > 0 {
 				break
 			}
@@ -685,7 +801,7 @@ func measureLoss(ctx context.Context, c *client, r *Record) error {
 		if k < 0 {
 			return fmt.Errorf("position %d: target %d is not among the candidates", i, target)
 		}
-		r.Positions = append(r.Positions, LossPosition{Target: target, Logprob: top[k].Logprob, TopID: top[0].ID, Bans: len(req.LogitBias)})
+		r.Positions = append(r.Positions, LossPosition{Target: target, Logprob: top[k].Logprob, TopID: top[0].ID, Candidates: len(top), Bans: len(req.LogitBias)})
 	}
 	return nil
 }

@@ -50,6 +50,7 @@ type fakeServer struct {
 	tokenizeOffset  int  // the tokenizer drifts
 	ignoreSeed      bool // the server resolves another seed
 	wrongThinkBlock bool // the template ignores reasoning_effort
+	nanLogits       bool // every log probability is null, as the server writes NaN
 }
 
 func newFake(modelPath string) *fakeServer {
@@ -161,6 +162,12 @@ func (f *fakeServer) complete(q completionRequest) map[string]any {
 	if f.ignoreSeed {
 		seed++
 	}
+	lpValue := func(v float64) any {
+		if f.nanLogits {
+			return nil
+		}
+		return v
+	}
 	settings := map[string]any{"seed": seed, "temperature": q.Temperature, "repeat_penalty": q.RepeatPenalty, "n_probs": q.NProbs, "samplers": q.Samplers}
 	var tokens []int
 	var probs []map[string]any
@@ -174,7 +181,7 @@ func (f *fakeServer) complete(q completionRequest) map[string]any {
 		lp := -math.Log(float64(f.nVocab))
 		top := make([]map[string]any, n)
 		for i := range top {
-			top[i] = map[string]any{"id": i, "token": "t", "bytes": []int{1}, "logprob": lp}
+			top[i] = map[string]any{"id": i, "token": "t", "bytes": []int{1}, "logprob": lpValue(lp)}
 		}
 		banned := map[int]bool{}
 		for _, b := range q.LogitBias {
@@ -186,7 +193,7 @@ func (f *fakeServer) complete(q completionRequest) map[string]any {
 		}
 		tokens = []int{first}
 		if !f.fragments[first] {
-			probs = []map[string]any{{"id": first, "token": "t", "bytes": []int{1}, "logprob": lp, "top_logprobs": top}}
+			probs = []map[string]any{{"id": first, "token": "t", "bytes": []int{1}, "logprob": lpValue(lp), "top_logprobs": top}}
 		}
 	} else {
 		tokens, stop = f.gen(q.Prompt, q.NPredict)
@@ -194,13 +201,13 @@ func (f *fakeServer) complete(q completionRequest) map[string]any {
 			if f.fragments[t] {
 				continue
 			}
-			top := []map[string]any{{"id": t, "logprob": -0.1}, {"id": t + 1, "logprob": -3.0}}
+			top := []map[string]any{{"id": t, "logprob": lpValue(-0.1)}, {"id": t + 1, "logprob": lpValue(-3.0)}}
 			lp := -0.1
 			if f.notGreedy {
 				top = []map[string]any{{"id": t + 1, "logprob": -0.1}, {"id": t, "logprob": -3.0}}
 				lp = -3.0
 			}
-			probs = append(probs, map[string]any{"id": t, "token": "t", "logprob": lp, "top_logprobs": top[:min(q.NProbs, 2)]})
+			probs = append(probs, map[string]any{"id": t, "token": "t", "logprob": lpValue(lp), "top_logprobs": top[:min(q.NProbs, 2)]})
 		}
 	}
 	var content strings.Builder

@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // seq repeats unit n times and appends the first part of unit up to tail tokens.
 func seq(unit []int, n, tail int) []int {
@@ -83,6 +86,14 @@ func TestDetectNearMisses(t *testing.T) {
 		{"a period past the cap", seq(unit(65), 3, 0)},
 		{"a run that ends before the last token", concat(distinct(1, 10), seq([]int{7}, 100, 0), distinct(200, 40))},
 		{"a loop broken by the very last token", concat(seq([]int{7}, 100, 0), []int{9})},
+		// the shape of "1. Berlin 2. Berlin 3. Berlin": the counter breaks the period
+		{"a numbered list of one word", func() []int {
+			var out []int
+			for i := range 64 {
+				out = append(out, 3000+i, 13, 7)
+			}
+			return out
+		}()},
 		{"counting with a repeated separator", func() []int {
 			var out []int
 			for i := range 100 {
@@ -99,6 +110,43 @@ func TestDetectNearMisses(t *testing.T) {
 	}
 }
 
+// Legitimate periodic output that the limit cuts off is a false positive of the
+// rule. It stands, because the rule cannot tell it from a loop by token IDs, and
+// docs/loop-baseline.md says so: a Markdown separator such as "|---|---|---" is
+// this shape if it tokenizes to a repeating pair.
+func TestDetectCountsPeriodicOutputAtTheLimit(t *testing.T) {
+	separator := concat(distinct(1, 40), seq([]int{5, 6}, 8, 0))
+	if got := FixedRule.Detect(separator, true); !got.Looping || got.Start != 40 || got.Period != 2 {
+		t.Fatalf("Detect = %+v", got)
+	}
+	if got := FixedRule.Detect(separator, false); got.Looping {
+		t.Fatalf("Detect after EOS = %+v", got)
+	}
+}
+
+// The limit censors detection: a loop counts only if it starts by
+// n - max(MinRegion, MinRepeats*p).
+func TestDetectCensoredByTheLimit(t *testing.T) {
+	const n = 256
+	for _, c := range []struct{ period, latest int }{
+		{1, n - 16},
+		{5, n - 16},
+		{6, n - 18},
+		{30, n - 90},
+		{64, n - 192},
+	} {
+		tail := func(start int) []int {
+			return concat(distinct(5000, start), seq(unit(c.period), n/c.period+1, 0))[:n]
+		}
+		if got := FixedRule.Detect(tail(c.latest), true); !got.Looping || got.Start != c.latest || got.Period != c.period {
+			t.Errorf("period %d from %d: Detect = %+v", c.period, c.latest, got)
+		}
+		if got := FixedRule.Detect(tail(c.latest+1), true); got.Looping {
+			t.Errorf("period %d from %d: Detect = %+v; want it censored", c.period, c.latest+1, got)
+		}
+	}
+}
+
 func TestDetectEOSEscapes(t *testing.T) {
 	tokens := seq([]int{7}, 200, 0)
 	if got := FixedRule.Detect(tokens, false); got.Looping {
@@ -110,6 +158,10 @@ func TestScoreAnswer(t *testing.T) {
 	berlin := &Answer{Accept: []string{"Berlin"}}
 	canberra := &Answer{Accept: []string{"Canberra"}, Reject: []string{"Sydney"}}
 	twelve := &Answer{Accept: []string{"12", "zwölf"}}
+	wall := &Answer{Accept: []string{"1989"}}
+	east := &Answer{Accept: []string{"east"}}
+	hundred := &Answer{Accept: []string{"100"}}
+	water := &Answer{Accept: []string{"H2O", "H₂O", "H_2O", "H_{2}O", `\text{H}_2\text{O}`, `\mathrm{H}_2\mathrm{O}`}}
 	for _, c := range []struct {
 		name    string
 		answer  *Answer
@@ -129,6 +181,16 @@ func TestScoreAnswer(t *testing.T) {
 		{"a number", twelve, formRaw, " 12.", scoreCorrect},
 		{"umlauts stay one word", twelve, formRaw, " zwölfte", scoreWrong},
 		{"a second term", twelve, formRaw, " zwölf", scoreCorrect},
+		{"a wrong year, then the right one", wall, formRaw, " 1961. Sie wurde 1961 gebaut und erst 1989 geöffnet.", scoreWrong},
+		{"a wrong direction, then the right one", east, formRaw, " west. Not in the east.", scoreWrong},
+		{"the first sentence decides", berlin, formRaw, " Berlin. Sie ist groß. Paris auch.", scoreCorrect},
+		{"a later line does not count", berlin, formRaw, " Paris\nBerlin", scoreWrong},
+		{"leading space is not a sentence", berlin, formRaw, "\n\n Berlin.", scoreCorrect},
+		{"a decimal is not a sentence end", hundred, formRaw, " etwa 99.9 oder 100 Grad.", scoreCorrect},
+		{"a long sentence is cut at the window", berlin, formRaw, strings.Repeat("x ", answerWindow) + " Berlin", scoreWrong},
+		{"the formula in LaTeX", water, formChat, "Die Formel ist $\\text{H}_2\\text{O}$.", scoreCorrect},
+		{"the formula as plain LaTeX", water, formChat, "Sie lautet $H_2O$.", scoreCorrect},
+		{"the first sentence after reasoning", berlin, formChatThink, "<think>hm</think>\n\nParis. Berlin.", scoreWrong},
 		{"reasoning does not count", berlin, formChatThink, "<think>Berlin?</think>\n\nParis", scoreWrong},
 		{"the answer after reasoning", berlin, formChatThink, "<think>hm</think>\n\nBerlin", scoreCorrect},
 		{"reasoning never closed", berlin, formChatThink, "<think>Berlin Berlin", scoreUnanswered},
@@ -137,6 +199,34 @@ func TestScoreAnswer(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := ScoreAnswer(c.answer, c.form, c.content); got != c.want {
 				t.Fatalf("ScoreAnswer = %q; want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// Mentioned is the occurrence rate accuracy is not: it counts what a later
+// sentence says, so a longer generation can move it.
+func TestAnswerMentioned(t *testing.T) {
+	wall := &Answer{Accept: []string{"1989"}}
+	canberra := &Answer{Accept: []string{"Canberra"}, Reject: []string{"Sydney"}}
+	for _, c := range []struct {
+		name    string
+		answer  *Answer
+		form    string
+		content string
+		want    bool
+	}{
+		{"no known answer", nil, formRaw, "1989", false},
+		{"after a wrong first answer", wall, formRaw, " 1961. Sie wurde 1961 gebaut und erst 1989 geöffnet.", true},
+		{"not at all", wall, formRaw, " 1961.", false},
+		{"nothing generated", wall, formRaw, " ", false},
+		{"a rejected term first", canberra, formRaw, "Sydney. Canberra.", false},
+		{"only in the reasoning", wall, formChatThink, "<think>1989</think>1961", false},
+		{"reasoning never closed", wall, formChatThink, "<think>1989", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := AnswerMentioned(c.answer, c.form, c.content); got != c.want {
+				t.Fatalf("AnswerMentioned = %v; want %v", got, c.want)
 			}
 		})
 	}
