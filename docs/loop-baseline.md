@@ -29,7 +29,7 @@ go run ./cmd/kolibri-loops report -out ~/models/eval/loop-baseline/iq3-cache128 
 
 `run` hashes the weight first, so it reads the whole file before the server starts. The same command continues an interrupted run.
 
-**Which build.** `-server` is whatever `build/bin` holds when the run starts. On 2026-11-07 that is `b11839-90311e5a2`, fork branch `feat/kolibri1-waves`: `feat/kolibri1` without its last commit, plus the Stage E4 waves code that left the patch series ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)). Waves need `--expert-cache-waves`, which the command does not pass, and on this build `--expert-cache 128` still logs "n_ubatch 512 capped to 21". Whether a build without that code gives the same tokens has not been measured. The pins record which build a run used, and a resume on another one is refused.
+**Which build.** `-server` is whatever `build/bin` holds when the run starts. On 2026-11-07 that is `b11839-90311e5a2`, fork branch `feat/kolibri1-waves`: `feat/kolibri1` without its last commit, plus the Stage E4 waves code that left the patch series ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)). Waves need `--expert-cache-waves`, which the command does not pass, and on this build `--expert-cache 128` still logs "n_ubatch 512 capped to 21". A build without that code gave the same tokens in every record: see [On the patch series](#on-the-patch-series). The pins record which build a run used, and a resume on another one is refused.
 
 ### What a run on this weight does not replace
 
@@ -221,7 +221,7 @@ The numbers start at M72 because M70 and M71 are taken by PR #72's controls in [
   - `--expert-cache 128`, `--fit off` and `-ngl 99` on the router fixture ran 3 prompts, with the server's log showing the ubatch capped to 21.
 
   This shows the tool works, and nothing about loops: random weights say nothing about Kolibri-1.
-- **The real weight:** one run; see [Results](#results). A second run on it, and so its repeatability there, has not been checked.
+- **The real weight:** two runs, one per build, with identical tokens in all 112 records; see [On the patch series](#on-the-patch-series). They differ in the build, so no run has been repeated on one build.
 
 ## Not done
 
@@ -238,9 +238,9 @@ One run on 2026-11-07, 112 of 112 records in a single pass, with no resume. It u
 **What this run is, and is not:**
 - **One quantized weight.** It does not replace BF16, and [the BF16 run remains a follow-up](#what-a-run-on-this-weight-does-not-replace).
 - **`--expert-cache 128` at ubatch 21.** `server.log` shows "n_ubatch 512 capped to 21". The documented runs used the default ubatch, and tokens from the two settings differ, so the control table informs and does not gate.
-- **The waves build.** `b11839-90311e5a2` is fork branch `feat/kolibri1-waves`, without passing `--expert-cache-waves`. Whether a build without that code gives the same tokens has not been measured.
+- **The waves build.** `b11839-90311e5a2` is fork branch `feat/kolibri1-waves`, without passing `--expert-cache-waves`. A run on `feat/kolibri1` [gave the same records](#on-the-patch-series) at these settings.
 - **No reference logits.** "p(first)" and "p(in loop)" are this run's own probabilities.
-- **Run once.** Repeatability was checked on tiny random weights only, not on this weight.
+- **Run once on this build.** The second run on this weight used [another build](#on-the-patch-series). Before it, repeatability had been checked on tiny random weights only.
 - **No timing.** The run took no timing, and none is published.
 - **Not done:** reference logits, BF16 and tool use; see [Not done](#not-done).
 - **A baseline only.** It says nothing about any intervention.
@@ -251,6 +251,30 @@ One run on 2026-11-07, 112 of 112 records in a single pass, with no resume. It u
 - **Inputs:** chat template SHA-256 `9ba35d4bd6baa26b66aa75d03a922dfee98b16bb1fa37481b195d247267b0f97`, corpus SHA-256 `722992046f85c1ac63394e954dd776239d08ad7a283b4117cdd1140bf36b2ddc`, vocabulary 128000.
 - **Decoding:** greedy, seed 42, `n_predict` 256 (768 with thinking on), `n_probs` 10.
 - **Counts:** 0 generated tokens without a listed probability, 0 bans while measuring the loss.
+
+### On the patch series
+
+The same command ran a second time, on `feat/kolibri1` at `b11839-634e34bb4`, which has no Stage E4 code, into a new directory: 112 of 112 records in a single pass from commit `6b04d16`, whose only changes after `65d1be4` are docs. Records, `report.json` and `server.log` are in `~/models/eval/loop-baseline/iq3-cache128-series`.
+
+**There is no difference. Every record's token IDs are the same, so there is no first differing token.**
+
+| Compared record by record, all 112 | Result |
+|---|---|
+| Generated token IDs, 16,862 tokens over 104 generations | equal |
+| Prompt token IDs, rendered prompts and all request bodies | equal |
+| `content`, stop type, resolved settings, truncation and token counts | equal |
+| Top 10 log probabilities per generated token | equal, as JSON numbers |
+| Log probabilities of the 8 texts' 273 loss positions | equal, as JSON numbers |
+| Pins | differ only in `server_realpath`, `server_sha256`, `server_libs` and `server_build_info` |
+| `kolibri-loops report`, text | differs only in the line that names the server |
+
+So all tables in this section hold for both builds. The series build's directory holds 9 libraries rather than 16, because only `llama-server` and `libllama` were built there. Its `server.log` shows the same "n_ubatch 512 capped to 21".
+
+**What this reaches:**
+- **The two builds at these settings:** this weight, `--expert-cache 128`, ubatch 21 and these 112 prompts. It says nothing about them resident or at another ubatch.
+- **Repeatability, in part.** These are two separate server processes, and any variation between them that changed a token or a stored log probability would show here. No such variation came up. They ran on two builds, and two runs are not a measured rate.
+
+The comparison is `~/models/eval/loop-baseline/iq3-cache128-series.compare.py`, and the report's text is next to it.
 
 ### Repetition
 
