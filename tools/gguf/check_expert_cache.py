@@ -33,6 +33,18 @@ the CPU its weights are not repacked (the slots are not either).
   --expert-cache-stats without the cache writes the decode timing alone; with a quote, a backslash and a tab in the
   model's file name the stats are still valid JSON and name the file.
 
+GPU remap (--expert-cache-gpu-remap): only on fork branch feat/kolibri1-gpu-remap, not yet in the patch
+series, so without it these checks are skipped with a note, and --gpu-remap-only is an error. The
+router's ids become slots on the GPU, with no CPU split: the logits must be bit-identical to the
+UNSPLIT resident run on Metal (Stage E2's requirement; a same-split reference would not do), and
+the counters equal the CPU remap's, since a gate defers but never changes what the remaps do. With
+fusion on the CPU remap can route differently, because its splits round differently; so the checks
+run once more under GGML_METAL_FUSION_DISABLE=1, where it routes alike and the counters must match
+exactly. Split control (M61): 2 scheduler splits per decoded token, as resident; and a pass that
+repeats earlier routing stops nowhere and costs what a resident token does (2 command buffers, 3
+commits). Metal commits: one per command buffer, plus 1 for each output copy. Requesting it where
+it cannot work fails to load: on the CPU, with some layers off Metal, and with prefetch.
+
 Waves (--expert-cache-waves): only on fork branch feat/kolibri1-waves, not in the patch series
 (patch 0013 is retired, docs/expert-streaming.md, "Stage E4"). Against a checkout without them the
 wave checks are skipped with a note, and --waves-only is an error. The prompt runs in one ubatch,
@@ -57,10 +69,12 @@ the page cache, since the resident run maps the whole file first.
     check_expert_cache.py --llama-cpp third_party/llama.cpp
     check_expert_cache.py --llama-cpp third_party/llama.cpp --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
     check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only   # the wave checks alone, on a waves build
+    check_expert_cache.py --llama-cpp third_party/llama.cpp-e2 --gpu-remap-only   # the GPU remap checks alone
 """
 
 import argparse
 import json
+import os
 import random
 import shutil
 import subprocess
@@ -95,6 +109,19 @@ def has_waves(r: Runner, llama_cpp: Path) -> bool:
     return header
 
 
+def has_gpu_remap(r: Runner, llama_cpp: Path) -> bool:
+    """Whether the checkout has --expert-cache-gpu-remap, by the same rule as has_waves: header and
+    library must agree, or gpu_remap=true would land in padding and silently compare the CPU remap
+    with itself."""
+    header = any(name == "gpu_remap" for name, _ in r.ffi.typeof("struct llama_expert_cache_params").fields)
+    path = llama_cpp / "build" / "bin" / ("libllama.dylib" if sys.platform == "darwin" else "libllama.so")
+    library = b"gpu_stops" in path.read_bytes()
+    if header != library:
+        raise SystemExit(f"{llama_cpp}: include/llama.h {'has' if header else 'has no'} expert cache field gpu_remap, "
+                         f"but {path.name} was built {'without' if header else 'with'} it: rebuild the checkout")
+    return header
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llama-cpp", type=Path, required=True, help="llama.cpp checkout with a built libllama")
@@ -103,6 +130,7 @@ def main() -> None:
     ap.add_argument("--tokens", type=Path, default=Path.home() / "models/eval/locality/coding.tokens.npy",
                     help="the token IDs of a locality workload, for --real")
     ap.add_argument("--waves-only", action="store_true", help="only the wave checks")
+    ap.add_argument("--gpu-remap-only", action="store_true", help="only the GPU remap checks")
     args = ap.parse_args()
     import numpy as np
 
@@ -112,6 +140,12 @@ def main() -> None:
         ap.error(f"--waves-only: {args.llama_cpp} has no expert cache waves; they need a build of fork branch feat/kolibri1-waves")
     if not waves_on:
         print(f"note: {args.llama_cpp} has no expert cache waves (fork branch feat/kolibri1-waves): skipping check_waves", flush=True)
+    gpu_remap_on = has_gpu_remap(r, args.llama_cpp)
+    if args.gpu_remap_only and not gpu_remap_on:
+        ap.error(f"--gpu-remap-only: {args.llama_cpp} has no GPU remap; it needs a build of fork branch feat/kolibri1-gpu-remap")
+    if not gpu_remap_on:
+        print(f"note: {args.llama_cpp} has no GPU remap (fork branch feat/kolibri1-gpu-remap): skipping check_gpu_remap", flush=True)
+    fusion_disabled = bool(os.environ.get("GGML_METAL_FUSION_DISABLE"))
     failed = 0
 
     def report(ok: bool, msg: str) -> None:
@@ -192,6 +226,151 @@ def main() -> None:
                            f"{(dec['metal_commits'] or 0) / max(dec['tokens'], 1):.2f} Metal commits; "
                            f"{s['process']['disk_bytes_read']} bytes read from disk)")
 
+    def check_gpu_remap(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
+                        n_layer: int, k: int, stats: Path, label: str) -> None:
+        """Stage E2: bit identity to the UNSPLIT resident run, with the CPU remap's counters."""
+        if not gpu_remap_on:
+            return
+        chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
+        same_fields = ("steps", "needed", "hits", "hits_loading", "misses", "evictions", "demand_bytes", "load_failures")
+        if not on_gpu(dev):
+            # it cannot work here, and a benchmark must not silently compare the CPU remap with itself
+            try:
+                r.logits(gguf, dev, tokens[:n_prompt], k, no_repack=True, expert_cache={"n_slots": 64, "gpu_remap": True})
+                report(False, f"{label} {dev_name}: GPU remap loaded on the CPU")
+            except RuntimeError:
+                report("needs every expert layer on Metal" in "".join(r.log), f"{label} {dev_name}: GPU remap fails to load, and says why")
+            return
+        for slots in slots_list:
+            ub = min(n_prompt, max(1, slots // k))
+            sizes = [ub] * (n_prompt // ub) + ([n_prompt % ub] if n_prompt % ub else [])
+            n_dec = len(tokens) - n_prompt + sum(n == 1 for n in sizes)
+            ref = r.logits(gguf, dev, tokens, ub, chunks=chunks, no_repack=True)
+            stats.unlink(missing_ok=True)
+            cpu_arm = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, expert_cache={"n_slots": slots, "stats_path": str(stats)})
+            c = json.loads(stats.read_text())
+            for buffered in (False, True):
+                what = f"{label} {dev_name}, GPU remap, {slots} slots, ubatch {ub}" + (", buffered" if buffered else "")
+                stats.unlink(missing_ok=True)
+                got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True,
+                               expert_cache={"n_slots": slots, "stats_path": str(stats), "buffered": buffered, "gpu_remap": True})
+                same = np.array_equal(got, ref)
+                diff = "" if same else f", max |diff| {float(np.abs(got - ref).max()):.3g}"
+                report(same, f"{what}: logits of {len(tokens)} positions bit-identical to the UNSPLIT resident run{diff}")
+                print(f"info {what}: max |diff| to the CPU remap {float(np.abs(got - cpu_arm).max()):.3g}")
+                s = json.loads(stats.read_text())
+                pre, dec = s["prefill"], s["decode"]
+                diffs = [f"{ph} {key} {x[key]} != {y[key]}" for ph, x, y in (("prefill", pre, c["prefill"]), ("decode", dec, c["decode"]))
+                         for key in same_fields if x[key] != y[key]]
+                # The CPU remap's splits round differently, and that can route an expert differently
+                # (E0.1), so its counters can only be held to these where its logits equal the
+                # unsplit run's; GGML_METAL_FUSION_DISABLE=1 removes the difference, and main runs
+                # these checks once more with it, which makes the comparison exact.
+                routes_alike = np.array_equal(cpu_arm, ref)
+                if fusion_disabled:
+                    report(routes_alike, f"{what}: without fusion the CPU remap equals the unsplit resident run")
+                strict = not diffs if routes_alike else all(pre[key] == c["prefill"][key] for key in ("steps", "needed")) \
+                    and all(dec[key] == c["decode"][key] for key in ("steps", "needed", "load_failures"))
+                report(strict and s["expert_cache"]["gpu_remap"] is True and c["expert_cache"]["gpu_remap"] is False,
+                       f"{what}: the stats record the mode, and the remaps' counters equal the CPU remap's "
+                       f"{'exactly' if routes_alike else 'as far as its different rounding lets them'} "
+                       f"(decode {dec['hits']} hits, {dec['misses']} misses, {dec['evictions']} evictions)" + (f": {diffs}" if diffs else ""))
+                # M61: no CPU split: 2 splits per decoded token, as resident
+                report(dec["tokens"] == n_dec and dec["splits"] == 2 * n_dec,
+                       f"{what}: {dec['splits'] / max(dec['tokens'], 1):.2f} scheduler splits per decoded token, want 2 (CPU remap: "
+                       f"{c['decode']['splits'] / max(c['decode']['tokens'], 1):.2f})")
+                # one commit per command buffer, 1 per output copy; a layer that hits adds none
+                runs, stops = dec["gpu_runs"], dec["gpu_stops"]
+                grown = 2 + len(bin(n_layer)) - 2
+                ok = dec["metal_commits"] == runs + n_dec and stops <= dec["misses"] and (dec["misses"] == 0 or stops > 0) \
+                    and 2 * n_dec <= runs <= 2 * n_dec + stops * grown
+                report(ok, f"{what}: {runs / max(n_dec, 1):.2f} command buffers and {stops / max(n_dec, 1):.2f} stops per decoded token, "
+                           f"{dec['metal_commits'] / max(n_dec, 1):.2f} commits (CPU remap {c['decode']['metal_commits'] / max(n_dec, 1):.2f}), "
+                           f"{1e3 * dec['wall_seconds'] / max(n_dec, 1):.3f} ms per token (not a result)")
+
+            # as a server decodes: the last layer of a prefill ubatch sees only the output rows
+            outs = list(range(n_prompt - 1, len(tokens)))
+            want = r.logits(gguf, dev, tokens, ub, chunks=chunks, no_repack=True, outputs=outs)
+            got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, outputs=outs, expert_cache={"n_slots": slots, "gpu_remap": True})
+            report(np.array_equal(got, want), f"{label} {dev_name}, GPU remap, {slots} slots, ubatch {ub}, only {len(outs)} output positions: logits bit-identical to the UNSPLIT resident run")
+
+        # what cannot work fails to load, instead of running the CPU remap
+        try:
+            r.logits(gguf, dev, tokens[:n_prompt], k, no_repack=True, expert_cache={"n_slots": 64, "gpu_remap": True, "prefetch_k": 8})
+            report(False, f"{label} {dev_name}: GPU remap with prefetch loaded")
+        except RuntimeError:
+            report("does not work with --expert-prefetch" in "".join(r.log), f"{label} {dev_name}: GPU remap with prefetch fails to load, and says why")
+        try:
+            r.logits(gguf, dev, tokens[:n_prompt], k, no_repack=True, n_gpu_layers=n_layer // 2, expert_cache={"n_slots": 64, "gpu_remap": True})
+            report(False, f"{label} {dev_name}: GPU remap with {n_layer // 2} of {n_layer} layers on Metal loaded")
+        except RuntimeError:
+            report("needs every expert layer on Metal" in "".join(r.log), f"{label} {dev_name}: GPU remap with some layers off Metal fails to load, and says why")
+
+    def check_gpu_remap_hits(gguf: Path, dev_name: str, dev, tokens: list[int], k: int, stats: Path, label: str, n_slots: int = 384) -> None:
+        """What a layer that hits costs (control M61): the same one-token decodes again after clearing
+        the KV cache route alike, so with every expert in a slot the last pass stops nowhere, and a
+        token takes the 2 scheduler splits, 2 command buffers and 3 commits of a resident token."""
+        if not gpu_remap_on or not on_gpu(dev):
+            return
+
+        def passes(n: int) -> dict:
+            stats.unlink(missing_ok=True)
+            devs = r.ffi.new("ggml_backend_dev_t[]", [dev, r.ffi.NULL])
+            ec = r.ffi.new("struct llama_expert_cache_params *", r.lib.llama_expert_cache_default_params())
+            ec.n_slots, ec.gpu_remap = n_slots, True
+            path = r.ffi.new("char[]", str(stats).encode())
+            ec.stats_path = path
+            model = r.lib.llama_model_load_from_file(str(gguf).encode(), r.ll.model_default_params(devices=devs, n_gpu_layers=-1, expert_cache=ec, use_extra_bufts=False))
+            ctx = r.lib.llama_init_from_model(model, r.ll.context_default_params(n_ctx=256, n_batch=1, n_ubatch=1, op_offload=False))
+            batch = r.lib.llama_batch_init(1, 0, 1)
+            for _ in range(n):
+                r.lib.llama_memory_clear(r.lib.llama_get_memory(ctx), True)
+                for i, t in enumerate(tokens):
+                    batch.token[0], batch.pos[0], batch.n_seq_id[0], batch.seq_id[0][0], batch.logits[0] = t, i, 1, 0, True
+                    batch.n_tokens = 1
+                    if r.lib.llama_decode(ctx, batch) != 0:
+                        raise RuntimeError("llama_decode failed: " + r.errors())
+            r.lib.llama_batch_free(batch)
+            r.lib.llama_free(ctx)
+            r.lib.llama_model_free(model)
+            return json.loads(stats.read_text())["decode"]
+
+        a, b = passes(3), passes(4)
+        n = len(tokens)
+        d = {key: b[key] - a[key] for key in ("tokens", "splits", "metal_commits", "gpu_runs", "gpu_stops", "hits", "misses", "needed")}
+        n_layer = a["needed"] // (3 * n * k)
+        report(d == {"tokens": n, "splits": 2 * n, "metal_commits": 3 * n, "gpu_runs": 2 * n, "gpu_stops": 0, "hits": n * n_layer * k, "misses": 0, "needed": n * n_layer * k},
+               f"{label} {dev_name}, GPU remap, all hits: a further pass of {n} tokens costs {d}, want 2 splits, 2 command buffers and 3 commits per token and no stop")
+
+    def check_gpu_remap_exact() -> None:
+        """The counters exactly: without fusion the CPU remap routes as the unsplit run does."""
+        if not gpu_remap_on or fusion_disabled:
+            return
+        sub = subprocess.run([sys.executable, __file__, "--llama-cpp", str(args.llama_cpp), "--seed", str(args.seed), "--gpu-remap-only"],
+                             capture_output=True, text=True, env={**os.environ, "GGML_METAL_FUSION_DISABLE": "1"})
+        n_pass = sub.stdout.count("\nPASS ")
+        report(sub.returncode == 0 and n_pass > 0, f"GPU remap with GGML_METAL_FUSION_DISABLE=1: {n_pass} checks passed, rc {sub.returncode}"
+               + ("" if sub.returncode == 0 else ": " + " | ".join(ln for ln in sub.stdout.splitlines() if ln.startswith("FAIL"))[:800]))
+
+    def check_gpu_remap_cli(base: list[str], gguf: Path, stats: Path, want: str) -> None:
+        """The option on the command line: it runs and says so in the stats, or the tool fails."""
+        stats.unlink(missing_ok=True)
+        run = subprocess.run(base + ["--expert-cache", "64", "--expert-cache-gpu-remap", "--expert-cache-stats", str(stats)],
+                             capture_output=True, text=True)
+        try:
+            mode = json.loads(stats.read_text())["expert_cache"]["gpu_remap"]
+        except (OSError, ValueError, KeyError) as e:
+            mode = str(e)
+        report(run.returncode == 0 and mode is True and run.stdout == want,
+               f"llama-completion --expert-cache-gpu-remap: the stats say gpu_remap {mode}, same text as resident -ub 2 ({run.stdout.strip()[:40]!r}), rc {run.returncode}")
+        # as a server starts: with its warmup decode
+        warm = subprocess.run([a for a in base if a != "--no-warmup"] + ["--expert-cache", "64", "--expert-cache-gpu-remap"], capture_output=True, text=True)
+        report(warm.returncode == 0 and warm.stdout == want, f"llama-completion --expert-cache-gpu-remap with the warmup decode: same text, rc {warm.returncode}")
+        for extra, msg, what in ((["-ngl", "0"], "needs every expert layer on Metal", "-ngl 0"),
+                                 (["--expert-prefetch", "8"], "does not work with --expert-prefetch", "--expert-prefetch 8")):
+            run = subprocess.run(base + ["--expert-cache", "64", "--expert-cache-gpu-remap"] + extra, capture_output=True, text=True)
+            report(run.returncode != 0 and msg in run.stderr, f"llama-completion --expert-cache-gpu-remap with {what} exits {run.returncode} and says why")
+
     def check_waves(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
                     n_layer: int, n_expert: int, k: int, stats: Path, label: str, grown: bool = False) -> None:
         if not waves_on:
@@ -242,12 +421,32 @@ def main() -> None:
             workload = [int(t) for t in np.load(args.tokens)]
             tokens = workload[:160]
             gpu = [(n, d) for n, d in r.devices() if r.lib.ggml_backend_dev_type(d) == r.lib.GGML_BACKEND_DEVICE_TYPE_GPU]
+            if args.gpu_remap_only:
+                check_gpu_remap(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
+                # 16 tokens' 96 experts per layer at most fit 128 slots, so a repeated pass stops nowhere
+                check_gpu_remap_hits(args.real, *gpu[0], tokens[:16], 6, stats, args.real.stem, n_slots=128)
+                print(f"{'FAIL' if failed else 'PASS'}: {failed} failures")
+                sys.exit(1 if failed else 0)
             if not args.waves_only:
                 check(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
+                check_gpu_remap(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
+                check_gpu_remap_hits(args.real, *gpu[0], tokens[:16], 6, stats, args.real.stem, n_slots=128)
             check_waves(args.real, *gpu[0], tokens, 128, [128, 64], 50, 384, 6, stats, args.real.stem)
             check_waves(args.real, *gpu[0], tokens[:40], N_GROWN_REAL, [18], 50, 384, 6, stats, f"{args.real.stem} grown waves", grown=True)
             # the benchmark's ubatch: on a real workload about a third of the layers' unions outgrow 4 waves of 61
             check_waves(args.real, *gpu[0], workload[:N_BENCH_UBATCH + 32], N_BENCH_UBATCH, [128], 50, 384, 6, stats, f"{args.real.stem} benchmark ubatch")
+        elif args.gpu_remap_only:
+            model = generate_tiny(Path(tmp), args.seed, "router")
+            cfg = json.loads((model / "config.json").read_text())
+            rng = random.Random(args.seed)
+            tokens = [rng.randrange(1000, 100000) for _ in range(N_PROMPT + N_DECODE)]
+            for outtype in ["f32", "q8_0"]:
+                gguf = convert(model, args.llama_cpp, outtype)
+                for dev_name, dev in r.devices():
+                    check_gpu_remap(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, cfg["num_hidden_layers"],
+                                    cfg["num_experts_per_tok"], stats, outtype)
+                    check_gpu_remap_hits(gguf, dev_name, dev, tokens[:N_PROMPT], cfg["num_experts_per_tok"], stats, outtype)
+            check_gpu_remap_exact()
         elif args.waves_only:
             model = generate_tiny(Path(tmp), args.seed, "router")
             cfg = json.loads((model / "config.json").read_text())
@@ -272,6 +471,8 @@ def main() -> None:
                     check(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
                     check_waves(gguf, dev_name, dev, tokens, N_PROMPT, WAVE_SLOTS, n_layer, cfg["num_experts"], k, stats, outtype)
                     check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], n_layer, cfg["num_experts"], k, stats, f"{outtype} grown waves", grown=True)
+                    check_gpu_remap(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
+                    check_gpu_remap_hits(gguf, dev_name, dev, tokens[:N_PROMPT], k, stats, outtype)
 
                 # fewer slots than one token's experts cannot work
                 try:
@@ -369,6 +570,9 @@ def main() -> None:
             report(ok and plain.stdout == cached.stdout and plain.stdout.strip() != "",
                    f"llama-completion --expert-cache-layers/--expert-prefetch/--expert-cache-buffered/--expert-cache-stats: as asked, same text as without the cache "
                    f"({plain.stdout.strip()[:60]!r})" + ("" if ok else f" rc {plain.returncode}/{cached.returncode}: {cached.stderr.strip()[-300:]}"))
+            if gpu_remap_on:
+                check_gpu_remap_cli(base, gguf, stats, plain.stdout)
+            check_gpu_remap_exact()
 
     print(f"{'FAIL' if failed else 'PASS'}: {failed} failures")
     sys.exit(1 if failed else 0)
