@@ -1,0 +1,118 @@
+{
+  "server_args": [
+    "-ngl",
+    "99",
+    "-t",
+    "10",
+    "-c",
+    "4096",
+    "-np",
+    "1",
+    "--fit",
+    "off"
+  ],
+  "prompt_first": 2048,
+  "n_predict": 128,
+  "cold": "coding",
+  "warm": [
+    "coding",
+    "research",
+    "hr",
+    "medtech"
+  ],
+  "configs": [
+    {
+      "name": "iq3-cache128-sidefile-gpuremap",
+      "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
+      "args": [
+        "--expert-cache",
+        "128",
+        "--expert-cache-sidefile",
+        "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf.experts",
+        "--expert-cache-gpu-remap"
+      ],
+      "ceilings_gib": [
+        16
+      ],
+      "reps": 3
+    },
+    {
+      "name": "iq3-cache128-prefetch12",
+      "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
+      "args": [
+        "--expert-cache",
+        "128",
+        "--expert-prefetch",
+        "12"
+      ],
+      "ceilings_gib": [
+        16
+      ],
+      "reps": 3
+    },
+    {
+      "name": "iq3-cache128-sidefile-prefetch12",
+      "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf",
+      "args": [
+        "--expert-cache",
+        "128",
+        "--expert-cache-sidefile",
+        "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf.experts",
+        "--expert-prefetch",
+        "12"
+      ],
+      "ceilings_gib": [
+        16
+      ],
+      "reps": 3
+    }
+  ],
+  "equivalence": [
+    {
+      "reference": "iq3-cache128-prefetch12",
+      "arms": [
+        "iq3-cache128-sidefile-prefetch12"
+      ],
+      "exact": true
+    }
+  ],
+  "gates": [
+    {
+      "ceiling_gib": 16,
+      "candidate": "iq3-cache128-sidefile-gpuremap",
+      "baselines": [
+        "iq3-cache128-sidefile-prefetch12",
+        "iq3-cache128-prefetch12"
+      ],
+      "metric": "decode",
+      "decides": true
+    },
+    {
+      "ceiling_gib": 16,
+      "candidate": "iq3-cache128-sidefile-gpuremap",
+      "baselines": [
+        "iq3-cache128-sidefile-prefetch12"
+      ],
+      "metric": "prefill",
+      "decides": false
+    },
+    {
+      "ceiling_gib": 16,
+      "candidate": "iq3-cache128-sidefile-gpuremap",
+      "baselines": [
+        "iq3-cache128-sidefile-prefetch12"
+      ],
+      "metric": "ttft",
+      "decides": false
+    },
+    {
+      "ceiling_gib": 16,
+      "candidate": "iq3-cache128-sidefile-prefetch12",
+      "baselines": [
+        "iq3-cache128-prefetch12"
+      ],
+      "metric": "decode",
+      "decides": false
+    }
+  ]
+}
