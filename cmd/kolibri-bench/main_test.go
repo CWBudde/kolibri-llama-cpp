@@ -716,12 +716,14 @@ func TestE4Matrix(t *testing.T) {
 	}
 }
 
-// TestE2Matrix keeps E2's two arms comparable with Stage D's and E4's cache (the
-// same workloads, model and slots), the second differing only by the GPU remap,
-// and fixes the gates as in the plan: decode by the Stage D rule at both ceilings.
-// The arms are not compared exactly: the CPU remap's splits round differently
-// from the unsplit graph the GPU remap keeps (docs/upstream.md, E0.1). Bit
-// identity to the unsplit resident run is check_expert_cache.py's.
+// TestE2Matrix keeps E2's arms comparable with Stage D's and E4's cache (the same
+// workloads, model and slots), the GPU arm differing only by the option, and fixes
+// what the plan asks for: decode by the Stage D rule at both ceilings, against the
+// best other cache arm, and token IDs exactly those of the resident run in the same
+// ubatches. Resident at 0 GiB is that reference, not a baseline: Stage D decided at
+// 16 GiB, where it does not fit, and E2's bar is Stage D's cache. The comparison
+// with the CPU remap stays INFO: its splits round differently from the unsplit
+// graph the GPU remap keeps (docs/upstream.md, E0.1).
 func TestE2Matrix(t *testing.T) {
 	d, e := loadMatrix(t, "../../testdata/bench/e4.json"), loadMatrix(t, "../../testdata/bench/e2.json")
 	if !slices.Equal(d.ServerArgs, e.ServerArgs) || d.PromptFirst != e.PromptFirst || d.NPredict != e.NPredict ||
@@ -736,29 +738,47 @@ func TestE2Matrix(t *testing.T) {
 	if !ok || !slices.Equal(arm.Args, append(slices.Clone(base.Args), "--expert-cache-gpu-remap")) || arm.Model != base.Model || arm.Server != base.Server {
 		t.Errorf("iq3-cache128-gpuremap differs by more than the option: %+v", arm)
 	}
-	if len(e.Configs) != 2 {
-		t.Errorf("%d configs, want the two arms", len(e.Configs))
+	// the other two as Stage D ran them
+	stageD := loadMatrix(t, "../../testdata/bench/expert-cache.json")
+	for _, name := range []string{"iq3-cache128-prefetch12", "iq3-resident-ub21"} {
+		c, ok := e.config(name)
+		want, _ := stageD.config(name)
+		if !ok || c.Model != want.Model || c.Server != want.Server || !slices.Equal(c.Args, want.Args) || !slices.Equal(c.Ceilings, want.Ceilings) || c.Reps != want.Reps {
+			t.Errorf("%s differs from Stage D's: %+v against %+v", name, c, want)
+		}
 	}
 	for _, c := range []config{base, arm} {
 		if !slices.Equal(c.Ceilings, []float64{0, 16}) || c.Reps != 3 {
 			t.Errorf("%s: ceilings %v, %d reps", c.Name, c.Ceilings, c.Reps)
 		}
 	}
+	if len(e.Configs) != 4 {
+		t.Errorf("%d configs, want the two arms, the prefetch baseline and the resident reference", len(e.Configs))
+	}
+	if n := len(e.expand()); n != 6+6+6+1 {
+		t.Errorf("%d runs, want 19", n)
+	}
 	var got []string
 	for _, g := range e.Gates {
 		got = append(got, fmt.Sprintf("%s %s %g %v %s", g.Candidate, g.Metric, g.CeilingGiB, g.Decides, strings.Join(g.Baselines, "+")))
 	}
 	want := []string{
-		"iq3-cache128-gpuremap decode 0 true iq3-cache128",
-		"iq3-cache128-gpuremap decode 16 true iq3-cache128",
+		"iq3-cache128-gpuremap decode 0 true iq3-cache128+iq3-cache128-prefetch12",
+		"iq3-cache128-gpuremap decode 16 true iq3-cache128+iq3-cache128-prefetch12",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("gates %q, want %q", got, want)
 	}
+	var eq []string
 	for _, q := range e.Equivalence {
-		if q.Exact {
-			t.Errorf("equivalence of %s is exact: the arms' graphs fuse differently", q.Reference)
-		}
+		eq = append(eq, fmt.Sprintf("%s %s %v", q.Reference, strings.Join(q.Arms, "+"), q.Exact))
+	}
+	wantEq := []string{
+		"iq3-resident-ub21 iq3-cache128-gpuremap true",
+		"iq3-cache128 iq3-cache128-gpuremap false",
+	}
+	if !slices.Equal(eq, wantEq) {
+		t.Errorf("equivalence %q, want %q", eq, wantEq)
 	}
 }
 
