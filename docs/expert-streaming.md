@@ -238,7 +238,7 @@ Bit identity with `np.array_equal` against a resident run at the same ubatch and
 
 ### Negative controls
 
-- **M50, wrong extent offsets:** the writer's table sends each expert to its neighbour's extent, with a valid checksum, so the load accepts it. All 56 side-file lines against the resident run fail (max |diff| up to 1.44), "FAIL: 139 failures", and the same-misses and pair checks fail with them.
+- **M50, wrong extent offsets:** the writer's table sends each expert to its neighbour's extent, with a valid checksum, so the load accepts it. All 56 side-file lines against the resident run fail (max |diff| up to 1.46), "FAIL: 139 failures", and the same-misses and pair checks fail with them.
 - **M51, a corrupt manifest**, on an APFS clone of the real side-file: a flipped table byte is refused at load ("table checksum mismatch", exit 1, no text generated), and `verify` reports it. One edited extent hash in the JSON manifest: `verify` reports "layer 7 expert 11: sha256 ..., the manifest says ...", exit 1.
 - **M52, the load without its checksum test:** `test-expert-cache` fails 3 checks, and the tiny check fails 2 ("FAIL: 2 failures").
 - **M53, `kolibri-bench` without the side-file's eviction:** `TestEvictSidefile` fails.
