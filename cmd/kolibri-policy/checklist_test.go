@@ -130,3 +130,29 @@ func TestChecklistOnlyWithPinnedOracles(t *testing.T) {
 		t.Fatalf("wrote %q", b.String())
 	}
 }
+
+func TestSharedFits(t *testing.T) {
+	model := func(sizes ...int64) Model {
+		m := Model{NExpert: 4}
+		m.Layers = make([]struct {
+			BytesPerExpert int64 `json:"bytes_per_expert"`
+		}, len(sizes))
+		for l, b := range sizes {
+			m.Layers[l].BytesPerExpert = b
+		}
+		return m
+	}
+	rs := func(m Model, budget int64, union int) []result {
+		return []result{{t: trace{m: m}, w: Workload{Unions: []UnionStats{{Max: union}},
+			PinnedOracles: []Runs{{Runs: []Run{{BudgetBytes: budget}}}}}}}
+	}
+	if n, ok := sharedFits(rs(model(2, 2), 8, 4)); !ok || n != 4 {
+		t.Fatalf("a union of 4 experts of 2 bytes in 8 bytes: %d, %v", n, ok)
+	}
+	if _, ok := sharedFits(rs(model(2, 2), 7, 4)); ok {
+		t.Fatal("a union over the budget fits")
+	}
+	if _, ok := sharedFits(rs(model(2, 3), 80, 4)); ok {
+		t.Fatal("experts of two sizes pass")
+	}
+}

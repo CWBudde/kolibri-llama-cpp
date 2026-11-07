@@ -243,6 +243,28 @@ func bestCausal(rs []result, s int) (string, tally) {
 	return name, best
 }
 
+// sharedFits returns the largest prefill union in rs, and whether all experts have one size and that
+// union fits the smallest shared budget of the replays, so that every step of a shared cache fits.
+func sharedFits(rs []result) (int, bool) {
+	largest := 0
+	for _, r := range rs {
+		for _, u := range r.w.Unions {
+			largest = max(largest, u.Max)
+		}
+	}
+	bytes := rs[0].t.m.bytes()
+	if len(bytes) == 0 || slices.Min(bytes) != slices.Max(bytes) {
+		return largest, false
+	}
+	var smallest int64 = math.MaxInt64
+	for _, p := range rs[0].w.PinnedOracles {
+		for _, run := range p.Runs {
+			smallest = min(smallest, run.BudgetBytes)
+		}
+	}
+	return largest, int64(largest)*bytes[0] <= smallest
+}
+
 // ofModel are the results of a model.
 func ofModel(results []result, model string) []result {
 	return slices.DeleteFunc(slices.Clone(results), func(r result) bool { return r.model != model })
@@ -304,13 +326,17 @@ func writeChecklist(w io.Writer, sizes []int, results []result, gatesP map[strin
 	fmt.Fprintf(w, "\n### The step-pinned oracles\n\nA pinned oracle is Belady's MIN, except that it never evicts or "+
 		"drops an expert of the running step while the step's union fits, so where every step fits it is a schedule "+
 		"a server could run. The plain oracle bounds such a schedule's bytes from below and the pinned one from "+
-		"above. With equal experts a unit test holds the pinned one to the optimum; a shared budget over layers of "+
-		"unequal sizes has no such test, so there the two only bracket it. A step that does not fit has no atomic "+
-		"schedule, and what does not fit is used once. So in prefill, where unions pass the budget, the pinned "+
-		"columns are not an atomic schedule either.\n\nWhole online replays, all workloads together, MB/token and "+
+		"above. Where experts have one size and every step fits, `TestPinnedOracleOptimal` finds the pinned one equal "+
+		"to the optimum, by exhaustive search on small random traces: a test, not a proof. A step that does not fit "+
+		"has no atomic schedule, and what does not fit is used once, so a per-layer pinned oracle is not an atomic "+
+		"schedule at budgets below the unions above.\n\nWhole online replays, all workloads together, MB/token and "+
 		"step evictions:\n")
 	for _, m := range models {
 		rs := ofModel(results, m)
+		if n, ok := sharedFits(rs); ok {
+			fmt.Fprintf(w, "\n%s: every expert has one size, and the largest union of any ubatch, %d experts, fits the "+
+				"shared budget at every size, so the pinned shared oracle is an atomic schedule throughout.\n", m, n)
+		}
 		fmt.Fprintf(w, "\n%s:\n\n| Experts per layer | Decode: oracle, shared † | Pinned † | Prefill: oracle, shared "+
 			"† | Pinned † | Oracle's step evictions, decode | Prefill | Pinned's, both phases |\n"+
 			"|--:|--:|--:|--:|--:|--:|--:|--:|\n", m)

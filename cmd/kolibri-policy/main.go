@@ -63,6 +63,8 @@
 //     in <dir>/cache-<model>.json of cmd/kolibri-cache at every size;
 //   - at every size, the shared oracle loads no more expert bytes than any policy and the per-layer
 //     oracle none more than the layer LRU;
+//   - at every size, the step-pinned oracles have no step evictions and load no less than the oracles
+//     they pin, and the references of Stage B's pinned gate have no step evictions in a test suffix;
 //   - at every size, the layer miss curves give the uniform layer LRU's per-layer decode misses, in
 //     the training prefix and in the test suffix;
 //   - for each horizon, the predictor as an online policy, learning from Use alone, replays exactly
