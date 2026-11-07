@@ -494,7 +494,7 @@ Bit identity with `np.array_equal` against a resident run at the same ubatch and
 
 The 30 benchmark runs do not test lossless. E4 has no resident arm, and its equivalence entry is `exact: false`. What they do show: waves, buffered waves and #25294 generate identical tokens to each other, 128 of 128 on all 5 request kinds, across all repetitions and ceilings (90 requests).
 
-The ubatch 512 case is on real routing, where a replay put 6 to 35% of the layers' unions above 244 experts, so waves should grow there. The check has no counter for grown waves, so it does not confirm that any grew in those 512 tokens.
+The ubatch 512 case is on real routing, where a replay put 6 to 35% of the layers' unions above 244 experts, so waves should grow there. Stage E7 did not reproduce that range, though unions above 244 do occur: 2.9 to 22.1% of steps per workload, 0 to 100% of a layer's full ubatches ([expert-predictor-result.md](expert-predictor-result.md), "Per-step union against capacity"). The check has no counter for grown waves, so it does not confirm that any grew in those 512 tokens.
 
 ### Negative controls
 
