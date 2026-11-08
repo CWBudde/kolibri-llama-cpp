@@ -49,7 +49,9 @@
 // Stage B's gate retains it only where it beats the best Stage A policy at that size. So does a
 // linear predictor (locality.Linear) fitted on the training prefix before its last answer's
 // decoded tokens and chosen and calibrated on those, then frozen, with its own measured cost
-// (-linear-us).
+// (-linear-us). Given -oracle-predictor-us, a perfect same-token predictor (locality.Perfect), an
+// oracle that knows the step it predicts, is replayed and judged there too at each declared cost:
+// Stage E6's bound on any predictor of that horizon (perfect.go). Without it nothing changes.
 //
 // For each model and workload it reads <dir>/<workload>.<model>.experts.npy and the token IDs
 // <dir>/<workload>.tokens.npy, and the answers' prompt lengths and generated tokens from
@@ -177,6 +179,8 @@ type Workload struct {
 	LastN         LastNGrid     `json:"last_n"`
 	Markov        []HorizonGrid `json:"markov"`
 	Linear        []LinearGrid  `json:"linear,omitempty"`
+	// Perfect is Stage E6's bound at every -oracle-predictor-us cost, in perfect.go; none by default.
+	Perfect []PerfectGrid `json:"perfect_same_token,omitempty"`
 	// PinnedOracles and Unions are Stage E7's, in checklist.go.
 	PinnedOracles []Runs `json:"pinned_oracles,omitempty"`
 	// HeldOutOracles bound a test suffix's decode alone, in checklist.go.
@@ -205,6 +209,7 @@ type Assumptions struct {
 	SLRUProtected          float64            `json:"slru_protected_fraction"`
 	HotnessHalfLife        int                `json:"hotness_half_life_tokens"`
 	HotnessHalfLives       []int              `json:"hotness_tuning_half_lives"`
+	PerfectSeconds         []float64          `json:"perfect_seconds_per_step,omitempty"`
 }
 
 // Output is <dir>/policy-<model>.json.
@@ -613,6 +618,7 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 	writeGate(w, "Stage A gate", stageAIntro, gates, modelsOf(results))
 	writeMarkov(w, a, links, sizes, d, results, gatesB)
 	writeLinear(w, a, links, sizes, d, results, gatesB)
+	writePerfect(w, links, sizes, results, gatesB)
 	writeGate(w, "Stage B gate", stageBIntro, gatesB, modelsOf(results))
 	writeE1(w, a, sizes, d, results)
 	writeChecklist(w, sizes, results, gatesP)
@@ -803,6 +809,8 @@ func main() {
 	splitsPath := flag.String("splits", "testdata/locality/splits.json", "the workloads' train/test splits")
 	detail := flag.Int("detail", 128, "the size the detail tables show")
 	layersFlag := flag.String("layers", "0,1,2,10,25,49", "the layers whose recall the report shows")
+	perfectUS := flag.String("oracle-predictor-us", "", "comma-separated costs per decoded layer step, µs, at "+
+		"which to judge a perfect same-token predictor at Stage B's gate (Stage E6's bound); off if empty")
 	md := flag.String("md", "", "write the Markdown report here")
 	outDir := flag.String("out", "", "write policy-<model>.json here instead of -dir, created if missing")
 	flag.Parse()
@@ -826,6 +834,10 @@ func main() {
 			"of -sizes, -predict-us and -linear-us finite and not negative")
 	}
 	cost, linearCost := *predictUS*1e-6, *linearUS*1e-6
+	perfectCosts, err := parseCosts(*perfectUS)
+	if err != nil {
+		log.Fatalf("-oracle-predictor-us: %v", err)
+	}
 	var splits SplitManifest
 	readJSON(*splitsPath, &splits)
 	hs := halfLives(*halfLife)
@@ -834,7 +846,7 @@ func main() {
 		LastN: lastNs, PredictSeconds: cost, MarkovHalfLives: markovHalfLives, MarkovMixes: markovMixes,
 		MarkovK: markovKs, LinearSeconds: linearCost, LinearL2s: linearL2s, LinearEpochs: linearEpochs,
 		LinearRate: linearRate, SLRUProtected: *slruProtected, HotnessHalfLife: *hotHalfLife,
-		HotnessHalfLives: hotnessHalfLives(*hotHalfLife)}
+		HotnessHalfLives: hotnessHalfLives(*hotHalfLife), PerfectSeconds: perfectCosts}
 	for _, l := range links {
 		a.LinkGBPerSecond[l.Name] = l.BytesPerSecond / 1e9
 	}
@@ -1020,6 +1032,12 @@ func main() {
 			w := Workload{Tokens: sel.Tokens, Answers: len(answers), Split: d, NoCache: noCache, Policies: runs,
 				TraceOrder: tr, LFUGrid: grid, HotnessGrid: hotGrid, LastN: lastN, Markov: markov, Linear: linear,
 				PinnedOracles: pinned, HeldOutOracles: heldOut, Unions: unions}
+			if len(perfectCosts) > 0 {
+				g := markov[slices.Index(horizons, locality.SameToken)]
+				if w.Perfect, err = perfectGrids(t, g.Params[g.Own], sizes, perfectCosts); err != nil {
+					log.Fatalf("%s %s: %v", name, wl, err)
+				}
+			}
 			for _, s := range spans {
 				if s.Phase == locality.Prefill {
 					w.Ubatches++
@@ -1063,6 +1081,9 @@ func main() {
 			}
 			fmt.Printf("CHECK %s: Stage B gate retains %s, against step-pinned references %s\n", m,
 				retainedCount(gatesB[m]), retainedCount(gatesP[m]))
+			for _, line := range perfectChecks(m, gatesB[m], perfectCosts) {
+				fmt.Println(line)
+			}
 		}
 	}
 	for _, name := range names {
@@ -1095,8 +1116,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		writeMarkdown(f, "go run ./cmd/kolibri-policy -models "+*models+" -md "+*md, a, links, sizes, *detail, layers,
-			results, gates, gatesB, gatesP)
+		command := "go run ./cmd/kolibri-policy -models " + *models
+		if *perfectUS != "" {
+			command += " -oracle-predictor-us " + *perfectUS
+		}
+		writeMarkdown(f, command+" -md "+*md, a, links, sizes, *detail, layers, results, gates, gatesB, gatesP)
 		if err := f.Close(); err != nil {
 			log.Fatal(err)
 		}

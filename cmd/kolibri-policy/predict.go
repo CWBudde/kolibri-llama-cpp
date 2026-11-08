@@ -269,7 +269,7 @@ func stageBGate(results []result, model string, sizes []int, links []string, a G
 	ref := bestOf(append([]GateEntry{a.Reference}, a.Policies...), "best Stage A policy")
 	var cands []heldOut
 	var only [][]int
-	for _, kind := range predictorKinds {
+	for _, kind := range stageBKinds(results) {
 		for hi, h := range horizons {
 			for li, l := range links {
 				c := heldOut{policy: predictorName(kind.name, h, l)}
