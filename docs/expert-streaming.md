@@ -1176,6 +1176,55 @@ These runs use the fork build `46fcc4069` with `-b 512`, wiki.valid, 20 × 512 t
 - **The matrix `testdata/bench/e5-skip.json` uses W = 0.2.** It is committed before both the KLD gate and its first run.
 - The results are in `~/models/eval/e5/tune/`, and the scripts in `~/models/eval/e5/tools/`.
 
+### Result (2026-11-08): the KLD gate passed, the speed gate did not; E5 does not pass
+
+**The KLD gate passed.** Both runs used fork build `46fcc4069`, the registered command, and the 20 `wiki.test` chunks against `kld-bf16-c512-n20.bin`, with the IQ3 GGUF and its side-file on the home volume. The limit is 1.10 × 0.095231 = 0.104754.
+
+| W | Mean KLD | Same top token | PPL(Q)/PPL(base) | Skipped experts per token | Misses per token |
+|---|---|---|---|---|---|
+| 0 | 0.095231 ± 0.007111 | 88.53 ± 0.45% | 1.025305 | 0 | 29.08 |
+| 0.2 | 0.099640 ± 0.007066 | 88.12 ± 0.45% | 1.020928 | 14.14 | 20.25 |
+
+- W = 0 re-measures the 0.095 that PLAN's proposed limit names.
+- At W = 0.2, KLD rises by 4.6%. The difference is within one standard error of either run.
+
+**The speed gate did not pass** (`testdata/bench/e5-skip.json`; 9 of 9 runs ok, 0 restarts, 16:44 to 17:18). The deciding arm was `decode-and-p95` at 16 GiB against side-file + GPU remap + spin, and the skip arm lost both halves:
+
+| Arm, 16 GiB | Warm decode t/s | Warm p95 ms | Decode ms/token | Wait | Remap | Other | Splits | Skipped per decoded token | Disk GB read |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| skip W = 0.2, CPU remap, spin | 21.74 (18.92–21.87) | 67.4 (64.7–74.6) | 46.59 | 6.21 | 0.59 | 39.52 | 102 | 15.60 | 299.3 |
+| side-file + GPU remap + spin (baseline) | 25.61 (25.56–26.39) | 60.9 (60.3–62.1) | 40.29 | 9.24 | 0.17 | 30.65 | 2 | 0 | 440.2 |
+| side-file, CPU remap, spin (same path) | 19.31 (18.70–19.92) | 75.2 (72.4–78.1) | 51.42 | 9.23 | 0.59 | 41.60 | 102 | 0 | 437.2 |
+
+- **Why it lost:** the skip cuts the wait by 3.0 ms per token against the same path, and the disk reads by 32%. It runs on the CPU remap, though, whose 102 splits per token cost about 9 ms more "other" than the GPU remap's 2. The wait it saves is smaller than the GPU remap's advantage.
+- **The margin is wide:** the skip arm's best repetition, 21.87 t/s and 64.7 ms, is below the baseline's slowest, 25.56 t/s and 60.3 ms.
+- **INFO, against the same-path lossless arm:** not passed. Skip repetition r2 decoded at 18.92 t/s with a p95 of 74.6 ms, slower than the same-path arm's best, 19.92 t/s and 72.4 ms. Others' CPU in that run peaked at 445%, the highest of the session. Without r2, the skip arm would win both halves (21.74 against 19.92 t/s; 67.4 against 72.4 ms). No gate allows dropping a run, so this is a fact, not a verdict.
+- **INFO, prefill and TTFT against the baseline:** passed. Warm prompt was 113.8 against 103.5 t/s; cold TTFT was 22.39 against 27.07 s.
+- **An equivalence line failed because the pre-registration was wrong, and the build is not at fault.**
+  - The GPU-remap baseline generated the same token IDs as resident `-ub 21` in 15 of 15 requests.
+  - The same-path arm differed in 4 of 5 requests in both repetitions, from tokens 0 to 29.
+  - The registration demanded exactness from a CPU-remap arm. Since E0.1, that arm's rounding is known to differ from the unsplit resident graph ("Stage E2 and E3 together" found the same 4 of 5).
+  - The same-path arm's text is identical in all 5 requests to E2E3's `iq3-cache128-sidefile/16g/r1`, a CPU-remap arm on build `24bd5385848a`. So with W = 0 this build generates what the lossless code generated before.
+  - The line stays as registered, with this explanation.
+- **Validity:**
+  - One server digest, `2fb7f5745f45`, for all 9 runs.
+  - Every eviction left 0 pages resident, and every run read the home volume.
+  - The runs were on AC power, with no sleep or wake between 16:44 and 17:18.
+  - Each run started with a load average of 1.80 to 2.79 and 5.5 GiB of swap. Others' CPU averaged 65 to 101% per run.
+  - The arms ran in a fixed order: skip, baseline, same path.
+
+**Checks on the final build:**
+- `test-expert-cache`: "all expert cache tests passed".
+- `check_expert_cache.py --skip-only`:
+  - tiny: 76 PASS, "PASS: 0 failures";
+  - `--real` IQ3 at 64 slots: "PASS: 0 failures". W = 0 and W = 1e-30 were bit-identical to the lossless run. W = 1 skipped 15.9% of the decode ids with consistent counters. The rank-2 metamorphic check was bit-identical.
+- The controls were each applied and then reverted:
+  - M107 (cutoff at rank 3): 4 FAIL lines in `test-expert-cache`;
+  - M108 (mask not applied): `--skip-only` exits with "FAIL: 12 failures", metamorphic max |diff| 1.38.
+  - M106 (rank by id position) and M109 (skipping a loading expert) failed `test-expert-cache` when the patch was written. They were not repeated on the final build.
+
+**What follows.** Patch 0018 stays proposed and is not merged, and the default stays lossless. The code is on fork branch `feat/kolibri1-lossy-skip` (`46fcc4069`). A skip inside the GPU remap would remove the CPU remap's cost. That was out of scope here and would need its own registration: the owner chose the best lossless arm as the baseline instead of building it.
+
 ## Limits
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
