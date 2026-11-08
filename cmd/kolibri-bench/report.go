@@ -37,11 +37,14 @@ type streamSummary struct {
 
 // cacheStats is the part of --expert-cache-stats the report uses. Without the
 // cache (patch 0012) expert_cache is null and decode has only the timing:
-// tokens, wall_seconds, splits and metal_commits.
+// tokens, wall_seconds, splits and metal_commits. A build that skips experts
+// (Stage E5) adds skip_weight to the header and skipped to each phase; an
+// older build writes neither, which leaves them nil.
 type cacheStats struct {
 	ExpertCache *struct {
-		Buffered bool    `json:"buffered"`
-		Sidefile *string `json:"sidefile"`
+		Buffered   bool     `json:"buffered"`
+		Sidefile   *string  `json:"sidefile"`
+		SkipWeight *float64 `json:"skip_weight"`
 	} `json:"expert_cache"`
 	Decode struct {
 		Needed       int64   `json:"needed"`
@@ -56,11 +59,13 @@ type cacheStats struct {
 		WallSeconds  float64 `json:"wall_seconds"`
 		Splits       int64   `json:"splits"`
 		MetalCommits *int64  `json:"metal_commits"`
+		Skipped      *int64  `json:"skipped"` // experts not computed (not prefetch_skipped)
 	} `json:"decode"`
 	Prefill struct {
-		Failures int64 `json:"load_failures"`
-		Loads    int64 `json:"loads"`
-		Preads   int64 `json:"preads"`
+		Failures int64  `json:"load_failures"`
+		Loads    int64  `json:"loads"`
+		Preads   int64  `json:"preads"`
+		Skipped  *int64 `json:"skipped"`
 	} `json:"prefill"`
 	Process struct {
 		DiskBytesRead    *int64 `json:"disk_bytes_read"`
@@ -150,6 +155,15 @@ func (s *cacheStats) split() (decodeSplit, bool) {
 		d.Commits = float64(*s.Decode.MetalCommits) / n
 	}
 	return d, true
+}
+
+// skippedPerToken is a run's skipped experts per decoded token; false if its
+// stats have no decoded tokens or do not count skips.
+func (s *cacheStats) skippedPerToken() (float64, bool) {
+	if s == nil || s.Decode.Tokens <= 0 || s.Decode.Skipped == nil {
+		return 0, false
+	}
+	return float64(*s.Decode.Skipped) / float64(s.Decode.Tokens), true
 }
 
 func median(v []float64) float64 {
@@ -300,7 +314,10 @@ func completed(m matrix, runs []runResult, cfg string, ceiling float64) (ok, wan
 //   - ttft: if every repetition's cold time to first token is below the
 //     baseline's lowest one;
 //   - decode-not-slower: if the candidate's median warm decode tokens/s is at
-//     least the baseline's slowest repetition.
+//     least the baseline's slowest repetition;
+//   - decode-and-p95: if both of decode's wins hold, against the same baseline
+//     (the highest median decode): every repetition faster than its fastest
+//     one, and every warm p95 below its lowest one.
 //
 // A config runs at a ceiling if all its repetitions completed and does not if
 // all were recorded as not fitting; anything else, missing or failed runs
@@ -354,6 +371,9 @@ func evalGate(m matrix, g gate, runs []runResult) verdict {
 		v.DecodeWin = slices.Min(v.Candidate) > slices.Max(v.Best)
 		v.TailWin = len(v.CandP95) > 0 && len(v.BestP95) > 0 && slices.Max(v.CandP95) < slices.Min(v.BestP95)
 		v.Pass = v.DecodeWin || v.TailWin
+		if g.Metric == "decode-and-p95" {
+			v.Pass = v.DecodeWin && v.TailWin
+		}
 	}
 	return v
 }
@@ -559,6 +579,9 @@ func report(w io.Writer, m matrix, runs []runResult) bool {
 				result = fmt.Sprintf("%s: decode median %.2f against %s's slowest of %.2f (median %.2f, %.2f–%.2f) t/s", result, median(v.Candidate), v.Baseline,
 					slices.Min(v.Best), median(v.Best), slices.Min(v.Best), slices.Max(v.Best))
 			default:
+				if g.Metric == "decode-and-p95" {
+					result += ", needs both wins"
+				}
 				result = fmt.Sprintf("%s: decode %s against %s's %s t/s (win %v), p95 %s against %s ms (win %v)", result,
 					fmtRange(v.Candidate, 2), v.Baseline, fmtRange(v.Best, 2), v.DecodeWin, fmtRange(v.CandP95, 1), fmtRange(v.BestP95, 1), v.TailWin)
 			}
@@ -694,14 +717,16 @@ func buildCheck(w io.Writer, m matrix, runs []runResult) bool {
 // per token, and the memory beside it: the stats' lifetime peak
 // phys_footprint and the model file's pages in the page cache, at their peak
 // during the requests and after the server stopped. A page cache that keeps
-// the file is memory too, which the footprint does not show.
+// the file is memory too, which the footprint does not show. The last column
+// is the experts skipped per decoded token, the mean over the runs, blank for
+// a build that does not count them.
 func decodeTable(w io.Writer, m matrix, runs []runResult) {
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "| Config | Ceiling | Decode ms/token | Wait ms/token | Remap ms/token | Other ms/token | Splits/token | Commits/token | Max footprint GiB | Page cache peak GiB | Page cache end GiB |")
-	fmt.Fprintln(w, "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+	fmt.Fprintln(w, "| Config | Ceiling | Decode ms/token | Wait ms/token | Remap ms/token | Other ms/token | Splits/token | Commits/token | Max footprint GiB | Page cache peak GiB | Page cache end GiB | Skipped/token |")
+	fmt.Fprintln(w, "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
 	for _, c := range m.Configs {
 		for _, ceil := range c.Ceilings {
-			var wall, wait, remap, other, splits, commits, foot, pcPeak, pcEnd []float64
+			var wall, wait, remap, other, splits, commits, foot, pcPeak, pcEnd, skipped []float64
 			for _, r := range runs {
 				if r.Config != c.Name || r.CeilingGiB != ceil || r.Status != statusOK {
 					continue
@@ -722,10 +747,21 @@ func decodeTable(w io.Writer, m matrix, runs []runResult) {
 				if r.EndPageCacheMiB != nil {
 					pcEnd = append(pcEnd, *r.EndPageCacheMiB/1024)
 				}
+				if v, ok := r.Stats.skippedPerToken(); ok {
+					skipped = append(skipped, v)
+				}
 			}
-			fmt.Fprintf(w, "| %s | %g GiB | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", c.Name, ceil,
+			skipStr := "–"
+			if len(skipped) > 0 {
+				sum := 0.0
+				for _, v := range skipped {
+					sum += v
+				}
+				skipStr = fmt.Sprintf("%.3f", sum/float64(len(skipped)))
+			}
+			fmt.Fprintf(w, "| %s | %g GiB | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", c.Name, ceil,
 				fmtRange(wall, 2), fmtRange(wait, 2), fmtRange(remap, 3), fmtRange(other, 2), fmtRange(splits, 1), fmtRange(commits, 1),
-				fmtRange(foot, 1), fmtRange(pcPeak, 1), fmtRange(pcEnd, 1))
+				fmtRange(foot, 1), fmtRange(pcPeak, 1), fmtRange(pcEnd, 1), skipStr)
 		}
 	}
 }

@@ -399,6 +399,87 @@ func TestReportDecodeNotSlowerThreshold(t *testing.T) {
 	}
 }
 
+// decode-and-p95 (Stage E5's speed gate) needs both wins of the decode rule:
+// every repetition faster than the best baseline's fastest one, and every warm
+// p95 below that baseline's lowest one.
+func TestGateDecodeAndP95(t *testing.T) {
+	m := matrix{Configs: []config{
+		{Name: "skip", Ceilings: []float64{16}, Reps: 2},
+		{Name: "lossless", Ceilings: []float64{16}, Reps: 2},
+		{Name: "slow", Ceilings: []float64{16}, Reps: 2},
+	}}
+	runs := func(cfg string, dec [2]float64, tail [2]float64) []runResult {
+		return []runResult{
+			fakeRun(cfg, 16, 1, []float64{dec[0], dec[0]}, []float64{tail[0], tail[0]}, nil),
+			fakeRun(cfg, 16, 2, []float64{dec[1], dec[1]}, []float64{tail[1], tail[1]}, nil),
+		}
+	}
+	// the baselines: lossless is the best one (median decode 13 against 6), and
+	// slow has the lower p95, which must not count: the p95 is lossless's
+	baselines := slices.Concat(runs("lossless", [2]float64{12, 14}, [2]float64{90, 100}), runs("slow", [2]float64{5, 7}, [2]float64{40, 40}))
+	for _, tc := range []struct {
+		name               string
+		dec, tail          [2]float64
+		decodeWin, tailWin bool
+	}{
+		// (a) both win: 15 > 14 and 85 < 90
+		{"both win", [2]float64{15, 16}, [2]float64{80, 85}, true, true},
+		// (b) decode wins, the p95 does not: 90 is not below 90
+		{"decode only", [2]float64{15, 16}, [2]float64{80, 90}, true, false},
+		// (c) the p95 wins, decode does not: 14 is not faster than 14
+		{"p95 only", [2]float64{14, 16}, [2]float64{80, 85}, false, true},
+		// (d) neither
+		{"neither", [2]float64{10, 11}, [2]float64{95, 110}, false, false},
+	} {
+		all := slices.Concat(runs("skip", tc.dec, tc.tail), baselines)
+		g := gate{CeilingGiB: 16, Candidate: "skip", Baselines: []string{"slow", "lossless"}, Metric: "decode-and-p95", Decides: true}
+		v := evalGate(m, g, all)
+		pass := tc.decodeWin && tc.tailWin
+		if v.Baseline != "lossless" || v.DecodeWin != tc.decodeWin || v.TailWin != tc.tailWin || v.Pass != pass || v.Incomplete != "" {
+			t.Errorf("%s: verdict %+v, want lossless, decode win %v, p95 win %v, pass %v", tc.name, v, tc.decodeWin, tc.tailWin, pass)
+		}
+		// the decode rule on the same runs passes on either win
+		g.Metric = "decode"
+		if d := evalGate(m, g, all); d.Pass != (tc.decodeWin || tc.tailWin) {
+			t.Errorf("%s: decode verdict %+v, want pass %v", tc.name, d, tc.decodeWin || tc.tailWin)
+		}
+	}
+}
+
+// The decode-and-p95 line shows both sub-results with their numbers.
+func TestReportDecodeAndP95(t *testing.T) {
+	m := matrix{Cold: "coding", Warm: []string{"coding", "research"},
+		Configs: []config{
+			{Name: "skip", Ceilings: []float64{16}, Reps: 1},
+			{Name: "lossless", Ceilings: []float64{16}, Reps: 1},
+		},
+		Gates: []gate{{CeilingGiB: 16, Candidate: "skip", Baselines: []string{"lossless"}, Metric: "decode-and-p95", Decides: true}}}
+	runs := []runResult{
+		fakeRun("skip", 16, 1, []float64{15, 15}, []float64{95, 95}, nil),
+		fakeRun("lossless", 16, 1, []float64{12, 12}, []float64{90, 90}, nil),
+	}
+	var out strings.Builder
+	report(&out, m, runs)
+	want := "- GATE (decode-and-p95) skip at 16 GiB against the best of lossless: not passed, needs both wins: " +
+		"decode 15.00 against lossless's 12.00 t/s (win true), p95 95.0 against 90.0 ms (win false)"
+	if !strings.Contains(out.String(), want) {
+		t.Errorf("want %q in the report:\n%s", want, out.String())
+	}
+}
+
+func TestGateMetricValidation(t *testing.T) {
+	for _, metric := range []string{"", "decode", "prefill", "ttft", "decode-not-slower", "decode-and-p95"} {
+		if err := (matrix{Gates: []gate{{Metric: metric}}}).validate(); err != nil {
+			t.Errorf("metric %q: %v", metric, err)
+		}
+	}
+	for _, metric := range []string{"decode-or-p95", "p95", "Decode-and-p95"} {
+		if err := (matrix{Gates: []gate{{Metric: metric}}}).validate(); err == nil {
+			t.Errorf("an unknown gate metric %q is accepted", metric)
+		}
+	}
+}
+
 func TestReportCountsRequests(t *testing.T) {
 	m := matrix{Cold: "coding", Warm: []string{"coding"},
 		Configs: []config{
@@ -553,6 +634,36 @@ func TestDecodeSplit(t *testing.T) {
 	if w, ok := waves.split(); !ok || !near(w.Wall, 54) || !near(w.Other, 37.125) || w.Splits != 102 {
 		t.Fatalf("split with waves = %+v, %v", w, ok)
 	}
+	// a build that skips experts (Stage E5) counts them per phase, with the
+	// weight below which it skips in the header
+	var skip cacheStats
+	if err := json.Unmarshal([]byte(`{"expert_cache": {"buffered": false, "skip_weight": 0.05, "wait": "spin"},
+		"prefill": {"loads": 7, "skipped": 120, "prefetch_skipped": 3},
+		"decode": {"needed": 10, "skipped": 254, "prefetch_skipped": 9, "tokens": 635, "wall_seconds": 25.4}, "process": {}}`), &skip); err != nil {
+		t.Fatal(err)
+	}
+	if sw := skip.ExpertCache.SkipWeight; sw == nil || *sw != 0.05 {
+		t.Fatalf("skip_weight = %v, want 0.05", sw)
+	}
+	if s := skip.Decode.Skipped; s == nil || *s != 254 {
+		t.Fatalf("decode skipped = %v, want 254", s)
+	}
+	if s := skip.Prefill.Skipped; s == nil || *s != 120 {
+		t.Fatalf("prefill skipped = %v, want 120", s)
+	}
+	if got, ok := skip.skippedPerToken(); !ok || !near(got, 0.4) {
+		t.Fatalf("skipped per token = %v, %v; want 0.4", got, ok)
+	}
+	// an older build writes neither: absent, not zero
+	if cache.ExpertCache.SkipWeight != nil || cache.Decode.Skipped != nil || cache.Prefill.Skipped != nil {
+		t.Fatalf("stats without the skip keys: %v, %v, %v", cache.ExpertCache.SkipWeight, cache.Decode.Skipped, cache.Prefill.Skipped)
+	}
+	if _, ok := cache.skippedPerToken(); ok {
+		t.Fatal("stats without skipped give a skip count")
+	}
+	if _, ok := (*cacheStats)(nil).skippedPerToken(); ok {
+		t.Fatal("no stats give a skip count")
+	}
 	// Stage D's stats have no timing
 	var old cacheStats
 	if err := json.Unmarshal([]byte(`{"expert_cache": {}, "decode": {"wait_seconds": 9.2}}`), &old); err != nil {
@@ -580,12 +691,51 @@ func TestDecodeTable(t *testing.T) {
 	var out strings.Builder
 	decodeTable(&out, m, []runResult{r1, r2, {Config: "old", Rep: 1, Status: statusOK}})
 	for _, want := range []string{
-		"| res | 0 GiB | 16.50 (16.50–16.50) | 0.00 (0.00–0.00) | 0.000 (0.000–0.000) | 16.50 (16.50–16.50) | 2.0 (2.0–2.0) | 3.0 (3.0–3.0) | 2.0 (2.0–2.0) | 4.0 (4.0–4.0) | 1.0 (1.0–1.0) |",
-		"| old | 0 GiB | – | – | – | – | – | – | – | – | – |",
+		"| res | 0 GiB | 16.50 (16.50–16.50) | 0.00 (0.00–0.00) | 0.000 (0.000–0.000) | 16.50 (16.50–16.50) | 2.0 (2.0–2.0) | 3.0 (3.0–3.0) | 2.0 (2.0–2.0) | 4.0 (4.0–4.0) | 1.0 (1.0–1.0) | – |",
+		"| old | 0 GiB | – | – | – | – | – | – | – | – | – | – |",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("decode table lacks %q:\n%s", want, out.String())
 		}
+	}
+}
+
+// The skipped experts per decoded token are the mean over a config's runs, and
+// blank for a build that does not count them.
+func TestDecodeTableSkipped(t *testing.T) {
+	m := matrix{Configs: []config{{Name: "skip", Ceilings: []float64{16}, Reps: 2}, {Name: "lossless", Ceilings: []float64{16}, Reps: 1}}}
+	run := func(cfg string, rep int, tokens int64, skipped *int64) runResult {
+		r := runResult{Config: cfg, CeilingGiB: 16, Rep: rep, Status: statusOK, Stats: &cacheStats{}}
+		r.Stats.Decode.Tokens, r.Stats.Decode.WallSeconds, r.Stats.Decode.Skipped = tokens, 1, skipped
+		return r
+	}
+	s1, s2, zero := int64(100), int64(300), int64(0)
+	var out strings.Builder
+	// 100/400 and 300/500 tokens: a mean of (0.25 + 0.6) / 2
+	decodeTable(&out, m, []runResult{run("skip", 1, 400, &s1), run("skip", 2, 500, &s2), run("lossless", 1, 400, nil)})
+	if !strings.Contains(out.String(), "| Skipped/token |") {
+		t.Errorf("decode table lacks the skip column:\n%s", out.String())
+	}
+	for _, want := range []string{"| skip | 16 GiB |", "| lossless | 16 GiB |"} {
+		i := strings.Index(out.String(), want)
+		if i < 0 {
+			t.Fatalf("decode table lacks %q:\n%s", want, out.String())
+		}
+		line, _, _ := strings.Cut(out.String()[i:], "\n")
+		cells := strings.Split(strings.Trim(line, "| "), " | ")
+		got, wantCell := cells[len(cells)-1], "0.425"
+		if want == "| lossless | 16 GiB |" {
+			wantCell = "–"
+		}
+		if got != wantCell {
+			t.Errorf("%s skipped/token %q, want %q", want, got, wantCell)
+		}
+	}
+	// a build that counts and skipped nothing shows 0
+	out.Reset()
+	decodeTable(&out, m, []runResult{run("skip", 1, 400, &zero), run("skip", 2, 500, &zero)})
+	if !strings.Contains(out.String(), " | 0.000 |") {
+		t.Errorf("no skips shows no zero:\n%s", out.String())
 	}
 }
 
