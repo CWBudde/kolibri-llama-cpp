@@ -105,7 +105,7 @@ type gate struct {
 }
 
 // gateMetrics are what a gate compares (evalGate has the rules).
-var gateMetrics = []string{"", "decode", "prefill", "ttft", "decode-not-slower"}
+var gateMetrics = []string{"", "decode", "prefill", "ttft", "decode-not-slower", "decode-and-p95"}
 
 // validate rejects what the report could not evaluate.
 func (m matrix) validate() error {
