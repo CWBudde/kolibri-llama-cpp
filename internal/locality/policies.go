@@ -399,6 +399,10 @@ func (a *ARC) Use(_ StepInfo, k int) {
 // cheap. ORACLE: it uses future knowledge and is an unattainable upper bound, not a baseline to
 // deploy. With unequal sizes dropping the furthest first is a heuristic, not a bound.
 //
+// That bound is on the bytes of the whole replay. A slice of it, a phase or a test suffix, is what
+// one schedule loads there and bounds nothing: a schedule may load more elsewhere to load less there.
+// NewHeldOutOracle bounds a test suffix's decode.
+//
 // The global Oracle holds budget bytes for all layers; the per-layer one capacity experts in every
 // layer, as LayerLRU. It must be replayed with the selections and spans it was built from.
 type Oracle struct {
@@ -413,6 +417,17 @@ type Oracle struct {
 	h       []keyHeap // per group, resident keys, furthest next use first
 	evict   []int
 	err     error
+	// pinned (NewPinnedOracle): the keys the running step has used are out of h, pins, and never
+	// evicted; pinBytes are their bytes per group and step the running step, plus one.
+	pinned   bool
+	pins     []int
+	pinBytes []int64
+	step     int
+	// held out (NewHeldOutOracle): costs says which accesses cost anything, by number. next ranks a key
+	// by its next access only if that costs, so a step's own experts need not rank first, and a
+	// pinned one pins stepKeys, every step's keys, when the step starts.
+	costs    []bool
+	stepKeys [][]int32
 }
 
 // NewOracle returns an Oracle of budget bytes shared by all layers, for Replay(sel, spans, ...).
@@ -422,11 +437,94 @@ func NewOracle(sel Selections, spans []Span, nExpert int, bytes []int64, budget 
 
 // NewLayerOracle returns an Oracle of capacity experts in every layer.
 func NewLayerOracle(sel Selections, spans []Span, nExpert int, bytes []int64, capacity int) *Oracle {
+	return newOracle(sel, spans, nExpert, bytes, layerBudgets(bytes, capacity), true)
+}
+
+func layerBudgets(bytes []int64, capacity int) []int64 {
 	budget := make([]int64, len(bytes))
 	for l, b := range bytes {
 		budget[l] = int64(capacity) * b
 	}
-	return newOracle(sel, spans, nExpert, bytes, budget, true)
+	return budget
+}
+
+// NewPinnedOracle is NewOracle that holds a step's experts together, as a server does (eviction.go):
+// it never evicts an expert the running step has used, and it keeps an expert it loads even when
+// that expert's next use is the furthest, as long as the step's experts fit. A step whose union does
+// not fit has no such schedule, and what does not fit is used once, as in the pinned LFU.
+//
+// So where every step fits this is a valid event-atomic schedule, and its bytes bound the
+// event-atomic optimum from above, as NewOracle's bound it from below. With experts of equal size
+// TestPinnedOracleOptimal holds it to that optimum; with a shared budget over layers of unequal
+// sizes it is only a bound.
+func NewPinnedOracle(sel Selections, spans []Span, nExpert int, bytes []int64, budget int64) *Oracle {
+	return pinnedOracle(newOracle(sel, spans, nExpert, bytes, []int64{budget}, false))
+}
+
+// NewPinnedLayerOracle is NewLayerOracle with NewPinnedOracle's pins.
+func NewPinnedLayerOracle(sel Selections, spans []Span, nExpert int, bytes []int64, capacity int) *Oracle {
+	return pinnedOracle(newOracle(sel, spans, nExpert, bytes, layerBudgets(bytes, capacity), true))
+}
+
+func pinnedOracle(o *Oracle) *Oracle {
+	o.pinned, o.pinBytes = true, make([]int64, len(o.budget))
+	return o
+}
+
+// NewHeldOutOracle is the Oracle of one objective: the decode misses of spans[cut:]. Every other
+// access costs nothing, so the training prefix and every prefill serve only to fill the cache. An
+// expert whose next access is free can be dropped for nothing, since that access brings it back, so
+// it ranks with those never used again; the others rank by next access, as in MIN. With equal expert
+// sizes no demand cache of the budget has fewer decode misses in the suffix, however it spent its
+// prefix and prefills. TestHeldOutOracleOptimal holds it to that by exhaustive search. A policy that
+// prefetches is not bound by it, since a prefetch in a prefill costs decode nothing.
+// ORACLE: an unattainable bound, looser than any schedule that also pays for what it loads elsewhere.
+func NewHeldOutOracle(sel Selections, spans []Span, cut, nExpert int, bytes []int64, budget int64) *Oracle {
+	o := newOracle(sel, spans, nExpert, bytes, []int64{budget}, false)
+	return o.heldOut(sel, spans, cut)
+}
+
+// NewHeldOutLayerOracle is NewHeldOutOracle with capacity experts in every layer.
+func NewHeldOutLayerOracle(sel Selections, spans []Span, cut, nExpert int, bytes []int64, capacity int) *Oracle {
+	o := newOracle(sel, spans, nExpert, bytes, layerBudgets(bytes, capacity), true)
+	return o.heldOut(sel, spans, cut)
+}
+
+// NewPinnedHeldOutOracle is NewHeldOutOracle that holds a step's experts together, as
+// NewPinnedOracle does. Where every step fits it is a valid event-atomic schedule, so its decode
+// misses in the suffix bound the event-atomic optimum from above, as NewHeldOutOracle's bound it from
+// below.
+func NewPinnedHeldOutOracle(sel Selections, spans []Span, cut, nExpert int, bytes []int64, budget int64) *Oracle {
+	return pinnedOracle(NewHeldOutOracle(sel, spans, cut, nExpert, bytes, budget))
+}
+
+// NewPinnedHeldOutLayerOracle is NewHeldOutLayerOracle with NewPinnedOracle's pins.
+func NewPinnedHeldOutLayerOracle(sel Selections, spans []Span, cut, nExpert int, bytes []int64, capacity int) *Oracle {
+	return pinnedOracle(NewHeldOutLayerOracle(sel, spans, cut, nExpert, bytes, capacity))
+}
+
+// heldOut narrows the objective to the decode of spans[cut:], numbering accesses as newOracle does.
+func (o *Oracle) heldOut(sel Selections, spans []Span, cut int) *Oracle {
+	needed := make([]int, sel.Layers*o.nExpert)
+	step := 0
+	for i, s := range spans {
+		for l := range sel.Layers {
+			step++
+			var keys []int32
+			for t := s.First; t < s.End && t < sel.Tokens; t++ {
+				for _, e := range sel.IDs[(l*sel.Tokens+t)*sel.K : (l*sel.Tokens+t+1)*sel.K] {
+					k := l*o.nExpert + int(e)
+					if needed[k] != step {
+						needed[k] = step
+						keys = append(keys, int32(k))
+						o.costs = append(o.costs, i >= cut && s.Phase == Decode)
+					}
+				}
+			}
+			o.stepKeys = append(o.stepKeys, keys)
+		}
+	}
+	return o
 }
 
 func newOracle(sel Selections, spans []Span, nExpert int, bytes []int64, budget []int64, perL bool) *Oracle {
@@ -460,12 +558,19 @@ func newOracle(sel Selections, spans []Span, nExpert int, bytes []int64, budget 
 	return o
 }
 
-// next is key k's next access, math.MaxInt for none.
-func (o *Oracle) next(k int) int {
-	if o.ptr[k] < len(o.uses[k]) {
-		return int(o.uses[k][o.ptr[k]])
+// next is what key k's next access is worth: its number, or math.MaxInt for none or for a free one.
+func (o *Oracle) next(k int) int { return o.rank(k, o.ptr[k]) }
+
+// rank is next(k) with key k's accesses before its i-th already run.
+func (o *Oracle) rank(k, i int) int {
+	if i >= len(o.uses[k]) {
+		return math.MaxInt
 	}
-	return math.MaxInt
+	a := int(o.uses[k][i])
+	if o.costs != nil && !o.costs[a] {
+		return math.MaxInt
+	}
+	return a
 }
 
 // Err reports a replay that did not follow the trace the Oracle was built from.
@@ -480,15 +585,53 @@ func (o *Oracle) group(k int) int {
 
 func (o *Oracle) size(k int) int64 { return o.bytes[k/o.nExpert] }
 
-func (o *Oracle) Prefetch(StepInfo) []int { return nil }
+// Prefetch releases the last step's pins; it prefetches nothing.
+func (o *Oracle) Prefetch(s StepInfo) []int {
+	if o.pinned && s.Index+1 != o.step {
+		o.step = s.Index + 1
+		for _, k := range o.pins {
+			heap.Push(&o.h[o.group(k)], k)
+		}
+		o.pins = o.pins[:0]
+		clear(o.pinBytes)
+		if o.costs != nil {
+			// next does not rank a free step's experts first, so hold them before anything loads
+			for _, k := range o.stepKeys[s.Index] {
+				o.pin(int(k))
+			}
+		}
+	}
+	return nil
+}
+
+// pin moves resident key k out of h, so that nothing evicts it in this step.
+func (o *Oracle) pin(k int) {
+	g := o.group(k)
+	if p := o.h[g].pos[k]; p >= 0 {
+		heap.Remove(&o.h[g], p)
+		o.pins = append(o.pins, k)
+		o.pinBytes[g] += o.size(k)
+	}
+}
 
 func (o *Oracle) Load(k int) []int {
 	o.evict = o.evict[:0]
 	g := o.group(k)
-	after := math.MaxInt // k's next access after the one it is loaded for
-	if o.ptr[k]+1 < len(o.uses[k]) {
-		after = int(o.uses[k][o.ptr[k]+1])
+	if o.pinned {
+		if o.pinBytes[g]+o.size(k) > o.budget[g] {
+			return append(o.evict, k) // the step's union does not fit: no atomic schedule exists
+		}
+		h := &o.h[g]
+		for o.cur[g]+o.size(k) > o.budget[g] {
+			v := heap.Pop(h).(int)
+			o.cur[g] -= o.size(v)
+			o.evict = append(o.evict, v)
+		}
+		heap.Push(h, k)
+		o.cur[g] += o.size(k)
+		return o.evict
 	}
+	after := o.rank(k, o.ptr[k]+1) // k's next access after the one it is loaded for
 	h := &o.h[g]
 	for o.cur[g]+o.size(k) > o.budget[g] {
 		if h.Len() == 0 || o.next(h.keys[0]) <= after {
@@ -504,12 +647,16 @@ func (o *Oracle) Load(k int) []int {
 }
 
 func (o *Oracle) Use(_ StepInfo, k int) {
-	if o.next(k) != o.access && o.err == nil {
+	if (o.ptr[k] >= len(o.uses[k]) || int(o.uses[k][o.ptr[k]]) != o.access) && o.err == nil {
 		o.err = fmt.Errorf("oracle: access %d is key %d, not the one the trace it was built from has there", o.access, k)
+	}
+	g := o.group(k)
+	if o.pinned {
+		o.pin(k)
 	}
 	o.access++
 	o.ptr[k]++
-	if p := o.h[o.group(k)].pos[k]; p >= 0 {
-		heap.Fix(&o.h[o.group(k)], p)
+	if p := o.h[g].pos[k]; p >= 0 {
+		heap.Fix(&o.h[g], p)
 	}
 }

@@ -189,7 +189,7 @@ func TestMarkdownLabelsOracle(t *testing.T) {
 	writeMarkdown(&b, "cmd", Assumptions{Ubatch: 512, DecodeTokensPerSecond: 63.7, PrefillTokensPerSecond: 1347,
 		LFUHalfLife: 512, LFUHalfLives: hs, SplitRule: "the rule.", SLRUProtected: 0.5, HotnessHalfLife: 512,
 		HotnessHalfLives: hotnessHalfLives(512)}, tinyTiming.Links, sizes, 2, []int{0, 1},
-		results, map[string]Gate{"tiny": g}, map[string]Gate{"tiny": gb})
+		results, map[string]Gate{"tiny": g}, map[string]Gate{"tiny": gb}, nil)
 	md := b.String()
 	for _, want := range []string{"| oracle, shared † |", "unattainable upper bound", "not a measurement",
 		"| ssd ms/token |", "| layer LRU | decode |", "| no cache | prefill |", "Held-out test suffix",
