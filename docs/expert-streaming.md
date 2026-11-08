@@ -578,7 +578,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4.json -out ~/models/eval/exp
 
 ## Stage E2: GPU remap
 
-Phase 11, Stage E2. `--expert-cache-gpu-remap` removes the scheduler split and CPU sync at every expert layer that hits. **This stage's own gate failed at 16 GiB, and patch 0015 stays retired. The option is now patch 0016, on top of the side-file, because E2 and E3 together passed their registered gates against prefetch ("Stage E2 and E3 together" below). It reaches `feat/kolibri1` through fork PR [#16](https://github.com/CWBudde/llama.cpp/pull/16) (`b001e946f`). The section below records E2 alone, at `0bb0f5444`.**
+Phase 11, Stage E2. `--expert-cache-gpu-remap` removes the scheduler split and CPU sync at every expert layer that hits. **This stage's own gate failed at 16 GiB, and patch 0015 stays retired. The option is now patch 0016, on top of the side-file, because E2 and E3 together passed their registered gates against prefetch ("Stage E2 and E3 together" below). It reaches `feat/kolibri1` through fork PR [#16](https://github.com/CWBudde/llama.cpp/pull/16) (`714f6bb42`, the benchmarked `b001e946f` plus a fix for draft models). The section below records E2 alone, at `0bb0f5444`.**
 
 ### Verdict
 
@@ -1007,7 +1007,7 @@ One disturbed repetition decided the 16 GiB result above, so the owner asked for
 
 ### The build
 
-Fork branch `feat/kolibri1-e2-e3`, commit `b001e946f`, merges `feat/kolibri1` (`c0b2de9be`, the series) and `feat/kolibri1-gpu-remap` (`abc6835f1`). Since 2026-11-08 it is also the head of fork PR #16: `feat/kolibri1-gpu-remap` was fast-forwarded to it, and `git diff c0b2de9be b001e946f` is patch 0016. Applying the series to `184f6536` gives its tree, `6b84facb`. `feat/kolibri1` stays at `c0b2de9be` until that PR is merged. The conflicts Known limits lists were all side-by-side additions: the two options, their fields and their stats keys. The features meet only in `load()`, where a side-file read replaces the three-part read of the GGUF. `check_expert_cache.py --stack-only` holds the stack to the unsplit resident run's logits and to the GPU remap's counters on the GGUF path.
+Fork branch `feat/kolibri1-e2-e3`, commit `b001e946f`, merges `feat/kolibri1` (`c0b2de9be`, the series) and `feat/kolibri1-gpu-remap` (`abc6835f1`). This build's tree is `6b84facb`. On 2026-11-08 `feat/kolibri1-gpu-remap`, the branch of fork PR #16, was fast-forwarded to it. The review then added one commit, `714f6bb42`: a draft model for speculative decoding inherited `--expert-cache-gpu-remap` without cache slots and failed to load, so the draft's params now clear the remap with the other cache settings. No benchmark here uses a draft model, so the code the matrices ran is unchanged. Patch 0016 is `git diff c0b2de9be 714f6bb42`, and applying the series to `184f6536` gives its tree, `1826ba42`. `feat/kolibri1` stays at `c0b2de9be` until that PR is merged. The conflicts Known limits lists were all side-by-side additions: the two options, their fields and their stats keys. The features meet only in `load()`, where a side-file read replaces the three-part read of the GGUF. `check_expert_cache.py --stack-only` holds the stack to the unsplit resident run's logits and to the GPU remap's counters on the GGUF path.
 
 ### Open decisions
 

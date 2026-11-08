@@ -491,9 +491,10 @@ in this PR's merge. The next patch was 0016.
 
 **Patch 0016 is the GPU remap on top of the side-file (2026-11-08).** E2 and E3
 together passed their registered gates against prefetch, so the remap enters the
-series after all, now as `git diff c0b2de9be b001e946f`. Fork PR #16's branch was
-fast-forwarded to `b001e946f`, and a squash merge gives the series' tree. The next
-patch is 0017.
+series after all, now as `git diff c0b2de9be 714f6bb42`. Fork PR #16's branch was
+fast-forwarded to the benchmarked merge `b001e946f`, then got one fix from review:
+a draft model's params clear the remap with the other cache settings. A squash merge
+gives the series' tree. The next patch is 0017.
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's

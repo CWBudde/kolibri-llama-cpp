@@ -53,6 +53,18 @@ index d239d2450..9c4614195 100644
      llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
  
      bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 2fc8b46f0..af804a84d 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2585,6 +2585,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
+     result.expert_cache_layers.clear();
+     result.expert_cache_stats.clear();
+     result.expert_cache_sidefile.clear();
++    result.expert_cache_gpu_remap = false;
+ 
+     if (has_draft) {
+         // default to global devices value
 diff --git a/ggml/include/ggml-metal.h b/ggml/include/ggml-metal.h
 index 392a9a3c0..675c52439 100644
 --- a/ggml/include/ggml-metal.h
@@ -1155,7 +1167,7 @@ index 3952741b4..b18e24010 100644
  
      return result;
 diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
-index 2900fb100..ab95e8939 100644
+index 2900fb100..c4ca60773 100644
 --- a/tests/test-expert-cache.cpp
 +++ b/tests/test-expert-cache.cpp
 @@ -23,8 +23,10 @@
@@ -1294,7 +1306,25 @@ index 2900fb100..ab95e8939 100644
  
  static void test_top_k() {
      std::vector<int> out;
-@@ -912,6 +1032,8 @@ int main(int argc, char ** argv) {
+@@ -888,11 +1008,17 @@ static void test_draft_params() {
+     target.expert_cache        = 128;
+     target.expert_cache_layers = { 128, 64 };
+     target.expert_cache_stats  = "stats.json";
++    target.expert_cache_sidefile = "experts.side";
++    target.expert_cache_gpu_remap = true;
+     const common_params draft = common_base_params_to_speculative(target);
+     CHECK(draft.expert_cache == 0);
+     CHECK(draft.expert_cache_layers.empty());
+     CHECK(draft.expert_cache_stats.empty());
++    CHECK(draft.expert_cache_sidefile.empty());
++    // the remap without slots is refused at load, so the draft would not load
++    CHECK(!draft.expert_cache_gpu_remap);
+     CHECK(target.expert_cache == 128);
++    CHECK(target.expert_cache_gpu_remap);
+ }
+ 
+ int main(int argc, char ** argv) {
+@@ -912,6 +1038,8 @@ int main(int argc, char ** argv) {
      test_stress();
      test_concurrent_misses();
      test_preads_counted();
