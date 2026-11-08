@@ -486,7 +486,7 @@ def main() -> None:
                 s = json.loads(stats.read_text())
                 pre, dec = s["prefill"], s["decode"]
                 diffs = [f"{ph} {key} {x.get(key)} != {y.get(key)}" for ph, x, y in (("prefill", pre, c["prefill"]), ("decode", dec, c["decode"]))
-                         for key in same_fields if x[key] != y[key]]
+                         for key in same_fields if x.get(key) != y.get(key)]
                 # The CPU remap's splits round differently, and that can route an expert differently
                 # (E0.1), so its counters can only be held to these where its logits equal the
                 # unsplit run's; GGML_METAL_FUSION_DISABLE=1 removes the difference, and main runs
@@ -494,8 +494,8 @@ def main() -> None:
                 routes_alike = np.array_equal(cpu_arm, ref)
                 if fusion_disabled:
                     report(routes_alike, f"{what}: without fusion the CPU remap equals the unsplit resident run")
-                strict = not diffs if routes_alike else all(pre[key] == c["prefill"][key] for key in ("steps", "needed")) \
-                    and all(dec[key] == c["decode"][key] for key in ("steps", "needed", "load_failures"))
+                strict = not diffs if routes_alike else all(pre.get(key) == c["prefill"].get(key) for key in ("steps", "needed")) \
+                    and all(dec.get(key) == c["decode"].get(key) for key in ("steps", "needed", "load_failures"))
                 report(strict and s["expert_cache"]["gpu_remap"] is True and c["expert_cache"]["gpu_remap"] is False,
                        f"{what}: the stats record the mode, and the remaps' counters equal the CPU remap's "
                        f"{'exactly' if routes_alike else 'as far as its different rounding lets them'} "
