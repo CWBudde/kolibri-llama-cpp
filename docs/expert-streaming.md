@@ -1,6 +1,6 @@
 # Expert streaming: the runtime expert cache
 
-Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose deciding gates passed, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill". Stage E2's GPU remap alone failed its deciding gate at 16 GiB and passed at 0 GiB; it is in "Stage E2: GPU remap". The two together passed their registered gates, also against prefetch, so the GPU remap is patch 0016 on top of the side-file; that is in "Stage E2 and E3 together".
+Phase 10, Stage D, item 1: a bounded, byte-accounted cache of routed experts inside libllama (patch 0011, fork branch `feat/kolibri-expert-cache`). It is experimental and Kolibri only. Stage D was started by the user's decision (2026-10-14) although no predictor passed the offline gates of Stages A and B ([expert-policy.md](expert-policy.md)). This document covers the prototype and its correctness checks. The benchmark (item 2) and the gates (item 3) are in "Benchmark" below; the speeds before it are INFO, measured on a busy machine. Phase 11's one read per expert, whose deciding gates passed, is in "Stage E3: one read per expert". Phase 11's prefill experiment, whose code stays out of the patch series, is in "Stage E4: waves for prefill". Stage E2's GPU remap alone failed its deciding gate at 16 GiB and passed at 0 GiB; it is in "Stage E2: GPU remap". The two together passed their registered gates, also against prefetch, so the GPU remap is patch 0016 on top of the side-file; that is in "Stage E2 and E3 together". The spinning waiter, `--expert-cache-wait`, passed its gate on that build and is proposed as patch 0017; that is in "The spinning waiter".
 
 ## How it works
 
@@ -37,6 +37,7 @@ Options of every `common` tool (llama-cli, llama-completion, llama-server):
 | `--expert-cache-buffered` | read misses through the page cache instead of with `F_NOCACHE` (macOS; default off, patch 0012) |
 | `--expert-cache-sidefile FNAME` | read misses from this side-file, one `pread` per expert; the load fails if its table does not match the model and the GGUF, with no fallback (patch 0014) |
 | `--expert-cache-gpu-remap` | map the router's ids to slots on the GPU, so a layer that hits needs no CPU split; Metal only, refused with `--expert-prefetch` (patch 0016, "Stage E2: GPU remap") |
+| `--expert-cache-wait MODE` | how the decode thread waits for loads: `sleep` (default), `spin`, `hybrid:US`, `qos` (patch 0017, "The spinning waiter") |
 
 ```sh
 B=third_party/llama.cpp/build/bin
@@ -1014,7 +1015,82 @@ Fork branch `feat/kolibri1-e2-e3`, commit `b001e946f`, merges `feat/kolibri1` (`
 These are the owner's. None is planned, and merging this write-up decides none of them.
 
 - Whether E6 starts, against the facts above.
-- Whether to try the spinning waiter that [expert-decode-gap.md](expert-decode-gap.md) measured, now on this build. It has not been run here.
+- Whether to try the spinning waiter that [expert-decode-gap.md](expert-decode-gap.md) measured, now on this build. It has not been run here. (2026-11-08) — Run as `--expert-cache-wait`; see "The spinning waiter".
+
+## The spinning waiter
+
+`--expert-cache-wait sleep|spin|hybrid:US|qos` chooses how the decode thread waits for the I/O threads' loads. Fork branch `feat/kolibri1-load-spin`, commit `06563b40c` on `feat/kolibri1` (`ceaa65b79`); main-repo patch 0017 is its diff. The owner asked for this run as part of the overnight plan of 2026-11-08; it is not one of PLAN's stages, and its gate was chosen for this run. **The gated candidate, `spin`, passed its deciding gate at 0 and 16 GiB. It costs about half again as much CPU time. The default stays `sleep`.**
+
+| Mode | What the waiting thread does between two checks of the same predicate, under the same lock |
+|---|---|
+| `sleep` (default) | sleeps on the condition variable the I/O threads notify, as before |
+| `spin` | releases the lock, busy-waits about 10 µs with a pause hint, takes the lock again |
+| `hybrid:US` | `spin` for at most US µs per remap call, then `sleep` |
+| `qos` | `sleep`, the waiting thread raised once to `QOS_CLASS_USER_INTERACTIVE` (Apple only) |
+
+Both of a remap's wait sites use it: the wait for its loads and the wait for a free slot. The teardown's `drain()` sleeps in every mode. The stats JSON's `expert_cache.wait` names the mode. It is the spin that [expert-decode-gap.md](expert-decode-gap.md) measured as an environment switch on another build, now an option on the series' build.
+
+### Checks
+
+- `test-expert-cache` (fork): `all expert cache tests passed`, with `test_wait_modes` (every mode loads the same experts into the same slots and ends; hybrid's budget) and `test_wait_arg` (the parser, refused values).
+- `check_expert_cache.py --wait-mode` (main repo) passes the mode to the cache runs only and checks the stats' `wait`: tiny with `spin`, `PASS: 0 failures`; real IQ3 `--stack-only` with `spin`, `hybrid:50` and `qos`, each `PASS: 0 failures` (`~/models/eval/e2e3-spin-screen/checks/`).
+- Controls, each applied, shown to fail and reverted: a spin that keeps the lock (the I/O threads cannot finish, and the test's timeout catches it), and a wait that returns before its loads are done (bit identity fails, max |diff| 0.963).
+
+### The screen (tuning, not evidence)
+
+Before the matrix, an untimed screen picked one candidate: the replay runner of [expert-decode-gap.md](expert-decode-gap.md), side-file and GPU remap, 128 slots, 0 GiB, 2 repetitions per mode in the order sleep, spin, hybrid:50, hybrid:200, qos and then reversed. Decode ms per token is the mean of passes 1 to 5; CPU ms per token is the server's CPU time from `ps` over the decode passes.
+
+| Mode | Decode ms/token (r1, r2) | Mean | CPU ms/token |
+|---|---|--:|--:|
+| `sleep` | 40.46, 41.01 | 40.74 | 68.2 |
+| `spin` | 34.37, 34.31 | **34.34** | 76.5 |
+| `hybrid:200` | 34.59, 34.89 | 34.74 | 61.5 |
+| `qos` | 41.30, 38.90 | 40.10 | 66.5 |
+| `hybrid:50` | 41.70, 41.35 | 41.52 | 70.7 |
+
+The rule, fixed in the plan before the screen: decode first, then CPU cost. `spin` was fastest and became the gated candidate. `hybrid:200` was 0.40 ms slower and used the least CPU, so the matrix runs it as an INFO arm. `qos` and `hybrid:50` were within about 1 ms of `sleep`.
+
+### The matrix
+
+`testdata/bench/e2e3-spin.json`, committed and pushed in `e0e769b` before the first timed run, not moved afterwards. One binary for every arm: the fork build of `06563b40c` (`third_party/llama.cpp-spin`), so the baseline is the same binary in its default `sleep` mode. 0 and 16 GiB.
+
+- **Deciding:** `spin` against `sleep`, by the Stage D rule at each ceiling (every repetition's decode tokens/s above the baseline's fastest, or every warm p95 below its lowest), 3 repetitions each. It passes only if both ceilings pass.
+- **Exact:** the cache arms' token IDs equal the resident run's at `-ub 21`, and every other arm's equal `sleep`'s.
+- **INFO:** prefill and cold TTFT of `spin`; `spin` with `--expert-cache-threads 8` (prefill); `hybrid:200` (decode); 2 repetitions each.
+
+**21 of 21 runs ok, 0 restarts**, 03:17 to 04:31, on AC, with no sleep or wake in `pmset -g log`; the weight and the side-file were on the home volume. 80 of 80 and 70 of 70 requests generated the same token IDs as their references; 0 expert load failures; one pread per expert in every cache arm.
+
+| Ceiling | `spin` decode t/s, median (range) | `sleep` | Decode win | p95 win | Verdict |
+|---|--:|--:|---|---|---|
+| 0 GiB | 26.12 (25.84–26.24) | 24.77 (23.67–25.06) | yes | no: 59.2 (58.3–63.5) against 61.0 (59.9–67.0) ms | **passed** |
+| 16 GiB | 26.16 (26.03–26.51) | 23.65 (23.46–23.92) | yes | yes: 57.9 (55.6–60.3) against 65.5 (60.4–67.2) ms | **passed** |
+
+The medians are 5.5% (0 GiB) and 10.6% (16 GiB) above `sleep`'s, much less than the screen's 16% on a different workload and runner.
+
+INFO, medians:
+
+| Arm | Warm prompt t/s, 0 / 16 GiB | Cold TTFT s, 0 / 16 GiB | Decode t/s, 0 / 16 GiB | Server CPU s per run |
+|---|--:|--:|--:|--:|
+| `sleep` | 102.5 / 101.8 | 28.95 / 28.81 | 24.77 / 23.65 | 74–75 |
+| `spin` | 104.6 / 104.6 | 27.06 / 26.58 | 26.12 / 26.16 | 110–111 |
+| `spin`, 8 I/O threads | 105.4 / 106.2 | – | – | 116–117 |
+| `hybrid:200` | – | – | 25.72 / 24.99 | 76 |
+
+Server CPU is `server_cpu_seconds` (user + sys, from the server's exit status, new in `kolibri-bench` for this run) over the whole run: load, cold and warm requests, shutdown. `spin` costs about 48% more CPU time than `sleep` for 5–11% more decode speed. `hybrid:200` costs 2–3% more, and its slowest repetition also beat `sleep`'s fastest on decode at both ceilings, though not on p95; it was not a deciding arm, so this is no verdict on it.
+
+### Sustained decode (INFO)
+
+20 minutes of continuous decode with `spin` at 16 GiB (`~/models/eval/e2e3-spin-sustained/`): 170 requests of 256 tokens with `ignore_eos`, four short prompts in turn, `pmset -g therm` and the server's CPU time every 30 s.
+
+- Decode per 2-minute window: 37.82 to 38.91 t/s, with no trend. The short prompts make these speeds not comparable with the matrix.
+- `pmset -g therm`: "No thermal warning level has been recorded" and "No performance warning level has been recorded" in every sample.
+- Server CPU: 33 min 49 s in 20 min, on average 1.7 cores busy.
+- No baseline ran, so this says nothing about the speedup, only that `spin` did not throttle in 20 minutes on AC. Energy was not measured (`powermetrics` needs root).
+
+### Decisions for the owner
+
+- Whether to merge the fork PR and the main-repo PR for patch 0017. The default stays `sleep`, so merging changes no existing run.
+- Whether to make `spin` or `hybrid:200` the default in the Kolibri presets. `hybrid:200` was not gated.
 
 ## Limits
 
