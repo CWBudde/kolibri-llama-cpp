@@ -76,7 +76,8 @@ func perfectGrids(t trace, pad locality.MarkovParams, sizes []int, costs []float
 func perfectKind(cost float64) string { return fmt.Sprintf("perfect (oracle, %g µs)", 1e6*cost) }
 
 // stageBKinds are the predictors Stage B's gate judges: predictorKinds, then the oracle at every
-// cost the workloads of results have it at, for the same token only.
+// cost the workloads of results have it at, for the same token only, then the hidden-state
+// predictor likewise (hidden.go).
 func stageBKinds(results []result) []predictorKind {
 	kinds := slices.Clone(predictorKinds)
 	if len(results) == 0 {
@@ -91,7 +92,7 @@ func stageBKinds(results []result) []predictorKind {
 			return &w.Perfect[i].Prefetches
 		}})
 	}
-	return kinds
+	return append(kinds, hiddenKinds(results)...)
 }
 
 // perfectChecks are the CHECK lines of the oracle at Stage B's gate g: per cost, its rows retained.

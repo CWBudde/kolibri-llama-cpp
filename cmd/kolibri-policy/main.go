@@ -52,6 +52,11 @@
 // (-linear-us). Given -oracle-predictor-us, a perfect same-token predictor (locality.Perfect), an
 // oracle that knows the step it predicts, is replayed and judged there too at each declared cost:
 // Stage E6's bound on any predictor of that horizon (perfect.go). Without it nothing changes.
+// Given -hidden-state-dir and -hidden-state-us, Stage E6's hidden-state predictor
+// (locality.HiddenState), read from the capture files of tools/e6/capture_router.py, is replayed and
+// judged there too at each declared cost, with the recall of the capture files and the mapping check
+// against the perfect oracle (hidden.go); a model without a capture is not judged. Without them
+// nothing changes.
 //
 // For each model and workload it reads <dir>/<workload>.<model>.experts.npy and the token IDs
 // <dir>/<workload>.tokens.npy, and the answers' prompt lengths and generated tokens from
@@ -181,6 +186,11 @@ type Workload struct {
 	Linear        []LinearGrid  `json:"linear,omitempty"`
 	// Perfect is Stage E6's bound at every -oracle-predictor-us cost, in perfect.go; none by default.
 	Perfect []PerfectGrid `json:"perfect_same_token,omitempty"`
+	// Hidden, HiddenRecall and HiddenMapping are Stage E6's hidden-state predictor at every
+	// -hidden-state-us cost, in hidden.go; none by default or without a capture.
+	Hidden        []HiddenGrid   `json:"hidden_state_same_token,omitempty"`
+	HiddenRecall  []HiddenRecall `json:"hidden_state_recall,omitempty"`
+	HiddenMapping *MappingCheck  `json:"hidden_state_mapping_check,omitempty"`
 	// PinnedOracles and Unions are Stage E7's, in checklist.go.
 	PinnedOracles []Runs `json:"pinned_oracles,omitempty"`
 	// HeldOutOracles bound a test suffix's decode alone, in checklist.go.
@@ -210,6 +220,8 @@ type Assumptions struct {
 	HotnessHalfLife        int                `json:"hotness_half_life_tokens"`
 	HotnessHalfLives       []int              `json:"hotness_tuning_half_lives"`
 	PerfectSeconds         []float64          `json:"perfect_seconds_per_step,omitempty"`
+	HiddenStateDir         string             `json:"hidden_state_dir,omitempty"`
+	HiddenStateSeconds     []float64          `json:"hidden_state_seconds_per_step,omitempty"`
 }
 
 // Output is <dir>/policy-<model>.json.
@@ -619,6 +631,7 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 	writeMarkov(w, a, links, sizes, d, results, gatesB)
 	writeLinear(w, a, links, sizes, d, results, gatesB)
 	writePerfect(w, links, sizes, results, gatesB)
+	writeHidden(w, a, links, sizes, results, gatesB)
 	writeGate(w, "Stage B gate", stageBIntro, gatesB, modelsOf(results))
 	writeE1(w, a, sizes, d, results)
 	writeChecklist(w, sizes, results, gatesP)
@@ -811,6 +824,11 @@ func main() {
 	layersFlag := flag.String("layers", "0,1,2,10,25,49", "the layers whose recall the report shows")
 	perfectUS := flag.String("oracle-predictor-us", "", "comma-separated costs per decoded layer step, µs, at "+
 		"which to judge a perfect same-token predictor at Stage B's gate (Stage E6's bound); off if empty")
+	hiddenDir := flag.String("hidden-state-dir", "", "the capture files <workload>.<model>.pred-h1.npy, .pred-h2.npy "+
+		"and .experts.npy of tools/e6/capture_router.py, from which to judge the hidden-state predictor at Stage B's "+
+		"gate (Stage E6); off if empty, needs -hidden-state-us")
+	hiddenUS := flag.String("hidden-state-us", "", "comma-separated costs per decoded layer step, µs, at which to "+
+		"judge the hidden-state predictor (the gate's is 23); needs -hidden-state-dir")
 	md := flag.String("md", "", "write the Markdown report here")
 	outDir := flag.String("out", "", "write policy-<model>.json here instead of -dir, created if missing")
 	flag.Parse()
@@ -838,6 +856,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("-oracle-predictor-us: %v", err)
 	}
+	hiddenCosts, err := parseCosts(*hiddenUS)
+	if err != nil {
+		log.Fatalf("-hidden-state-us: %v", err)
+	}
+	if (*hiddenDir == "") != (len(hiddenCosts) == 0) {
+		log.Fatal("-hidden-state-dir and -hidden-state-us go together")
+	}
 	var splits SplitManifest
 	readJSON(*splitsPath, &splits)
 	hs := halfLives(*halfLife)
@@ -846,7 +871,8 @@ func main() {
 		LastN: lastNs, PredictSeconds: cost, MarkovHalfLives: markovHalfLives, MarkovMixes: markovMixes,
 		MarkovK: markovKs, LinearSeconds: linearCost, LinearL2s: linearL2s, LinearEpochs: linearEpochs,
 		LinearRate: linearRate, SLRUProtected: *slruProtected, HotnessHalfLife: *hotHalfLife,
-		HotnessHalfLives: hotnessHalfLives(*hotHalfLife), PerfectSeconds: perfectCosts}
+		HotnessHalfLives: hotnessHalfLives(*hotHalfLife), PerfectSeconds: perfectCosts,
+		HiddenStateDir: *hiddenDir, HiddenStateSeconds: hiddenCosts}
 	for _, l := range links {
 		a.LinkGBPerSecond[l.Name] = l.BytesPerSecond / 1e9
 	}
@@ -868,6 +894,16 @@ func main() {
 		}
 		var cache map[string]CacheSizes
 		readJSON(filepath.Join(*dir, "cache-"+name+".json"), &cache)
+		captured := false
+		if *hiddenDir != "" {
+			if captured, err = captureOf(*hiddenDir, name, strings.Split(*workloads, ",")); err != nil {
+				log.Fatalf("FAIL %v", err)
+			}
+			if !captured {
+				fmt.Printf("%s: no hidden-state capture in %s, the hidden-state predictor is not judged\n", short(name),
+					*hiddenDir)
+			}
+		}
 		grids[short(name)] = map[string]Grid{}
 		hotGrids[short(name)] = map[string]Grid{}
 		allCurves[short(name)] = map[string]curves{}
@@ -1038,6 +1074,13 @@ func main() {
 					log.Fatalf("%s %s: %v", name, wl, err)
 				}
 			}
+			if captured {
+				g := markov[slices.Index(horizons, locality.SameToken)]
+				if err := hiddenWorkload(&w, t, *hiddenDir, name, wl, g.Params[g.Own], sizes, at(sizes, *detail),
+					hiddenCosts); err != nil {
+					log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
+				}
+			}
 			for _, s := range spans {
 				if s.Phase == locality.Prefill {
 					w.Ubatches++
@@ -1084,6 +1127,11 @@ func main() {
 			for _, line := range perfectChecks(m, gatesB[m], perfectCosts) {
 				fmt.Println(line)
 			}
+			if len(hiddenKinds(ofModel(results, m))) > 0 {
+				for _, line := range hiddenChecks(m, gatesB[m], hiddenCosts) {
+					fmt.Println(line)
+				}
+			}
 		}
 	}
 	for _, name := range names {
@@ -1119,6 +1167,9 @@ func main() {
 		command := "go run ./cmd/kolibri-policy -models " + *models
 		if *perfectUS != "" {
 			command += " -oracle-predictor-us " + *perfectUS
+		}
+		if *hiddenDir != "" {
+			command += " -hidden-state-dir " + *hiddenDir + " -hidden-state-us " + *hiddenUS
 		}
 		writeMarkdown(f, command+" -md "+*md, a, links, sizes, *detail, layers, results, gates, gatesB, gatesP)
 		if err := f.Close(); err != nil {
