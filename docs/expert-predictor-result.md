@@ -319,6 +319,18 @@ Fixed and pushed before `tools/e6/capture_router.py` ran on the real model, and 
 - **Gated predictor.** `pred-h2`: block l+1's router applied to `l_out-(l-1)`. Before layer l of a decoded token it predicts layer l+1, the same step and the same lead (1) as the same-token predictors, with nothing known that they do not know at that point. `pred-h1` (block l's router on `l_out-(l-1)`) has lead 0 in the step model, is reported as INFO and is not gated.
 - **Rule.** Stage B's gate as written ([expert-policy.md](expert-policy.md), "Stage B gate"), on the decode of all IQ3 test suffixes together: k from 6, 12, 24, 48 (the capture's top-48 in score order), tuned per budget and link on the own training prefix, on the shared LRU, prefetched bytes counted as loaded, against the best Stage A policy at that budget. Retained at one budget or more on bytes or on a link's time is a pass; only a pass reopens runtime prefetch, and a pass does not start it.
 - **Cost.** One RMSNorm and one F32 matrix-vector product of 2560 × 384 per decoded layer step, plus the top-k. Measured before the replay, on Metal (`test-backend-ops perf`, `MUL_MAT` f32 m=384 n=1 k=2560) and on the CPU; the gate uses the larger of the two medians, rounded up to a whole µs. The rows at 0, 15 and 30 µs are INFO.
+- **Cost, measured (2026-11-08, before the capture):** medians of 3 runs of `test-backend-ops perf` (fork build `feat/kolibri1-load-spin`, cases added for the run and removed afterwards; `~/models/eval/e6/cost/perf.txt`), in µs per decoded layer step:
+
+  | Op | Metal | CPU |
+  |---|---|---|
+  | `MUL_MAT` f32, m=384 n=1 k=2560 | 6.37 | 10.30 |
+  | `RMS_NORM` f32, 2560 | 2.21 | 1.73 |
+  | `MUL` f32, 2560 (× `ffn_norm`) | 2.59 | 0.51 |
+  | `ADD` f32, 384 (+ `exp_probs_b`) | 1.89 | 0.48 |
+  | `TOP_K` f32, 384, k=48 | 9.55 | 2.13 |
+  | **Sum** | **22.61** | **15.15** |
+
+  **The gate uses 23 µs.** Per-op times inside a graph; a runtime predictor would also need the scores read back while the graph runs, which this does not include.
 - **Recall (INFO).** Recall at k = 6 and 12 of the actual Top-6, for `pred-h1` and `pred-h2`, on the Stage A test suffixes' decode and on all steps.
 - **Mapping check.** The replay's index mapping is checked against the perfect oracle: feeding the captured selections themselves through the file-backed predictor must give the oracle's rows exactly.
 - **If the capture's selections differ from the recorded ones** (MATCH fails: the recorded traces came from another llama.cpp build): the gate runs on the capture's own selections, with every Stage A policy and the shared LRU replayed on those, not on the recorded traces, and the agreement with the recorded selections (the share of layer steps with the same Top-6 set) reported with it. A predictor is never judged against a reference replayed on a different trace.
