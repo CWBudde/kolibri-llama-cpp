@@ -1,0 +1,33 @@
+{
+  "server_args": ["-ngl", "99", "-t", "10", "-c", "4096", "-np", "1", "--fit", "off"],
+  "prompt_first": 2048,
+  "n_predict": 128,
+  "cold": "coding",
+  "warm": ["coding", "research", "hr", "medtech"],
+  "configs": [
+    {"name": "iq3-cache128-sidefile-gpuremap-spin-waves", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128", "--expert-cache-sidefile", "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf.experts", "--expert-cache-gpu-remap", "--expert-cache-wait", "spin", "--expert-cache-waves"], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-cache128-sidefile-gpuremap-spin", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128", "--expert-cache-sidefile", "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf.experts", "--expert-cache-gpu-remap", "--expert-cache-wait", "spin"], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-cache128", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128"], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-moestream128", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "server": "pr25294", "args": ["--moe-stream-cache", "128s"], "ceilings_gib": [0, 16], "reps": 3},
+    {"name": "iq3-cache128-sidefile-gpuremap-spin-waves-buffered", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--expert-cache", "128", "--expert-cache-sidefile", "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf.experts", "--expert-cache-gpu-remap", "--expert-cache-wait", "spin", "--expert-cache-waves", "--expert-cache-buffered"], "ceilings_gib": [0, 16], "reps": 2},
+    {"name": "iq3-cpu-moe", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": ["--cpu-moe"], "ceilings_gib": [0, 16], "reps": 1},
+    {"name": "iq3-resident", "model": "~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf", "args": [], "ceilings_gib": [0], "reps": 1}
+  ],
+  "equivalence": [
+    {"reference": "iq3-resident", "arms": ["iq3-cache128-sidefile-gpuremap-spin-waves", "iq3-cache128-sidefile-gpuremap-spin-waves-buffered", "iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128", "iq3-cpu-moe"], "exact": false}
+  ],
+  "gates": [
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves", "baselines": ["iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128"], "metric": "prefill", "decides": true},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves", "baselines": ["iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128"], "metric": "prefill", "decides": true},
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves", "baselines": ["iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128"], "metric": "ttft", "decides": true},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves", "baselines": ["iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128"], "metric": "ttft", "decides": true},
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves", "baselines": ["iq3-cache128-sidefile-gpuremap-spin"], "metric": "decode-not-slower", "decides": true},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves", "baselines": ["iq3-cache128-sidefile-gpuremap-spin"], "metric": "decode-not-slower", "decides": true},
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves", "baselines": ["iq3-cpu-moe"], "metric": "prefill", "decides": false},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves", "baselines": ["iq3-cpu-moe"], "metric": "prefill", "decides": false},
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves-buffered", "baselines": ["iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128"], "metric": "prefill", "decides": false},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves-buffered", "baselines": ["iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128"], "metric": "prefill", "decides": false},
+    {"ceiling_gib": 0, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves-buffered", "baselines": ["iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128"], "metric": "ttft", "decides": false},
+    {"ceiling_gib": 16, "candidate": "iq3-cache128-sidefile-gpuremap-spin-waves-buffered", "baselines": ["iq3-cache128-sidefile-gpuremap-spin", "iq3-cache128", "iq3-moestream128"], "metric": "ttft", "decides": false}
+  ]
+}

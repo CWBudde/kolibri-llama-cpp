@@ -1225,6 +1225,42 @@ These runs use the fork build `46fcc4069` with `-b 512`, wiki.valid, 20 × 512 t
 
 **What follows.** By the stop rule, patch 0018 leaves the series and its number is retired (owner's decision, 2026-11-08); the default stays lossless. The code stays on fork branch `feat/kolibri1-lossy-skip` (`46fcc4069`), and fork PR #19 is closed unmerged. A skip inside the GPU remap would remove the CPU remap's cost. That was out of scope here: the owner chose the best lossless arm as the baseline instead of building it. It is parked as an open PLAN item and would need its own registration.
 
+## Stage E4 retry: waves on the series
+
+Phase 11, Stage E4, a second registration of E4's gate (owner's decision, 2026-11-08). E4's waves failed at 0 GiB on 2026-11-06 ("Stage E4: waves for prefill"), and that verdict stays recorded. The waves were built then on the GGUF path, with three reads per expert and the CPU remap. This retry rebases the same waves onto the series (side-file, GPU remap, spinning waiter) and runs E4's gate again, against the series' best arm as well.
+
+### Design
+
+- **Fork branch `feat/kolibri1-waves2`** from `feat/kolibri1` (`d5cc9763c`): the waves commit `90311e5a2` cherry-picked, its conflicts with the series resolved, and the semantics of "How waves work" unchanged.
+- **Prefill on the CPU remap with waves, decode on the GPU remap.** The GPU remap maps ids inside one Metal gate per layer and is capped at `slots / k` tokens, so it cannot run waves. Each graph chooses its path by its ubatch size: a ubatch of at most `slots / k` tokens takes the GPU remap as before, a larger one the CPU remap with waves. After a CPU graph every layer's GPU table is refreshed from the slots, since the waves evicted experts behind it.
+- **The side-file and the wait mode** apply unchanged: a wave's misses are read with one `pread` each, and waiting for a wave uses `--expert-cache-wait`.
+
+### Pre-registration
+
+Committed and pushed before the first timed run, and not moved afterwards.
+
+- **Matrix:** `testdata/bench/e4b.json`, E4's workloads and server arguments. 31 runs, run alone.
+  - Candidate `iq3-cache128-sidefile-gpuremap-spin-waves`: the series' best arm plus `--expert-cache-waves`. 0 and 16 GiB, 3 repetitions.
+  - Baselines, 0 and 16 GiB, 3 repetitions each: `iq3-cache128-sidefile-gpuremap-spin` (the series' best, E5's flags), `iq3-cache128` (Stage D, E4's flags) and `iq3-moestream128` (#25294, E4's flags and build).
+  - INFO: the candidate with `--expert-cache-buffered` (2 repetitions per ceiling), `--cpu-moe` (1 per ceiling, the 273 t/s reference of "on par") and resident at the default ubatch (0 GiB, 1).
+  - Every fork arm, the baselines included, runs on the one build of `feat/kolibri1-waves2`, so the arms differ only in their flags:
+
+    ```sh
+    go run ./cmd/kolibri-bench -matrix testdata/bench/e4b.json -out ~/models/eval/expert-bench-e4b \
+      -server third_party/llama.cpp-waves2/build/bin/llama-server \
+      -servers pr25294=third_party/llama.cpp-pr25294/build/bin/llama-server
+    ```
+
+- **Deciding gates, at 0 and at 16 GiB, all of which must pass** (E4's rule, `evalGate`):
+  - warm prefill: every candidate repetition above the fastest repetition of the best of the three baselines;
+  - cold TTFT: every candidate repetition below the lowest of the best of the three;
+  - decode not slower: the candidate's median warm decode at least the slowest repetition of the series' best arm.
+- **Lossless:** `check_expert_cache.py --waves-only`, tiny and real IQ3, "PASS: 0 failures".
+  - Waves, also with the side-file: bit identity to a resident run at the same ubatch and split, and with the side-file to the same waves on the GGUF path.
+  - Waves with the GPU remap: two prompts on waves, each followed by gated decodes. The logits at every position must be bit-identical to a resident run split after `ffn_moe_topk` only in the prompts' graphs. With Metal fusion turned off (`GGML_METAL_FUSION_DISABLE=1`, rerun automatically), they must also equal the same run without the GPU remap, and the decodes the unsplit resident run. The benchmark's equivalence entry is not exact: prefill runs on the CPU remap, whose splits round differently from the unsplit resident graph (E0.1).
+- **Controls**, numbered from M110: M110 leaves out the table refresh after a CPU graph; M111 sends a ubatch above `slots / k` down the gated path. Each must fail. M48 and M49 (strong form) are repeated on the new branch.
+- **If it passes,** the waves become patch 0019, proposed and not merged. **If not,** the stop rule applies again, and the code stays on the fork branch.
+
 ## Limits
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
