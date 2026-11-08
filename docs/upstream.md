@@ -394,7 +394,8 @@ applied to a clean `184f6536` gives exactly the fork's tree (`7ade40f0`).
 
 **Patch 0013 is retired (Phase 11, Stage E4, 2026-11-06).** Its gates failed at
 0 GiB, so the number is kept and the code stays on fork branch
-`feat/kolibri1-waves` (`90311e5a2`, fork PR #14, open and not merged). It never
+`feat/kolibri1-waves` (benchmarked at `90311e5a2`; fork PR #14 closed unmerged on
+2026-11-08, branch kept at `da53dfd25`). It never
 reached `feat/kolibri1`. At that date the next patch was 0014, and the series
 0008, 0010, 0011 and 0012 applied to a clean `184f6536` equalled
 `feat/kolibri1`'s tree (`7ade40f0`, `git diff --quiet` rc 0). The current tree
@@ -733,7 +734,7 @@ Collected 2026-11-07 from what is recorded on `main`, for the user to write from
 | #25294 | PR head `1248fd8fa` did not merge on master as of 2026-10-23. All numbers come from the port on `184f6536`, fork branch `ref/pr25294-on-184f6536` (`8a8ddf827`), with the PR's logic unchanged and only API changes, listed in its merge commit. **No number here comes from the PR head itself.** |
 | #29887 | as merged in `184f6536` |
 | Fork | `feat/kolibri1`: series 0008, 0010, 0011, 0012 for E0 to E2's baselines; 0014 was added by E3, and 0016 by E2 and E3 together (`patches/llama.cpp/`) |
-| Waves | `feat/kolibri1-waves` (`90311e5a2`), fork PR #14, open, not in the series |
+| Waves | `feat/kolibri1-waves` (`90311e5a2` benchmarked, head `da53dfd25`), fork PR #14 closed unmerged, not in the series |
 | GPU remap | E2 alone: `feat/kolibri1-gpu-remap` (`0bb0f5444`). With the side-file: `b001e946f`, since 2026-11-08 patch 0016 on `feat/kolibri1` (`ceaa65b79`, fork PR #16) |
 | GGUF | `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, 35.6 GB, this repo's own quantization mix, header rewritten by `cmd/kolibri-rekey` |
 

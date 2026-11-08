@@ -411,7 +411,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e3.json -out ~/models/eval/exp
 
 ## Stage E4: waves for prefill
 
-Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefill. **The option exists only on fork branch `feat/kolibri1-waves` (commit `90311e5a2`, fork PR #14, open and not merged). It is not in the patch series and not on `feat/kolibri1`.**
+Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefill. **The option exists only on fork branch `feat/kolibri1-waves` (benchmarked at commit `90311e5a2`; fork PR #14 was closed unmerged on 2026-11-08, and the branch stays at `da53dfd25`). It is not in the patch series and not on `feat/kolibri1`.**
 
 ### Verdict
 
