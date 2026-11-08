@@ -480,8 +480,11 @@ type runResult struct {
 		Mean float64 `json:"mean"`
 		Max  float64 `json:"max"`
 	} `json:"others_cpu_percent"` // the other processes' CPU while the server ran, in % of one core
-	PeakRSSMiB       float64 `json:"peak_rss_mib"`
-	PeakFootprintMiB float64 `json:"peak_footprint_mib"`
+	// the server's own CPU time over the whole run (load, requests, shutdown),
+	// from its exit status; nil when it did not exit
+	ServerCPU        *cpuSeconds `json:"server_cpu_seconds,omitempty"`
+	PeakRSSMiB       float64     `json:"peak_rss_mib"`
+	PeakFootprintMiB float64     `json:"peak_footprint_mib"`
 	// the model file's pages in the page cache: the largest sample during the
 	// requests, and once after the server stopped (nil: not measured)
 	PeakPageCacheMiB *float64 `json:"peak_page_cache_mib,omitempty"`
@@ -495,6 +498,12 @@ type runResult struct {
 }
 
 func (r runResult) key() string { return runKey(r.Config, r.CeilingGiB, r.Rep) }
+
+// cpuSeconds is a process's user and system CPU time.
+type cpuSeconds struct {
+	User float64 `json:"user"`
+	Sys  float64 `json:"sys"`
+}
 
 // machine is one sample of the machine's state.
 type machine struct {
@@ -813,6 +822,9 @@ func (b *bench) run(spec runSpec) (res runResult, err error) {
 	defer func() {
 		if !exited {
 			stop(srv, done, 3*time.Minute)
+		}
+		if ps := srv.ProcessState; ps != nil {
+			res.ServerCPU = &cpuSeconds{User: ps.UserTime().Seconds(), Sys: ps.SystemTime().Seconds()}
 		}
 		// what the page cache keeps of the file once the server is gone: a
 		// hidden tier that phys_footprint does not show

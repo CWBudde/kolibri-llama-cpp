@@ -606,7 +606,8 @@ func loadMatrix(t *testing.T, path string) matrix {
 // name exists, at the ceilings they compare.
 func TestShippedMatrix(t *testing.T) {
 	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json", "../../testdata/bench/e4.json", "../../testdata/bench/e3.json", "../../testdata/bench/e2.json",
-		"../../testdata/bench/e2e3.json", "../../testdata/bench/e2e3-prefetch.json", "../../testdata/bench/e2e3-prefetch-16g.json"} {
+		"../../testdata/bench/e2e3.json", "../../testdata/bench/e2e3-prefetch.json", "../../testdata/bench/e2e3-prefetch-16g.json",
+		"../../testdata/bench/e2e3-spin.json"} {
 		t.Run(filepath.Base(path), func(t *testing.T) { checkMatrix(t, loadMatrix(t, path)) })
 	}
 }

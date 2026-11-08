@@ -93,6 +93,8 @@ The next table holds the same 32 tokens, except `cpu128-n32`, whose 32 tokens ar
 
 ### Candidate next steps
 
+**Update (2026-11-08):** the first candidate below was run as an option on the series' build, `--expert-cache-wait spin`, and passed its registered decode gate at 0 and 16 GiB under `kolibri-bench`: 26.12 against 24.77 and 26.16 against 23.65 tokens/s, for about 48% more server CPU time. A 20-minute run at 16 GiB showed no thermal or performance warning. See [expert-streaming.md](expert-streaming.md), "The spinning waiter".
+
 For the owner to decide; none is proposed as a fix. Sizes are measured on the replay pattern, except where a line says otherwise.
 
 | Candidate | Measured size | What is not known |

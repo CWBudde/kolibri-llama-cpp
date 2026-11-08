@@ -239,6 +239,35 @@ def has_sidefile(r: Runner, llama_cpp: Path) -> bool:
     return header
 
 
+WAIT_MODES = {"sleep": 0, "spin": 1, "hybrid": 2, "qos": 3}  # enum llama_expert_cache_wait
+
+
+def wait_mode(value: str) -> str:
+    """--wait-mode: sleep, spin, hybrid:US or qos, as llama-completion's --expert-cache-wait takes it."""
+    name, _, us = value.partition(":")
+    if name not in WAIT_MODES or (name == "hybrid") != bool(us) or (us and not (us.isdigit() and int(us) > 0)):
+        raise argparse.ArgumentTypeError(f"unknown wait mode {value!r}: want sleep, spin, hybrid:US or qos")
+    return value
+
+
+def wait_fields(value: str) -> dict:
+    """The llama_expert_cache_params fields of a --wait-mode."""
+    name, _, us = value.partition(":")
+    return {"wait_mode": WAIT_MODES[name], "wait_spin_us": int(us or 0)}
+
+
+def has_wait(r: Runner, llama_cpp: Path) -> bool:
+    """Whether the checkout has --expert-cache-wait, by the same rule as has_waves: the header and
+    the built library must agree."""
+    header = any(name == "wait_mode" for name, _ in r.ffi.typeof("struct llama_expert_cache_params").fields)
+    path = llama_cpp / "build" / "bin" / ("libllama.dylib" if sys.platform == "darwin" else "libllama.so")
+    library = b'"wait": ' in path.read_bytes()
+    if header != library:
+        raise SystemExit(f"{llama_cpp}: include/llama.h {'has' if header else 'has no'} expert cache field wait_mode, "
+                         f"but {path.name} was built {'without' if header else 'with'} it: rebuild the checkout")
+    return header
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llama-cpp", type=Path, required=True, help="llama.cpp checkout with a built libllama")
@@ -250,6 +279,9 @@ def main() -> None:
     ap.add_argument("--waves-only", action="store_true", help="only the wave checks")
     ap.add_argument("--gpu-remap-only", action="store_true", help="only the GPU remap checks")
     ap.add_argument("--stack-only", action="store_true", help="only the checks of the side-file and the GPU remap together")
+    ap.add_argument("--wait-mode", type=wait_mode, metavar="MODE",
+                    help="how the cache runs wait for their loads: sleep, spin, hybrid:US or qos (--expert-cache-wait; "
+                         "the resident reference runs never get it; default: the library's, sleep)")
     args = ap.parse_args()
     import numpy as np
 
@@ -269,8 +301,27 @@ def main() -> None:
         print(f"note: {args.llama_cpp} has no expert cache side-file (patch 0014): skipping the side-file checks", flush=True)
     if args.stack_only and not (gpu_remap_on and sidefile_on):
         ap.error(f"--stack-only: {args.llama_cpp} lacks the GPU remap or the side-file; it needs a build of fork branch feat/kolibri1-e2-e3")
+    if args.wait_mode is not None:
+        if not has_wait(r, args.llama_cpp):
+            ap.error(f"--wait-mode: {args.llama_cpp} has no --expert-cache-wait; it needs a build of fork branch feat/kolibri1-load-spin")
+        # every run with slots waits as asked; the resident runs, with no slots, stay as they are
+        logits = r.logits
+
+        def logits_with_wait(*a, expert_cache: dict | None = None, **kw):
+            if expert_cache is not None and ("n_slots" in expert_cache or "n_slots_layer" in expert_cache):
+                expert_cache = {**expert_cache, **wait_fields(args.wait_mode)}
+            return logits(*a, expert_cache=expert_cache, **kw)
+
+        r.logits = logits_with_wait
+        print(f"note: the cache runs wait with --expert-cache-wait {args.wait_mode}", flush=True)
     fusion_disabled = bool(os.environ.get("GGML_METAL_FUSION_DISABLE"))
     failed = 0
+
+    def cli(cmd: list[str]) -> list[str]:
+        """A llama-completion command line, with --expert-cache-wait when it runs the cache."""
+        if args.wait_mode is not None and ("--expert-cache" in cmd or "--expert-cache-layers" in cmd):
+            return cmd + ["--expert-cache-wait", args.wait_mode]
+        return cmd
 
     def report(ok: bool, msg: str) -> None:
         nonlocal failed
@@ -352,7 +403,9 @@ def main() -> None:
                 ok = ok and tot["load_failures"] == 0
                 ok = ok and 0 <= tot["io_prefetch_seconds"] <= tot["io_seconds"] and (tot["prefetch_bytes"] > 0) == (tot["io_prefetch_seconds"] > 0)
                 ok = ok and reads_ok(s, None)
-                report(ok, f"{what}: counters consistent (prefill {pre['steps']} remaps, {pre['misses']} misses; "
+                # the wait mode as asked, the library's default without --wait-mode
+                ok = ok and s["expert_cache"].get("wait", "sleep") == (args.wait_mode or "sleep")
+                report(ok, f"{what}: counters consistent (wait {s['expert_cache'].get('wait', 'sleep')}; prefill {pre['steps']} remaps, {pre['misses']} misses; "
                            f"decode {dec['steps']} remaps, {dec['misses']} misses, {dec['hits']} hits, "
                            f"{dec['hits_loading']} awaited, prefetch {dec['prefetch_used']}/{dec['prefetch_issued']} used, "
                            f"{dec['prefetch_skipped']} skipped, {dec['prefetch_cancelled']} cancelled; "
@@ -643,6 +696,8 @@ def main() -> None:
             devs = r.ffi.new("ggml_backend_dev_t[]", [dev, r.ffi.NULL])
             ec = r.ffi.new("struct llama_expert_cache_params *", r.lib.llama_expert_cache_default_params())
             ec.n_slots, ec.gpu_remap = n_slots, True
+            for key, val in (wait_fields(args.wait_mode) if args.wait_mode is not None else {}).items():
+                setattr(ec, key, val)
             path = r.ffi.new("char[]", str(stats).encode())
             ec.stats_path = path
             model = r.lib.llama_model_load_from_file(str(gguf).encode(), r.ll.model_default_params(devices=devs, n_gpu_layers=-1, expert_cache=ec, use_extra_bufts=False))
@@ -671,7 +726,8 @@ def main() -> None:
         """The counters exactly: without fusion the CPU remap routes as the unsplit run does."""
         if not gpu_remap_on or fusion_disabled:
             return
-        sub = subprocess.run([sys.executable, __file__, "--llama-cpp", str(args.llama_cpp), "--seed", str(args.seed), "--gpu-remap-only"],
+        sub = subprocess.run([sys.executable, __file__, "--llama-cpp", str(args.llama_cpp), "--seed", str(args.seed), "--gpu-remap-only"]
+                             + (["--wait-mode", args.wait_mode] if args.wait_mode is not None else []),
                              capture_output=True, text=True, env={**os.environ, "GGML_METAL_FUSION_DISABLE": "1"})
         n_pass = sub.stdout.count("\nPASS ")
         report(sub.returncode == 0 and n_pass > 0, f"GPU remap with GGML_METAL_FUSION_DISABLE=1: {n_pass} checks passed, rc {sub.returncode}"
@@ -680,7 +736,7 @@ def main() -> None:
     def check_gpu_remap_cli(base: list[str], gguf: Path, stats: Path, want: str) -> None:
         """The option on the command line: it runs and says so in the stats, or the tool fails."""
         stats.unlink(missing_ok=True)
-        run = subprocess.run(base + ["--expert-cache", "64", "--expert-cache-gpu-remap", "--expert-cache-stats", str(stats)],
+        run = subprocess.run(cli(base + ["--expert-cache", "64", "--expert-cache-gpu-remap", "--expert-cache-stats", str(stats)]),
                              capture_output=True, text=True)
         try:
             mode = json.loads(stats.read_text())["expert_cache"]["gpu_remap"]
@@ -689,11 +745,11 @@ def main() -> None:
         report(run.returncode == 0 and mode is True and run.stdout == want,
                f"llama-completion --expert-cache-gpu-remap: the stats say gpu_remap {mode}, same text as resident -ub 2 ({run.stdout.strip()[:40]!r}), rc {run.returncode}")
         # as a server starts: with its warmup decode
-        warm = subprocess.run([a for a in base if a != "--no-warmup"] + ["--expert-cache", "64", "--expert-cache-gpu-remap"], capture_output=True, text=True)
+        warm = subprocess.run(cli([a for a in base if a != "--no-warmup"] + ["--expert-cache", "64", "--expert-cache-gpu-remap"]), capture_output=True, text=True)
         report(warm.returncode == 0 and warm.stdout == want, f"llama-completion --expert-cache-gpu-remap with the warmup decode: same text, rc {warm.returncode}")
         for extra, msg, what in ((["-ngl", "0"], "needs every expert layer on Metal", "-ngl 0"),
                                  (["--expert-prefetch", "8"], "does not work with --expert-prefetch", "--expert-prefetch 8")):
-            run = subprocess.run(base + ["--expert-cache", "64", "--expert-cache-gpu-remap"] + extra, capture_output=True, text=True)
+            run = subprocess.run(cli(base + ["--expert-cache", "64", "--expert-cache-gpu-remap"] + extra), capture_output=True, text=True)
             report(run.returncode != 0 and msg in run.stderr, f"llama-completion --expert-cache-gpu-remap with {what} exits {run.returncode} and says why")
 
     def check_waves(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
@@ -885,6 +941,8 @@ def main() -> None:
             gguf = model.parent / f"{model.name}-q8_0.gguf"
             ec = r.ffi.new("struct llama_expert_cache_params *", r.lib.llama_expert_cache_default_params())
             ec.n_slots = 16
+            for key, val in (wait_fields(args.wait_mode) if args.wait_mode is not None else {}).items():
+                setattr(ec, key, val)
             mparams = r.ll.model_default_params(expert_cache=ec)
             m = r.lib.llama_model_load_from_file(str(gguf).encode(), mparams)
             cparams = r.ll.context_default_params(n_ctx=256, n_batch=32, n_ubatch=32)
@@ -908,15 +966,16 @@ def main() -> None:
                     "--ignore-eos", "-no-cnv", "--no-display-prompt", "-c", "256", "--no-warmup"]
             plain = subprocess.run(base + ["-ub", "2"], capture_output=True, text=True)
             stats.unlink(missing_ok=True)
-            cached = subprocess.run(base + ["--expert-cache-layers", str(layers), "--expert-prefetch", "8,4,0.25",
-                                            "--expert-cache-threads", "2", "--expert-cache-buffered", "--expert-cache-stats", str(stats)],
+            cached = subprocess.run(cli(base + ["--expert-cache-layers", str(layers), "--expert-prefetch", "8,4,0.25",
+                                                "--expert-cache-threads", "2", "--expert-cache-buffered", "--expert-cache-stats", str(stats)]),
                                     capture_output=True, text=True)
             ok = plain.returncode == 0 and cached.returncode == 0 and stats.exists()
             if ok:
                 s = json.loads(stats.read_text())
                 c = s["expert_cache"]
                 ok = (c["slots_min"], c["slots_max"], c["prefetch_k"], c["prefetch_half_life"], c["prefetch_mix"], c["io_threads"], c["buffered"]) == \
-                     (12, 384, 8, 4, 0.25, 2, True) and s["decode"]["steps"] > 0 and s["decode"]["tokens"] > 0
+                     (12, 384, 8, 4, 0.25, 2, True) and s["decode"]["steps"] > 0 and s["decode"]["tokens"] > 0 \
+                     and c.get("wait", "sleep") == (args.wait_mode or "sleep")
             # without the cache, --expert-cache-stats writes the decode timing alone
             stats.unlink(missing_ok=True)
             resident = subprocess.run(base + ["-ub", "2", "--expert-cache-stats", str(stats)], capture_output=True, text=True)
@@ -928,14 +987,14 @@ def main() -> None:
             report(resident.returncode == 0 and rok and resident.stdout == plain.stdout,
                    f"llama-completion --expert-cache-stats without the cache: decode timing only, same text ({rs if not rok else rs['decode']})")
             # the MoE cache would take over the same matmuls, and the graph has one slot map for them
-            both = subprocess.run(base + ["--expert-cache", "16", "--moe-cache-mib", "8"], capture_output=True, text=True, errors="replace")
+            both = subprocess.run(cli(base + ["--expert-cache", "16", "--moe-cache-mib", "8"]), capture_output=True, text=True, errors="replace")
             report(both.returncode != 0 and both.stdout.strip() == "" and "cannot serve one model" in both.stderr,
                    f"llama-completion with --expert-cache and --moe-cache-mib exits {both.returncode} without generating, refused by name, no abort ({both.stderr[-200:] if both.returncode < 0 else 'no signal'})")
             # a LoRA on the experts the cache holds is refused; without the cache, or on what it does not hold, it applies
             for kind in ("gate", "up", "down"):
                 lora = Path(tmp) / f"lora-{kind}.gguf"
                 write_lora(args.llama_cpp, lora, gguf, [f"blk.0.ffn_{kind}_exps.weight"])
-                refused_run = subprocess.run(base + ["--expert-cache", "16", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+                refused_run = subprocess.run(cli(base + ["--expert-cache", "16", "--lora", str(lora)]), capture_output=True, text=True, errors="replace")
                 report(refused_run.returncode != 0 and refused_run.stdout.strip() == "" and "reads from its slots" in refused_run.stderr,
                        f"LoRA on ffn_{kind}_exps with the cache: exits {refused_run.returncode} without generating, refused by name")
                 applied = subprocess.run(base + ["-ub", "2", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
@@ -944,14 +1003,14 @@ def main() -> None:
             lora = Path(tmp) / "lora-router.gguf"
             write_lora(args.llama_cpp, lora, gguf, ["blk.0.ffn_gate_inp.weight"])
             on_resident = subprocess.run(base + ["-ub", "2", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
-            on_cache = subprocess.run(base + ["--expert-cache", "16", "--lora", str(lora)], capture_output=True, text=True, errors="replace")
+            on_cache = subprocess.run(cli(base + ["--expert-cache", "16", "--lora", str(lora)]), capture_output=True, text=True, errors="replace")
             report(on_resident.returncode == 0 and on_cache.returncode == 0 and on_resident.stdout != plain.stdout and on_cache.stdout == on_resident.stdout,
                    f"LoRA on the router's input with the cache: same text as without it, changed by the adapter ({on_cache.stdout.strip()[:40]!r}{'' if on_cache.returncode == 0 else ' ' + on_cache.stderr[-300:]})")
             odd = Path(tmp) / 'we"ird\\na\tme.gguf'
             shutil.copyfile(gguf, odd)
             stats.unlink(missing_ok=True)
-            run = subprocess.run([str(bin_dir / "llama-completion"), "-m", str(odd), "-p", prompt, "-n", "4", "-no-cnv",
-                                  "-c", "256", "--no-warmup", "--expert-cache", "16", "--expert-cache-stats", str(stats)],
+            run = subprocess.run(cli([str(bin_dir / "llama-completion"), "-m", str(odd), "-p", prompt, "-n", "4", "-no-cnv",
+                                      "-c", "256", "--no-warmup", "--expert-cache", "16", "--expert-cache-stats", str(stats)]),
                                  capture_output=True, text=True, errors="replace")  # no --temp 0: the tokens may not be UTF-8
             try:
                 named = json.loads(stats.read_text())["expert_cache"]["file"]
@@ -962,12 +1021,12 @@ def main() -> None:
             if sidefile_on:
                 sf = sides["q8_0"]
                 stats.unlink(missing_ok=True)
-                on_side = subprocess.run(base + ["--expert-cache", "16", "--expert-cache-sidefile", str(sf), "--expert-prefetch", "8",
-                                                 "--expert-cache-threads", "2", "--expert-cache-stats", str(stats)], capture_output=True, text=True)
+                on_side = subprocess.run(cli(base + ["--expert-cache", "16", "--expert-cache-sidefile", str(sf), "--expert-prefetch", "8",
+                                                     "--expert-cache-threads", "2", "--expert-cache-stats", str(stats)]), capture_output=True, text=True)
                 s = json.loads(stats.read_text()) if on_side.returncode == 0 and stats.exists() else None
                 report(s is not None and on_side.stdout == plain.stdout and reads_ok(s, sf) and s["expert_cache"]["io_threads"] == 2,
                        f"llama-completion --expert-cache-sidefile: same text as without the cache, one pread per expert ({s['decode']['preads'] if s else on_side.stderr[-300:]} in decode)")
-                gone = subprocess.run(base + ["--expert-cache", "16", "--expert-cache-sidefile", str(sf) + ".gone"], capture_output=True, text=True)
+                gone = subprocess.run(cli(base + ["--expert-cache", "16", "--expert-cache-sidefile", str(sf) + ".gone"]), capture_output=True, text=True)
                 report(gone.returncode != 0 and gone.stdout.strip() == "" and "no fallback" in gone.stderr,
                        f"llama-completion with a missing side-file exits {gone.returncode} without generating, no fallback to the GGUF")
                 # refused before any tensor is created: on the real model the load would wire the weights first
