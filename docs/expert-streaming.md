@@ -38,6 +38,7 @@ Options of every `common` tool (llama-cli, llama-completion, llama-server):
 | `--expert-cache-sidefile FNAME` | read misses from this side-file, one `pread` per expert; the load fails if its table does not match the model and the GGUF, with no fallback (patch 0014) |
 | `--expert-cache-gpu-remap` | map the router's ids to slots on the GPU, so a layer that hits needs no CPU split; Metal only, refused with `--expert-prefetch` (patch 0016, "Stage E2: GPU remap") |
 | `--expert-cache-wait MODE` | how the decode thread waits for loads: `sleep` (default), `spin`, `hybrid:US`, `qos` (patch 0017, "The spinning waiter") |
+| `--expert-cache-skip W` | experimental, lossy: do not read a missed expert at weight rank 4–6 of a token with a weight below W; its weight is masked to 0 (default 0, off; CPU remap only; patch 0018, "Stage E5: skip-only") |
 
 ```sh
 B=third_party/llama.cpp/build/bin
@@ -1091,6 +1092,68 @@ Server CPU is `server_cpu_seconds` (user + sys, from the server's exit status, n
 
 - Whether to merge the fork PR and the main-repo PR for patch 0017. The default stays `sleep`, so merging changes no existing run.
 - Whether to make `spin` or `hybrid:200` the default in the Kolibri presets. `hybrid:200` was not gated.
+
+## Stage E5: skip-only
+
+Phase 11, Stage E5, the optional lossy miss path. The owner started it on 2026-11-08 and chose skipping, which needs no extra file, over a low-bit copy. It deliberately breaks Phase 10's "the router decides" rule, so it is opt-in and gated on KLD. It is proposed as patch 0018 on top of 0017, on fork branch `feat/kolibri1-lossy-skip`.
+
+### The mode
+
+`--expert-cache-skip W` (default 0, off) applies the same rule in prefill and decode:
+
+1. For each token, the k router ids are ranked by their unbiased weight, `sigmoid(logits)`, largest first; ties go by position. The id order itself is the biased selection order, so the rank is computed from the weights.
+2. An id is skipped if all of these hold:
+   - its rank is 4 or lower (4th to 6th of 6);
+   - its weight is below W;
+   - its expert is a true miss, neither in a slot nor loading;
+   - no other token of the ubatch needs that expert unskipped.
+3. A skipped expert is not read. Its id maps to the slot of the token's rank-1 expert, which is ready and pinned, and its weight is masked to 0 (`ffn_moe_skip_mask`, then `ffn_moe_weights_skipped`).
+
+With W = 0 the graph and the code path are those of 0017. The stats count `skipped`, the distinct experts skipped per step, and `skipped_ids`, the token-expert pairs. The skip is refused together with `--expert-cache-gpu-remap`, since the GPU remap maps ids inside a Metal kernel, and without a cache.
+
+### Checks
+
+- `test-expert-cache` covers the rule:
+  - W = 0 is unchanged;
+  - a rank-5 true miss below W is not loaded and maps to the rank-1 slot;
+  - rank 1–3 misses, a miss at exactly W, and an expert that is loading are loaded;
+  - the rank comes from the weights, not the id position;
+  - an expert another token of the ubatch needs is loaded for both tokens;
+  - the arguments are parsed and refused as described.
+- `check_expert_cache.py --skip-only` checks the graph on the tiny checkpoints and on the real IQ3.
+- Negative controls:
+  - M106: rank by id position;
+  - M107: cutoff at rank 3;
+  - M108: the mask not applied, caught by the metamorphic check (a skipped id mapped to the rank-2 slot instead of rank-1 must give bit-identical logits);
+  - M109: skipping an expert that is loading.
+
+### Pre-registration (committed before the tuning runs)
+
+**All KLD runs** use `llama-perplexity` on `~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, Metal, with `-ngl 99 -t 10 --fit off -c 512 -ub 1 --expert-cache 128 --expert-cache-sidefile <GGUF>.experts --expert-cache-wait spin`, the CPU remap, and `--expert-cache-stats` for the skip counts. The ubatch is 1, so every token meets the skip rule as in decode; at the cache's ubatch of 21, tokens that share an expert would hide skips. W = 0 is this cache without skipping. It stands for plain IQ3 here, since it is the lossless configuration the skip is compared against.
+
+**Tuning:**
+- The split is wikitext-2 `wiki.valid.raw`, 20 chunks of 512, scored against a new BF16 base `~/models/eval/e5/kld-bf16-valid-c512-n20.bin`. That base was made CPU-only with `-dev none -t 10 --no-repack`, reading the BF16 GGUF from the cold volume, as no timing depends on it.
+- `wiki.test` holds the gate's chunks, and `wiki.train` fed the imatrix, so neither is used for tuning.
+- Thresholds: W ∈ {0.05, 0.1, 0.2, 0.3, 0.5, 1.0}, plus W = 0.
+- **Rule:** the chosen W is the largest whose tuning KLD is at most 1.10 × the tuning KLD at W = 0. If none qualifies, no W is chosen and the stage does not pass; the speed matrix then runs at W = 0.05 as INFO.
+
+**KLD gate:**
+- The base is `~/models/eval/kld-bf16-c512-n20.bin`, the 20 `wiki.test` chunks.
+- Two runs: W = 0, which re-measures plain IQ3 on this build, and the chosen W.
+- **It passes if** KLD(W) ≤ 1.10 × KLD(0).
+- Reported: same-top-token rates, and skipped experts per token.
+
+**Speed gate:**
+- `testdata/bench/e5-skip.json`, written after tuning with the chosen W and committed before its first run.
+- At 16 GiB, the skip arm (side-file, CPU remap, spin, 3 reps) against the best lossless configuration, side-file + GPU remap + spin (3 reps).
+- **Metric `decode-and-p95`:** every skip repetition must decode faster than the baseline's fastest, **and** every warm p95 must be below the baseline's lowest.
+- INFO:
+  - the same-path lossless arm (side-file, CPU remap, spin);
+  - prefill, TTFT, CPU time;
+  - skipped experts per decoded token.
+- Both lossless arms must be exactly equivalent to resident `-ub 21`. The skip arm, being lossy, has no equivalence.
+
+**E5 passes only if the KLD gate and the speed gate both pass.**
 
 ## Limits
 
