@@ -605,7 +605,8 @@ func loadMatrix(t *testing.T, path string) matrix {
 // TestShippedMatrix checks that every config the equivalence checks and gates
 // name exists, at the ceilings they compare.
 func TestShippedMatrix(t *testing.T) {
-	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json", "../../testdata/bench/e4.json", "../../testdata/bench/e3.json", "../../testdata/bench/e2.json"} {
+	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json", "../../testdata/bench/e4.json", "../../testdata/bench/e3.json", "../../testdata/bench/e2.json",
+		"../../testdata/bench/e2e3.json", "../../testdata/bench/e2e3-prefetch.json", "../../testdata/bench/e2e3-prefetch-16g.json"} {
 		t.Run(filepath.Base(path), func(t *testing.T) { checkMatrix(t, loadMatrix(t, path)) })
 	}
 }
@@ -780,6 +781,82 @@ func TestE2Matrix(t *testing.T) {
 	}
 	if !slices.Equal(eq, wantEq) {
 		t.Errorf("equivalence %q, want %q", eq, wantEq)
+	}
+}
+
+// TestE2E3Matrix fixes the three registered runs of E2 and E3 together: E4's
+// workloads, each arm the GGUF arm plus only its options, and the deciding gates
+// as they were committed before the first timed run (docs/expert-streaming.md).
+func TestE2E3Matrix(t *testing.T) {
+	d := loadMatrix(t, "../../testdata/bench/e4.json")
+	base, _ := d.config("iq3-cache128")
+	sideFile := base.Model + ".experts"
+	with := func(extra ...string) []string { return append(slices.Clone(base.Args), extra...) }
+	wantArgs := map[string][]string{
+		"iq3-cache128":                     base.Args,
+		"iq3-cache128-gpuremap":            with("--expert-cache-gpu-remap"),
+		"iq3-cache128-sidefile":            with(sidefileFlag, sideFile),
+		"iq3-cache128-sidefile-gpuremap":   with(sidefileFlag, sideFile, "--expert-cache-gpu-remap"),
+		"iq3-cache128-prefetch12":          with("--expert-prefetch", "12"),
+		"iq3-cache128-sidefile-prefetch12": with(sidefileFlag, sideFile, "--expert-prefetch", "12"),
+	}
+	for _, tc := range []struct {
+		path     string
+		arms     []string
+		ceilings []float64
+		runs     int
+		deciding []string
+	}{
+		{"e2e3.json", []string{"iq3-cache128", "iq3-cache128-gpuremap", "iq3-cache128-sidefile", "iq3-cache128-sidefile-gpuremap", "iq3-resident-ub21"},
+			[]float64{0, 16}, 4*6 + 1, []string{
+				"iq3-cache128-sidefile-gpuremap decode 0 iq3-cache128-sidefile+iq3-cache128-gpuremap",
+				"iq3-cache128-sidefile-gpuremap decode 16 iq3-cache128-sidefile+iq3-cache128-gpuremap",
+			}},
+		{"e2e3-prefetch.json", []string{"iq3-cache128-sidefile-gpuremap", "iq3-cache128-prefetch12", "iq3-cache128-sidefile-prefetch12", "iq3-resident-ub21"},
+			[]float64{0, 16}, 3*6 + 1, []string{
+				"iq3-cache128-sidefile-gpuremap decode 0 iq3-cache128-sidefile-prefetch12+iq3-cache128-prefetch12",
+				"iq3-cache128-sidefile-gpuremap decode 16 iq3-cache128-sidefile-prefetch12+iq3-cache128-prefetch12",
+			}},
+		{"e2e3-prefetch-16g.json", []string{"iq3-cache128-sidefile-gpuremap", "iq3-cache128-prefetch12", "iq3-cache128-sidefile-prefetch12"},
+			[]float64{16}, 3 * 3, []string{
+				"iq3-cache128-sidefile-gpuremap decode 16 iq3-cache128-sidefile-prefetch12+iq3-cache128-prefetch12",
+			}},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			e := loadMatrix(t, "../../testdata/bench/"+tc.path)
+			if !slices.Equal(d.ServerArgs, e.ServerArgs) || d.PromptFirst != e.PromptFirst || d.NPredict != e.NPredict ||
+				d.Cold != e.Cold || !slices.Equal(d.Warm, e.Warm) {
+				t.Errorf("workload settings differ from E4's")
+			}
+			var names []string
+			for _, c := range e.Configs {
+				names = append(names, c.Name)
+				if c.Name == "iq3-resident-ub21" {
+					continue
+				}
+				if c.Model != base.Model || c.Server != base.Server || !slices.Equal(c.Args, wantArgs[c.Name]) {
+					t.Errorf("%s: %+v, want %q", c.Name, c, wantArgs[c.Name])
+				}
+				if !slices.Equal(c.Ceilings, tc.ceilings) || c.Reps != 3 {
+					t.Errorf("%s: ceilings %v, %d reps", c.Name, c.Ceilings, c.Reps)
+				}
+			}
+			if !slices.Equal(names, tc.arms) {
+				t.Errorf("arms %q, want %q", names, tc.arms)
+			}
+			if n := len(e.expand()); n != tc.runs {
+				t.Errorf("%d runs, want %d", n, tc.runs)
+			}
+			var got []string
+			for _, g := range e.Gates {
+				if g.Decides {
+					got = append(got, fmt.Sprintf("%s %s %g %s", g.Candidate, g.Metric, g.CeilingGiB, strings.Join(g.Baselines, "+")))
+				}
+			}
+			if !slices.Equal(got, tc.deciding) {
+				t.Errorf("deciding gates %q, want %q", got, tc.deciding)
+			}
+		})
 	}
 }
 

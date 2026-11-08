@@ -375,6 +375,7 @@ BF16 checkpoint already gives the fork's bits at every captured node.
 | 0013 expert cache waves | no | retired 2026-11-06, the fork's own work: Stage E4's gates failed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e4-waves-for-prefill)) |
 | 0014 expert cache side-file | no | the fork's own work, Stage E3; its four deciding gates passed on 2026-11-07, merged by fork PR #15 ([expert-streaming.md](expert-streaming.md#stage-e3-one-read-per-expert)) |
 | 0015 expert cache GPU remap | no | retired 2026-11-07, the fork's own work: Stage E2's gate failed at 16 GiB and passed at 0 GiB ([expert-streaming.md](expert-streaming.md#stage-e2-gpu-remap)) |
+| 0016 expert cache GPU remap on the side-file | no | the fork's own work, 2026-11-08: E2 and E3 together passed their registered gates against prefetch, through fork PR #16 ([expert-streaming.md](expert-streaming.md#stage-e2-and-e3-together)) |
 
 ### Controls
 
@@ -486,7 +487,14 @@ failed at 16 GiB and passed at 0 GiB, so the number is kept and the code stays
 on fork branch `feat/kolibri1-gpu-remap` (`0bb0f5444`, fork PR #16, draft, open
 and not merged). It never reached `feat/kolibri1`. The series' glob matched it only on Stage E2's
 branch, from `35b6ee2` until `5c40670` moved it to `pending/`, and the patch is not
-in this PR's merge. The next patch is 0016.
+in this PR's merge. The next patch was 0016.
+
+**Patch 0016 is the GPU remap on top of the side-file (2026-11-08).** E2 and E3
+together passed their registered gates against prefetch, so the remap enters the
+series after all, now as `git diff c0b2de9be 714f6bb42`. Fork PR #16's branch was
+fast-forwarded to the benchmarked merge `b001e946f`, then got one fix from review:
+a draft model's params clear the remap with the other cache settings. Its squash is
+on `feat/kolibri1` as `ceaa65b79`, with the series' tree. The next patch is 0017.
 
 **What moved:**
 - The model hooks of 0011 moved from `src/models/kolibri.cpp` to upstream's
@@ -535,8 +543,8 @@ the CPU they still are.
   after each `ffn_moe_topk` (`Runner.logits(split_after=...)`) and reports the
   difference to the unsplit run as info. The CPU still compares against the
   plain resident run.
-- E2 removes the CPU split, behind `--expert-cache-gpu-remap`, on fork branch
-  `feat/kolibri1-gpu-remap` only (its decode gate failed at 16 GiB). There it
+- E2 removes the CPU split, behind `--expert-cache-gpu-remap`: patch 0016, on
+  top of the side-file (E2 alone failed its decode gate at 16 GiB). It
   requires bit identity to the unsplit run (`check_expert_cache.py`, tiny and
   real IQ3, "PASS: 0 failures") and the same token IDs as `iq3-resident-ub21`
   on the real workload (exact in `testdata/bench/e2.json`: 30 of 30 requests).
@@ -724,9 +732,9 @@ Collected 2026-11-07 from what is recorded on `main`, for the user to write from
 | Master used | `184f6536` (2026-10-23) |
 | #25294 | PR head `1248fd8fa` did not merge on master as of 2026-10-23. All numbers come from the port on `184f6536`, fork branch `ref/pr25294-on-184f6536` (`8a8ddf827`), with the PR's logic unchanged and only API changes, listed in its merge commit. **No number here comes from the PR head itself.** |
 | #29887 | as merged in `184f6536` |
-| Fork | `feat/kolibri1`: series 0008, 0010, 0011, 0012 for E0 to E2's baselines; 0014 was added by E3 (`patches/llama.cpp/`) |
+| Fork | `feat/kolibri1`: series 0008, 0010, 0011, 0012 for E0 to E2's baselines; 0014 was added by E3, and 0016 by E2 and E3 together (`patches/llama.cpp/`) |
 | Waves | `feat/kolibri1-waves` (`90311e5a2`), fork PR #14, open, not in the series |
-| GPU remap | `feat/kolibri1-gpu-remap` (`0bb0f5444`), fork PR #16, draft, not in the series |
+| GPU remap | E2 alone: `feat/kolibri1-gpu-remap` (`0bb0f5444`). With the side-file: `b001e946f`, since 2026-11-08 patch 0016 on `feat/kolibri1` (`ceaa65b79`, fork PR #16) |
 | GGUF | `Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, 35.6 GB, this repo's own quantization mix, header rewritten by `cmd/kolibri-rekey` |
 
 This repo (`CWBudde/kolibri-llama-cpp`) is public, so its files can be linked. The benchmark's raw `run.json` and `report.md` are under `~/models/eval/`, outside the repo, and would need attaching.
@@ -849,7 +857,7 @@ So 17.6 ms/token of the slot path is neither waiting nor remapping and comes wit
 
 ### The slot path after E3 and E2
 
-Both stages aim at the cost in the table above. Every number is from the fork's own cache at 128 IQ3 slots, as medians over 3 repetitions. Each stage has its own matrix and session, so compare only within a stage. **Neither matrix has a #25294 or #29887 arm, so no gate compares them with upstream, and no run has E2 and E3 together.** Sources, with ranges: [E3](expert-streaming.md#stage-e3-one-read-per-expert) and [E2](expert-streaming.md#stage-e2-gpu-remap).
+Both stages aim at the cost in the table above. Every number is from the fork's own cache at 128 IQ3 slots, as medians over 3 repetitions. Each stage has its own matrix and session, so compare only within a stage. **Neither matrix has a #25294 or #29887 arm, so no gate compares them with upstream.** E2 and E3 together have their own matrices, summarized after E2 below, and they have no upstream arm either. Sources, with ranges: [E3](expert-streaming.md#stage-e3-one-read-per-expert) and [E2](expert-streaming.md#stage-e2-gpu-remap).
 
 **E3: one `pread` per expert from a side-file, against three from the GGUF.** Gates passed, including on 30 of 30 identical token ID sequences.
 
@@ -873,6 +881,18 @@ The 16 GiB p95 did not win by the rule, so that decode gate passes on tokens/s a
 | Commits per token | 103 | 33.97 | 103 | 33.97 |
 
 At 16 GiB the gate's baseline was the CPU remap with `--expert-prefetch 12`, not this column: slowest 18.94 against fastest 19.00 t/s, highest p95 79.33 against lowest 78.58 ms. So removing 100 splits saved 4.72 and 2.21 ms/token here, well under the 17.6 ms that came with those splits at all hits.
+
+**E2 and E3 together: the GPU remap on top of the side-file** ([expert-streaming.md](expert-streaming.md#stage-e2-and-e3-together)). Three matrices on one build, each with its gate committed before its first timed run.
+
+| Matrix | Ceiling | Both, worst repetition | Selected baseline, best repetition | Verdict |
+|---|--:|--:|--:|---|
+| against the single features | 0 GiB | 24.22 t/s, 67.0 ms | side-file: 20.68 t/s, 68.9 ms | passed |
+| against the single features | 16 GiB | 23.88 t/s, 69.6 ms | GPU remap: 20.91 t/s, 73.3 ms | passed |
+| against prefetch | 0 GiB | 23.17 t/s, 65.6 ms | side-file with prefetch: 22.03 t/s, 67.9 ms | passed |
+| against prefetch | 16 GiB | 7.13 t/s, 226.9 ms | side-file with prefetch: 19.87 t/s, 68.4 ms | not passed, one disturbed repetition |
+| the registered repeat | 16 GiB | 23.79 t/s, 68.4 ms | side-file with prefetch: 21.76 t/s, 65.2 ms | passed on decode, no p95 win |
+
+So the GPU remap entered the series as patch 0016. The stack generates the token IDs of the resident run in every request, with logits bit-identical to the unsplit resident run. Prefill does not improve on the side-file, and the stack stays far from resident: 24.63 against 60.69 t/s warm decode at 0 GiB (medians). Its decode takes 42.11 ms/token there: wait 9.26, remap 0.17 and "other" 32.68, a remainder rather than one measured cost.
 
 **Where the rest of the gap goes** ([expert-decode-gap.md](expert-decode-gap.md)). This is a diagnosis on a replay pattern with private timers. It passes no gate, and its arms have one to three runs. On the GPU remap a token took 49.31 ms against 16.46 resident, including 13.33 ms of load wait. One ordering of the arms splits the remaining 19.5 ms as follows, and another order would change the sizes:
 
