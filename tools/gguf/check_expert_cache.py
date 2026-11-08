@@ -106,7 +106,7 @@ options the logits must be bit-identical to the UNSPLIT resident run and to the 
 path, with its counters, one pread per expert and 2 scheduler splits per decoded token. --real checks
 the same on the real weight.
 
-Skip (--expert-cache-skip): patch 0018, lossy and opt-in (Stage E5). Against a checkout without it the
+Skip (--expert-cache-skip): former patch 0018 (retired; fork branch feat/kolibri1-lossy-skip), lossy and opt-in (Stage E5). Against a checkout without it the
 skip checks are skipped with a note, and --skip-only is an error. Per token the remap ranks the ids by
 router weight; an id at rank 4 or below whose weight is under skip_weight and whose expert is a true
 miss (neither in a slot nor loading), and that no other id of the ubatch needs, is not read: it reads a
@@ -350,9 +350,9 @@ def main() -> None:
         ap.error(f"--stack-only: {args.llama_cpp} lacks the GPU remap or the side-file; it needs a build of fork branch feat/kolibri1-e2-e3")
     skip_on = has_skip(r, args.llama_cpp)
     if args.skip_only and not skip_on:
-        ap.error(f"--skip-only: {args.llama_cpp} has no --expert-cache-skip; it needs a build with patch 0018")
+        ap.error(f"--skip-only: {args.llama_cpp} has no --expert-cache-skip; it needs a build of fork branch feat/kolibri1-lossy-skip")
     if not skip_on:
-        print(f"note: {args.llama_cpp} has no expert cache skip (patch 0018): skipping check_skip", flush=True)
+        print(f"note: {args.llama_cpp} has no expert cache skip (fork branch feat/kolibri1-lossy-skip): skipping check_skip", flush=True)
     if args.wait_mode is not None:
         if not has_wait(r, args.llama_cpp):
             ap.error(f"--wait-mode: {args.llama_cpp} has no --expert-cache-wait; it needs a build of fork branch feat/kolibri1-load-spin")

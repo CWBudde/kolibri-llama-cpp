@@ -38,7 +38,7 @@ Options of every `common` tool (llama-cli, llama-completion, llama-server):
 | `--expert-cache-sidefile FNAME` | read misses from this side-file, one `pread` per expert; the load fails if its table does not match the model and the GGUF, with no fallback (patch 0014) |
 | `--expert-cache-gpu-remap` | map the router's ids to slots on the GPU, so a layer that hits needs no CPU split; Metal only, refused with `--expert-prefetch` (patch 0016, "Stage E2: GPU remap") |
 | `--expert-cache-wait MODE` | how the decode thread waits for loads: `sleep` (default), `spin`, `hybrid:US`, `qos` (patch 0017, "The spinning waiter") |
-| `--expert-cache-skip W` | experimental, lossy: do not read a missed expert at weight rank 4–6 of a token with a weight below W; its weight is masked to 0 (default 0, off; CPU remap only; patch 0018, "Stage E5: skip-only") |
+| `--expert-cache-skip W` | experimental, lossy: do not read a missed expert at weight rank 4–6 of a token with a weight below W; its weight is masked to 0 (default 0, off; CPU remap only; former patch 0018, retired: only on fork branch `feat/kolibri1-lossy-skip`, "Stage E5: skip-only") |
 
 ```sh
 B=third_party/llama.cpp/build/bin
@@ -1095,7 +1095,7 @@ Server CPU is `server_cpu_seconds` (user + sys, from the server's exit status, n
 
 ## Stage E5: skip-only
 
-Phase 11, Stage E5, the optional lossy miss path. The owner started it on 2026-11-08 and chose skipping, which needs no extra file, over a low-bit copy. It deliberately breaks Phase 10's "the router decides" rule, so it is opt-in and gated on KLD. It is proposed as patch 0018 on top of 0017, on fork branch `feat/kolibri1-lossy-skip`.
+Phase 11, Stage E5, the optional lossy miss path. The owner started it on 2026-11-08 and chose skipping, which needs no extra file, over a low-bit copy. It deliberately breaks Phase 10's "the router decides" rule, so it is opt-in and gated on KLD. It was built as patch 0018 on top of 0017, on fork branch `feat/kolibri1-lossy-skip`. **Its speed gate failed (2026-11-08), so patch 0018 is removed and its number is retired;** the code stays on that branch.
 
 ### The mode
 
@@ -1223,7 +1223,7 @@ These runs use the fork build `46fcc4069` with `-b 512`, wiki.valid, 20 × 512 t
   - M108 (mask not applied): `--skip-only` exits with "FAIL: 12 failures", metamorphic max |diff| 1.38.
   - M106 (rank by id position) and M109 (skipping a loading expert) failed `test-expert-cache` when the patch was written. They were not repeated on the final build.
 
-**What follows.** Patch 0018 stays proposed and is not merged, and the default stays lossless. The code is on fork branch `feat/kolibri1-lossy-skip` (`46fcc4069`). A skip inside the GPU remap would remove the CPU remap's cost. That was out of scope here and would need its own registration: the owner chose the best lossless arm as the baseline instead of building it.
+**What follows.** By the stop rule, patch 0018 leaves the series and its number is retired (owner's decision, 2026-11-08); the default stays lossless. The code stays on fork branch `feat/kolibri1-lossy-skip` (`46fcc4069`), and fork PR #19 is closed unmerged. A skip inside the GPU remap would remove the CPU remap's cost. That was out of scope here: the owner chose the best lossless arm as the baseline instead of building it. It is parked as an open PLAN item and would need its own registration.
 
 ## Limits
 
