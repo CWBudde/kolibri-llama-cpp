@@ -397,7 +397,7 @@ index b18e24010..85826f33d 100644
  
      return result;
 diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
-index c4ca60773..2bf47646f 100644
+index c4ca60773..7cb8dd923 100644
 --- a/tests/test-expert-cache.cpp
 +++ b/tests/test-expert-cache.cpp
 @@ -15,6 +15,7 @@
@@ -507,7 +507,7 @@ index c4ca60773..2bf47646f 100644
 +    };
 +    for (const auto & m : modes) {
 +        const bool spins = m.w.mode == llama_expert_wait::SPIN;
-+        const bool qos   = m.w.mode == llama_expert_wait::QOS;
++        [[maybe_unused]] const bool qos = m.w.mode == llama_expert_wait::QOS; // checked on Apple only
 +        char what[128];
 +
 +        // slow demand loads: the remap waits in its main loop

@@ -1020,7 +1020,7 @@ These are the owner's. None is planned, and merging this write-up decides none o
 
 ## The spinning waiter
 
-`--expert-cache-wait sleep|spin|hybrid:US|qos` chooses how the decode thread waits for the I/O threads' loads. Fork branch `feat/kolibri1-load-spin`, commit `06563b40c` on `feat/kolibri1` (`ceaa65b79`); main-repo patch 0017 is its diff. The owner asked for this run as part of the overnight plan of 2026-11-08; it is not one of PLAN's stages, and its gate was chosen for this run. **The gated candidate, `spin`, passed its deciding gate at 0 and 16 GiB. It costs about half again as much CPU time. The default stays `sleep`.**
+`--expert-cache-wait sleep|spin|hybrid:US|qos` chooses how the decode thread waits for the I/O threads' loads. Fork branch `feat/kolibri1-load-spin`, commits `06563b40c` (benchmarked) and `12e714b90` (test only: `test-expert-cache` builds without `__APPLE__`) on `feat/kolibri1` (`ceaa65b79`); main-repo patch 0017 is their diff. The owner asked for this run as part of the overnight plan of 2026-11-08; it is not one of PLAN's stages, and its gate was chosen for this run. **The gated candidate, `spin`, passed its deciding gate at 0 and 16 GiB. It costs about half again as much CPU time. The default stays `sleep`.**
 
 | Mode | What the waiting thread does between two checks of the same predicate, under the same lock |
 |---|---|
