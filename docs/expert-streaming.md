@@ -1375,7 +1375,7 @@ None of these changes a gate.
 
 ### Reproduce
 
-The fork branch `feat/kolibri1-waves2` is `feat/kolibri1` (`d5cc9763c`) plus the waves (`840920a6a`) and the per-graph path (`4816f45c0`). `patches/llama.cpp/0019-kolibri-expert-cache-waves.patch` is the diff `d5cc9763c..4816f45c0`; applied to `d5cc9763c` it gives the benchmarked tree `84a60e04`.
+The fork branch `feat/kolibri1-waves2` is `feat/kolibri1` (`d5cc9763c`) plus the waves (`840920a6a`) and the per-graph path (`4816f45c0`). Fork PR #21 proposes it for `feat/kolibri1`, and the main repo PR #86 carries this record. `patches/llama.cpp/0019-kolibri-expert-cache-waves.patch` is the diff `d5cc9763c..4816f45c0`; applied to `d5cc9763c` it gives the benchmarked tree `84a60e04`.
 
 ```sh
 git -C third_party/llama.cpp fetch origin feat/kolibri1-waves2
