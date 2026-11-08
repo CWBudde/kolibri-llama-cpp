@@ -1157,6 +1157,25 @@ With W = 0 the graph and the code path are those of 0017. The stats count `skipp
 
 **E5 passes only if the KLD gate and the speed gate both pass.**
 
+### Tuning (2026-11-08): W = 0.2
+
+These runs use the fork build `46fcc4069` with `-b 512`, wiki.valid, 20 × 512 tokens, against the BF16 base: PPL 19.8596 ± 0.92600, 2 h, CPU only, read from `/Volumes/Archive`. Every step is one decoded token: the W = 0 stats show 6.00 experts per step. The limit is 1.10 × 0.124430 = 0.13687.
+
+| W | Mean KLD | Same top token | Skipped experts per token | Misses per token |
+|---|---|---|---|---|
+| 0 | 0.124430 ± 0.008411 | 89.28% | 0 | 29.36 |
+| 0.05 | 0.123733 ± 0.008180 | 88.77% | 0.82 | 28.96 |
+| 0.1 | 0.136599 ± 0.008873 | 88.82% | 3.84 | 26.90 |
+| **0.2** | **0.132868 ± 0.008289** | 88.22% | 14.41 | 20.09 |
+| 0.3 | 0.146284 ± 0.008831 | 87.47% | 21.62 | 16.30 |
+| 0.5 | 0.161668 ± 0.009610 | 86.90% | 26.53 | 14.04 |
+| 1.0 | 0.163634 ± 0.009666 | 86.94% | 26.12 | 13.97 |
+
+- **The registered rule picks W = 0.2**, the largest W whose KLD is within the limit. At W = 0.2 a quarter of the router's ids are skipped (14.4 of 60 per token), and misses fall by 32%.
+- **Within the error bars, KLD does not rise monotonically in W.** W = 0.1 sits above W = 0.2.
+- **The matrix `testdata/bench/e5-skip.json` uses W = 0.2.** It is committed before both the KLD gate and its first run.
+- The results are in `~/models/eval/e5/tune/`, and the scripts in `~/models/eval/e5/tools/`.
+
 ## Limits
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
