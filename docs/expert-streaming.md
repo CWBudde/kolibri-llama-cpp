@@ -411,7 +411,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e3.json -out ~/models/eval/exp
 
 ## Stage E4: waves for prefill
 
-Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefill. **The option exists only on fork branch `feat/kolibri1-waves` (commit `90311e5a2`, fork PR #14, open and not merged). It is not in the patch series and not on `feat/kolibri1`.**
+Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefill. **The option exists only on fork branch `feat/kolibri1-waves` (benchmarked at commit `90311e5a2`; fork PR #14 was closed unmerged on 2026-11-08, and the branch stays at `da53dfd25`). It is not in the patch series and not on `feat/kolibri1`.**
 
 ### Verdict
 
@@ -569,7 +569,7 @@ The #25294 server is built as in [upstream.md](upstream.md#reproduce).
 
 ```sh
 git -C third_party/llama.cpp fetch origin feat/kolibri1-waves
-git -C third_party/llama.cpp switch feat/kolibri1-waves   # 90311e5a2
+git -C third_party/llama.cpp switch --detach 90311e5a2   # the benchmarked commit; the branch head is da53dfd25
 cmake --build third_party/llama.cpp/build --target llama llama-server llama-completion test-expert-cache -j
 go run ./cmd/kolibri-bench -matrix testdata/bench/e4.json -out ~/models/eval/expert-bench-e4 \
   -servers pr25294=third_party/llama.cpp-pr25294/build/bin/llama-server
