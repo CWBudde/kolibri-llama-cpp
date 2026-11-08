@@ -335,6 +335,41 @@ Fixed and pushed before `tools/e6/capture_router.py` ran on the real model, and 
 - **Mapping check.** The replay's index mapping is checked against the perfect oracle: feeding the captured selections themselves through the file-backed predictor must give the oracle's rows exactly.
 - **If the capture's selections differ from the recorded ones** (MATCH fails: the recorded traces came from another llama.cpp build): the gate runs on the capture's own selections, with every Stage A policy and the shared LRU replayed on those, not on the recorded traces, and the agreement with the recorded selections (the share of layer steps with the same Top-6 set) reported with it. A predictor is never judged against a reference replayed on a different trace.
 
+### Result (2026-11-08): not retained at the measured cost
+
+**At 23 µs per decoded layer step the hidden-state predictor is retained in 0 of 3 rows of the Stage B gate, on no budget and no link. Runtime prefetch stays closed.** It loads more bytes than the best Stage A policy at every budget, and at 23 µs it is also slower on every link at every budget. Only at a cost of 0 µs, which no implementation has, does it win time at 96 to 384 experts per layer, by at most 1.5%.
+
+**Capture.** `tools/e6/capture_router.py` with the libllama of fork build `feat/kolibri1-load-spin` (`06563b40c`, no cache flags: resident), Metal, ubatch 512, on all four workloads (61,200 tokens, 2.2 min, 596 MB in `~/models/eval/e6/capture/`). **Every workload's selections MATCH the recorded ones** (sha256 equal to `testdata/locality/experts.json`), so the fallback did not apply. The smoke test's self-check, block l's router on the graph's own `ffn_norm` input, selects the graph's Top-6 in 99.60–99.72% of (token, layer) pairs; every difference is a near-tie.
+
+**Replay.** `go run ./cmd/kolibri-policy -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx -hidden-state-dir ~/models/eval/e6/capture -hidden-state-us 0,15,23 -md …` (`~/models/eval/e6/replay/`; run twice, the JSON byte-identical, the markdown differing only in its output path; 68 PASS lines). The capture's selections are the replayed ones, ID for ID. **The mapping check passes:** the selections themselves, fed through the file-backed path as a pred-h2 file, rank as the perfect oracle before every predicted step (110,304 steps in coding and in medtech, 86,496 in research, 75,792 in hr) and replay exactly as it at k 6, every budget and every cost. Beyond the Top-6 the oracle pads with Markov ranks, so only k 6 is compared. Controls M104 (row l instead of l-1, future knowledge) and M105 (the token before) each fail the tests.
+
+| Cost | Rows retained | Where it wins | Best win |
+|---|---|---|---|
+| 0 µs (INFO) | 3 of 3 | time only: ssd at 128–384, pcie and ram at 96–384 | 1.5% on pcie at 128, 1.3% on ssd at 128 |
+| 15 µs (INFO) | 0 of 3 | – | – |
+| **23 µs (gate)** | **0 of 3** | – | – |
+
+At 128 experts per layer, all IQ3 test suffixes' decode together:
+
+| | MB/token | ssd ms/token | pcie ms/token | ram ms/token |
+|---|--:|--:|--:|--:|
+| best Stage A policy | 38.1 | 23.32 | 17.22 | 16.08 |
+| pred-h2, 0 µs | 55.4 | 23.02 | 16.96 | 16.01 |
+| pred-h2, 23 µs | 55.4 | 23.97 | 18.11 | 17.16 |
+
+The perfect oracle at the same horizon is retained up to 30 µs ("Pre-registration" above). *Inference:* the capture's routers fall short of it because their wrong candidates cost bytes that nearly cancel the hits (at 128 experts per layer and k 6: 55.4 MB/token, against 38.1 for the oracle and for the best Stage A policy).
+
+**Recall (INFO)**, needed experts covered (whole Top-6 sets covered), pooled over the four workloads. Layers no row predicts count as missed, as in Stage B's tables:
+
+| File | Lead | Test decode, k 6 | Test decode, k 12 | Every token, k 6 | Every token, k 12 |
+|---|--:|--:|--:|--:|--:|
+| pred-h1 (block l on `l_out-(l-1)`) | 0 | 71.3% (16.5%) | 85.9% (58.1%) | 71.2% (16.3%) | 85.9% (57.9%) |
+| pred-h2 (block l+1 on `l_out-(l-1)`) | 1 | 57.4% (5.7%) | 72.5% (32.7%) | 57.5% (5.7%) | 72.8% (32.9%) |
+
+Over the predicted layers alone, pred-h2 covers 59.8% at k 6 and 75.5% at k 12 on test decode; pred-h1, 72.8% and 87.6%. The literature's 90–96% one layer ahead (Mixtral, DeepSeek-MoE) is not reached here, even at lead 0; it is closer to the 67% reported for Qwen2-MoE.
+
+**Not covered.** Q8_0 (no capture). A runtime predictor would also need the scores read back while the graph runs, which the 23 µs leaves out, so this cost understates a real one. Other predictor forms, such as a trained probe on the hidden state or a mix with the Markov counts, were not tried.
+
 ## Reproduce
 
 ```sh
