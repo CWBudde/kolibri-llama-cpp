@@ -414,7 +414,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e3.json -out ~/models/eval/exp
 
 ## Stage E4: waves for prefill
 
-Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefill. **Rebased onto the series, the waves passed E4's gate on 2026-11-08 and are proposed as patch 0019: see "Stage E4 retry: waves on the series". This section records the first registration, which failed.** **The option exists only on fork branch `feat/kolibri1-waves` (benchmarked at commit `90311e5a2`; fork PR #14 was closed unmerged on 2026-11-08, and the branch stays at `da53dfd25`). It is not in the patch series and not on `feat/kolibri1`.**
+Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefill. **Rebased onto the series, the waves passed E4's gate on 2026-11-08 and are proposed as patch 0019: see "Stage E4 retry: waves on the series". This section records the first registration, which failed.** **That registration's code is on fork branch `feat/kolibri1-waves` (benchmarked at commit `90311e5a2`; fork PR #14 was closed unmerged on 2026-11-08, and the branch stays at `da53dfd25`), never in the patch series. The retry's code is on `feat/kolibri1-waves2` (fork PR #21) and in patch 0019, proposed and not yet on `feat/kolibri1`.**
 
 ### Verdict
 
@@ -1346,8 +1346,9 @@ Each was applied as a patch to `4816f45c0`, rebuilt, checked with tiny `--waves-
 | **M111:** every graph of a GPU remap context through the gates (`gpu_graph` returns `gpu_remap_on`) | fails: `b.gpu_graph(1) && b.gpu_graph(4) && !b.gpu_graph(5) && !b.gpu_graph(512)` | aborts: `GGML_ASSERT(n_waves == 1)` at `src/llama-graph.cpp:2379` |
 | **M48** (repeated): `wave_mask` always writes 1 | not run | fails: "FAIL: 139 failures", max \|diff\| 1.9 |
 | **M49, strong** (repeated): after a wave's ids are written, a load of the next wave overwrites a slot of this wave | not run | fails: "FAIL: 25 failures", counters and logits (max \|diff\| 0.214) |
+| **M112** (review fix `af36c5f19`, 2026-11-09): its two load-path changes reverted, so `--expert-cache-waves` without a cache loads resident | not run | fails: "FAIL: 7 failures", the six refusal checks (in-process and `llama-completion`) and the fusion-disabled rerun |
 
-Logs: `m110.log`, `m110-unit.log`, `m111.log`, `m111-unit.log`, `m48.log` and `m49b.log` in `~/models/eval/e4b/`.
+Logs: `m110.log`, `m110-unit.log`, `m111.log`, `m111-unit.log`, `m48.log`, `m49b.log` and `m112.log` in `~/models/eval/e4b/`. M112 was reverted by re-applying the fix; tiny `--waves-only` on `af36c5f19` then passed ("PASS: 0 failures", `pr-fix-tiny-waves.log`), as did `test-expert-cache` and `test-arg-parser`.
 
 ### Validity
 
@@ -1375,7 +1376,7 @@ None of these changes a gate.
 
 ### Reproduce
 
-The fork branch `feat/kolibri1-waves2` is `feat/kolibri1` (`d5cc9763c`) plus the waves (`840920a6a`) and the per-graph path (`4816f45c0`). Fork PR #21 proposes it for `feat/kolibri1`, and the main repo PR #86 carries this record. `patches/llama.cpp/0019-kolibri-expert-cache-waves.patch` is the diff `d5cc9763c..4816f45c0`; applied to `d5cc9763c` it gives the benchmarked tree `84a60e04`.
+The fork branch `feat/kolibri1-waves2` is `feat/kolibri1` (`d5cc9763c`) plus the waves (`840920a6a`), the per-graph path (`4816f45c0`, the benchmarked commit, tree `84a60e04`) and a review fix (`af36c5f19`, 2026-11-09). Fork PR #21 proposes it for `feat/kolibri1`, and the main repo PR #86 carries this record. `patches/llama.cpp/0019-kolibri-expert-cache-waves.patch` is the diff `d5cc9763c..af36c5f19`; applied to `d5cc9763c` it gives tree `9ed5f41b`. The review fix only makes `--expert-cache-waves` without `--expert-cache` or `--expert-cache-layers` fail to load instead of being ignored. That load path refuses a configuration every benchmarked arm passes, and the draft model clears the flag. So the timings above stand for the patch.
 
 ```sh
 git -C third_party/llama.cpp fetch origin feat/kolibri1-waves2

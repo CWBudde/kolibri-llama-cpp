@@ -26,9 +26,20 @@ index ec63ff25c..67925e18c 100644
          {"-ncmoe", "--n-cpu-moe"}, "N",
          "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
 diff --git a/common/common.cpp b/common/common.cpp
-index 6cdd3059b..d92321309 100644
+index 6cdd3059b..649cc5b4a 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
+@@ -1710,8 +1710,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+ 
+     // without the cache, --expert-cache-stats still asks for the decode timing of the resident model,
+-    // and --expert-cache-gpu-remap reaches the model's refusal
+-    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty() || !params.expert_cache_sidefile.empty() || params.expert_cache_gpu_remap) {
++    // and --expert-cache-gpu-remap and --expert-cache-waves reach the model's refusal
++    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty() || !params.expert_cache_sidefile.empty() || params.expert_cache_gpu_remap || params.expert_cache_waves) {
+         auto & ec = params.expert_cache_lp;
+         ec = llama_expert_cache_default_params();
+         ec.n_slots            = params.expert_cache;
 @@ -1727,6 +1727,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
          ec.gpu_remap          = params.expert_cache_gpu_remap;
          ec.wait_mode          = params.expert_cache_wait;
@@ -49,6 +60,18 @@ index 2b5109931..a243fccb3 100644
      llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
  
      bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index af804a84d..e8e311707 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2586,6 +2586,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
+     result.expert_cache_stats.clear();
+     result.expert_cache_sidefile.clear();
+     result.expert_cache_gpu_remap = false;
++    result.expert_cache_waves     = false;
+ 
+     if (has_draft) {
+         // default to global devices value
 diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
 index 66c59d3d6..6f2a304bd 100644
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
@@ -1448,10 +1471,20 @@ index 08c175f58..dd869b836 100644
  
      // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 85826f33d..2f336374c 100644
+index 85826f33d..e6d575b73 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3471,6 +3471,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
+@@ -1737,6 +1737,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         if (params.expert_cache && params.expert_cache->gpu_remap && !expert_cache_requested()) {
+             throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs --expert-cache or --expert-cache-layers");
+         }
++        if (params.expert_cache && params.expert_cache->waves && !expert_cache_requested()) {
++            throw std::runtime_error("expert cache: --expert-cache-waves needs --expert-cache or --expert-cache-layers");
++        }
+ 
+         if (expert_cache_requested()) {
+             if (arch != LLM_ARCH_KOLIBRI1) {
+@@ -3471,6 +3474,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
          /*.gpu_remap          =*/ false,
          /*.wait_mode          =*/ LLAMA_EXPERT_CACHE_WAIT_SLEEP,
          /*.wait_spin_us       =*/ 0,
@@ -1459,6 +1492,27 @@ index 85826f33d..2f336374c 100644
      };
  
      return result;
+diff --git a/tests/test-arg-parser.cpp b/tests/test-arg-parser.cpp
+index e75b00745..3b18d5651 100644
+--- a/tests/test-arg-parser.cpp
++++ b/tests/test-arg-parser.cpp
+@@ -115,12 +115,16 @@ static void test(void) {
+         base.expert_cache_layers = {128};
+         base.expert_cache_stats = "stats.json";
+         base.expert_cache_sidefile = "experts.side";
++        base.expert_cache_gpu_remap = true;
++        base.expert_cache_waves = true;
+         {
+             const auto draft = common_base_params_to_speculative(base);
+             assert(draft.expert_cache == 0);
+             assert(draft.expert_cache_layers.empty());
+             assert(draft.expert_cache_stats.empty());
+             assert(draft.expert_cache_sidefile.empty());
++            assert(!draft.expert_cache_gpu_remap);
++            assert(!draft.expert_cache_waves);
+         }
+     }
+ 
 diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
 index 7cb8dd923..3badfdf14 100644
 --- a/tests/test-expert-cache.cpp

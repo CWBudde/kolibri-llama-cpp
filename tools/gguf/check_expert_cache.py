@@ -87,7 +87,9 @@ from the first decodes, so without the refresh (control M110) the decodes after 
 - counters: the prompts' remaps on the CPU with the waves built, no gated command buffer in prefill;
   every decode through the gate, at 2 scheduler splits per decoded token, as resident; with alike
   routing, the same remaps, misses and wave passes as without the GPU remap;
-- with the side-file: bit-identical to the pair on the GGUF path, one pread per expert.
+- with the side-file: bit-identical to the pair on the GGUF path, one pread per expert;
+- refusal: the waves without a cache fail to load, also from the command line with the flag alone
+  (tiny only).
 
 Side-file (--expert-cache-sidefile): patch 0014. Against a checkout without it the side-file checks are
 skipped with a note. cmd/kolibri-sidefile writes and verifies the side-file of each fixture; then, next
@@ -858,6 +860,27 @@ def main() -> None:
             run = subprocess.run(cli(base + ["--expert-cache", "64", "--expert-cache-gpu-remap"] + extra), capture_output=True, text=True)
             report(run.returncode != 0 and msg in run.stderr, f"llama-completion --expert-cache-gpu-remap with {what} exits {run.returncode} and says why")
 
+    def check_waves_refusals(gguf: Path, dev_name: str, dev, label: str) -> None:
+        """--expert-cache-waves without a cache fails to load instead of loading resident. Tiny
+        checkpoints only: if the refusal failed, the refused run would load the model fully resident."""
+        if not waves_on:
+            return
+        needle = "--expert-cache-waves needs --expert-cache or --expert-cache-layers"
+        what = f"{label} {dev_name}: waves without a cache"
+        try:
+            r.logits(gguf, dev, list(range(1000, 1010)), 10, no_repack=True, expert_cache={"waves": True})
+            report(False, f"{what} loaded")
+        except RuntimeError:
+            report(needle in "".join(r.log), f"{what} fails to load, and says why")
+        if not on_gpu(dev):
+            return
+        # the command line reaches that refusal: the flag alone creates the cache's params
+        tool = [str(args.llama_cpp / "build" / "bin" / "llama-completion"), "-m", str(gguf), "-p", "Hello", "-n", "4", "-no-cnv", "-c", "256",
+                "--no-warmup", "--expert-cache-waves"]
+        run = subprocess.run(tool, capture_output=True, text=True)
+        report(run.returncode != 0 and needle in run.stderr and run.stdout.strip() == "",
+               f"{label}: llama-completion --expert-cache-waves alone exits {run.returncode} and says why")
+
     def check_waves(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
                     n_layer: int, n_expert: int, k: int, stats: Path, label: str, grown: bool = False,
                     side: Path | None = None) -> None:
@@ -1419,6 +1442,7 @@ def main() -> None:
                                 cfg["num_experts"], cfg["num_experts_per_tok"], stats, f"{outtype} grown waves", grown=True, side=side)
                     check_waves_gpu_remap(gguf, dev_name, dev, side, tokens, N_PROMPT, WAVE_GPU_SLOTS, cfg["num_hidden_layers"],
                                           cfg["num_experts"], cfg["num_experts_per_tok"], stats, outtype)
+                    check_waves_refusals(gguf, dev_name, dev, outtype)
             check_waves_exact()
         else:
             model = generate_tiny(Path(tmp), args.seed, "router")
@@ -1435,6 +1459,7 @@ def main() -> None:
                     check_waves(gguf, dev_name, dev, tokens, N_PROMPT, WAVE_SLOTS, n_layer, cfg["num_experts"], k, stats, outtype, side=side)
                     check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], n_layer, cfg["num_experts"], k, stats, f"{outtype} grown waves", grown=True, side=side)
                     check_waves_gpu_remap(gguf, dev_name, dev, side, tokens, N_PROMPT, WAVE_GPU_SLOTS, n_layer, cfg["num_experts"], k, stats, outtype)
+                    check_waves_refusals(gguf, dev_name, dev, outtype)
                     check_gpu_remap(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
                     check_gpu_remap_hits(gguf, dev_name, dev, tokens[:N_PROMPT], k, stats, outtype)
                     check_gpu_remap_refusals(gguf, dev_name, dev, stats, outtype)
