@@ -757,7 +757,7 @@ func loadMatrix(t *testing.T, path string) matrix {
 func TestShippedMatrix(t *testing.T) {
 	for _, path := range []string{"../../testdata/bench/expert-cache.json", "../../testdata/bench/e1.json", "../../testdata/bench/e0.json", "../../testdata/bench/e4.json", "../../testdata/bench/e3.json", "../../testdata/bench/e2.json",
 		"../../testdata/bench/e2e3.json", "../../testdata/bench/e2e3-prefetch.json", "../../testdata/bench/e2e3-prefetch-16g.json",
-		"../../testdata/bench/e2e3-spin.json", "../../testdata/bench/e5-skip.json"} {
+		"../../testdata/bench/e2e3-spin.json", "../../testdata/bench/e5-skip.json", "../../testdata/bench/e4b.json"} {
 		t.Run(filepath.Base(path), func(t *testing.T) { checkMatrix(t, loadMatrix(t, path)) })
 	}
 }
@@ -862,6 +862,76 @@ func TestE4Matrix(t *testing.T) {
 		"prefill 0 true iq3-cache128+iq3-moestream128", "prefill 16 true iq3-cache128+iq3-moestream128",
 		"ttft 0 true iq3-cache128+iq3-moestream128", "ttft 16 true iq3-cache128+iq3-moestream128",
 		"decode-not-slower 0 true iq3-cache128", "decode-not-slower 16 true iq3-cache128",
+		"prefill 0 false iq3-cpu-moe", "prefill 16 false iq3-cpu-moe",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("gates %q, want %q", got, want)
+	}
+}
+
+// TestE4bMatrix keeps E4's retry (waves on the series, owner's decision
+// 2026-11-08) comparable with E4: the same workloads, Stage D's cache and
+// #25294's arm with E4's flags, the series' best arm with E5's flags, and the
+// candidate that arm plus waves only. The gates are E4's, with the series'
+// best added as a baseline: prefill and TTFT against the best of the three,
+// decode not slower than the series' best, all deciding at both ceilings.
+// Prefill runs on the CPU remap, so no arm is exact against resident (E0.1).
+func TestE4bMatrix(t *testing.T) {
+	d, f, e := loadMatrix(t, "../../testdata/bench/e4.json"), loadMatrix(t, "../../testdata/bench/e5-skip.json"),
+		loadMatrix(t, "../../testdata/bench/e4b.json")
+	if !slices.Equal(d.ServerArgs, e.ServerArgs) || d.PromptFirst != e.PromptFirst || d.NPredict != e.NPredict ||
+		d.Cold != e.Cold || !slices.Equal(d.Warm, e.Warm) {
+		t.Errorf("E4b's workload settings differ from E4's")
+	}
+	for _, name := range []string{"iq3-cpu-moe", "iq3-cache128", "iq3-moestream128"} {
+		a, _ := d.config(name)
+		b, ok := e.config(name)
+		if !ok || !slices.Equal(a.Args, b.Args) || a.Server != b.Server || a.Model != b.Model {
+			t.Errorf("%s differs from E4's: %+v against %+v", name, b, a)
+		}
+	}
+	const best = "iq3-cache128-sidefile-gpuremap-spin"
+	a, _ := f.config(best)
+	b, ok := e.config(best)
+	if !ok || !slices.Equal(a.Args, b.Args) || a.Server != b.Server || a.Model != b.Model {
+		t.Errorf("%s differs from E5's: %+v against %+v", best, b, a)
+	}
+	cand, ok := e.config(best + "-waves")
+	if !ok || cand.Model != b.Model || cand.Server != "" || !slices.Equal(cand.Args, append(slices.Clone(b.Args), "--expert-cache-waves")) {
+		t.Errorf("candidate: %+v", cand)
+	}
+	buf, ok := e.config(best + "-waves-buffered")
+	if !ok || !slices.Equal(buf.Args, append(slices.Clone(cand.Args), "--expert-cache-buffered")) {
+		t.Errorf("buffered candidate: %+v", buf)
+	}
+	for _, name := range []string{best + "-waves", best, "iq3-cache128", "iq3-moestream128"} {
+		if c, _ := e.config(name); !slices.Equal(c.Ceilings, []float64{0, 16}) || c.Reps != 3 {
+			t.Errorf("%s: ceilings %v, %d repetitions", name, c.Ceilings, c.Reps)
+		}
+	}
+	for _, eq := range e.Equivalence {
+		if eq.Exact {
+			t.Errorf("exact equivalence %+v", eq)
+		}
+	}
+	three := strings.Join([]string{best, "iq3-cache128", "iq3-moestream128"}, "+")
+	var got []string
+	for _, g := range e.Gates {
+		if g.Candidate == best+"-waves-buffered" {
+			if g.Decides || strings.Join(g.Baselines, "+") != three {
+				t.Errorf("buffered waves gate %+v", g)
+			}
+			continue
+		}
+		if g.Candidate != best+"-waves" {
+			t.Errorf("gate of %s", g.Candidate)
+		}
+		got = append(got, fmt.Sprintf("%s %g %v %s", g.Metric, g.CeilingGiB, g.Decides, strings.Join(g.Baselines, "+")))
+	}
+	want := []string{
+		"prefill 0 true " + three, "prefill 16 true " + three,
+		"ttft 0 true " + three, "ttft 16 true " + three,
+		"decode-not-slower 0 true " + best, "decode-not-slower 16 true " + best,
 		"prefill 0 false iq3-cpu-moe", "prefill 16 false iq3-cpu-moe",
 	}
 	if !slices.Equal(got, want) {

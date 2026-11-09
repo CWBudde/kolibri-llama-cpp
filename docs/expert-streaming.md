@@ -38,6 +38,7 @@ Options of every `common` tool (llama-cli, llama-completion, llama-server):
 | `--expert-cache-sidefile FNAME` | read misses from this side-file, one `pread` per expert; the load fails if its table does not match the model and the GGUF, with no fallback (patch 0014) |
 | `--expert-cache-gpu-remap` | map the router's ids to slots on the GPU, so a layer that hits needs no CPU split; Metal only, refused with `--expert-prefetch` (patch 0016, "Stage E2: GPU remap") |
 | `--expert-cache-wait MODE` | how the decode thread waits for loads: `sleep` (default), `spin`, `hybrid:US`, `qos` (patch 0017, "The spinning waiter") |
+| `--expert-cache-waves` | lift the ubatch cap in prefill: a ubatch whose experts do not fit the slots runs in waves through the CPU remap; with `--expert-cache-gpu-remap` only such a ubatch, smaller ones keep the gate. Needs at least 3 × experts per token slots per layer (patch 0019, proposed, on fork branch `feat/kolibri1-waves2`; "Stage E4 retry") |
 | `--expert-cache-skip W` | experimental, lossy: do not read a missed expert at weight rank 4–6 of a token with a weight below W; its weight is masked to 0 (default 0, off; CPU remap only; former patch 0018, retired: only on fork branch `feat/kolibri1-lossy-skip`, "Stage E5: skip-only") |
 
 ```sh
@@ -413,7 +414,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e3.json -out ~/models/eval/exp
 
 ## Stage E4: waves for prefill
 
-Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefill. **The option exists only on fork branch `feat/kolibri1-waves` (benchmarked at commit `90311e5a2`; fork PR #14 was closed unmerged on 2026-11-08, and the branch stays at `da53dfd25`). It is not in the patch series and not on `feat/kolibri1`.**
+Phase 11, Stage E4. `--expert-cache-waves` lifts the cache's ubatch cap in prefill. **Rebased onto the series, the waves passed E4's gate on 2026-11-08 and are proposed as patch 0019: see "Stage E4 retry: waves on the series". This section records the first registration, which failed.** **That registration's code is on fork branch `feat/kolibri1-waves` (benchmarked at commit `90311e5a2`; fork PR #14 was closed unmerged on 2026-11-08, and the branch stays at `da53dfd25`), never in the patch series. The retry's code is on `feat/kolibri1-waves2` (fork PR #21) and in patch 0019, proposed and not yet on `feat/kolibri1`.**
 
 ### Verdict
 
@@ -1224,6 +1225,171 @@ These runs use the fork build `46fcc4069` with `-b 512`, wiki.valid, 20 × 512 t
   - M106 (rank by id position) and M109 (skipping a loading expert) failed `test-expert-cache` when the patch was written. They were not repeated on the final build.
 
 **What follows.** By the stop rule, patch 0018 leaves the series and its number is retired (owner's decision, 2026-11-08); the default stays lossless. The code stays on fork branch `feat/kolibri1-lossy-skip` (`46fcc4069`), and fork PR #19 is closed unmerged. A skip inside the GPU remap would remove the CPU remap's cost. That was out of scope here: the owner chose the best lossless arm as the baseline instead of building it. It is parked as an open PLAN item and would need its own registration.
+
+## Stage E4 retry: waves on the series
+
+Phase 11, Stage E4, a second registration of E4's gate (owner's decision, 2026-11-08). E4's waves failed at 0 GiB on 2026-11-06 ("Stage E4: waves for prefill"), and that verdict stays recorded. The waves were built then on the GGUF path, with three reads per expert and the CPU remap. This retry rebases the same waves onto the series (side-file, GPU remap, spinning waiter) and runs E4's gate again, against the series' best arm as well.
+
+### Verdict
+
+**All six deciding gates passed, at 0 and at 16 GiB (2026-11-08).** The waves become patch 0019, proposed and not merged.
+
+- **Warm prefill:** 355.4 (355.3–356.7) t/s at 0 GiB and 354.3 (340.3–355.3) at 16 GiB. The best baseline at both ceilings was #25294, at 314.9 (305.3–315.9) and 205.8 (192.4–213.9). The series' best arm reached 104.6 and 103.9.
+- **Cold TTFT:** 7.05 (7.00–7.08) s and 7.08 (7.03–7.19) s, against #25294's 8.27 (8.21–8.56) and 12.10 (11.77–13.23). The series' best arm took 27.42 and 26.84 s.
+- **Decode not slower:** a median of 27.49 and 27.74 t/s, against the series' best arm's slowest repetition, 25.17 and 24.98 (medians 25.56 and 25.06).
+- **Lossless:** `check_expert_cache.py --waves-only`, tiny and real IQ3, each "PASS: 0 failures" (see "Lossless" below).
+- **The gates were committed before the first timed run** (`c2714e5`) and not moved. The 2026-11-06 failure of E4's first registration stays recorded in "Stage E4: waves for prefill".
+- **Phase 11's prefill target is met in this matrix:** 273 t/s and 10 s, the `--cpu-moe` reference. Decode (30 t/s) is not.
+- **Buffered waves decide nothing (INFO).** They passed all four of their lines: 435.5 t/s and 5.97 s at 0 GiB, 263.7 t/s and 9.60 s at 16 GiB. Unlike on 2026-11-06, `F_NOCACHE` waves are now ahead of #25294 at both ceilings.
+- **Not built:** layer streaming and prefill admission, which stay open.
+
+### Design
+
+- **Fork branch `feat/kolibri1-waves2`** from `feat/kolibri1` (`d5cc9763c`): the waves commit `90311e5a2` cherry-picked, its conflicts with the series resolved, and the semantics of "How waves work" unchanged.
+- **Prefill on the CPU remap with waves, decode on the GPU remap.** The GPU remap maps ids inside one Metal gate per layer and is capped at `slots / k` tokens, so it cannot run waves. Each graph chooses its path by its ubatch size: a ubatch of at most `slots / k` tokens takes the GPU remap as before, a larger one the CPU remap with waves. After a CPU graph every layer's GPU table is refreshed from the slots, since the waves evicted experts behind it.
+- **The side-file and the wait mode** apply unchanged: a wave's misses are read with one `pread` each, and waiting for a wave uses `--expert-cache-wait`.
+
+### Pre-registration
+
+Committed and pushed before the first timed run, and not moved afterwards.
+
+- **Matrix:** `testdata/bench/e4b.json`, E4's workloads and server arguments. 31 runs, run alone.
+  - Candidate `iq3-cache128-sidefile-gpuremap-spin-waves`: the series' best arm plus `--expert-cache-waves`. 0 and 16 GiB, 3 repetitions.
+  - Baselines, 0 and 16 GiB, 3 repetitions each: `iq3-cache128-sidefile-gpuremap-spin` (the series' best, E5's flags), `iq3-cache128` (Stage D, E4's flags) and `iq3-moestream128` (#25294, E4's flags and build).
+  - INFO: the candidate with `--expert-cache-buffered` (2 repetitions per ceiling), `--cpu-moe` (1 per ceiling, the 273 t/s reference of "on par") and resident at the default ubatch (0 GiB, 1).
+  - Every fork arm, the baselines included, runs on the one build of `feat/kolibri1-waves2`, so the arms differ only in their flags:
+
+    ```sh
+    go run ./cmd/kolibri-bench -matrix testdata/bench/e4b.json -out ~/models/eval/expert-bench-e4b \
+      -server third_party/llama.cpp-waves2/build/bin/llama-server \
+      -servers pr25294=third_party/llama.cpp-pr25294/build/bin/llama-server
+    ```
+
+- **Deciding gates, at 0 and at 16 GiB, all of which must pass** (E4's rule, `evalGate`):
+  - warm prefill: every candidate repetition above the fastest repetition of the best of the three baselines;
+  - cold TTFT: every candidate repetition below the lowest of the best of the three;
+  - decode not slower: the candidate's median warm decode at least the slowest repetition of the series' best arm.
+- **Lossless:** `check_expert_cache.py --waves-only`, tiny and real IQ3, "PASS: 0 failures".
+  - Waves, also with the side-file: bit identity to a resident run at the same ubatch and split, and with the side-file to the same waves on the GGUF path.
+  - Waves with the GPU remap: two prompts on waves, each followed by gated decodes. The logits at every position must be bit-identical to a resident run split after `ffn_moe_topk` only in the prompts' graphs. With Metal fusion turned off (`GGML_METAL_FUSION_DISABLE=1`, rerun automatically), they must also equal the same run without the GPU remap, and the decodes the unsplit resident run. The benchmark's equivalence entry is not exact: prefill runs on the CPU remap, whose splits round differently from the unsplit resident graph (E0.1).
+- **Controls**, numbered from M110: M110 leaves out the table refresh after a CPU graph; M111 sends a ubatch above `slots / k` down the gated path. Each must fail. M48 and M49 (strong form) are repeated on the new branch.
+- **If it passes,** the waves become patch 0019, proposed and not merged. **If not,** the stop rule applies again, and the code stays on the fork branch.
+
+### Results
+
+`testdata/bench/e4b.json`, `~/models/eval/expert-bench-e4b/report.md`. All 31 runs are ok, from 21:24 to 23:09. `~/models/eval` is backed up on the cold volume as `eval.backup-2026-11-08-e4b`. The fork's 25 runs ran on one `llama-server` build (`17a2907d282c`, commit `4816f45c0`), and #25294's 6 on `61489d419276`.
+
+| Config | Ceiling | Runs | Warm prompt t/s | Cold TTFT s | Warm decode t/s | Decode hits | Disk GB read | Server CPU s |
+|---|--:|---|--:|--:|--:|--:|--:|--:|
+| sidefile-gpuremap-spin-waves | 0 GiB | 3 ok | 355.4 (355.3–356.7) | 7.05 (7.00–7.08) | 27.49 (27.14–27.58) | 92.3% | 292.31 | 148–150 |
+| sidefile-gpuremap-spin-waves | 16 GiB | 3 ok | 354.3 (340.3–355.3) | 7.08 (7.03–7.19) | 27.74 (27.09–28.07) | 92.3% | 292.31 | 150–151 |
+| sidefile-gpuremap-spin | 0 GiB | 3 ok | 104.6 (103.6–105.7) | 27.42 (26.50–27.45) | 25.56 (25.17–26.24) | 90.0% | 440.15 | 110 |
+| sidefile-gpuremap-spin | 16 GiB | 3 ok | 103.9 (103.3–104.8) | 26.84 (26.53–27.44) | 25.06 (24.98–25.99) | 90.0% | 440.15 | 110 |
+| iq3-cache128 | 0 GiB | 3 ok | 83.0 (81.5–85.6) | 35.89 (34.24–36.06) | 16.98 (16.69–18.58) | 91.0% | 448.68 | 948–972 |
+| iq3-cache128 | 16 GiB | 3 ok | 83.2 (82.7–85.1) | 34.50 (33.69–35.12) | 17.73 (16.89–18.26) | 91.0% | 448.68 | 945–959 |
+| iq3-moestream128 (#25294) | 0 GiB | 3 ok | 314.9 (305.3–315.9) | 8.27 (8.21–8.56) | 21.33 (20.89–23.49) | – | – | |
+| iq3-moestream128 (#25294) | 16 GiB | 3 ok | 205.8 (192.4–213.9) | 12.10 (11.77–13.23) | 17.42 (15.35–19.61) | – | – | |
+| sidefile-gpuremap-spin-waves-buffered | 0 GiB | 2 ok | 435.5 (433.8–437.3) | 5.97 (5.93–6.01) | 33.75 (33.36–34.15) | 92.3% | 73.23 | 154–158 |
+| sidefile-gpuremap-spin-waves-buffered | 16 GiB | 2 ok | 263.7 (257.5–270.0) | 9.60 (9.47–9.74) | 26.97 (26.65–27.28) | 92.3% | 284.64 | 187–192 |
+| iq3-cpu-moe | 0 GiB | 1 ok | 279.0 | 11.78 | 15.68 | – | 0.26 | |
+| iq3-cpu-moe | 16 GiB | 1 ok | 32.0 | 109.53 | 9.28 | – | 178.97 | |
+| iq3-resident | 0 GiB | 1 ok | 1190.3 | 1.82 | 60.19 | – | 0.00 | |
+
+"sidefile-gpuremap-spin" stands for `iq3-cache128-sidefile-gpuremap-spin`. Aggregation is E4's: each repetition's value is the median over its 4 warm requests, cold TTFT is the one cold request, and a cell is the median (min–max) over repetitions. Server CPU is user + sys per run, from `run.json`.
+
+**Gates, as the report prints them:**
+
+- GATE (prefill) waves at 0 GiB against the best of sidefile-gpuremap-spin, iq3-cache128, iq3-moestream128: passed: warm prompt 355.4 (355.3–356.7) against iq3-moestream128's 314.9 (305.3–315.9) t/s
+- GATE (prefill) waves at 16 GiB, same baselines: passed: warm prompt 354.3 (340.3–355.3) against iq3-moestream128's 205.8 (192.4–213.9) t/s
+- GATE (ttft) waves at 0 GiB, same baselines: passed: cold TTFT 7.05 (7.00–7.08) against iq3-moestream128's 8.27 (8.21–8.56) s
+- GATE (ttft) waves at 16 GiB, same baselines: passed: cold TTFT 7.08 (7.03–7.19) against iq3-moestream128's 12.10 (11.77–13.23) s
+- GATE (decode-not-slower) waves at 0 GiB against sidefile-gpuremap-spin: passed: decode median 27.49 against its slowest of 25.17 (median 25.56, 25.17–26.24) t/s
+- GATE (decode-not-slower) waves at 16 GiB against sidefile-gpuremap-spin: passed: decode median 27.74 against its slowest of 24.98 (median 25.06, 24.98–25.99) t/s
+- INFO (prefill) waves against iq3-cpu-moe: passed at 0 GiB (355.4 against 279.0) and at 16 GiB (354.3 against 32.0)
+- INFO buffered waves against the three baselines: prefill and TTFT passed at both ceilings, as in the verdict
+- PASS expert load failures: 0 in the 22 of 22 cache runs. PASS reads: every side-file arm read one `pread` per expert (waves 1029312 for 1029312 experts); `iq3-cache128` read three from the GGUF.
+- INFO equivalence against `iq3-resident` (`exact: false`, as registered): 6 of 150 requests generate resident's token IDs.
+
+An independent recomputation of the six deciding gates from `run.json`, with the rule as `evalGate` states it, gave the same six passes.
+
+**Token IDs.** The waves arm generates the same tokens in all 6 repetitions of each of the 5 requests (30 of 30), and buffered waves generate the same tokens (20 of 20). Against resident at the default ubatch the first difference is at token 82, 82, 12, 14 and 12 for cold coding and warm coding, research, hr and medtech. Against `--cpu-moe` it is at 15, 15, 13, 14 and 15. Prefill runs on the CPU remap, whose split graph rounds differently from the unsplit resident graph under Metal fusion (E0.1, and "Lossless" below). The series' best arm differs from this resident run as well (first differences 89, 89, 29, 27 and 0), since its ubatch is capped at 21.
+
+### Lossless
+
+All runs on the benchmarked commit `4816f45c0`. Logs are in `~/models/eval/e4b/`, and the real weight resolved to the home volume.
+
+| Run | Result |
+|---|---|
+| tiny `--waves-only` (`c-tiny-spin.log`, `--wait-mode spin`; `b-tiny-waves.log`, default wait) | "PASS: 0 failures", 510 PASS lines. The automatic rerun under `GGML_METAL_FUSION_DISABLE=1` passed 514 checks. |
+| real IQ3 `--waves-only --wait-mode spin` (`c-real-spin.log`) | "PASS: 0 failures", 54 PASS lines |
+| real IQ3, the same under `GGML_METAL_FUSION_DISABLE=1` (`c-real-spin-nofusion.log`) | "PASS: 0 failures", 55 PASS lines |
+
+The real run covers the benchmarked arm itself: 128 slots, ubatch 512, the side-file, the GPU remap. Waves with the GPU remap ran a 512-token prompt, 16 decodes, a 100-token prompt and 16 decodes, with a gate ubatch of 21.
+
+- **With fusion,** all 644 positions are bit-identical to a resident run split after `ffn_moe_topk` only in the prompts' graphs. The side-file run is bit-identical to the GGUF path, with one `pread` per expert.
+  - Two comparisons are INFO lines here, because fusion rounds the CPU remap's split prompt graph differently from an unsplit one, and the decodes then see other K and V. The decodes against the unsplit resident run show max |diff| 4.13. All positions against the same run without the GPU remap show 2.09.
+- **Without fusion,** the split resident run equals the unsplit one. All 644 positions are then bit-identical to the same run without the GPU remap, and the 32 decodes to the unsplit resident run.
+
+The counters show the path each graph took. No prompt graph went through a gate (0 gated command buffers in prefill). Every decode went through one: 2.00 scheduler splits per decoded token, against 102.00 without the GPU remap.
+
+Plain waves and waves with the side-file are bit-identical to resident at the same ubatch and split, on tiny and on real at ubatch 128 and 512.
+
+E2's box "without the CPU split, require bit identity to the unsplit resident run" was checked separately on the series (`check_expert_cache.py --real … --stack-only` on `feat/kolibri1`: "PASS: 0 failures", `e2-series-stack-check.log`).
+
+### Negative controls
+
+Each was applied as a patch to `4816f45c0`, rebuilt, checked with tiny `--waves-only`, and reverted with `git checkout`. After the last one the tree was clean, the build was redone, and `test-expert-cache` passed.
+
+| Control | `test-expert-cache` | Bit identity (tiny `--waves-only`) |
+|---|---|---|
+| **M110:** no `refresh_tables()` after a CPU graph (`src/llama-context.cpp`, the call commented out; the unit-test variant leaves out `fill_table` in `llama_expert_slots::refresh_tables`) | the variant fails: "FAIL s == c->slot_of(l, e)", 60 times | fails: "FAIL: 21 failures", max \|diff\| 0.671, in the waves + GPU remap case |
+| **M111:** every graph of a GPU remap context through the gates (`gpu_graph` returns `gpu_remap_on`) | fails: `b.gpu_graph(1) && b.gpu_graph(4) && !b.gpu_graph(5) && !b.gpu_graph(512)` | aborts: `GGML_ASSERT(n_waves == 1)` at `src/llama-graph.cpp:2379` |
+| **M48** (repeated): `wave_mask` always writes 1 | not run | fails: "FAIL: 139 failures", max \|diff\| 1.9 |
+| **M49, strong** (repeated): after a wave's ids are written, a load of the next wave overwrites a slot of this wave | not run | fails: "FAIL: 25 failures", counters and logits (max \|diff\| 0.214) |
+| **M112** (review fix `af36c5f19`, 2026-11-09): its two load-path changes reverted, so `--expert-cache-waves` without a cache loads resident | not run | fails: "FAIL: 7 failures", the six refusal checks (in-process and `llama-completion`) and the fusion-disabled rerun |
+
+Logs: `m110.log`, `m110-unit.log`, `m111.log`, `m111-unit.log`, `m48.log`, `m49b.log` and `m112.log` in `~/models/eval/e4b/`. M112 was reverted by re-applying the fix; tiny `--waves-only` on `af36c5f19` then passed ("PASS: 0 failures", `pr-fix-tiny-waves.log`), as did `test-expert-cache` and `test-arg-parser`.
+
+### Validity
+
+- **Location:** every run read the model and the side-file from the home volume (`evict` and `evict_sidefiles` in `run.json`).
+- **Power and sleep:** on AC power throughout, under `caffeinate -i -s`. `pmset -g log` has no sleep after Nov 5 (`kern.sleeptime` is Nov 5 22:11:48) and only "Using AC" on Nov 8.
+- **Others' CPU:** at most 108% on average per run (buffered/0g/r1), the means between 53% and 108%, so no disturbed block like E4's.
+- **Swap at start:** 7563 to 7907 MiB, falling slowly through the session.
+- **Nothing else ran:** no agent, build or other model ran during the matrix, and no Docker.
+- **The waves arm's lowest repetition,** 340.3 t/s (16g/r3, others 90/165), is still above #25294's fastest at that ceiling (213.9).
+
+### Observations
+
+None of these changes a gate.
+
+- **Prefill reads once per expert and waits less.**
+  - Waves read 267 GB of prefill demand per run in 31.0 to 31.5 s of summed prompt time, 8.5 to 8.6 GB/s. That is up from 7.05 GB/s for E4's GGUF waves, which read each expert three times.
+  - The graph waits 11.0 to 11.3 s, 36% of prompt time (E4: 43%).
+  - The series' best arm reads 407 GB at the capped ubatch, at 3.7 GB/s.
+- **Decode is faster after waves, and the cause is not established.**
+  - 27.5 against 25.6 t/s, with 92.3% decode hits against 90.0%.
+  - Waits are 7.32 against 9.20 ms per token, and commits 29.3 against 34.0 per token.
+  - Both arms decode on the same GPU remap. They differ in which experts prefill leaves resident: the waves plan loads the least used first, and the capped ubatch evicts in remap order.
+- **Cost:** the waves arm used 148 to 151 s of server CPU per run against 110 s for the series' best, while finishing its prompts in about a third of the time.
+- **Buffered waves split by ceiling again.** At 0 GiB they are the fastest arm: 435.5 t/s, 5.97 s, and 33.75 t/s decode from the page cache. At 16 GiB they fall to 263.7 t/s and 9.60 s, still ahead of #25294 but behind `F_NOCACHE` waves.
+
+### Reproduce
+
+The fork branch `feat/kolibri1-waves2` is `feat/kolibri1` (`d5cc9763c`) plus the waves (`840920a6a`), the per-graph path (`4816f45c0`, the benchmarked commit, tree `84a60e04`) and a review fix (`af36c5f19`, 2026-11-09). Fork PR #21 proposes it for `feat/kolibri1`, and the main repo PR #86 carries this record. `patches/llama.cpp/0019-kolibri-expert-cache-waves.patch` is the diff `d5cc9763c..af36c5f19`; applied to `d5cc9763c` it gives tree `9ed5f41b`. The review fix only makes `--expert-cache-waves` without `--expert-cache` or `--expert-cache-layers` fail to load instead of being ignored. That load path refuses a configuration every benchmarked arm passes, and the draft model clears the flag. So the timings above stand for the patch.
+
+```sh
+git -C third_party/llama.cpp fetch origin feat/kolibri1-waves2
+git -C third_party/llama.cpp switch --detach 4816f45c0
+cmake --build third_party/llama.cpp/build --target llama llama-server llama-completion test-expert-cache -j
+third_party/llama.cpp/build/bin/test-expert-cache
+.venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only --wait-mode spin
+.venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp \
+  --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf --waves-only --wait-mode spin
+go run ./cmd/kolibri-bench -matrix testdata/bench/e4b.json -out ~/models/eval/expert-bench-e4b \
+  -server third_party/llama.cpp/build/bin/llama-server \
+  -servers pr25294=third_party/llama.cpp-pr25294/build/bin/llama-server
+```
 
 ## Limits
 

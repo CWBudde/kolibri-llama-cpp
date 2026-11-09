@@ -49,19 +49,47 @@ in a child process, since both abort: a cb_eval that stops between a layer's mat
 llama_set_warmup, whose router ids are wider than the gate's slot ids. A cb_eval that stops outside
 the matmuls still runs, and a decode the abort callback ended does not stop the next one.
 
-Waves (--expert-cache-waves): only on fork branch feat/kolibri1-waves, not in the patch series
-(patch 0013 is retired, docs/expert-streaming.md, "Stage E4"). Against a checkout without them the
-wave checks are skipped with a note, and --waves-only is an error. The prompt runs in one ubatch,
-uncapped, with 16, 18, 24, 64 and 384 slots on every device, with and without prefetch and buffered
-reads; and a prompt of 4 tokens at 18 slots, whose union does not fit the built waves at their usual
-size.
+Waves (--expert-cache-waves): not in the patch series. Fork branch feat/kolibri1-waves2 (checkout
+third_party/llama.cpp-waves2) rebases them onto the series, so one build has the waves, the side-file,
+the GPU remap and --expert-cache-wait (docs/expert-streaming.md, "Stage E4 retry"). The older fork
+branch feat/kolibri1-waves (retired patch 0013, on a base without the side-file and the GPU remap)
+still runs the wave checks, and the cases that need what it lacks are skipped with a SKIP line.
+Against a checkout without waves the wave checks are skipped with a note, and --waves-only is an
+error. The prompt runs in one ubatch, uncapped, with 16, 18, 24, 64 and 384 slots on every device,
+with and without prefetch and buffered reads; and a prompt of 4 tokens at 18 slots, whose union does
+not fit the built waves at their usual size.
 
 - logits: bit-identical to the resident run at the same ubatch (the whole prompt), split as above;
 - with at least 3 * 6 slots nothing is capped; below that the ubatch is capped as before and a
   warning says why; with 384 slots every expert fits, so there are no waves;
 - counters: one plan per layer and prefill ubatch, waves only in prefill and only where the
   prompt's experts can exceed the slots, the graph's passes as built (as few as waves of up to
-  slots - 6 experts take), the decode counts as without waves.
+  slots - 6 experts take), the decode counts as without waves;
+- with the side-file, next to every wave run the same run reads its misses from the side-file:
+  logits bit-identical to the same resident run and to the waves on the GGUF path, one pread per
+  expert, and without prefetch the GGUF path's hits, misses and wave passes.
+
+Waves with the GPU remap (--expert-cache-waves --expert-cache-gpu-remap), on Metal: a graph of more
+than slots / 6 tokens runs the CPU remap with waves, one of at most slots / 6 the Metal gate, and
+after each CPU graph every layer's GPU table is refreshed from the slots. Whether a build takes the
+pair is probed at load: a build that refuses it is skipped with a SKIP line naming the refusal. At
+18, 24 and 64 slots a 40-token prompt, 20 decodes, a 20-token prompt and 20 decodes, every prompt
+in one ubatch with waves. The second prompt's waves evict experts that the gate's tables still hold
+from the first decodes, so without the refresh (control M110) the decodes after it read stale slots.
+
+- logits: bit-identical at every position to a resident run split after each ffn_moe_topk only in
+  the prompts' graphs, where the CPU remap splits, and unsplit in the decodes, as the gate runs; the
+  decodes alone bit-identical to the UNSPLIT resident run, and every position to the same run
+  without the GPU remap. Where Metal's fusion makes the split resident run differ from the unsplit
+  one, those two hold only up to the first decode and the rest is info, as in the GPU remap checks;
+  so where a build takes the pair, --waves-only runs once more under GGML_METAL_FUSION_DISABLE=1,
+  where they must hold exactly;
+- counters: the prompts' remaps on the CPU with the waves built, no gated command buffer in prefill;
+  every decode through the gate, at 2 scheduler splits per decoded token, as resident; with alike
+  routing, the same remaps, misses and wave passes as without the GPU remap;
+- with the side-file: bit-identical to the pair on the GGUF path, one pread per expert;
+- refusal: the waves without a cache fail to load, also from the command line with the flag alone
+  (tiny only).
 
 Side-file (--expert-cache-sidefile): patch 0014. Against a checkout without it the side-file checks are
 skipped with a note. cmd/kolibri-sidefile writes and verifies the side-file of each fixture; then, next
@@ -87,14 +115,17 @@ With --real GGUF it checks a real checkpoint on the GPU instead: the first 160 t
 locality workload (128 prefilled, 32 decoded), resident against the cache with 128 and 64 slots per
 layer, with and without prefetch, again bit-identical, with the same counter checks; with waves the
 128 prompt tokens run in one ubatch (4 and 7 waves per layer built), 6 tokens at 18 slots grow
-their waves, and 512 tokens at 128 slots check the benchmark's own ubatch. Its reads may come from
+their waves, and 512 tokens at 128 slots check the benchmark's own ubatch, there also with the
+side-file. The benchmarked arm, waves with the GPU remap at 128 slots, runs a 512-token prompt, 16
+decodes, a 100-token prompt and 16 decodes, with and without the side-file, unbuffered only (no
+fusion-disabled rerun on the real weight). Its reads may come from
 the page cache, since the resident run maps the whole file first. With side-file support the side-file
 is <GGUF>.experts (or --sidefile) and must exist; the --real run checks the pair's bytes on 8 experts
 of each layer and not the whole file: kolibri-sidefile verify does that.
 
     check_expert_cache.py --llama-cpp third_party/llama.cpp
     check_expert_cache.py --llama-cpp third_party/llama.cpp --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf
-    check_expert_cache.py --llama-cpp third_party/llama.cpp --waves-only   # the wave checks alone, on a waves build
+    check_expert_cache.py --llama-cpp third_party/llama.cpp-waves2 --waves-only   # the wave checks alone, on a waves build
     check_expert_cache.py --llama-cpp third_party/llama.cpp-e2 --gpu-remap-only   # the GPU remap checks alone
     check_expert_cache.py --llama-cpp third_party/llama.cpp-e2e3 --stack-only     # the side-file and the GPU remap together
     check_expert_cache.py --llama-cpp third_party/llama.cpp-skip --skip-only      # the lossy skip alone
@@ -154,6 +185,12 @@ WAVE_SLOTS = [16, 18, 24, 64, 384]
 N_GROWN = 4  # 4 tokens' 24 pairs at 18 slots: 2 waves built, and a union above 2 * 6 grows them
 N_GROWN_REAL = 6  # likewise on a real checkpoint: 36 pairs at 18 slots, 3 waves built
 N_BENCH_UBATCH = 512  # testdata/bench/e4.json's arms prefill in ubatches of the server's default
+# waves with the GPU remap: at least 3 * 6 slots, so the waves are on, and gate ubatches of 3, 4 and
+# 10 tokens, below both prompts (40 and 20 tokens), whose 240 and 120 experts exceed the slots
+WAVE_GPU_SLOTS = [18, 24, 64]
+# --real: after a prompt of N_BENCH_UBATCH tokens at 128 slots (gate ubatch 21 at 6 experts per
+# token), 16 decodes, a second prompt of 100 tokens and 16 decodes: 644 positions
+WAVE_GPU_LAYOUT_REAL = (16, 100, 16)
 # the skip: the fewest legal slots (one token's 6, ubatch 1, all decode), a few (ubatch 2, so prefill
 # remaps of 2 tokens), and a slot for every expert (nothing evicted, only first touches miss)
 SKIP_SLOTS = [6, 16, 384]
@@ -230,6 +267,17 @@ def write_lora(llama_cpp: Path, path: Path, base: Path, targets: list[str], rank
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
+
+
+def model_shape(llama_cpp: Path, path: Path) -> tuple[int, int, int]:
+    """(layers, experts, experts per token) from a GGUF's header, read by the checkout's gguf-py
+    without loading the model."""
+    sys.path.insert(0, str(llama_cpp / "gguf-py"))
+    import gguf
+
+    fields = gguf.GGUFReader(path).fields
+    arch = fields["general.architecture"].contents()
+    return tuple(int(fields[f"{arch}.{key}"].contents()) for key in ("block_count", "expert_count", "expert_used_count"))
 
 
 def has_waves(r: Runner, llama_cpp: Path) -> bool:
@@ -335,9 +383,10 @@ def main() -> None:
     r = Runner(args.llama_cpp)
     waves_on = has_waves(r, args.llama_cpp)
     if args.waves_only and not waves_on:
-        ap.error(f"--waves-only: {args.llama_cpp} has no expert cache waves; they need a build of fork branch feat/kolibri1-waves")
+        ap.error(f"--waves-only: {args.llama_cpp} has no expert cache waves; they need a build of fork branch feat/kolibri1-waves2 "
+                 f"(the waves on the series) or the older feat/kolibri1-waves")
     if not waves_on:
-        print(f"note: {args.llama_cpp} has no expert cache waves (fork branch feat/kolibri1-waves): skipping check_waves", flush=True)
+        print(f"note: {args.llama_cpp} has no expert cache waves (fork branch feat/kolibri1-waves2): skipping check_waves", flush=True)
     gpu_remap_on = has_gpu_remap(r, args.llama_cpp)
     if args.gpu_remap_only and not gpu_remap_on:
         ap.error(f"--gpu-remap-only: {args.llama_cpp} has no GPU remap; it needs a build of fork branch feat/kolibri1-gpu-remap")
@@ -346,6 +395,12 @@ def main() -> None:
     sidefile_on = has_sidefile(r, args.llama_cpp)
     if not sidefile_on:
         print(f"note: {args.llama_cpp} has no expert cache side-file (patch 0014): skipping the side-file checks", flush=True)
+    if waves_on and not sidefile_on:
+        print(f"SKIP waves with the side-file: {args.llama_cpp} has no expert cache side-file (an old waves build, "
+              f"feat/kolibri1-waves; feat/kolibri1-waves2 has both)", flush=True)
+    if waves_on and not gpu_remap_on:
+        print(f"SKIP waves with the GPU remap: {args.llama_cpp} has no GPU remap (an old waves build, "
+              f"feat/kolibri1-waves; feat/kolibri1-waves2 has both)", flush=True)
     if args.stack_only and not (gpu_remap_on and sidefile_on):
         ap.error(f"--stack-only: {args.llama_cpp} lacks the GPU remap or the side-file; it needs a build of fork branch feat/kolibri1-e2-e3")
     skip_on = has_skip(r, args.llama_cpp)
@@ -368,6 +423,7 @@ def main() -> None:
         print(f"note: the cache runs wait with --expert-cache-wait {args.wait_mode}", flush=True)
     fusion_disabled = bool(os.environ.get("GGML_METAL_FUSION_DISABLE"))
     failed = 0
+    waves_gpu_ran = False  # a build took waves with the GPU remap on some GPU: check_waves_exact reruns them
 
     def cli(cmd: list[str]) -> list[str]:
         """A llama-completion command line, with --expert-cache-wait when it runs the cache."""
@@ -804,8 +860,32 @@ def main() -> None:
             run = subprocess.run(cli(base + ["--expert-cache", "64", "--expert-cache-gpu-remap"] + extra), capture_output=True, text=True)
             report(run.returncode != 0 and msg in run.stderr, f"llama-completion --expert-cache-gpu-remap with {what} exits {run.returncode} and says why")
 
+    def check_waves_refusals(gguf: Path, dev_name: str, dev, label: str) -> None:
+        """--expert-cache-waves without a cache fails to load instead of loading resident. Tiny
+        checkpoints only: if the refusal failed, the refused run would load the model fully resident."""
+        if not waves_on:
+            return
+        needle = "--expert-cache-waves needs --expert-cache or --expert-cache-layers"
+        what = f"{label} {dev_name}: waves without a cache"
+        try:
+            r.logits(gguf, dev, list(range(1000, 1010)), 10, no_repack=True, expert_cache={"waves": True})
+            report(False, f"{what} loaded")
+        except RuntimeError:
+            report(needle in "".join(r.log), f"{what} fails to load, and says why")
+        if not on_gpu(dev):
+            return
+        # the command line reaches that refusal: the flag alone creates the cache's params
+        tool = [str(args.llama_cpp / "build" / "bin" / "llama-completion"), "-m", str(gguf), "-p", "Hello", "-n", "4", "-no-cnv", "-c", "256",
+                "--no-warmup", "--expert-cache-waves"]
+        run = subprocess.run(tool, capture_output=True, text=True)
+        report(run.returncode != 0 and needle in run.stderr and run.stdout.strip() == "",
+               f"{label}: llama-completion --expert-cache-waves alone exits {run.returncode} and says why")
+
     def check_waves(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
-                    n_layer: int, n_expert: int, k: int, stats: Path, label: str, grown: bool = False) -> None:
+                    n_layer: int, n_expert: int, k: int, stats: Path, label: str, grown: bool = False,
+                    side: Path | None = None) -> None:
+        """The waves against the resident run at the same ubatch and split; with side, each run once
+        more reading its misses from the side-file."""
         if not waves_on:
             return
         chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
@@ -847,6 +927,242 @@ def main() -> None:
                 report(ok, f"{what}: counters consistent ({built} waves per layer built, {pre['waves']} of {pre['waves_built']} passes used over {n_layer} layers, "
                            f"{pre['wave_parked']} pairs parked; prefill {pre['needed']} needed, {pre['misses']} misses, "
                            f"{pre['hits']} hits, {pre['wait_seconds']:.3f} s wait; decode {dec['steps']} remaps, {dec['misses']} misses)")
+
+                if side is None:
+                    continue
+                # the same run, its misses read from the side-file: a wave's loads go through the same
+                # slots, so nothing may differ but the reads
+                gguf_pre, gguf_dec = pre, dec
+                stats.unlink(missing_ok=True)
+                on_side = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, n_ctx=n_ctx,
+                                   expert_cache={"n_slots": slots, "prefetch_k": pf, "stats_path": str(stats), "buffered": buffered, "waves": True,
+                                                 "sidefile_path": str(side)})
+                same = np.array_equal(on_side, ref)
+                diff = "" if same else f", max |diff| {float(np.abs(on_side - ref).max()):.3g}"
+                report(same, f"{what}, side-file: logits of {len(tokens)} positions bit-identical to the resident run at ubatch {ub}{diff}")
+                report(np.array_equal(on_side, got), f"{what}, side-file: logits bit-identical to the waves on the GGUF path")
+                s = json.loads(stats.read_text())
+                pre, dec = s["prefill"], s["decode"]
+                ok = reads_ok(s, side) and s["expert_cache"]["waves"] == waves and pre["load_failures"] + dec["load_failures"] == 0
+                ok = ok and s["expert_cache"]["buffered"] == (buffered or sys.platform != "darwin")
+                ok = ok and s["expert_cache"].get("wait", "sleep") == (args.wait_mode or "sleep")
+                # prefetches race with the remaps, so only a run without them plans the same waves
+                diffs = [] if pf else [f"{ph} {key} {a.get(key)} != {b.get(key)}" for ph, a, b in (("prefill", pre, gguf_pre), ("decode", dec, gguf_dec))
+                                       for key in ("needed", "hits", "misses", "demand_bytes", "evictions", "waves", "waves_built", "wave_parked")
+                                       if a.get(key) != b.get(key)]
+                report(ok and not diffs, f"{what}, side-file: {pre['preads']} and {dec['preads']} preads for {pre['loads']} and {dec['loads']} experts in prefill and decode "
+                                         f"({gguf_pre['preads']} and {gguf_dec['preads']} on the GGUF path); {pre['waves']} of {pre['waves_built']} wave passes "
+                                         f"({gguf_pre['waves']} of {gguf_pre['waves_built']} on the GGUF path)" + (f": {diffs}" if diffs else ""))
+
+    def resident_gated(gguf: Path, dev, tokens: list[int], chunks: list[int], ub: int, n_ctx: int, gate_ub: int):
+        """The resident run that waves with the GPU remap must match at every position: split after
+        each layer's ffn_moe_topk only in a graph of more than gate_ub tokens, which the CPU remap
+        runs (with its waves), and unsplit in one of at most gate_ub, which the Metal gate runs.
+        Runner.logits splits every graph or none, so this one decodes by hand, as
+        check_gpu_remap_hits does. Each chunk is one llama_decode of one ubatch."""
+        assert max(chunks) <= ub
+        r.log.clear()
+        devs = r.ffi.new("ggml_backend_dev_t[]", [dev, r.ffi.NULL])
+        model = r.lib.llama_model_load_from_file(str(gguf).encode(), r.ll.model_default_params(devices=devs, n_gpu_layers=-1, use_extra_bufts=False))
+        if not model:
+            raise RuntimeError("load failed: " + r.errors())
+        n_cur = [0]  # the tokens of the graph being computed
+
+        @r.ffi.callback("bool(struct ggml_tensor *, bool, void *)")
+        def on_node(t, ask, user_data):
+            if ask:
+                return n_cur[0] > gate_ub and r.ffi.string(t.name).decode().startswith("ffn_moe_topk")
+            return True
+
+        cparams = r.ll.context_default_params(n_ctx=n_ctx, n_batch=max(chunks), n_ubatch=ub, op_offload=False)
+        cparams.cb_eval = on_node
+        ctx = r.lib.llama_init_from_model(model, cparams)
+        if not ctx:
+            r.lib.llama_model_free(model)
+            raise RuntimeError("context failed: " + r.errors())
+        batch = r.lib.llama_batch_init(max(chunks), 0, 1)
+        try:
+            n_vocab = r.lib.llama_vocab_n_tokens(r.lib.llama_model_get_vocab(model))
+            out, start = [], 0
+            for n in chunks:
+                for i in range(n):
+                    batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tokens[start + i], start + i, 1, 0, True
+                batch.n_tokens = n
+                n_cur[0] = n
+                if (rc := r.lib.llama_decode(ctx, batch)) != 0:
+                    raise RuntimeError(f"llama_decode returned {rc} at position {start}: " + r.errors())
+                out += [np.frombuffer(r.ffi.buffer(r.lib.llama_get_logits_ith(ctx, i), 4 * n_vocab), dtype=np.float32).copy() for i in range(n)]
+                start += n
+            return np.stack(out)
+        finally:
+            r.lib.llama_batch_free(batch)
+            r.lib.llama_free(ctx)
+            r.lib.llama_model_free(model)
+
+    def check_waves_gpu_remap(gguf: Path, dev_name: str, dev, side: Path | None, tokens: list[int], n_prompt: int, slots_list: list[int],
+                              n_layer: int, n_expert: int, k: int, stats: Path, label: str,
+                              layout: tuple[int, int, int] | None = None, buffered_list: tuple[bool, ...] = (False, True)) -> None:
+        """Waves with the GPU remap in one context (Stage E4 retry): a graph of more than slots / k
+        tokens runs the CPU remap with waves, one of at most slots / k the Metal gate, and after each
+        CPU graph every layer's GPU table is refreshed from the slots. Two prompts, each followed by
+        decodes: the gate's tables only hold residents once a decode has run (a stopped layer copies
+        its table in), so it is the second prompt's waves that evict experts the tables still hold,
+        and the decodes after it that read stale slots without the refresh (control M110). layout
+        is (decodes, second prompt, decodes) after the first prompt of n_prompt tokens (default:
+        the rest of the tokens in thirds); buffered_list the read modes of the runs with the gate."""
+        nonlocal waves_gpu_ran
+        if not (waves_on and gpu_remap_on) or not on_gpu(dev):
+            return
+        n_rest = len(tokens) - n_prompt
+        n_dec1, n_prompt2, n_dec2 = layout or (n_rest // 3, n_rest // 3, n_rest - 2 * (n_rest // 3))
+        assert n_dec1 + n_prompt2 + n_dec2 == n_rest
+        chunks = [n_prompt] + [1] * n_dec1 + [n_prompt2] + [1] * n_dec2
+        starts, at = [], 0
+        for c in chunks:
+            starts.append(at)
+            at += c
+        gated = [p for p, c in zip(starts, chunks) if c == 1]  # the decodes, each a graph of one token
+        prompts = [c for c in chunks if c > 1]
+        n_dec = len(gated)
+        n_ctx = max(256, len(tokens))
+        same_fields = ("steps", "needed", "hits", "misses", "evictions", "demand_bytes", "load_failures", "waves", "waves_built", "wave_parked")
+
+        # a build that cannot run the pair refuses it at load, by name
+        try:
+            r.logits(gguf, dev, tokens[:2], 2, no_repack=True, n_ctx=n_ctx, expert_cache={"n_slots": slots_list[0], "waves": True, "gpu_remap": True})
+        except RuntimeError:
+            log = "".join(r.log)
+            line = next((ln.strip() for ln in log.splitlines() if "does not work with --expert-cache-waves" in ln), None)
+            if line is None:
+                report(False, f"{label} {dev_name}, waves + GPU remap: fails to load, and not by the known refusal: {log.strip()[-300:]}")
+            else:
+                print(f"SKIP {label} {dev_name}, waves + GPU remap: the build refuses the pair at load: {line[:200]}", flush=True)
+            return
+        waves_gpu_ran = True
+
+        refs = {}  # the resident references, by which graphs are split
+        for slots in slots_list:
+            gate_ub = max(1, slots // k)
+            base = f"{label} {dev_name}, waves + GPU remap, {slots} slots (gate ubatch {gate_ub}), prompts of {prompts} tokens, {n_dec} decodes"
+            # every prompt must take the CPU remap with waves, every decode the gate
+            if not (slots >= 3 * k and min(prompts) > gate_ub and all(min(n_expert, c * k) > slots for c in prompts) and max(chunks) <= n_prompt):
+                report(False, f"{base}: the setup would not run waves in every prompt")
+                continue
+            built = [-(-min(n_expert, c * k) // (slots - k)) for c in prompts]  # waves per layer each prompt's graph holds
+            key = tuple(c > gate_ub for c in chunks)
+            if key not in refs:
+                refs[key] = (resident(gguf, dev, tokens, n_prompt, chunks=chunks, n_ctx=n_ctx),            # split after ffn_moe_topk everywhere
+                             r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, n_ctx=n_ctx),  # split nowhere
+                             resident_gated(gguf, dev, tokens, chunks, n_prompt, n_ctx, gate_ub))         # split in the prompts only
+            split_ref, plain_ref, gated_ref = refs[key]
+            # Metal fuses across the CPU remap's split points and rounds differently there (E0.1); where
+            # that shows, a prompt split for the CPU remap writes other K and V than an unsplit one
+            fusion_shows = not np.array_equal(split_ref, plain_ref)
+            if fusion_disabled:
+                report(not fusion_shows, f"{base}: without fusion the split resident run equals the unsplit one")
+
+            stats.unlink(missing_ok=True)
+            cpu_arm = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, n_ctx=n_ctx,
+                               expert_cache={"n_slots": slots, "stats_path": str(stats), "waves": True})
+            c = json.loads(stats.read_text())
+            same = np.array_equal(cpu_arm, split_ref)
+            report(same, f"{base}, without the GPU remap: logits of {len(tokens)} positions bit-identical to the resident run split after each ffn_moe_topk"
+                         + ("" if same else f", max |diff| {float(np.abs(cpu_arm - split_ref).max()):.3g}"))
+
+            on_gguf = None  # the unbuffered run with the gate, which the side-file's must equal
+            assert False in buffered_list
+            for buffered in buffered_list:
+                what = base + (", buffered" if buffered else "")
+                stats.unlink(missing_ok=True)
+                got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, n_ctx=n_ctx,
+                               expert_cache={"n_slots": slots, "stats_path": str(stats), "buffered": buffered, "waves": True, "gpu_remap": True})
+                on_gguf = got if not buffered else on_gguf
+                same = np.array_equal(got, gated_ref)
+                report(same, f"{what}: logits of {len(tokens)} positions bit-identical to the resident run split only in the prompts' graphs"
+                             + ("" if same else f", max |diff| {float(np.abs(got - gated_ref).max()):.3g}"))
+                # the decodes against the UNSPLIT resident run: what reads a stale table differs here
+                want = gated_ref if fusion_shows else plain_ref
+                same = np.array_equal(got[gated], want[gated])
+                report(same, f"{what}: the {n_dec} decode positions bit-identical to the "
+                             + ("resident run unsplit in the decodes (the prompts split, since fusion shows)" if fusion_shows else "UNSPLIT resident run")
+                             + ("" if same else f", max |diff| {float(np.abs(got[gated] - want[gated]).max()):.3g}"))
+                if fusion_shows:
+                    print(f"info {what}: the decode positions' max |diff| to the UNSPLIT resident run {float(np.abs(got[gated] - plain_ref[gated]).max()):.3g}", flush=True)
+                # against the same run without the GPU remap: up to the first decode the graphs are the
+                # same; after it, only where fusion does not round the CPU remap's splits differently
+                if fusion_shows:
+                    report(np.array_equal(got[:n_prompt], cpu_arm[:n_prompt]),
+                           f"{what}: the first prompt's {n_prompt} positions bit-identical to the same run without the GPU remap")
+                    print(f"info {what}: max |diff| to the same run without the GPU remap {float(np.abs(got - cpu_arm).max()):.3g} "
+                          f"(its decodes split, and fusion rounds the split graph differently; exact under GGML_METAL_FUSION_DISABLE=1)", flush=True)
+                else:
+                    same = np.array_equal(got, cpu_arm)
+                    report(same, f"{what}: logits of {len(tokens)} positions bit-identical to the same run without the GPU remap"
+                                 + ("" if same else f", max |diff| {float(np.abs(got - cpu_arm).max()):.3g}"))
+
+                s = json.loads(stats.read_text())
+                ec, pre, dec = s["expert_cache"], s["prefill"], s["decode"]
+                bad = []
+                if not (ec["gpu_remap"] is True and ec["waves"] is True and c["expert_cache"]["gpu_remap"] is False):
+                    bad.append(f"mode: gpu_remap {ec['gpu_remap']}, waves {ec['waves']}")
+                if ec.get("wait", "sleep") != (args.wait_mode or "sleep"):
+                    bad.append(f"wait {ec.get('wait')}")
+                if ec["buffered"] != (buffered or sys.platform != "darwin"):
+                    bad.append(f"buffered {ec['buffered']}")
+                for ph, x in (("prefill", pre), ("decode", dec)):
+                    if x["hits"] + x["hits_loading"] + x["misses"] != x["needed"] or x["demand_bytes"] != x["misses"] * ec["expert_bytes"]:
+                        bad.append(f"{ph}: hits + hits_loading + misses != needed, or demand bytes != misses * expert bytes")
+                    if x["load_failures"]:
+                        bad.append(f"{ph}: {x['load_failures']} load failures")
+                if pre["steps"] != len(prompts) * n_layer or dec["steps"] != n_dec * n_layer:
+                    bad.append(f"remaps {pre['steps']} and {dec['steps']}, want {len(prompts) * n_layer} and {n_dec * n_layer}")
+                want_built = sum(n_layer * b for b in built if b > 1)
+                if pre["waves_built"] != want_built or not 0 < pre["waves"] <= want_built or pre["wave_parked"] == 0:
+                    bad.append(f"prefill: {pre['waves']} of {pre['waves_built']} wave passes, {pre['wave_parked']} parked, want {want_built} built")
+                if dec["waves"] or dec["waves_built"]:
+                    bad.append(f"decode: {dec['waves']} of {dec['waves_built']} wave passes")
+                # with alike routing the gate defers what the remaps do but never changes it
+                diffs = [f"{ph} {key} {x.get(key)} != {y.get(key)}" for ph, x, y in (("prefill", pre, c["prefill"]), ("decode", dec, c["decode"]))
+                         for key in (same_fields if not fusion_shows else ("steps",)) if x.get(key) != y.get(key)]
+                report(not bad and not diffs,
+                       f"{what}: counters consistent (prefill {pre['steps']} remaps, {pre['waves']} of {pre['waves_built']} wave passes, {built} per layer built, "
+                       f"{pre['wave_parked']} pairs parked, {pre['misses']} misses; decode {dec['steps']} remaps, {dec['hits']} hits, {dec['misses']} misses, "
+                       f"{dec['evictions']} evictions), {'as' if not fusion_shows else 'remaps as'} without the GPU remap" + (f": {bad + diffs}" if bad or diffs else ""))
+                # the path each graph took (M111): no prompt through a gate, every decode through one, so
+                # no CPU split: 2 scheduler splits per decoded token, as resident
+                runs, stops = dec.get("gpu_runs", 0), dec.get("gpu_stops", 0)
+                report(pre.get("gpu_runs") == 0 and dec["tokens"] == n_dec and dec["splits"] == 2 * n_dec and runs >= 2 * n_dec
+                       and stops <= dec["misses"] and (dec["misses"] == 0 or stops > 0),
+                       f"{what}: the prompts took the CPU remap ({pre.get('gpu_runs')} gated command buffers in prefill), the decodes the gate: "
+                       f"{dec['splits'] / max(dec['tokens'], 1):.2f} scheduler splits per decoded token, want 2 (without the GPU remap "
+                       f"{c['decode']['splits'] / max(c['decode']['tokens'], 1):.2f}); {runs / max(n_dec, 1):.2f} command buffers and "
+                       f"{stops / max(n_dec, 1):.2f} stops per decoded token, {(dec.get('metal_commits') or 0) / max(n_dec, 1):.2f} commits")
+
+            if side is None:
+                continue
+            # the whole stack: the waves' and the gate's misses read from the side-file
+            stats.unlink(missing_ok=True)
+            got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True, n_ctx=n_ctx,
+                           expert_cache={"n_slots": slots, "stats_path": str(stats), "waves": True, "gpu_remap": True, "sidefile_path": str(side)})
+            s = json.loads(stats.read_text())
+            pre, dec = s["prefill"], s["decode"]
+            same = np.array_equal(got, on_gguf)
+            report(same and reads_ok(s, side) and s["expert_cache"]["gpu_remap"] is True and s["expert_cache"]["waves"] is True,
+                   f"{base}, side-file: logits bit-identical to the GGUF path; {pre['preads']} and {dec['preads']} preads for {pre['loads']} and {dec['loads']} "
+                   f"experts in prefill and decode" + ("" if same else f", max |diff| {float(np.abs(got - on_gguf).max()):.3g}"))
+
+    def check_waves_exact() -> None:
+        """Waves with the GPU remap exactly: without fusion the CPU remap's split graph rounds as the
+        gate's unsplit one does, so every position must equal the same run without the GPU remap and
+        the decodes the unsplit resident run."""
+        if not waves_gpu_ran or fusion_disabled:
+            return
+        sub = subprocess.run([sys.executable, __file__, "--llama-cpp", str(args.llama_cpp), "--seed", str(args.seed), "--waves-only"]
+                             + (["--wait-mode", args.wait_mode] if args.wait_mode is not None else []),
+                             capture_output=True, text=True, env={**os.environ, "GGML_METAL_FUSION_DISABLE": "1"})
+        n_pass = sub.stdout.count("\nPASS ")
+        report(sub.returncode == 0 and n_pass > 0, f"waves with GGML_METAL_FUSION_DISABLE=1: {n_pass} checks passed, rc {sub.returncode}"
+               + ("" if sub.returncode == 0 else ": " + " | ".join(ln for ln in sub.stdout.splitlines() if ln.startswith("FAIL"))[:800]))
 
     def check_skip(gguf: Path, dev_name: str, dev, tokens: list[int], n_prompt: int, slots_list: list[int],
                    n_layer: int, n_expert: int, k: int, stats: Path, label: str, ranks: bool = True) -> None:
@@ -1046,21 +1362,34 @@ def main() -> None:
                 print(f"{'FAIL' if failed else 'PASS'}: {failed} failures")
                 sys.exit(1 if failed else 0)
             side = None
-            if sidefile_on and not args.waves_only:
+            if sidefile_on:
                 side = args.sidefile or args.real.with_name(args.real.name + ".experts")
-                if not side.exists():
+                if side.exists():
+                    pair(args.real, side, f"{args.real.stem} side-file", 8)
+                elif not args.waves_only:
                     raise SystemExit(f"{side} does not exist: go run ./cmd/kolibri-sidefile write -gguf {args.real}")
-                pair(args.real, side, f"{args.real.stem} side-file", 8)
+                else:
+                    # never written here: a real side-file is 30 GB, and kolibri-sidefile writes it
+                    print(f"SKIP {args.real.stem}: the waves with the side-file: {side} does not exist "
+                          f"(go run ./cmd/kolibri-sidefile write -gguf {args.real})", flush=True)
+                    side = None
             if not args.waves_only:
                 check(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem, side)
                 check_gpu_remap(args.real, *gpu[0], tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
                 check_gpu_remap_hits(args.real, *gpu[0], tokens[:16], 6, stats, args.real.stem, n_slots=128)
                 check_stack(args.real, *gpu[0], side, tokens, 128, [128, 64], 50, 6, stats, args.real.stem)
                 check_skip(args.real, *gpu[0], tokens, 128, [SKIP_SLOTS_REAL], 50, 384, 6, stats, args.real.stem, ranks=False)
-            check_waves(args.real, *gpu[0], tokens, 128, [128, 64], 50, 384, 6, stats, args.real.stem)
-            check_waves(args.real, *gpu[0], tokens[:40], N_GROWN_REAL, [18], 50, 384, 6, stats, f"{args.real.stem} grown waves", grown=True)
-            # the benchmark's ubatch: on a real workload about a third of the layers' unions outgrow 4 waves of 61
-            check_waves(args.real, *gpu[0], workload[:N_BENCH_UBATCH + 32], N_BENCH_UBATCH, [128], 50, 384, 6, stats, f"{args.real.stem} benchmark ubatch")
+            n_layer, n_expert, k = model_shape(args.llama_cpp, args.real)
+            check_waves(args.real, *gpu[0], tokens, 128, [128, 64], n_layer, n_expert, k, stats, args.real.stem)
+            check_waves(args.real, *gpu[0], tokens[:40], N_GROWN_REAL, [18], n_layer, n_expert, k, stats, f"{args.real.stem} grown waves", grown=True)
+            # the benchmark's ubatch: on a real workload about a third of the layers' unions outgrow 4 waves of 61;
+            # with the side-file twin, as the benchmark reads its misses
+            check_waves(args.real, *gpu[0], workload[:N_BENCH_UBATCH + 32], N_BENCH_UBATCH, [128], n_layer, n_expert, k, stats,
+                        f"{args.real.stem} benchmark ubatch", side=side)
+            # the benchmarked arm: waves for the prompts, the gate for the decodes, with and without the
+            # side-file; unbuffered only, since every reference is a resident run of the real weight
+            check_waves_gpu_remap(args.real, *gpu[0], side, workload[:N_BENCH_UBATCH + sum(WAVE_GPU_LAYOUT_REAL)], N_BENCH_UBATCH, [128],
+                                  n_layer, n_expert, k, stats, f"{args.real.stem} benchmark ubatch", layout=WAVE_GPU_LAYOUT_REAL, buffered_list=(False,))
         elif args.gpu_remap_only:
             model = generate_tiny(Path(tmp), args.seed, "router")
             cfg = json.loads((model / "config.json").read_text())
@@ -1105,11 +1434,16 @@ def main() -> None:
             tokens = [rng.randrange(1000, 100000) for _ in range(N_PROMPT + N_DECODE)]
             for outtype in ["f32", "q8_0"]:
                 gguf = convert(model, args.llama_cpp, outtype)
+                side = write_sidefile(gguf, f"{outtype} side-file") if sidefile_on else None
                 for dev_name, dev in r.devices():
                     check_waves(gguf, dev_name, dev, tokens, N_PROMPT, WAVE_SLOTS, cfg["num_hidden_layers"],
-                                cfg["num_experts"], cfg["num_experts_per_tok"], stats, outtype)
+                                cfg["num_experts"], cfg["num_experts_per_tok"], stats, outtype, side=side)
                     check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], cfg["num_hidden_layers"],
-                                cfg["num_experts"], cfg["num_experts_per_tok"], stats, f"{outtype} grown waves", grown=True)
+                                cfg["num_experts"], cfg["num_experts_per_tok"], stats, f"{outtype} grown waves", grown=True, side=side)
+                    check_waves_gpu_remap(gguf, dev_name, dev, side, tokens, N_PROMPT, WAVE_GPU_SLOTS, cfg["num_hidden_layers"],
+                                          cfg["num_experts"], cfg["num_experts_per_tok"], stats, outtype)
+                    check_waves_refusals(gguf, dev_name, dev, outtype)
+            check_waves_exact()
         else:
             model = generate_tiny(Path(tmp), args.seed, "router")
             cfg = json.loads((model / "config.json").read_text())
@@ -1122,8 +1456,10 @@ def main() -> None:
                 side = sides[outtype] = write_sidefile(gguf, f"{outtype} side-file") if sidefile_on else None
                 for dev_name, dev in r.devices():
                     check(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype, side)
-                    check_waves(gguf, dev_name, dev, tokens, N_PROMPT, WAVE_SLOTS, n_layer, cfg["num_experts"], k, stats, outtype)
-                    check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], n_layer, cfg["num_experts"], k, stats, f"{outtype} grown waves", grown=True)
+                    check_waves(gguf, dev_name, dev, tokens, N_PROMPT, WAVE_SLOTS, n_layer, cfg["num_experts"], k, stats, outtype, side=side)
+                    check_waves(gguf, dev_name, dev, tokens, N_GROWN, [18], n_layer, cfg["num_experts"], k, stats, f"{outtype} grown waves", grown=True, side=side)
+                    check_waves_gpu_remap(gguf, dev_name, dev, side, tokens, N_PROMPT, WAVE_GPU_SLOTS, n_layer, cfg["num_experts"], k, stats, outtype)
+                    check_waves_refusals(gguf, dev_name, dev, outtype)
                     check_gpu_remap(gguf, dev_name, dev, tokens, N_PROMPT, SLOTS, n_layer, k, stats, outtype)
                     check_gpu_remap_hits(gguf, dev_name, dev, tokens[:N_PROMPT], k, stats, outtype)
                     check_gpu_remap_refusals(gguf, dev_name, dev, stats, outtype)
@@ -1286,6 +1622,7 @@ def main() -> None:
                 check_gpu_remap_cli(base, gguf, stats, plain.stdout)
             check_skip_cli(base, stats, plain.stdout)
             check_gpu_remap_exact()
+            check_waves_exact()
 
     print(f"{'FAIL' if failed else 'PASS'}: {failed} failures")
     sys.exit(1 if failed else 0)
