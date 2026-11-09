@@ -1391,6 +1391,91 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4b.json -out ~/models/eval/ex
   -servers pr25294=third_party/llama.cpp-pr25294/build/bin/llama-server
 ```
 
+## Stage E4: prefill admission, measured offline
+
+Phase 11, Stage E4, the open item "Admission: prefill must not flush the decode working set". **Result (2026-11-10): the waves leave the slots close to what decode needs, and no seeding of the slots pays for its own loads. Admission was not built.** The item stays open for the owner's decision.
+
+### Rule, fixed before the replay ran
+
+Admission is built only if both hold:
+- in the replay, the best implementable seed raises the decode hit rate on the first 64 decoded tokens by at least 5 points over what the waves leave;
+- a run on the real model has more misses per token in the first 64 decoded tokens than afterwards.
+
+The first did not hold: 89.5% against 90.4%, 0.9 points. The second did (below).
+
+### Replay
+
+`cmd/kolibri-admission` replays the Stage A traces at 128 slots per layer with the fork's slot rules (`feat/kolibri1-waves2`, `5fe8b6df0`): victim choice, the plain remap, the wave plan and its stages, the last layer running output rows only, and the server's batch cuts. At the end of every prefill it sets the slots in one of five ways and then replays the decode:
+
+- **today:** what the waves leave;
+- **lfu:** the prompt's most-used experts per layer, the plan's proposal;
+- **recency:** the experts of the prompt's last tokens;
+- **decode-set:** what the slots held before the prefill, which is the plan's "bypass";
+- **oracle:** the experts the following answer uses most. No runtime can know them.
+
+IQ3, test suffixes (12 prompts, 4,402 decoded tokens), decode only. Misses per token are summed over the 50 layers. Seed loads are the experts a variant must load at the end of prefill, per prompt.
+
+| Variant | First 16: hits | misses/token | First 64: hits | misses/token | From token 65: hits | misses/token | Seed loads per prompt |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| today | 86.2% | 41.4 | 89.5% | 31.6 | 92.6% | 22.3 | 0 |
+| lfu | 87.9% | 36.2 | 90.4% | 28.9 | 92.6% | 22.1 | 839 |
+| recency | 86.2% | 41.4 | 89.1% | 32.7 | 92.5% | 22.5 | 1,051 |
+| decode-set | 83.5% | 49.4 | 88.2% | 35.3 | 92.6% | 22.3 | 2,395 |
+| oracle | 93.4% | 19.8 | 94.0% | 18.0 | 93.1% | 20.7 | 2,046 |
+
+- **The flush exists and is short.** After a waves prefill the first 16 decoded tokens miss 41.4 experts each, against 22.3 from token 65 on.
+- **LFU seeding costs more loads than it saves.** Over the 12 prompts it saves 2,887 decode loads (105,437 against 102,550) and needs 10,068 seed loads.
+- **Recency changes nothing, and bypassing is worse** than today in every window: the previous answer's experts predict the next answer worse than the prompt's end does.
+- **Even the oracle does not pay in loads:** 16,340 decode loads saved for 24,557 seed loads. A seed can only win if its loads are cheaper than decode misses, for example batched with the last wave. The replay does not model time.
+- Q8_0 gives the same pooled rows within 0.3 misses per token.
+
+### On the real model
+
+One prompt of 2,048 tokens, then 16, 64, 128 and 320 generated tokens, each on a fresh server (`llama-server` of `5fe8b6df0`, IQ3, 128 slots, side-file, GPU remap, spin, waves; `~/models/eval/e4-admission/`, home volume). Decode misses per token, from differences of the runs' `--expert-cache-stats`:
+
+| Prompt | Tokens 1–15 | 16–63 | 64–127 | 128–319 |
+|---|---:|---:|---:|---:|
+| coding | 39.1 | 26.7 | 28.5 | 27.3 |
+| research | 35.5 | 31.6 | 13.2 | 7.6 |
+
+- **Coding:** the excess is over after about 15 tokens: about 175 extra misses in all. At the 0.35 ms of wait per miss that these runs show, that is about 60 ms per answer. Agents ran tests during these runs, so this is an order of magnitude, not a timing result.
+- **Research:** the answer turns repetitive, so its later windows say nothing about the flush.
+- **The benchmark agrees.** In E4's retry (`~/models/eval/expert-bench-e4b`, 12 warm requests per arm and ceiling), the waves arm decodes tokens 2–17 in a mean of 35.4 ms, 18–65 in 39.0 ms and 66–128 in 31.6 ms at 0 GiB. The arm without waves takes 37.5, 41.0 and 38.8 ms. The waves do not make the first tokens slower than the capped prefill did.
+
+### How far the replay matches the runtime
+
+The same prompt replayed from empty slots, against the run's counters (`~/models/eval/e4-admission/replay/validate.md`):
+
+| | Steps | Needed | Misses | Waves | Waves built |
+|---|---:|---:|---:|---:|---:|
+| coding, replay | 246 | 46,728 | 40,082 | 762 | 784 |
+| coding, runtime | 346 | 47,575 | 40,418 | 762 | 784 |
+| research, replay | 246 | 38,884 | 29,336 | 703 | 784 |
+| research, runtime | 346 | 39,730 | 29,683 | 704 | 784 |
+
+- Waves and built waves match for coding. Prefill misses are 0.8% and 1.2% low.
+- The 100 missing steps are two decodes of two tokens that a fresh server runs before the first prompt (the warmup and a probe). The cache counts them as prefill, and the traces do not hold their selections.
+- Research has one more non-empty wave in the runtime, so a few of its selections differ from the recorded trace. The cause was not found.
+- Coding's first 15 decoded tokens are the trace's tokens: 602 misses replayed against 586 counted (+2.7%). The longer runs leave the trace after 25 tokens.
+- **So the model is close, not proven exact.** The differences are far smaller than the gap to the rule's 5 points.
+
+### Limits
+
+- The replay counts loads, not time.
+- The test suffixes hold 12 prompts, and the first-16 window 192 tokens. One prompt can move a workload's row by 1–2 misses per token.
+- A smaller seed (the top N per layer) was not tried.
+- A chat request can end a batch at a message start, which the replay's batch cuts do not model.
+- Nothing here was benchmarked under the Stage D rule, and no gate was registered.
+
+### Reproduce
+
+```sh
+go run ./cmd/kolibri-admission -md admission.md -out .
+go run ./cmd/kolibri-admission -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx -workloads coding,research \
+  -validate-first 2048 -validate-decode 15 -validate-startup 0 \
+  -runtime-stats coding=$HOME/models/eval/e4-admission/coding-n16/stats.json,research=$HOME/models/eval/e4-admission/research-n16/stats.json
+```
+
 ## Limits
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
