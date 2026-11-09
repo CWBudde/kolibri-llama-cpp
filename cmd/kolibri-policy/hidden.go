@@ -6,7 +6,9 @@ package main
 // step and lead as the same-token predictors. It is replayed and judged at Stage B's gate like the
 // perfect same-token predictor (perfect.go), with a declared cost per decoded layer step
 // (-hidden-state-us). pred-h1 (block l's router on the same stream, lead 0) is scored for recall
-// only. Off by default (-hidden-state-dir); a model without a capture is not judged.
+// only. Off by default (-hidden-state-dir); a model without a capture is not judged. A workload whose
+// capture selected other experts than the recorded trace is replayed on the capture's selections,
+// every policy with it (captureTrace), as docs/expert-predictor-result.md pre-registers.
 
 import (
 	"errors"
@@ -110,7 +112,8 @@ func loadPred(path string, h int, sel locality.Selections, nExpert int) (localit
 }
 
 // sameSelections fails unless the capture's selections at path are sel, ID for ID: the predictor
-// is never judged on a trace other than the one it was captured on.
+// is never judged on a trace other than the one it was captured on. sel is the trace captureTrace
+// chose, so a capture that differs from the recorded selections passes on its own.
 func sameSelections(path string, sel locality.Selections) error {
 	c, err := locality.ReadNPYFile(path)
 	if err != nil {
@@ -120,6 +123,47 @@ func sameSelections(path string, sel locality.Selections) error {
 		return fmt.Errorf("%s: the capture's selections differ from the replayed ones", path)
 	}
 	return nil
+}
+
+// TraceAgreement records the pre-registered fallback of a workload: the capture's selections in File
+// differ from the recorded ones, so the workload is replayed on the capture's. SameSets of the Pairs
+// (layer, token) pairs of the trace have the same Top-K set in both.
+type TraceAgreement struct {
+	File     string `json:"file"`
+	SameSets int    `json:"same_top_k_sets"`
+	Pairs    int    `json:"layer_token_pairs"`
+	K        int    `json:"k"`
+}
+
+// captureTrace is the trace a workload with a capture is replayed on. The capture's selections at
+// path are normally the recorded ones, ID for ID: then it returns recorded and no agreement. If they
+// differ (the recorded trace came from another llama.cpp build), it returns the capture's, for every
+// policy and the gate to be replayed on, and their agreement with the recorded ones. The capture
+// must have the recorded trace's layers, tokens and K: it is the same workload.
+func captureTrace(path string, recorded locality.Selections) (locality.Selections, *TraceAgreement, error) {
+	c, err := locality.ReadNPYFile(path)
+	if err != nil {
+		return recorded, nil, err
+	}
+	if c.Layers != recorded.Layers || c.Tokens != recorded.Tokens || c.K != recorded.K {
+		return recorded, nil, fmt.Errorf("%s: %d layers x %d tokens x %d, the recorded selections %d x %d x %d", path,
+			c.Layers, c.Tokens, c.K, recorded.Layers, recorded.Tokens, recorded.K)
+	}
+	if slices.Equal(c.IDs, recorded.IDs) {
+		return recorded, nil, nil
+	}
+	a := TraceAgreement{File: path, Pairs: c.Layers * c.Tokens, K: c.K}
+	x, y := make([]int32, c.K), make([]int32, c.K)
+	for i := 0; i < len(c.IDs); i += c.K {
+		copy(x, c.IDs[i:i+c.K])
+		copy(y, recorded.IDs[i:i+c.K])
+		slices.Sort(x)
+		slices.Sort(y)
+		if slices.Equal(x, y) {
+			a.SameSets++
+		}
+	}
+	return c, &a, nil
 }
 
 // synthPred is a pred-h2 file of the selections themselves: row r of token t holds layer r+2's
@@ -332,6 +376,16 @@ func writeHidden(w io.Writer, a Assumptions, links []locality.Link, sizes []int,
 			continue
 		}
 		with = append(with, m)
+	}
+	for _, r := range results {
+		if x := r.w.HiddenTrace; x != nil {
+			fmt.Fprintf(w, "\n**%s %s is replayed on the capture's own selections.** `%s` differs from the recorded "+
+				"trace, which came from another llama.cpp build: %d of %d (layer, token) pairs (%.2f%%) have the same "+
+				"Top-%d set. As pre-registered, every policy of this workload, the shared LRU and the gate's reference "+
+				"among them, is replayed on the capture's selections and not on the recorded ones; the recorded hits "+
+				"of `kolibri-cache` are not compared.\n", r.model, r.workload, x.File, x.SameSets, x.Pairs,
+				100*float64(x.SameSets)/float64(max(x.Pairs, 1)), x.K)
+		}
 	}
 	for _, m := range with {
 		var ks []string

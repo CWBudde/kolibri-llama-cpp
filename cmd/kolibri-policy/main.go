@@ -191,6 +191,9 @@ type Workload struct {
 	Hidden        []HiddenGrid   `json:"hidden_state_same_token,omitempty"`
 	HiddenRecall  []HiddenRecall `json:"hidden_state_recall,omitempty"`
 	HiddenMapping *MappingCheck  `json:"hidden_state_mapping_check,omitempty"`
+	// HiddenTrace is set if the workload is replayed on the capture's selections because they differ
+	// from the recorded ones (captureTrace).
+	HiddenTrace *TraceAgreement `json:"hidden_state_trace,omitempty"`
 	// PinnedOracles and Unions are Stage E7's, in checklist.go.
 	PinnedOracles []Runs `json:"pinned_oracles,omitempty"`
 	// HeldOutOracles bound a test suffix's decode alone, in checklist.go.
@@ -915,6 +918,19 @@ func main() {
 			if sel.Layers != len(m.Layers) {
 				log.Fatalf("%s %s: %d layers of selections, %d of expert sizes", name, wl, sel.Layers, len(m.Layers))
 			}
+			var ownTrace *TraceAgreement
+			if captured {
+				if sel, ownTrace, err = captureTrace(filepath.Join(*hiddenDir, fmt.Sprintf("%s.%s.experts.npy", wl, name)),
+					sel); err != nil {
+					log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
+				}
+				if x := ownTrace; x != nil {
+					fmt.Printf("NOTE %s %s: the capture's selections differ from the recorded ones (the same Top-%d set "+
+						"in %d of %d (layer, token) pairs, %.2f%%): every policy and the gate are replayed on the "+
+						"capture's selections (%s)\n", short(name), wl, x.K, x.SameSets, x.Pairs,
+						100*float64(x.SameSets)/float64(max(x.Pairs, 1)), x.File)
+				}
+			}
 			f, err := os.Open(filepath.Join(*dir, wl+".tokens.npy"))
 			if err != nil {
 				log.Fatal(err)
@@ -959,18 +975,23 @@ func main() {
 			if err != nil {
 				log.Fatalf("%s %s: %v", name, wl, err)
 			}
-			if err := check(tr.LayerLRU, sizes, cache[wl].PerLayer); err != nil {
-				log.Fatalf("FAIL %s %s: the layer LRU in trace order disagrees with cache-%s.json: %v", short(name),
-					wl, short(name), err)
+			if ownTrace != nil {
+				fmt.Printf("NOTE %s %s: cache-%s.json holds the recorded trace's hits, not compared with the capture's "+
+					"selections\n", short(name), wl, short(name))
+			} else {
+				if err := check(tr.LayerLRU, sizes, cache[wl].PerLayer); err != nil {
+					log.Fatalf("FAIL %s %s: the layer LRU in trace order disagrees with cache-%s.json: %v", short(name),
+						wl, short(name), err)
+				}
+				fmt.Printf("PASS %s %s: per-layer LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
+					wl, short(name), len(sizes))
+				if err := check(tr.SharedLRU, sizes, cache[wl].Shared); err != nil {
+					log.Fatalf("FAIL %s %s: the shared LRU in trace order disagrees with cache-%s.json: %v",
+						short(name), wl, short(name), err)
+				}
+				fmt.Printf("PASS %s %s: shared LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
+					wl, short(name), len(sizes))
 			}
-			fmt.Printf("PASS %s %s: per-layer LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
-				wl, short(name), len(sizes))
-			if err := check(tr.SharedLRU, sizes, cache[wl].Shared); err != nil {
-				log.Fatalf("FAIL %s %s: the shared LRU in trace order disagrees with cache-%s.json: %v",
-					short(name), wl, short(name), err)
-			}
-			fmt.Printf("PASS %s %s: shared LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
-				wl, short(name), len(sizes))
 			timing := locality.Timing{Links: links, DecodeStep: 1 / (*decodeTPS * float64(sel.Layers)),
 				PrefillToken: 1 / (*prefillTPS * float64(sel.Layers))}
 			noCache, runs, err := replay(sel, spans, cut, m, sizes, baselines(sel, spans, m, k), timing)
@@ -1075,6 +1096,7 @@ func main() {
 				}
 			}
 			if captured {
+				w.HiddenTrace = ownTrace
 				g := markov[slices.Index(horizons, locality.SameToken)]
 				if err := hiddenWorkload(&w, t, *hiddenDir, name, wl, g.Params[g.Own], sizes, at(sizes, *detail),
 					hiddenCosts); err != nil {

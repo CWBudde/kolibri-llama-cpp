@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -256,5 +258,118 @@ func TestWriteHidden(t *testing.T) {
 	writeHidden(&b, Assumptions{}, tr.timing.Links, sizes, []result{{model: "q8", workload: "w", t: tr}}, gatesB)
 	if b.Len() != 0 {
 		t.Fatalf("written without the flag: %q", b.String())
+	}
+}
+
+// writeSelections writes sel as numpy.save writes an int16 [layers, tokens, k] array.
+func writeSelections(t *testing.T, path string, sel locality.Selections) {
+	t.Helper()
+	header := fmt.Sprintf("{'descr': '<i2', 'fortran_order': False, 'shape': (%d, %d, %d), }", sel.Layers, sel.Tokens,
+		sel.K)
+	header += strings.Repeat(" ", (64-(10+len(header)+1)%64)%64) + "\n"
+	var b bytes.Buffer
+	b.WriteString("\x93NUMPY\x01\x00")
+	_ = binary.Write(&b, binary.LittleEndian, uint16(len(header)))
+	b.WriteString(header)
+	ids := make([]int16, len(sel.IDs))
+	for i, e := range sel.IDs {
+		ids[i] = int16(e)
+	}
+	_ = binary.Write(&b, binary.LittleEndian, ids)
+	if err := os.WriteFile(path, b.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The pre-registered fallback: a capture whose selections differ from the recorded ones becomes the
+// trace, and the share of (layer, token) pairs with the same Top-K set is reported. A capture that
+// matches changes nothing, and one of another shape is an error.
+func TestCaptureTrace(t *testing.T) {
+	rec := hiddenTestTrace(t).sel
+	path := filepath.Join(t.TempDir(), "w.M.experts.npy")
+
+	writeSelections(t, path, rec)
+	got, agree, err := captureTrace(path, rec)
+	if err != nil || agree != nil || !slices.Equal(got.IDs, rec.IDs) {
+		t.Fatalf("a matching capture: agreement %v, err %v", agree, err)
+	}
+
+	// three pairs change: one to another set, two keep their set in another order
+	other := rec
+	other.IDs = slices.Clone(rec.IDs)
+	pair := func(l, tok int) []int32 { return other.IDs[(l*rec.Tokens+tok)*rec.K:][:rec.K] }
+	p := pair(1, 7)
+	for e := range int32(8) {
+		if e != p[0] && e != p[1] {
+			p[0] = e
+			break
+		}
+	}
+	for _, lt := range [][2]int{{0, 0}, {3, 399}} {
+		p := pair(lt[0], lt[1])
+		p[0], p[1] = p[1], p[0]
+	}
+	writeSelections(t, path, other)
+	got, agree, err = captureTrace(path, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got.IDs, other.IDs) || slices.Equal(got.IDs, rec.IDs) {
+		t.Fatal("a differing capture: the trace is not the capture's selections")
+	}
+	if want := (TraceAgreement{File: path, SameSets: 4*400 - 1, Pairs: 4 * 400, K: 2}); agree == nil || *agree != want {
+		t.Fatalf("agreement %+v, want %+v", agree, want)
+	}
+	if err := sameSelections(path, got); err != nil {
+		t.Fatalf("the capture against the trace it became: %v", err)
+	}
+	if err := sameSelections(path, rec); err == nil {
+		t.Fatal("the capture against the recorded trace: no error")
+	}
+
+	writeSelections(t, path, locality.Selections{Layers: 4, Tokens: 399, K: 2, IDs: rec.IDs[:4*399*2]})
+	if _, _, err := captureTrace(path, rec); err == nil {
+		t.Fatal("a capture of another token count: no error")
+	}
+}
+
+// The report names a workload replayed on the capture's own selections, and says nothing new
+// without one.
+func TestWriteHiddenAgreement(t *testing.T) {
+	tr := hiddenTestTrace(t)
+	pred := widen(synthPred(tr.sel), 8)
+	sizes := []int{1, 2}
+	grids, err := hiddenGrids(tr, pred, "f", sizes, []float64{23e-6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := func(agree *TraceAgreement) string {
+		w := Workload{Hidden: grids, HiddenRecall: []HiddenRecall{hiddenRecall(tr, pred, 2, "f2")},
+			HiddenMapping: &MappingCheck{K: 2, Sizes: 2, CostsSeconds: []float64{23e-6}}, HiddenTrace: agree}
+		results := []result{{model: "m", workload: "w", w: w, t: tr}}
+		ref := GateEntry{Policy: "best", Sizes: []GateSize{{ExpertsPerLayer: 1, Seconds: []float64{1}},
+			{ExpertsPerLayer: 2, Seconds: []float64{1}}}}
+		a := Gate{Tokens: 1, Links: []string{"ssd"}, Reference: ref}
+		var b bytes.Buffer
+		writeHidden(&b, Assumptions{HiddenStateDir: "/cap", HiddenStateSeconds: []float64{23e-6}}, tr.timing.Links,
+			sizes, results, map[string]Gate{"m": stageBGate(results, "m", sizes, []string{"ssd"}, a)})
+		return b.String()
+	}
+	plain := report(nil)
+	if strings.Contains(plain, "own selections") {
+		t.Fatalf("a matching capture is reported as a fallback:\n%s", plain)
+	}
+	md := report(&TraceAgreement{File: "/cap/w.M.experts.npy", SameSets: 1599, Pairs: 1600, K: 2})
+	for _, want := range []string{"m w is replayed on the capture's own selections", "1599 of 1600", "99.94%",
+		"same Top-2 set"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("the report lacks %q", want)
+		}
+	}
+	// nothing else changes
+	i := strings.Index(md, "\n\n**m w is replayed")
+	j := i + 2 + strings.Index(md[i+2:], "\n")
+	if i < 0 || md[:i]+md[j:] != plain {
+		t.Errorf("the fallback changes more of the report than its own paragraph")
 	}
 }
