@@ -101,11 +101,8 @@ def top_k(scores, k: int):
     """The k best columns per row, best first; ties go to the lower expert ID. int16 [n, k]."""
     import numpy as np
 
-    n_expert = scores.shape[1]
-    idx = np.argpartition(-scores, k - 1, axis=1)[:, :k] if k < n_expert else np.tile(np.arange(n_expert), (len(scores), 1))
-    idx.sort(axis=1)
-    order = np.argsort(-np.take_along_axis(scores, idx, axis=1), axis=1, kind="stable")
-    return np.take_along_axis(idx, order, axis=1).astype(np.int16)
+    # A stable sort of every column: a partition to k first would cut a tie at the k-th place anywhere.
+    return np.argsort(-scores, axis=1, kind="stable")[:, :k].astype(np.int16)
 
 
 class Routers:

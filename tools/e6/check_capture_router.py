@@ -15,6 +15,8 @@ without any real weight. Token IDs are random (two "workloads" of 1100 and 700 t
   within 1e-4 of the scale. The reference reads ffn_moe_topk too: on Metal, splitting the graph at
   those nodes changes the later blocks' activations (an INFO line prints by how much), so the tool,
   experts.py and this reference all read the same set;
+- top_k orders exact ties by the lower expert ID, also a tie across the k-th place (synthetic scores,
+  no model);
 - refuse_out refuses ~/models/eval/locality and a non-empty directory (called directly; nothing runs).
 
 Controls: --control no-bias (block l's selection without exp_probs_b) and --control wrong-norm (block
@@ -40,6 +42,31 @@ LENGTHS = {"coding": 1100, "hr": 700}
 THREADS = 4
 
 
+def top_k_ties(seed: int) -> tuple[bool, str]:
+    """cr.top_k on scores with exact ties, also across the k-th place: every row must be the first k
+    experts by (score descending, expert ID ascending). Needs no model."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    n_expert, k = 384, 48
+    rows = [np.zeros(n_expert), np.arange(n_expert) // 100, -(np.arange(n_expert) // 100)]  # all tied; tied blocks
+    for levels in (2, 3, 5, 40, 200):  # ever fewer ties; with 200 levels most rows still tie at the cut
+        rows += list(rng.integers(0, levels, (200, n_expert)))
+    scores = np.asarray(rows, dtype=np.float32)
+    want = np.array([sorted(range(n_expert), key=lambda e: (-row[e], e))[:k] for row in scores.tolist()])
+    srt = -np.sort(-scores, axis=1)
+    straddle = int((srt[:, k - 1] == srt[:, k]).sum())
+    bad = 0
+    for kk in (k, 6, 1, n_expert):
+        got = cr.top_k(scores, kk)
+        ref = want[:, :kk] if kk < n_expert else np.array([sorted(range(n_expert), key=lambda e: (-row[e], e))
+                                                           for row in scores.tolist()])
+        bad += int((got != ref).any(axis=1).sum())
+    return bad == 0 and straddle > 100, (f"top_k breaks exact ties by the lower expert ID, also across the k-th place: {bad} "
+                                         f"differing rows of {len(scores)} at k 48, 6, 1 and 384 ({straddle} rows tie across "
+                                         f"the 48th place)")
+
+
 def main() -> int:
     import numpy as np
 
@@ -57,6 +84,8 @@ def main() -> int:
         print(f"{'PASS' if ok else 'FAIL'} {what}", flush=True)
         if not ok:
             failures.append(what)
+
+    report(*top_k_ties(args.seed))
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
