@@ -1235,6 +1235,7 @@ The user decides before this stage starts. It deliberately breaks Phase 10's "ro
   - **KLD: passed.** On `wiki.test`, 0.101960 ± 0.007076 against 0.097870 ± 0.007511 at W = 0, limit 0.107657; 14.18 ids skipped per token.
   - **Speed, `decode-and-p95` at 16 GiB: passed** (`testdata/bench/e5-gpu-skip.json`, 13 of 13 runs). Decode 31.03 (30.74–31.32) against 27.44 (27.30–27.53) t/s, and p95 44.2 (43.1–45.3) against 50.5 (49.1–54.9) ms; 10.35 ids skipped per decoded token. At 0 GiB (INFO): 31.80 against 28.01 t/s.
   - Every skip repetition is above Phase 11's 30 t/s decode target, in a lossy mode. Whether that counts towards "on par" is the owner's decision.
+  - INFO, unregistered: 10 minutes per arm of four repeated generations show no gain (37.84 against 37.68 t/s). The lossless cache loads a recurring expert once, and the skip never admits it.
   - Design sketch: on a miss, the Metal gate stops the command buffer and the CPU runs the same `remap()`. There it can apply the skip rule, zero a skipped id's weight in place (the weights are already in shared memory), and point that token's slot id at its rank-1 slot, with no extra graph node. A layer whose misses are all skippable would not stop at all.
   - Estimate from E5's numbers: the CPU-path skip saved 3.0 ms of wait per token. Applied to the baseline's 40.3 ms, that gives about 37.3 ms, or 26.8–27.5 t/s against the baseline's best repetition of 26.39, a marginal pass before any saved stops. The KLD gate must be re-run on the GPU path, which rounds differently.
 
