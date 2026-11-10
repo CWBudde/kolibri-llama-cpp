@@ -1476,6 +1476,71 @@ go run ./cmd/kolibri-admission -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx -worklo
   -runtime-stats coding=$HOME/models/eval/e4-admission/coding-n16/stats.json,research=$HOME/models/eval/e4-admission/research-n16/stats.json
 ```
 
+## Stage E5: the skip in the GPU remap
+
+Phase 11, Stage E5's parked item: the lossy skip of "Stage E5: skip-only" inside the GPU remap's Metal gate, which the owner asked for on 2026-11-10. The CPU-remap skip passed its KLD gate and lost its speed gate, because the CPU remap costs more than the skipped waits save. This build keeps the GPU remap. It is on fork branch `feat/kolibri1-gpu-skip` (`15d89aa23`), on top of `feat/kolibri1-waves2` (`5fe8b6df0`), and is off by default.
+
+### The mode
+
+`--expert-cache-skip W` (default 0, off) needs `--expert-cache-gpu-remap`; without it the model fails to load.
+
+1. The rule applies only in a graph layer that computes **one token**, which is every decode step. A prefill ubatch of more tokens is not skipped: the gate would have to know which experts the ubatch's other tokens need.
+2. The gate ranks the token's k router ids by their weight, largest first; ties go by position.
+3. An id is skipped if its expert has no slot, its rank is 4 or lower, and its weight is below W. The GPU remap has no prefetch, so "no slot" is a true miss.
+4. If every miss of the layer is skipped, the gate passes: it maps each skipped id to the slot of the token's rank-1 expert and writes 0 over its weight, in place. **The command buffer does not stop.**
+5. If another miss remains, the gate stops as before and writes neither slots nor weights. The CPU loads the misses that are not skipped, and the resumed gate ranks the same weights again.
+6. The gate logs a skipped id as `-1 - id`. The CPU's bookkeeping counts it (`skipped` per phase in the stats) and neither pins nor loads it.
+
+No graph node is added: the layer's first expert matmul gets the router weights as one more source, so that they are computed before the gate. With W = 0 the graph is the GPU remap's. With W so small that nothing is skipped, the logits are bit-identical to it as well.
+
+For one token this is the rule of the CPU-remap skip. What differs: prefill ubatches are not skipped, and a skipped miss can save a stop, not only a read.
+
+### Checks (before the registration below)
+
+- `test-expert-cache`: "all expert cache tests passed", with the argument parsing and the refusals. `test-arg-parser`: "all tests OK".
+- `check_expert_cache.py --skip-only --skip-ref third_party/llama.cpp-skip`, tiny F32 and Q8_0 on Metal: 49 PASS, "PASS: 0 failures".
+  - W = 0 and W = 1e-30: logits bit-identical to the GPU remap without the option, same counters.
+  - W = 1: decode skips, the counters are consistent (each decode id is needed or skipped, once), no prefill ubatch of more than one token skips, and decode stops do not rise.
+  - Metamorphic: a skipped id on rank 2's slot instead of rank 1's gives bit-identical logits.
+  - 3 experts per token: nothing skips. 4: only the rank-4 id.
+  - **Against the CPU-remap skip** (`--skip-ref`, build `46fcc4069`, an independent implementation of the one-token rule): with one token per ubatch at 6 slots and W = 0.3, 0.5 and 0.7, both builds count the same steps, needed experts, misses and skipped ids (F32: 74, 163 and 339 skipped), and their logits differ by at most 1.3e-4.
+- `--real` IQ3 at 64 slots: "PASS: 0 failures". W = 1 skips 12.7% of the decode ids; decode stops fall from 1050 to 754.
+- Negative controls, each applied, rebuilt, run and reverted:
+
+| Control | Change | Result |
+|---|---|---|
+| **M113** | the gate does not zero the skipped weight | "FAIL: 12 failures": the metamorphic check (max \|diff\| 1.38) and the reference |
+| **M114** | cutoff at rank 3 | the process aborts in the CPU bookkeeping: `GGML_ASSERT(n_kept >= std::min(n_ids, 3))` |
+| **M115** | rank by id position | "FAIL: 6 failures": the reference counts differ (44, 102, 205 skipped against 74, 163, 339) |
+| **M116** | the CPU loads the skipped ids | "FAIL: 17 failures": nothing is counted as skipped |
+
+### Pre-registration (committed and pushed before the tuning runs)
+
+This repeats E5's registration on the new path. The thresholds, the rule and the limits are E5's; only the build and the flag `--expert-cache-gpu-remap` are new.
+
+**All KLD runs** use `llama-perplexity` of fork build `15d89aa23` on `~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, Metal, with `-ngl 99 -t 10 --fit off -c 512 -b 512 -ub 1 --expert-cache 128 --expert-cache-sidefile <GGUF>.experts --expert-cache-wait spin --expert-cache-gpu-remap --expert-cache-skip W` and `--expert-cache-stats` for the counts. The ubatch is 1, so every token meets the rule as in decode. W = 0 is the lossless GPU remap on this build.
+
+**Tuning:**
+- wikitext-2 `wiki.valid.raw`, 20 chunks of 512, against E5's base `~/models/eval/e5/kld-bf16-valid-c512-n20.bin`.
+- Thresholds: W ∈ {0.05, 0.1, 0.2, 0.3, 0.5, 1.0}, plus W = 0.
+- **Rule:** the chosen W is the largest whose tuning KLD is at most 1.10 × the tuning KLD at W = 0. If none qualifies, no W is chosen and the stage does not pass; the speed matrix then runs at W = 0.05 as INFO.
+
+**KLD gate:**
+- Base `~/models/eval/kld-bf16-c512-n20.bin`, the 20 `wiki.test` chunks.
+- Two runs: W = 0 and the chosen W.
+- **It passes if** KLD(W) ≤ 1.10 × KLD(0).
+- Reported: same-top-token rates, skipped ids and stops per token.
+
+**Speed gate:**
+- `testdata/bench/e5-gpu-skip.json`, written after tuning with the chosen W and committed before the KLD gate and its own first run. Every arm runs on the one build `15d89aa23`, so the arms differ only in the flag.
+- Candidate: the series' best arm (`--expert-cache 128`, side-file, GPU remap, spin, waves) plus `--expert-cache-skip W`. Baseline: the same arm without it. 3 repetitions each at 16 GiB and at 0 GiB.
+- **Deciding, at 16 GiB, metric `decode-and-p95`** (PLAN's gate, E5's metric): every skip repetition must decode faster than the baseline's fastest, **and** every warm p95 must be below the baseline's lowest.
+- INFO: the same metric at 0 GiB; prefill and TTFT at both ceilings; skipped ids per decoded token; stops per token.
+- The baseline must generate the token IDs of resident (not exact in prefill, which runs waves on the CPU remap, as in E4's retry). The skip arm, being lossy, has no equivalence.
+- The runs are alone on the machine: no agent, no build, home volume, AC power.
+
+**The stage passes only if the KLD gate and the speed gate both pass.** If it passes, the skip is proposed as a patch on top of 0019, not merged, and the default stays lossless. If not, the stop rule applies: no patch, and the code stays on the fork branch.
+
 ## Limits
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
