@@ -432,8 +432,9 @@ const (
 	// AdmitDecodeSet restores what the slots held before the prefill phase began: the prefill
 	// bypasses the slots.
 	AdmitDecodeSet
-	// AdmitOracle seeds the experts the decode run that follows uses most. It reads the future:
-	// an upper bound, not a policy.
+	// AdmitOracle seeds the experts the decode run that follows uses most. It reads the future, so
+	// it is no policy. It is not an upper bound either: with two slots and the decode 0,0,0,1,2,2
+	// it seeds 0 and 2 for four hits, while 1 and 0 give five.
 	AdmitOracle
 )
 
@@ -451,7 +452,7 @@ func (v AdmissionVariant) String() string {
 	case AdmitDecodeSet:
 		return "decode-set"
 	case AdmitOracle:
-		return "oracle"
+		return "future-lfu"
 	}
 	return fmt.Sprintf("AdmissionVariant(%d)", int(v))
 }

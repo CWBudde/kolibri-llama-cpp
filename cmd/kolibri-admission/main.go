@@ -17,7 +17,8 @@
 //   - lfu: the experts the prompt's prefill used most;
 //   - recency: the experts of the prompt's last tokens;
 //   - decode-set: what the slots held before the prefill, as if it had bypassed them;
-//   - oracle: the experts the following decode uses most. Not implementable: an upper bound.
+//   - future-lfu: the experts the following decode uses most. Not implementable, and a frequency
+//     seed that reads the answer, not an upper bound: another resident set or order can hit more.
 //
 // It prints a Markdown report, also written to -md, and writes admission-<model>.json to -out.
 // It loads no weights.
@@ -196,8 +197,9 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, rows []Row) {
 		"- `lfu`: the experts the prompt's prefill used most, the most used the most recent.\n"+
 		"- `recency`: the experts of the prompt's last tokens, walking back until the slots are full.\n"+
 		"- `decode-set`: what the slots held before the prefill began, as if it had bypassed them.\n"+
-		"- `oracle`: the experts the following decode uses most. **Not implementable**: it reads the future and "+
-		"is the upper bound of seeding.\n\n"+
+		"- `future-lfu`: the experts the following decode uses most. **Not implementable**: it reads the answer. "+
+		"It is a frequency seed, not an upper bound of seeding: a set or order chosen against the decode's "+
+		"sequence can hit more.\n\n"+
 		"A seeding variant keeps residents it does not replace, older than its seeds.\n\n")
 	fmt.Fprintf(w, "**Columns.** hit: experts found resident of experts needed, over all layers. miss/tok: experts "+
 		"loaded per decoded token, summed over the layers. The windows are each answer's first decoded tokens; "+
@@ -440,6 +442,10 @@ func main() {
 	if *validateFirst > 0 {
 		runtime := map[string]string{}
 		if *runtimeStats != "" {
+			// the pairs name a workload only, so they belong to one model
+			if n := len(strings.Split(*models, ",")); n != 1 {
+				log.Fatalf("-runtime-stats takes one model's runs, -models names %d", n)
+			}
 			for f := range strings.SplitSeq(*runtimeStats, ",") {
 				wl, path, ok := strings.Cut(f, "=")
 				if !ok {

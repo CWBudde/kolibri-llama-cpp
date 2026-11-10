@@ -71,7 +71,7 @@ func TestEvaluate(t *testing.T) {
 		t.Error("two runs give different reports")
 	}
 	md := one.String()
-	for _, want := range []string{"| w | today |", "| w | oracle (not implementable) |", "first 16", "tokens 65+", "12 slots", "24 slots"} {
+	for _, want := range []string{"| w | today |", "| w | future-lfu (not implementable) |", "first 16", "tokens 65+", "12 slots", "24 slots"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("the report lacks %q:\n%s", want, md)
 		}

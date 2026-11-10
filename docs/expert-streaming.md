@@ -1393,7 +1393,7 @@ go run ./cmd/kolibri-bench -matrix testdata/bench/e4b.json -out ~/models/eval/ex
 
 ## Stage E4: prefill admission, measured offline
 
-Phase 11, Stage E4, the open item "Admission: prefill must not flush the decode working set". **Result (2026-11-10): the waves leave the slots close to what decode needs, and no seeding of the slots pays for its own loads. Admission was not built.** The item stays open for the owner's decision.
+Phase 11, Stage E4, the open item "Admission: prefill must not flush the decode working set". **Result (2026-11-10): the waves leave the slots close to what decode needs, and no seeding that was tried pays for its own loads. Admission was not built.** The item stays open for the owner's decision.
 
 ### Rule, fixed before the replay ran
 
@@ -1411,7 +1411,7 @@ The first did not hold: 89.5% against 90.4%, 0.9 points. The second did (below).
 - **lfu:** the prompt's most-used experts per layer, the plan's proposal;
 - **recency:** the experts of the prompt's last tokens;
 - **decode-set:** what the slots held before the prefill, which is the plan's "bypass";
-- **oracle:** the experts the following answer uses most. No runtime can know them.
+- **future-lfu:** the experts the following answer uses most. No runtime can know them. It is a frequency seed, not an upper bound: a set or order chosen against the answer's sequence can hit more.
 
 IQ3, test suffixes (12 prompts, 4,402 decoded tokens), decode only. Misses per token are summed over the 50 layers. Seed loads are the experts a variant must load at the end of prefill, per prompt.
 
@@ -1421,12 +1421,12 @@ IQ3, test suffixes (12 prompts, 4,402 decoded tokens), decode only. Misses per t
 | lfu | 87.9% | 36.2 | 90.4% | 28.9 | 92.6% | 22.1 | 839 |
 | recency | 86.2% | 41.4 | 89.1% | 32.7 | 92.5% | 22.5 | 1,051 |
 | decode-set | 83.5% | 49.4 | 88.2% | 35.3 | 92.6% | 22.3 | 2,395 |
-| oracle | 93.4% | 19.8 | 94.0% | 18.0 | 93.1% | 20.7 | 2,046 |
+| future-lfu | 93.4% | 19.8 | 94.0% | 18.0 | 93.1% | 20.7 | 2,046 |
 
 - **The flush exists and is short.** After a waves prefill the first 16 decoded tokens miss 41.4 experts each, against 22.3 from token 65 on.
 - **LFU seeding costs more loads than it saves.** Over the 12 prompts it saves 2,887 decode loads (105,437 against 102,550) and needs 10,068 seed loads.
 - **Recency changes nothing, and bypassing is worse** than today in every window: the previous answer's experts predict the next answer worse than the prompt's end does.
-- **Even the oracle does not pay in loads:** 16,340 decode loads saved for 24,557 seed loads. A seed can only win if its loads are cheaper than decode misses, for example batched with the last wave. The replay does not model time.
+- **Even a seed that reads the answer does not pay in loads:** future-lfu saves 16,340 decode loads for 24,557 seed loads. It is not the best possible seed, so this does not prove that none could. A seed can only win if its loads are cheaper than decode misses, for example batched with the last wave. The replay does not model time.
 - Q8_0 gives the same pooled rows within 0.3 misses per token.
 
 ### On the real model
