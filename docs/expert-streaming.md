@@ -1486,7 +1486,7 @@ Phase 11, Stage E5's parked item: the lossy skip of "Stage E5: skip-only" inside
 
 `--expert-cache-skip W` (default 0, off) needs `--expert-cache-gpu-remap`; without it the model fails to load.
 
-1. The rule applies only in a graph layer that computes **one token**, which is every decode step. A prefill ubatch of more tokens is not skipped: the gate would have to know which experts the ubatch's other tokens need.
+1. The rule applies only in a graph layer that computes **one token**, which is every decode step. A prefill ubatch of more tokens is not skipped: the gate would have to know which experts the ubatch's other tokens need. (Its last layer is, when it computes only the last token; see "Limits of this result".)
 2. The gate ranks the token's k router ids by their weight, largest first; ties go by position.
 3. An id is skipped if its expert has no slot, its rank is 4 or lower, and its weight is below W. The GPU remap has no prefetch, so "no slot" is a true miss.
 4. If every miss of the layer is skipped, the gate passes: it maps each skipped id to the slot of the token's rank-1 expert and writes 0 over its weight, in place. **The command buffer does not stop.**
@@ -1614,14 +1614,22 @@ Both cache arms are `--expert-cache 128` with the side-file, the GPU remap, spin
   - Others' CPU averaged 76 to 102% in the baseline runs, and 92 to 247% in the skip runs (the first run, right after the KLD gate, had 247%, peak 410%). The disturbance fell on the candidate.
   - The arms alternated: skip 16 GiB, skip 0 GiB, baseline 16 GiB, baseline 0 GiB, per repetition.
 
-**Checks on the final build.** After the benchmark, one commit was added (`1dab37af4`): it keeps the skip out of a draft model's params, which would otherwise fail to load. No benchmarked arm has a draft model. On `1dab37af4`:
+**Checks on the final build.** After the benchmark, two commits were added. Neither touches the Metal backend (`ggml/` is unchanged since `15d89aa23`), the gate's rule or the CPU bookkeeping.
+- `1dab37af4` keeps the skip out of a draft model's params, which would otherwise fail to load. No benchmarked arm has a draft model.
+- `8ce7227b7` follows an independent review of the diff, which found no defect on Kolibri:
+  - a model with normalised or softmax router weights now fails to load with the skip, instead of asserting at the first decode (Kolibri has neither);
+  - `skip_map_rank` is checked only with the skip on;
+  - the help text says where the rule applies.
+
+On `8ce7227b7`:
 - `test-expert-cache`: "all expert cache tests passed"; `test-arg-parser`: "all tests OK";
-- `check_expert_cache.py --skip-only --skip-ref third_party/llama.cpp-skip`: 49 PASS, "PASS: 0 failures".
+- `check_expert_cache.py --skip-only --skip-ref third_party/llama.cpp-skip`: 49 PASS, "PASS: 0 failures";
+- `--real` IQ3 `--skip-only`: "PASS: 0 failures".
 
 On `15d89aa23`, the whole tiny suite with `--wait-mode spin` gave 1102 PASS, "PASS: 0 failures". The controls M113 to M116 ran on the tree that became `15d89aa23`.
 
 **What follows.**
-- `patches/llama.cpp/0020-kolibri-expert-cache-gpu-skip.patch` is the diff `5fe8b6df0..1dab37af4`; applied to `5fe8b6df0` it gives the branch's tree `bac70aca`. It applies on top of 0019 as PR #87 regenerates it (with `5fe8b6df0`).
+- `patches/llama.cpp/0020-kolibri-expert-cache-gpu-skip.patch` is the diff `5fe8b6df0..8ce7227b7`; applied to `5fe8b6df0` it gives the branch's tree `5658a450`. It applies on top of 0019 as PR #87 regenerates it (with `5fe8b6df0`).
 - The fork PR proposes `feat/kolibri1-gpu-skip` for `feat/kolibri1-waves2`. Nothing is merged, and the default stays lossless.
 
 ### Limits of this result
@@ -1629,14 +1637,15 @@ On `15d89aa23`, the whole tiny suite with `--wait-mode spin` gave 1102 PASS, "PA
 - **Quality is measured by KLD on 10,240 wikitext tokens only.** No task benchmark ran, and the generated text differs from the lossless run after 14 to 22 tokens in four of five requests.
 - **W was tuned and gated on wikitext, and the speed was measured on the four workloads,** where the mode skips less.
 - **128 decoded tokens per request.** A sustained decode was not measured.
-- **Prefill is not skipped.** A one-token prefill ubatch is, since the rule cannot tell it from a decode step.
+- **Prefill is not skipped, with two exceptions.** A one-token prefill ubatch is, since the rule cannot tell it from a decode step. So is the last layer of a prompt ubatch that computes only its last token: the logits of the first generated token are lossy too. The stats count those ids under `prefill`; the benchmark's skip arm has 0 there.
+- **A `cb_eval` observer of `ffn_moe_weights` sees the weights before the gate zeroes them** (`cmd/kolibri-routing` reads that tensor). Its trace would show a skipped expert with its router weight.
 - **Metal only,** as the GPU remap.
 
 ### Reproduce
 
 ```sh
 git -C third_party/llama.cpp fetch origin feat/kolibri1-gpu-skip
-git -C third_party/llama.cpp switch --detach 15d89aa23   # the benchmarked build; 1dab37af4 is the patch
+git -C third_party/llama.cpp switch --detach 15d89aa23   # the benchmarked build; 8ce7227b7 is the patch
 cmake --build third_party/llama.cpp/build --target llama llama-server llama-perplexity llama-completion test-expert-cache -j
 third_party/llama.cpp/build/bin/test-expert-cache
 .venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp --skip-only \
