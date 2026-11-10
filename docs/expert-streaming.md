@@ -1478,7 +1478,7 @@ go run ./cmd/kolibri-admission -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx -worklo
 
 ## Stage E5: the skip in the GPU remap
 
-**Verdict (2026-11-10): passed.** The KLD gate and the deciding speed gate at 16 GiB both passed, at the tuned W = 0.2. Warm decode is 31.03 against 27.44 t/s, and warm p95 44.2 against 50.5 ms, against the same build without the flag. The skip is proposed as patch 0020, not merged, and the default stays lossless. The sections below are in the order they were written: mode, checks, registration, tuning, result.
+**Verdict (2026-11-10): passed.** The KLD gate and the deciding speed gate at 16 GiB both passed, at the tuned W = 0.2. Warm decode is 31.03 against 27.44 t/s, and warm p95 44.2 against 50.5 ms, against the same build without the flag. The skip is proposed as patch 0020, not merged, and the default stays lossless. An unregistered sustained run on repeated generations showed no gain ("Sustained decode" below). The sections below are in the order they were written: mode, checks, registration, tuning, result.
 
 Phase 11, Stage E5's parked item: the lossy skip of "Stage E5: skip-only" inside the GPU remap's Metal gate, which the owner asked for on 2026-11-10. The CPU-remap skip passed its KLD gate and lost its speed gate, because the CPU remap costs more than the skipped waits save. This build keeps the GPU remap. It is on fork branch `feat/kolibri1-gpu-skip` (`15d89aa23`), on top of `feat/kolibri1-waves2` (`5fe8b6df0`), and is off by default.
 
@@ -1632,11 +1632,27 @@ On `15d89aa23`, the whole tiny suite with `--wait-mode spin` gave 1102 PASS, "PA
 - `patches/llama.cpp/0020-kolibri-expert-cache-gpu-skip.patch` is the diff `5fe8b6df0..8ce7227b7`; applied to `5fe8b6df0` it gives the branch's tree `5658a450`. It applies on top of 0019 as PR #87 regenerates it (with `5fe8b6df0`).
 - The fork PR proposes `feat/kolibri1-gpu-skip` for `feat/kolibri1-waves2`. Nothing is merged, and the default stays lossless.
 
+### Sustained decode (INFO, after the gates)
+
+10 minutes of continuous decode per arm at 16 GiB, the skip first and then the lossless arm (`~/models/eval/e5-gpu-sustained/`, build `8ce7227b7`). Each arm ran 84 requests of 256 tokens with `ignore_eos` at temperature 0, four short prompts in turn without the prompt cache, so **each arm generates the same four texts 21 times.**
+
+| Arm | Mean decode t/s | Median | Per 2-minute window | Misses per token | Stops per token | Skipped ids per token |
+|---|--:|--:|---|--:|--:|--:|
+| skip W = 0.2 | 37.84 | 39.74 | 37.37 to 38.57 | 10.65 | 8.30 | 14.13 |
+| lossless | 37.68 | 37.35 | 36.67 to 38.13 | 12.45 | 9.29 | 0 |
+
+- **No measurable gain in the mean** (0.4%), and both arms finished the same 84 requests in their 10 minutes. The short prompts make these speeds not comparable with the matrix.
+- **Why:** on repeated text the lossless cache misses only 12.45 experts per token, against 23.21 in the matrix, because it loads a recurring expert once. The skip leaves 14.13 ids per token out, but saves only 1.80 misses per token, as most of what it skips would have been a hit after the first load.
+- **So the matrix's 13% holds for new text after a long prompt, not for repeated generations.** How the gain behaves over one long generation of new text was not measured.
+- No window shows a trend. `pmset -g therm` reported no thermal or performance warning in any of the 21 samples per arm. Server CPU: 16 min 59 s and 16 min 58 s in 10 minutes.
+- One run per arm, in a fixed order, with no repetition: this is INFO, not a gate.
+
 ### Limits of this result
 
 - **Quality is measured by KLD on 10,240 wikitext tokens only.** No task benchmark ran, and the generated text differs from the lossless run after 14 to 22 tokens in four of five requests.
 - **W was tuned and gated on wikitext, and the speed was measured on the four workloads,** where the mode skips less.
-- **128 decoded tokens per request.** A sustained decode was not measured.
+- **128 decoded tokens per request in the matrix.** The sustained run below repeats four generations, and there the skip gains nothing measurable.
+- **A skipped expert is never admitted.** If the router keeps choosing it, the lossless cache loads it once and then hits, while the skip leaves it out every time.
 - **Prefill is not skipped, with two exceptions.** A one-token prefill ubatch is, since the rule cannot tell it from a decode step. So is the last layer of a prompt ubatch that computes only its last token: the logits of the first generated token are lossy too. The stats count those ids under `prefill`: 8 ids per run of the benchmark's skip arm, over its 5 requests.
 - **A `cb_eval` observer of `ffn_moe_weights` sees the weights before the gate zeroes them** (`cmd/kolibri-routing` reads that tensor). Its trace would show a skipped expert with its router weight.
 - **Metal only,** as the GPU remap.
