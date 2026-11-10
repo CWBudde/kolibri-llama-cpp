@@ -49,7 +49,14 @@
 // Stage B's gate retains it only where it beats the best Stage A policy at that size. So does a
 // linear predictor (locality.Linear) fitted on the training prefix before its last answer's
 // decoded tokens and chosen and calibrated on those, then frozen, with its own measured cost
-// (-linear-us).
+// (-linear-us). Given -oracle-predictor-us, a perfect same-token predictor (locality.Perfect), an
+// oracle that knows the step it predicts, is replayed and judged there too at each declared cost:
+// Stage E6's bound on any predictor of that horizon (perfect.go). Without it nothing changes.
+// Given -hidden-state-dir and -hidden-state-us, Stage E6's hidden-state predictor
+// (locality.HiddenState), read from the capture files of tools/e6/capture_router.py, is replayed and
+// judged there too at each declared cost, with the recall of the capture files and the mapping check
+// against the perfect oracle (hidden.go); a model without a capture is not judged. Without them
+// nothing changes.
 //
 // For each model and workload it reads <dir>/<workload>.<model>.experts.npy and the token IDs
 // <dir>/<workload>.tokens.npy, and the answers' prompt lengths and generated tokens from
@@ -177,6 +184,16 @@ type Workload struct {
 	LastN         LastNGrid     `json:"last_n"`
 	Markov        []HorizonGrid `json:"markov"`
 	Linear        []LinearGrid  `json:"linear,omitempty"`
+	// Perfect is Stage E6's bound at every -oracle-predictor-us cost, in perfect.go; none by default.
+	Perfect []PerfectGrid `json:"perfect_same_token,omitempty"`
+	// Hidden, HiddenRecall and HiddenMapping are Stage E6's hidden-state predictor at every
+	// -hidden-state-us cost, in hidden.go; none by default or without a capture.
+	Hidden        []HiddenGrid   `json:"hidden_state_same_token,omitempty"`
+	HiddenRecall  []HiddenRecall `json:"hidden_state_recall,omitempty"`
+	HiddenMapping *MappingCheck  `json:"hidden_state_mapping_check,omitempty"`
+	// HiddenTrace is set if the workload is replayed on the capture's selections because they differ
+	// from the recorded ones (captureTrace).
+	HiddenTrace *TraceAgreement `json:"hidden_state_trace,omitempty"`
 	// PinnedOracles and Unions are Stage E7's, in checklist.go.
 	PinnedOracles []Runs `json:"pinned_oracles,omitempty"`
 	// HeldOutOracles bound a test suffix's decode alone, in checklist.go.
@@ -205,6 +222,9 @@ type Assumptions struct {
 	SLRUProtected          float64            `json:"slru_protected_fraction"`
 	HotnessHalfLife        int                `json:"hotness_half_life_tokens"`
 	HotnessHalfLives       []int              `json:"hotness_tuning_half_lives"`
+	PerfectSeconds         []float64          `json:"perfect_seconds_per_step,omitempty"`
+	HiddenStateDir         string             `json:"hidden_state_dir,omitempty"`
+	HiddenStateSeconds     []float64          `json:"hidden_state_seconds_per_step,omitempty"`
 }
 
 // Output is <dir>/policy-<model>.json.
@@ -613,6 +633,8 @@ func writeMarkdown(w io.Writer, command string, a Assumptions, links []locality.
 	writeGate(w, "Stage A gate", stageAIntro, gates, modelsOf(results))
 	writeMarkov(w, a, links, sizes, d, results, gatesB)
 	writeLinear(w, a, links, sizes, d, results, gatesB)
+	writePerfect(w, links, sizes, results, gatesB)
+	writeHidden(w, a, links, sizes, results, gatesB)
 	writeGate(w, "Stage B gate", stageBIntro, gatesB, modelsOf(results))
 	writeE1(w, a, sizes, d, results)
 	writeChecklist(w, sizes, results, gatesP)
@@ -803,6 +825,13 @@ func main() {
 	splitsPath := flag.String("splits", "testdata/locality/splits.json", "the workloads' train/test splits")
 	detail := flag.Int("detail", 128, "the size the detail tables show")
 	layersFlag := flag.String("layers", "0,1,2,10,25,49", "the layers whose recall the report shows")
+	perfectUS := flag.String("oracle-predictor-us", "", "comma-separated costs per decoded layer step, µs, at "+
+		"which to judge a perfect same-token predictor at Stage B's gate (Stage E6's bound); off if empty")
+	hiddenDir := flag.String("hidden-state-dir", "", "the capture files <workload>.<model>.pred-h1.npy, .pred-h2.npy "+
+		"and .experts.npy of tools/e6/capture_router.py, from which to judge the hidden-state predictor at Stage B's "+
+		"gate (Stage E6); off if empty, needs -hidden-state-us")
+	hiddenUS := flag.String("hidden-state-us", "", "comma-separated costs per decoded layer step, µs, at which to "+
+		"judge the hidden-state predictor (the gate's is 23); needs -hidden-state-dir")
 	md := flag.String("md", "", "write the Markdown report here")
 	outDir := flag.String("out", "", "write policy-<model>.json here instead of -dir, created if missing")
 	flag.Parse()
@@ -826,6 +855,17 @@ func main() {
 			"of -sizes, -predict-us and -linear-us finite and not negative")
 	}
 	cost, linearCost := *predictUS*1e-6, *linearUS*1e-6
+	perfectCosts, err := parseCosts(*perfectUS)
+	if err != nil {
+		log.Fatalf("-oracle-predictor-us: %v", err)
+	}
+	hiddenCosts, err := parseCosts(*hiddenUS)
+	if err != nil {
+		log.Fatalf("-hidden-state-us: %v", err)
+	}
+	if (*hiddenDir == "") != (len(hiddenCosts) == 0) {
+		log.Fatal("-hidden-state-dir and -hidden-state-us go together")
+	}
 	var splits SplitManifest
 	readJSON(*splitsPath, &splits)
 	hs := halfLives(*halfLife)
@@ -834,7 +874,8 @@ func main() {
 		LastN: lastNs, PredictSeconds: cost, MarkovHalfLives: markovHalfLives, MarkovMixes: markovMixes,
 		MarkovK: markovKs, LinearSeconds: linearCost, LinearL2s: linearL2s, LinearEpochs: linearEpochs,
 		LinearRate: linearRate, SLRUProtected: *slruProtected, HotnessHalfLife: *hotHalfLife,
-		HotnessHalfLives: hotnessHalfLives(*hotHalfLife)}
+		HotnessHalfLives: hotnessHalfLives(*hotHalfLife), PerfectSeconds: perfectCosts,
+		HiddenStateDir: *hiddenDir, HiddenStateSeconds: hiddenCosts}
 	for _, l := range links {
 		a.LinkGBPerSecond[l.Name] = l.BytesPerSecond / 1e9
 	}
@@ -856,6 +897,16 @@ func main() {
 		}
 		var cache map[string]CacheSizes
 		readJSON(filepath.Join(*dir, "cache-"+name+".json"), &cache)
+		captured := false
+		if *hiddenDir != "" {
+			if captured, err = captureOf(*hiddenDir, name, strings.Split(*workloads, ",")); err != nil {
+				log.Fatalf("FAIL %v", err)
+			}
+			if !captured {
+				fmt.Printf("%s: no hidden-state capture in %s, the hidden-state predictor is not judged\n", short(name),
+					*hiddenDir)
+			}
+		}
 		grids[short(name)] = map[string]Grid{}
 		hotGrids[short(name)] = map[string]Grid{}
 		allCurves[short(name)] = map[string]curves{}
@@ -866,6 +917,19 @@ func main() {
 			}
 			if sel.Layers != len(m.Layers) {
 				log.Fatalf("%s %s: %d layers of selections, %d of expert sizes", name, wl, sel.Layers, len(m.Layers))
+			}
+			var ownTrace *TraceAgreement
+			if captured {
+				if sel, ownTrace, err = captureTrace(filepath.Join(*hiddenDir, fmt.Sprintf("%s.%s.experts.npy", wl, name)),
+					sel); err != nil {
+					log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
+				}
+				if x := ownTrace; x != nil {
+					fmt.Printf("NOTE %s %s: the capture's selections differ from the recorded ones (the same Top-%d set "+
+						"in %d of %d (layer, token) pairs, %.2f%%): every policy and the gate are replayed on the "+
+						"capture's selections (%s)\n", short(name), wl, x.K, x.SameSets, x.Pairs,
+						100*float64(x.SameSets)/float64(max(x.Pairs, 1)), x.File)
+				}
 			}
 			f, err := os.Open(filepath.Join(*dir, wl+".tokens.npy"))
 			if err != nil {
@@ -887,6 +951,11 @@ func main() {
 			}
 			if len(ids) != sel.Tokens {
 				log.Fatalf("FAIL %s: %d token IDs, %d tokens of selections", wl, len(ids), sel.Tokens)
+			}
+			if captured {
+				if err := captureTokens(*hiddenDir, wl, ids); err != nil {
+					log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
+				}
 			}
 			if err := locality.CheckAnswers(ids, answers); err != nil {
 				log.Fatalf("FAIL %s: %v", wl, err)
@@ -911,18 +980,23 @@ func main() {
 			if err != nil {
 				log.Fatalf("%s %s: %v", name, wl, err)
 			}
-			if err := check(tr.LayerLRU, sizes, cache[wl].PerLayer); err != nil {
-				log.Fatalf("FAIL %s %s: the layer LRU in trace order disagrees with cache-%s.json: %v", short(name),
-					wl, short(name), err)
+			if ownTrace != nil {
+				fmt.Printf("NOTE %s %s: cache-%s.json holds the recorded trace's hits, not compared with the capture's "+
+					"selections\n", short(name), wl, short(name))
+			} else {
+				if err := check(tr.LayerLRU, sizes, cache[wl].PerLayer); err != nil {
+					log.Fatalf("FAIL %s %s: the layer LRU in trace order disagrees with cache-%s.json: %v", short(name),
+						wl, short(name), err)
+				}
+				fmt.Printf("PASS %s %s: per-layer LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
+					wl, short(name), len(sizes))
+				if err := check(tr.SharedLRU, sizes, cache[wl].Shared); err != nil {
+					log.Fatalf("FAIL %s %s: the shared LRU in trace order disagrees with cache-%s.json: %v",
+						short(name), wl, short(name), err)
+				}
+				fmt.Printf("PASS %s %s: shared LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
+					wl, short(name), len(sizes))
 			}
-			fmt.Printf("PASS %s %s: per-layer LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
-				wl, short(name), len(sizes))
-			if err := check(tr.SharedLRU, sizes, cache[wl].Shared); err != nil {
-				log.Fatalf("FAIL %s %s: the shared LRU in trace order disagrees with cache-%s.json: %v",
-					short(name), wl, short(name), err)
-			}
-			fmt.Printf("PASS %s %s: shared LRU in trace order hits as in cache-%s.json at %d sizes\n", short(name),
-				wl, short(name), len(sizes))
 			timing := locality.Timing{Links: links, DecodeStep: 1 / (*decodeTPS * float64(sel.Layers)),
 				PrefillToken: 1 / (*prefillTPS * float64(sel.Layers))}
 			noCache, runs, err := replay(sel, spans, cut, m, sizes, baselines(sel, spans, m, k), timing)
@@ -1020,6 +1094,20 @@ func main() {
 			w := Workload{Tokens: sel.Tokens, Answers: len(answers), Split: d, NoCache: noCache, Policies: runs,
 				TraceOrder: tr, LFUGrid: grid, HotnessGrid: hotGrid, LastN: lastN, Markov: markov, Linear: linear,
 				PinnedOracles: pinned, HeldOutOracles: heldOut, Unions: unions}
+			if len(perfectCosts) > 0 {
+				g := markov[slices.Index(horizons, locality.SameToken)]
+				if w.Perfect, err = perfectGrids(t, g.Params[g.Own], sizes, perfectCosts); err != nil {
+					log.Fatalf("%s %s: %v", name, wl, err)
+				}
+			}
+			if captured {
+				w.HiddenTrace = ownTrace
+				g := markov[slices.Index(horizons, locality.SameToken)]
+				if err := hiddenWorkload(&w, t, *hiddenDir, name, wl, g.Params[g.Own], sizes, at(sizes, *detail),
+					hiddenCosts); err != nil {
+					log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
+				}
+			}
 			for _, s := range spans {
 				if s.Phase == locality.Prefill {
 					w.Ubatches++
@@ -1063,6 +1151,14 @@ func main() {
 			}
 			fmt.Printf("CHECK %s: Stage B gate retains %s, against step-pinned references %s\n", m,
 				retainedCount(gatesB[m]), retainedCount(gatesP[m]))
+			for _, line := range perfectChecks(m, gatesB[m], perfectCosts) {
+				fmt.Println(line)
+			}
+			if len(hiddenKinds(ofModel(results, m))) > 0 {
+				for _, line := range hiddenChecks(m, gatesB[m], hiddenCosts) {
+					fmt.Println(line)
+				}
+			}
 		}
 	}
 	for _, name := range names {
@@ -1095,8 +1191,14 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		writeMarkdown(f, "go run ./cmd/kolibri-policy -models "+*models+" -md "+*md, a, links, sizes, *detail, layers,
-			results, gates, gatesB, gatesP)
+		command := "go run ./cmd/kolibri-policy -models " + *models
+		if *perfectUS != "" {
+			command += " -oracle-predictor-us " + *perfectUS
+		}
+		if *hiddenDir != "" {
+			command += " -hidden-state-dir " + *hiddenDir + " -hidden-state-us " + *hiddenUS
+		}
+		writeMarkdown(f, command+" -md "+*md, a, links, sizes, *detail, layers, results, gates, gatesB, gatesP)
 		if err := f.Close(); err != nil {
 			log.Fatal(err)
 		}

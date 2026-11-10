@@ -1235,10 +1235,19 @@ Only if E2 and E3 leave the load wait as the largest remaining cost.
 
 **Fact for the condition, no decision (2026-11-07):** with both features the wait is 9.26 ms of 42.11 at 0 GiB (22.0%) and 9.27 of 42.86 at 16 GiB (21.6%). "Other" is 77.6% and 78.0%, or 16.27 and 17.01 ms above resident's 16.41. "Other" is a remainder, not one measured cost. E6 is not started ([docs/expert-streaming.md](docs/expert-streaming.md), "Stage E2 and E3 together").
 
-- [ ] Record residual streams on the frozen traces. Offline, apply layer l+1's and l+2's sigmoid routers to layer l's hidden state; measure recall at k = 6 and 12 on the Stage A test suffixes.
+**Started at the owner's overnight request (2026-11-08); the gate was not passed** ([docs/expert-predictor-result.md](docs/expert-predictor-result.md), "Stage E6: a hidden-state predictor").
+
+- [x] Record residual streams on the frozen traces. Offline, apply layer l+1's and l+2's sigmoid routers to layer l's hidden state; measure recall at k = 6 and 12 on the Stage A test suffixes.
   - Stage B used expert ids only.
   - The literature reports 90–96% one layer ahead on Mixtral/DeepSeek-MoE, but 67% on Qwen2-MoE, and nothing for sigmoid Top-6 over 384 experts.
+  - (2026-11-08) — `tools/e6/capture_router.py` stored each layer's top-48 through the next two routers for all four IQ3 workloads (`~/models/eval/e6/capture/`). The selections MATCH the recorded traces' sha256 for every workload. No hidden state is stored, and Q8_0 has no capture. Recall of the actual Top-6 on the test suffixes' decode, pooled: block l+1's router on layer l (lead 0) 71.3% at k 6 and 85.9% at k 12; block l+2's (lead 1) 57.4% and 72.5%.
 - [ ] Gate: the Stage B gate, cost included. Only a pass reopens runtime prefetch.
+  - (2026-11-08) — **Not passed.** The gate and cost rule were committed before the capture (`93e1149`, `c5c5686`). The cost was measured at 23 µs per decoded layer step on Metal, against 15.15 µs on the CPU. At that cost the predictor (block l+1's router on layer l−1, the same-token horizon) is retained in 0 of 3 rows: "CHECK IQ3_XXS-IQ4_XS-down-imx: the hidden-state predictor (pred-h2) at 23 µs per decoded layer step is retained in 0 of 3 rows of the Stage B gate".
+    - It loads 55.4 MB/token against 38.1 at 128 experts per layer.
+    - Only at 0 µs does it win time, by at most 1.5%.
+    - A perfect predictor at the same horizon would be retained up to 30 µs.
+    - The mapping check against that oracle passes. Controls M104 and M105 each fail the tests.
+    - Runtime prefetch stays closed. This box stays open, as for E2's failed gate.
 
 ### Stage E7 --- Write-up and upstream evidence — ✅ DONE (2026-11-07)
 

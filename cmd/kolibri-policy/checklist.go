@@ -467,7 +467,7 @@ func writeChecklist(w io.Writer, sizes []int, results []result, gatesP map[strin
 		for _, l := range rs[0].t.timing.Links {
 			links = append(links, l.Name)
 		}
-		for _, kind := range predictorKinds {
+		for _, kind := range stageBKinds(rs) {
 			for hi, h := range horizons {
 				if slices.ContainsFunc(rs, func(r result) bool { return kind.pick(r.w, hi) == nil }) {
 					continue

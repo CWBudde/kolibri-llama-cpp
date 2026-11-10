@@ -308,6 +308,75 @@ Each of these is absent from the repo, and no estimate is given in its place. No
 
 Items 1, 3, 4, 5 and 6 can be computed from the selection files under `~/models/eval/locality/`, which `cmd/kolibri-policy` reads, without loading a weight. They need new replay code or a new report. Item 2 needs a new predictor.
 
+## Stage E6: a hidden-state predictor
+
+### Pre-registration (2026-11-08, before the capture ran)
+
+Fixed and pushed before `tools/e6/capture_router.py` ran on the real model, and not moved afterwards.
+
+- **Bound first.** A perfect predictor at the same-token horizon (`-oracle-predictor-us 0,15,30`) is retained by the Stage B gate at every one of those costs, for both models (IQ3 and Q8_0 each "retains 9 of 21", all 9 the oracle's rows; `~/models/eval/e6/bound/`). So the gate does not rule E6 out before a predictor exists.
+- **Model.** IQ3_XXS-IQ4_XS-down-imx only, the GGUF the capture reads. Q8_0 has no capture and is not judged.
+- **Gated predictor.** `pred-h2`: block l+1's router applied to `l_out-(l-1)`. Before layer l of a decoded token it predicts layer l+1, the same step and the same lead (1) as the same-token predictors, with nothing known that they do not know at that point. `pred-h1` (block l's router on `l_out-(l-1)`) has lead 0 in the step model, is reported as INFO and is not gated.
+- **Rule.** Stage B's gate as written ([expert-policy.md](expert-policy.md), "Stage B gate"), on the decode of all IQ3 test suffixes together: k from 6, 12, 24, 48 (the capture's top-48 in score order), tuned per budget and link on the own training prefix, on the shared LRU, prefetched bytes counted as loaded, against the best Stage A policy at that budget. Retained at one budget or more on bytes or on a link's time is a pass; only a pass reopens runtime prefetch, and a pass does not start it.
+- **Cost.** One RMSNorm and one F32 matrix-vector product of 2560 × 384 per decoded layer step, plus the top-k. Measured before the replay, on Metal (`test-backend-ops perf`, `MUL_MAT` f32 m=384 n=1 k=2560) and on the CPU; the gate uses the larger of the two medians, rounded up to a whole µs. The rows at 0, 15 and 30 µs are INFO.
+- **Cost, measured (2026-11-08, before the capture):** medians of 3 runs of `test-backend-ops perf` (fork build `feat/kolibri1-load-spin`, cases added for the run and removed afterwards; `~/models/eval/e6/cost/perf.txt`), in µs per decoded layer step:
+
+  | Op | Metal | CPU |
+  |---|---|---|
+  | `MUL_MAT` f32, m=384 n=1 k=2560 | 6.37 | 10.30 |
+  | `RMS_NORM` f32, 2560 | 2.21 | 1.73 |
+  | `MUL` f32, 2560 (× `ffn_norm`) | 2.59 | 0.51 |
+  | `ADD` f32, 384 (+ `exp_probs_b`) | 1.89 | 0.48 |
+  | `TOP_K` f32, 384, k=48 | 9.55 | 2.13 |
+  | **Sum** | **22.61** | **15.15** |
+
+  **The gate uses 23 µs.** Per-op times inside a graph; a runtime predictor would also need the scores read back while the graph runs, which this does not include.
+- **Recall (INFO).** Recall at k = 6 and 12 of the actual Top-6, for `pred-h1` and `pred-h2`, on the Stage A test suffixes' decode and on all steps.
+- **Mapping check.** The replay's index mapping is checked against the perfect oracle: feeding the captured selections themselves through the file-backed predictor must give the oracle's rows exactly.
+- **If the capture's selections differ from the recorded ones** (MATCH fails: the recorded traces came from another llama.cpp build): the gate runs on the capture's own selections, with every Stage A policy and the shared LRU replayed on those, not on the recorded traces, and the agreement with the recorded selections (the share of layer steps with the same Top-6 set) reported with it. A predictor is never judged against a reference replayed on a different trace.
+
+### Result (2026-11-08): not retained at the measured cost
+
+**At 23 µs per decoded layer step the hidden-state predictor is retained in 0 of 3 rows of the Stage B gate, on no budget and no link. Runtime prefetch stays closed.** It loads more bytes than the best Stage A policy at every budget, and at 23 µs it is also slower on every link at every budget. Only at a cost of 0 µs, which no implementation has, does it win time at 96 to 384 experts per layer, by at most 1.5%.
+
+**Capture.** `tools/e6/capture_router.py` with the libllama of fork build `feat/kolibri1-load-spin` (`06563b40c`, no cache flags: resident), Metal, ubatch 512, on all four workloads (61,200 tokens, 2.2 min, 596 MB in `~/models/eval/e6/capture/`). **Every workload's selections MATCH the recorded ones** (sha256 equal to `testdata/locality/experts.json`), so the fallback did not apply. The smoke test's self-check, block l's router on the graph's own `ffn_norm` input, selects the graph's Top-6 in 99.60–99.72% of (token, layer) pairs; every difference is a near-tie.
+
+**Review fix (2026-11-10), after the result.** Review comments on PR #84 (Codex, then Copilot) were valid, and none moves the result.
+- **Ties at the 48th place.** `top_k` cut with a partition, which may keep either of two equal scores at the cut, although its contract says "ties to the lower ID". It is now a stable sort. A second capture with the fix (`~/models/eval/e6/recapture-tiefix/`, fork build `12e714b90`, every workload MATCH) differs from the judged one in 50 of 6,120,000 rows, each only at rank 48. No row differs in its first 24 experts.
+- **The replay on that capture** (`~/models/eval/e6/replay-tiefix/`): 68 PASS lines, the same three CHECK lines, and a markdown report identical to the judged one except for its paths. The JSON differs in one k = 48 replay by one prefetch (3,355,545 against 3,355,544). The judged capture and its numbers above stay as they are.
+- **The mismatch fallback** registered above was not implemented: the replay stopped on a mismatch instead. It now replays every policy and the gate on the capture's own selections and reports the share of (layer, token) pairs with the same Top-6 set, prefill included. The judged run never took this path, since every workload matched. `capture_router.py` still exits on a mismatch and writes `*.rejected.npy`, so reaching the fallback takes renaming those files by hand.
+- **The oracle is a reference, not a bound.** The code and the generated report said that if the perfect same-token predictor is not retained with a cost, no predictor of that horizon is. That is not proven: a prefetched expert stays in the cache, so candidates beyond the true Top-6 can serve later tokens, and the oracle fills those ranks from the Markov predictor. The stored runs show it: at 384 experts per layer on ssd at k = 48, the hidden-state predictor's decode time is below the oracle's by at most 0.03%, at 0 µs in all four workloads and at 15 µs in two. At the gate it is never ahead. This document used the oracle only the other way ("it is retained, so the gate does not rule E6 out"), which does not need a bound, so no verdict changes. The wording in `perfect.go` and `oracle.go` now says "reference"; the stored report in `~/models/eval/e6/bound/` keeps the old sentence.
+- **Two input checks were added to the replay:** the capture manifest's token hash must equal the hash of the token IDs replayed, and a pred file narrower than the largest k ranked (48) is rejected instead of crashing. The judged capture passes both, and its replay is byte-identical.
+
+**Replay.** `go run ./cmd/kolibri-policy -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx -hidden-state-dir ~/models/eval/e6/capture -hidden-state-us 0,15,23 -md …` (`~/models/eval/e6/replay/`; run twice, the JSON byte-identical, the markdown differing only in its output path; 68 PASS lines). The capture's selections are the replayed ones, ID for ID. **The mapping check passes:** the selections themselves, fed through the file-backed path as a pred-h2 file, rank as the perfect oracle before every predicted step (110,304 steps in coding and in medtech, 86,496 in research, 75,792 in hr) and replay exactly as it at k 6, every budget and every cost. Beyond the Top-6 the oracle pads with Markov ranks, so only k 6 is compared. Controls M104 (row l instead of l-1, future knowledge) and M105 (the token before) each fail the tests.
+
+| Cost | Rows retained | Where it wins | Best win |
+|---|---|---|---|
+| 0 µs (INFO) | 3 of 3 | time only: ssd at 128–384, pcie and ram at 96–384 | 1.5% on pcie at 128, 1.3% on ssd at 128 |
+| 15 µs (INFO) | 0 of 3 | – | – |
+| **23 µs (gate)** | **0 of 3** | – | – |
+
+At 128 experts per layer, all IQ3 test suffixes' decode together:
+
+| | MB/token | ssd ms/token | pcie ms/token | ram ms/token |
+|---|--:|--:|--:|--:|
+| best Stage A policy | 38.1 | 23.32 | 17.22 | 16.08 |
+| pred-h2, 0 µs | 55.4 | 23.02 | 16.96 | 16.01 |
+| pred-h2, 23 µs | 55.4 | 23.97 | 18.11 | 17.16 |
+
+The perfect oracle at the same horizon is retained up to 30 µs ("Pre-registration" above). *Inference:* the capture's routers fall short of it because their wrong candidates cost bytes that nearly cancel the hits (at 128 experts per layer and k 6: 55.4 MB/token, against 38.1 for the oracle and for the best Stage A policy).
+
+**Recall (INFO)**, needed experts covered (whole Top-6 sets covered), pooled over the four workloads. Layers no row predicts count as missed, as in Stage B's tables:
+
+| File | Lead | Test decode, k 6 | Test decode, k 12 | Every token, k 6 | Every token, k 12 |
+|---|--:|--:|--:|--:|--:|
+| pred-h1 (block l on `l_out-(l-1)`) | 0 | 71.3% (16.5%) | 85.9% (58.1%) | 71.2% (16.3%) | 85.9% (57.9%) |
+| pred-h2 (block l+1 on `l_out-(l-1)`) | 1 | 57.4% (5.7%) | 72.5% (32.7%) | 57.5% (5.7%) | 72.8% (32.9%) |
+
+Over the predicted layers alone, pred-h2 covers 59.8% at k 6 and 75.5% at k 12 on test decode; pred-h1, 72.8% and 87.6%. The literature's 90–96% one layer ahead (Mixtral, DeepSeek-MoE) is not reached here, even at lead 0; it is closer to the 67% reported for Qwen2-MoE.
+
+**Not covered.** Q8_0 (no capture). A runtime predictor would also need the scores read back while the graph runs, which the 23 µs leaves out, so this cost understates a real one. Other predictor forms, such as a trained probe on the hidden state or a mix with the Markov counts, were not tried.
+
 ## Reproduce
 
 ```sh
