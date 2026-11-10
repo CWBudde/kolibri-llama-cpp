@@ -1,0 +1,560 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 67925e18c..64826d9b9 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2897,6 +2897,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.expert_cache_waves = true;
+         }
+     ).set_env("LLAMA_ARG_EXPERT_CACHE_WAVES"));
++    add_opt(common_arg(
++        {"--expert-cache-skip"}, "W",
++        "[EXPERIMENTAL, lossy] in a ubatch of one token (decode), do not read an expert that is not in the cache when the router chose it "
++        "at weight rank 4 or below of the token with a weight below W: its weight becomes 0. Needs --expert-cache-gpu-remap, "
++        "whose Metal gate applies it; otherwise the model fails to load (default: 0, off)",
++        [](common_params & params, const std::string & value) {
++            size_t pos = 0;
++            float w = NAN;
++            try {
++                w = std::stof(value, &pos);
++            } catch (const std::exception &) {
++                pos = 0;
++            }
++            if (value.empty() || pos != value.size() || !std::isfinite(w) || w < 0.0f) {
++                throw std::invalid_argument("--expert-cache-skip " + value + ": want a finite weight >= 0");
++            }
++            params.expert_cache_skip = w;
++        }
++    ).set_env("LLAMA_ARG_EXPERT_CACHE_SKIP"));
+     add_opt(common_arg(
+         {"-ncmoe", "--n-cpu-moe"}, "N",
+         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
+diff --git a/common/common.cpp b/common/common.cpp
+index 649cc5b4a..cf9526edd 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1711,7 +1711,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+ 
+     // without the cache, --expert-cache-stats still asks for the decode timing of the resident model,
+     // and --expert-cache-gpu-remap and --expert-cache-waves reach the model's refusal
+-    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty() || !params.expert_cache_sidefile.empty() || params.expert_cache_gpu_remap || params.expert_cache_waves) {
++    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty() || !params.expert_cache_sidefile.empty() || params.expert_cache_gpu_remap || params.expert_cache_waves || params.expert_cache_skip != 0.0f) {
+         auto & ec = params.expert_cache_lp;
+         ec = llama_expert_cache_default_params();
+         ec.n_slots            = params.expert_cache;
+@@ -1728,6 +1728,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+         ec.wait_mode          = params.expert_cache_wait;
+         ec.wait_spin_us       = params.expert_cache_wait_us;
+         ec.waves              = params.expert_cache_waves;
++        ec.skip_weight        = params.expert_cache_skip;
+         mparams.expert_cache  = &ec;
+     }
+ 
+diff --git a/common/common.h b/common/common.h
+index a243fccb3..be6583916 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -547,6 +547,7 @@ struct common_params {
+     llama_expert_cache_wait expert_cache_wait      = LLAMA_EXPERT_CACHE_WAIT_SLEEP; // how a remap waits for its loads
+     int32_t              expert_cache_wait_us      = 0;     // the spin of LLAMA_EXPERT_CACHE_WAIT_HYBRID, microseconds per remap
+     bool                 expert_cache_waves        = false; // run large ubatches in waves instead of capping them
++    float                expert_cache_skip         = 0.0f;  // lossy: skip one-token misses at weight rank >= 4 below this weight, 0 = off
+     llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
+ 
+     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index e8e311707..0faabd0b5 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2587,6 +2587,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
+     result.expert_cache_sidefile.clear();
+     result.expert_cache_gpu_remap = false;
+     result.expert_cache_waves     = false;
++    result.expert_cache_skip      = 0.0f;
+ 
+     if (has_draft) {
+         // default to global devices value
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index f6fc60c7c..d84e9bd70 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -581,6 +581,8 @@ typedef struct {
+     uint32_t gate;     // this gate's place in the graph
+     uint32_t entry;    // the first indirect entry after this gate
+     uint32_t hdr;      // the words before the first entry
++    float    skip_w;   // [lossy] > 0: the skip of a one-token ubatch's low-weight misses, see kernel_expert_gate
++    int32_t  skip_map; // the weight rank whose slot a skipped id reads, 1 or 2
+ } ggml_metal_kargs_expert_gate;
+ 
+ typedef struct {
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 797b845ec..d6b80b24a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2843,6 +2843,15 @@ static void ggml_metal_op_expert_gate(ggml_metal_op_t ctx, ggml_tensor * op, int
+     const ggml_tensor * slots = op->src[3];
+     const ggml_tensor * table = op->src[4];
+ 
++    // [lossy] the skip: the router weights of the ids, which the gate ranks and zeroes; one token only
++    const ggml_tensor * weights = op->src[5];
++    float skip_w = 0.0f;
++    if (weights && ids->ne[1] == 1) {
++        const int32_t bits = ggml_get_op_params_i32(slots, 2);
++        memcpy(&skip_w, &bits, sizeof(skip_w));
++        GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_nelements(weights) == ggml_nelements(ids) && ggml_is_contiguous(weights) && ggml_is_contiguous(ids));
++    }
++
+     // the router has written its ids; nothing else of this layer runs alongside the gate
+     ggml_metal_op_concurrency_reset(ctx);
+ 
+@@ -2862,6 +2871,8 @@ static void ggml_metal_op_expert_gate(ggml_metal_op_t ctx, ggml_tensor * op, int
+         /*.gate     =*/ (uint32_t) gate,
+         /*.entry    =*/ next + (ggml_metal_encoder_gate_active(enc) ? 1 : 0),
+         /*.hdr      =*/ GGML_METAL_GATE_HDR,
++        /*.skip_w   =*/ skip_w,
++        /*.skip_map =*/ ggml_get_op_params_i32(slots, 3),
+     };
+ 
+     ggml_metal_buffer_id bid_words = { ctx->gates->metal_buf, 0 };
+@@ -2872,6 +2883,8 @@ static void ggml_metal_op_expert_gate(ggml_metal_op_t ctx, ggml_tensor * op, int
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(table), 2);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(slots), 3);
+     ggml_metal_encoder_set_buffer  (enc, bid_words,                       4);
++    // without the skip the kernel does not touch it: any buffer serves
++    ggml_metal_encoder_set_buffer  (enc, skip_w > 0.0f ? ggml_metal_get_buffer_id(weights) : ggml_metal_get_buffer_id(slots), 5);
+ 
+     ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
+ 
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index aa3b8ad4d..a4c1c3992 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -1084,11 +1084,51 @@ kernel void kernel_expert_gate(
+         device const char    * ids   [[buffer(1)]],
+         device const int32_t * table [[buffer(2)]],
+         device       int32_t * slots [[buffer(3)]],
+-        device       uint32_t * words [[buffer(4)]]) {
++        device       uint32_t * words [[buffer(4)]],
++        device       float   * weights [[buffer(5)]]) {
+     device int32_t * logged = slots + args.n_log;
+ 
+     bool miss = false;
+-    for (int t = 0; t < args.n_tokens; ++t) {
++
++    // [lossy] the skip, for a ubatch of one token (args.skip_w > 0 only then): an id without a slot at
++    // weight rank 4 or below of the token, with a weight below skip_w, does not stop the buffer. It is
++    // logged as -1 - id, reads the slot of the token's rank-skip_map id, and its weight becomes 0.
++    // Ranks go by weight, the earlier position first of equal weights. A gate that stops writes
++    // neither slots nor weights, so the resumed gate ranks the same weights.
++    if (args.skip_w > 0.0f) {
++        device const int32_t * row = (device const int32_t *) ids;
++        int target = 0;
++        for (int i = 0; i < args.n_used; ++i) {
++            const float w = weights[i];
++            int rank = 1;
++            for (int j = 0; j < args.n_used; ++j) {
++                const float v = weights[j];
++                rank += (v > w || (v == w && j < i)) ? 1 : 0;
++            }
++            if (rank == args.skip_map) {
++                target = i;
++            }
++            const int32_t id = row[i];
++            const bool skip  = table[id] < 0 && rank >= 4 && w < args.skip_w;
++            logged[i] = skip ? -1 - id : id;
++            if (table[id] < 0 && !skip) {
++                miss = true;
++            }
++        }
++        if (!miss) {
++            const int32_t s_target = table[row[target]];
++            for (int i = 0; i < args.n_used; ++i) {
++                if (logged[i] < 0) {
++                    slots[i]   = s_target;
++                    weights[i] = 0.0f;
++                } else {
++                    slots[i] = table[row[i]];
++                }
++            }
++        }
++    }
++
++    for (int t = 0; args.skip_w <= 0.0f && t < args.n_tokens; ++t) {
+         device const int32_t * row = (device const int32_t *) (ids + t*args.nb1);
+         for (int i = 0; i < args.n_used; ++i) {
+             const int32_t id = row[i];
+diff --git a/include/llama.h b/include/llama.h
+index ee54c51c7..46750bd19 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -351,6 +351,11 @@ extern "C" {
+         bool            waves;         // a ubatch with more experts than the slots runs its expert matmuls in
+                                        // waves of experts instead of being capped (needs 3*n_expert_used slots;
+                                        // with gpu_remap, such a ubatch runs on the CPU remap)
++        float           skip_weight;   // [lossy] in a ubatch of one token, an expert that is not in the cache, at
++                                       // weight rank 4 or below of the token and with a router weight below this,
++                                       // is not read and its weight becomes 0; 0 = off (needs gpu_remap: the Metal
++                                       // gate applies it; else the model fails to load)
++        int32_t         skip_map_rank; // the token's expert whose slot a skipped id reads, 1 or 2 (a test hook; default 1)
+     };
+ 
+     struct llama_model_params {
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 024fe0832..b8fe2f519 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cerrno>
++#include <cmath>
+ #include <cstring>
+ #include <fstream>
+ #include <stdexcept>
+@@ -126,12 +127,12 @@ void wave_mask_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+ std::string counts_json(const llama_expert_cache_counts & c, const std::string & extra) {
+     return format(
+         "{\"steps\": %llu, \"needed\": %llu, \"hits\": %llu, \"hits_loading\": %llu, \"misses\": %llu, "
+-        "\"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
++        "\"skipped\": %llu, \"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
+         "\"prefetch_used\": %llu, \"prefetch_wasted\": %llu, \"prefetch_cancelled\": %llu, "
+         "\"prefetch_skipped\": %llu, \"load_failures\": %llu, \"wait_seconds\": %.6f, \"io_seconds\": %.6f, "
+         "\"io_prefetch_seconds\": %.6f, \"loads\": %llu, \"preads\": %llu, \"waves\": %llu, \"waves_built\": %llu, \"wave_parked\": %llu%s}",
+         (unsigned long long) c.steps, (unsigned long long) c.needed, (unsigned long long) c.hits,
+-        (unsigned long long) c.hits_loading, (unsigned long long) c.misses, (unsigned long long) c.evictions,
++        (unsigned long long) c.hits_loading, (unsigned long long) c.misses, (unsigned long long) c.skipped, (unsigned long long) c.evictions,
+         (unsigned long long) c.demand_bytes, (unsigned long long) c.prefetch_bytes,
+         (unsigned long long) c.prefetch_issued, (unsigned long long) c.prefetch_used,
+         (unsigned long long) c.prefetch_wasted, (unsigned long long) c.prefetch_cancelled,
+@@ -208,6 +209,18 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int
+         }
+         wait.spin_us = p.wait_spin_us;
+     }
++    if (!std::isfinite(p.skip_weight) || p.skip_weight < 0) {
++        throw std::runtime_error(format("expert cache: skip weight %g, want a finite weight >= 0", (double) p.skip_weight));
++    }
++    if (p.skip_map_rank != 1 && p.skip_map_rank != 2) {
++        throw std::runtime_error(format("expert cache: skip map rank %d, want 1 or 2", (int) p.skip_map_rank));
++    }
++    skip_weight   = p.skip_weight;
++    skip_map_rank = p.skip_map_rank;
++    if (skip_on() && !gpu_remap_on) {
++        // the rule lives in the Metal gate, which ranks the weights and zeroes them in place
++        throw std::runtime_error("expert cache: --expert-cache-skip needs --expert-cache-gpu-remap");
++    }
+     if (gpu_remap_on && prefetch_k > 0) {
+         // a prefetch writes a slot while the GPU runs; the gate relies on an idle GPU for every write
+         throw std::runtime_error("expert cache: --expert-cache-gpu-remap does not work with --expert-prefetch");
+@@ -365,6 +378,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+             // what the Metal backend needs to know of it
+             sl->op_params[0] = il;
+             sl->op_params[1] = (int32_t) gate_ubatch();
++            // [lossy] the skip's threshold, as bits, and the rank its ids map to
++            memcpy(&sl->op_params[2], &skip_weight, sizeof(float));
++            sl->op_params[3] = skip_map_rank;
+             gate_table[il] = tb;
+             gate_slots[il] = sl;
+         }
+@@ -490,10 +506,11 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
+     for (const auto & gr : groups) {
+         where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
+     }
+-    LLAMA_LOG_INFO("%s: %s, %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, wait %s, reading %s%s%s\n",
++    const std::string sk = skip_on() ? format(", skip of one-token misses at rank >= 4 below %g (lossy)", (double) skip_weight) : std::string();
++    LLAMA_LOG_INFO("%s: %s, %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, wait %s, reading %s%s%s%s\n",
+         __func__, gpu_remap_on ? "GPU remap" : "CPU remap", *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
+         n_expert, where.c_str(), n_threads, pf.c_str(), wait_name().c_str(), sidefile ? sidefile_path.c_str() : path.c_str(), buffered ? " (buffered)" : "",
+-        waves_on() ? ", waves" : "");
++        waves_on() ? ", waves" : "", sk.c_str());
+ }
+ 
+ uint32_t llama_expert_cache::max_ubatch() const {
+@@ -554,12 +571,18 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
+     remap_ids(il, (const int32_t *) ids->data, (int) ggml_nelements(ids), (int) ids->ne[1], (int32_t *) dst->data);
+ }
+ 
+-void llama_expert_cache::bind_gate(ggml_tensor * mul_mat_id, int il) const {
++void llama_expert_cache::bind_gate(ggml_tensor * mul_mat_id, int il, ggml_tensor * weights) const {
+     if (mul_mat_id->op != GGML_OP_MUL_MAT_ID) {
+         throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs plain expert matmuls (no LoRA adapter)");
+     }
+     mul_mat_id->src[3] = gate_slots[il];
+     mul_mat_id->src[4] = gate_table[il];
++    // [lossy] the skip: the gate ranks the ids' weights and zeroes those of the ids it skips, so the
++    // weights are computed before the matmul, and nothing may read them before it
++    if (weights) {
++        GGML_ASSERT(skip_on() && weights->type == GGML_TYPE_F32);
++        mul_mat_id->src[5] = weights;
++    }
+ }
+ 
+ void llama_expert_cache::gate_remap(int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped) {
+@@ -572,7 +595,24 @@ void llama_expert_cache::gate_remap(int il, const int32_t * ids, int n_ids, int
+     gate_il = il;
+     gate_seen++;
+     gate_scratch.resize(n_ids);
+-    remap_ids(il, ids, n_ids, n_tokens, gate_scratch.data());
++    // [lossy] the gate logs an id it skipped as -1 - id: it is counted, and neither pinned nor loaded
++    int n_kept = n_ids;
++    if (skip_on() && n_tokens == 1) {
++        gate_kept.clear();
++        for (int i = 0; i < n_ids; ++i) {
++            if (ids[i] >= 0) {
++                gate_kept.push_back(ids[i]);
++            }
++        }
++        n_kept = (int) gate_kept.size();
++        // ranks 1 to 3 are never skipped
++        GGML_ASSERT(n_kept >= std::min(n_ids, 3));
++        ids = gate_kept.data();
++    }
++    remap_ids(il, ids, n_kept, n_tokens, gate_scratch.data());
++    if (n_kept < n_ids) {
++        slots->add_skipped(decode, n_ids - n_kept);
++    }
+     // only a stopped layer has new residents; the gate that resumes reads them from the table
+     if (stopped) {
+         slots->copy_table(il, (int32_t *) gate_table[il]->data);
+@@ -729,11 +769,11 @@ std::string llama_expert_cache::stats_json() const {
+     const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + gate(1) + (diag ? ", " + diag->json_fields() : std::string());
+     return format(
+         "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
+-        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"gpu_remap\": %s, \"wait\": \"%s\", \"waves\": %s, \"file\": %s, \"sidefile\": %s}, "
++        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"gpu_remap\": %s, \"wait\": \"%s\", \"waves\": %s, \"skip_weight\": %g, \"file\": %s, \"sidefile\": %s}, "
+         "\"prefill\": %s, \"decode\": %s, \"process\": %s}",
+         s_min, s_max, slot_bytes(), expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
+         n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, buffered ? "true" : "false", gpu_remap_on ? "true" : "false", wait_name().c_str(),
+-        waves_on() ? "true" : "false", json_string(path).c_str(), sidefile ? json_string(sidefile_path).c_str() : "null",
++        waves_on() ? "true" : "false", (double) skip_weight, json_string(path).c_str(), sidefile ? json_string(sidefile_path).c_str() : "null",
+         counts_json(c_pre, x_pre).c_str(), counts_json(c_dec, x_dec).c_str(),
+         process_json(pc, disk_read0, pageins0, faults0).c_str());
+ }
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index 09e7cdd87..7fa0dfc43 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -123,7 +123,12 @@ struct llama_expert_cache {
+     // [EXPERIMENTAL] the GPU remap (--expert-cache-gpu-remap): no CPU op; the layer's matmuls read
+     // their ids from the slot ids, which the Metal backend's gate fills from the layer's table
+     bool gpu_remap() const { return gpu_remap_on; }
+-    void bind_gate(ggml_tensor * mul_mat_id, int il) const;
++    void bind_gate(ggml_tensor * mul_mat_id, int il, ggml_tensor * weights = nullptr) const;
++
++    // [EXPERIMENTAL, lossy] the skip (--expert-cache-skip): in a gated graph of one token, the Metal gate
++    // leaves an id without a slot unread when its weight ranks 4th or lower of the token and is below
++    // the threshold; it zeroes that weight, so bind_gate gets the layer's router weights
++    bool skip_on() const { return skip_weight > 0; }
+ 
+     // whether the graph of a ubatch of n_tokens runs behind the gates: with the GPU remap, every
+     // ubatch whose experts always fit the slots. A larger one, which only waves allow, takes the CPU
+@@ -191,6 +196,8 @@ private:
+     bool gpu_remap_on;
+     llama_expert_wait wait; // how a remap waits for its loads
+     bool waves;    // asked for: see waves_on()
++    float skip_weight   = 0; // off with 0
++    int   skip_map_rank = 1; // 1 or 2; 2 is a test hook: with the weight zeroed the slot does not matter
+ 
+     std::vector<tensors>  stacked;
+     std::vector<tensors>  slot_t; // the slot tensors; offs unused
+@@ -203,6 +210,7 @@ private:
+     std::vector<ggml_tensor *> gate_table;
+     std::vector<ggml_tensor *> gate_slots;
+     std::vector<int32_t>       gate_scratch;
++    std::vector<int32_t>       gate_kept; // the ids of a gate's log that it did not skip
+     int      gate_seen = 0;           // layers through their gate in this graph
+     int      gate_il   = -1;          // the last of them
+     uint64_t gate_runs[2]  = {0, 0};  // command buffers per phase
+diff --git a/src/llama-expert-slots.cpp b/src/llama-expert-slots.cpp
+index 7be326231..734a9ec2e 100644
+--- a/src/llama-expert-slots.cpp
++++ b/src/llama-expert-slots.cpp
+@@ -82,6 +82,11 @@ llama_expert_cache_counts llama_expert_slots::counts(bool decode) const {
+     return decode ? c_decode : c_prefill;
+ }
+ 
++void llama_expert_slots::add_skipped(bool decode, int n) {
++    std::lock_guard<std::mutex> lock(mtx);
++    counts_of(decode).skipped += n;
++}
++
+ bool llama_expert_slots::failure(int & l, int & e) const {
+     std::lock_guard<std::mutex> lock(mtx);
+     l = failed_layer;
+diff --git a/src/llama-expert-slots.h b/src/llama-expert-slots.h
+index 0d37d5626..ba4bbe2d8 100644
+--- a/src/llama-expert-slots.h
++++ b/src/llama-expert-slots.h
+@@ -21,6 +21,8 @@ struct llama_expert_cache_counts {
+     uint64_t hits           = 0; // needed and ready
+     uint64_t hits_loading   = 0; // needed while a prefetch of it was queued or running: awaited, not repeated
+     uint64_t misses         = 0; // needed and not in the cache: loaded on demand
++    uint64_t skipped        = 0; // [lossy] ids the Metal gate left out by --expert-cache-skip: neither needed nor a
++                                 // miss, so in a one-token ubatch hits + hits_loading + misses + skipped = ids
+     uint64_t evictions      = 0; // a ready expert replaced
+     uint64_t demand_bytes   = 0; // read for misses
+     uint64_t prefetch_bytes = 0; // read for prefetches
+@@ -136,6 +138,9 @@ struct llama_expert_slots {
+ 
+     llama_expert_cache_counts counts(bool decode) const;
+ 
++    // [lossy] n ids that the Metal gate skipped: counted, never loaded
++    void add_skipped(bool decode, int n);
++
+ private:
+     enum slot_state { EMPTY, LOADING, READY };
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1d03d48e7..9edc1148e 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2389,6 +2389,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         down_exps = expert_cache->down(il);
+     }
+ 
++    // [EXPERIMENTAL, lossy] the skip: the gate of a one-token graph zeroes the weights of the ids it skips,
++    // in place, before the layer's matmuls; the product with the experts below reads them after
++    ggml_tensor * skip_weights = nullptr;
++    if (gated && expert_cache->skip_on() && n_tokens == 1) {
++        GGML_ASSERT(!weight_before_ffn && "the expert cache's skip needs the weights applied after the experts");
++        // the gate writes the tensor, so it must own its data: a view would zero the probabilities of
++        // what it views. No node is added, so that the graph fuses and rounds as without the skip
++        GGML_ASSERT(weights->view_src == nullptr && ggml_is_contiguous(weights));
++        skip_weights = weights;
++    }
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+@@ -2434,7 +2445,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             // separate gate and up path
+             up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+             if (gated) {
+-                expert_cache->bind_gate(up, il);
++                expert_cache->bind_gate(up, il, skip_weights);
+             }
+             cb(up, "ffn_moe_up", il);
+ 
+@@ -2450,7 +2461,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             if (gate_exps) {
+                 cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+                 if (gated) {
+-                    expert_cache->bind_gate(cur, il);
++                    expert_cache->bind_gate(cur, il, skip_weights);
+                 }
+                 cb(cur, "ffn_moe_gate", il);
+             } else {
+@@ -2565,7 +2576,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+             experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
+             if (gated) {
+-                expert_cache->bind_gate(experts, il);
++                expert_cache->bind_gate(experts, il, skip_weights);
+             }
+             //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
+             cb(experts, "ffn_moe_down", il);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e6d575b73..b97a1cf5c 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1737,6 +1737,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         if (params.expert_cache && params.expert_cache->gpu_remap && !expert_cache_requested()) {
+             throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs --expert-cache or --expert-cache-layers");
+         }
++        if (params.expert_cache && params.expert_cache->skip_weight != 0.0f && !expert_cache_requested()) {
++            throw std::runtime_error("expert cache: --expert-cache-skip needs --expert-cache or --expert-cache-layers");
++        }
+         if (params.expert_cache && params.expert_cache->waves && !expert_cache_requested()) {
+             throw std::runtime_error("expert cache: --expert-cache-waves needs --expert-cache or --expert-cache-layers");
+         }
+@@ -3475,6 +3478,8 @@ llama_expert_cache_params llama_expert_cache_default_params() {
+         /*.wait_mode          =*/ LLAMA_EXPERT_CACHE_WAIT_SLEEP,
+         /*.wait_spin_us       =*/ 0,
+         /*.waves              =*/ false,
++        /*.skip_weight        =*/ 0.0f,
++        /*.skip_map_rank      =*/ 1,
+     };
+ 
+     return result;
+diff --git a/tests/test-expert-cache.cpp b/tests/test-expert-cache.cpp
+index 3badfdf14..2a70eab4c 100644
+--- a/tests/test-expert-cache.cpp
++++ b/tests/test-expert-cache.cpp
+@@ -524,6 +524,71 @@ static void test_wait_arg() {
+     CHECK(llama_expert_wait{}.mode == llama_expert_wait::SLEEP);
+ }
+ 
++// --expert-cache-skip: a finite weight >= 0 reaches the model's params; the cache refuses it without
++// the GPU remap, whose Metal gate applies it (the rule itself is checked on a model, by
++// check_expert_cache.py --skip-only)
++static void test_skip_arg() {
++    auto parse = [](common_params & params, std::vector<std::string> args) {
++        args.insert(args.begin(), { "test-expert-cache", "-m", "none.gguf" });
++        std::vector<char *> argv;
++        for (auto & a : args) {
++            argv.push_back(a.data());
++        }
++        return common_params_parse((int) argv.size(), argv.data(), params, LLAMA_EXAMPLE_COMMON);
++    };
++    auto refusal = [](const llama_expert_cache_params & p) -> std::string {
++        try {
++            llama_expert_cache c(p, 4, 16, 6);
++            return "";
++        } catch (const std::exception & e) {
++            return e.what();
++        }
++    };
++    for (const auto & [arg, v] : std::vector<std::pair<const char *, float>>{ { "0.05", 0.05f }, { "0", 0.0f }, { "1", 1.0f } }) {
++        common_params params;
++        CHECK_IN(arg, parse(params, { "--expert-cache", "16", "--expert-cache-gpu-remap", "--expert-cache-skip", arg }));
++        CHECK_IN(arg, params.expert_cache_skip == v);
++        const llama_model_params mp = common_model_params_to_llama(params);
++        CHECK_IN(arg, mp.expert_cache && mp.expert_cache->skip_weight == v && mp.expert_cache->skip_map_rank == 1 && mp.expert_cache->gpu_remap);
++    }
++    for (const char * bad : { "-0.1", "-1", "nan", "inf", "-inf", "abc", "" }) {
++        common_params params;
++        CHECK_IN(bad, !parse(params, { "--expert-cache-skip", bad }));
++        CHECK_IN(bad, params.expert_cache_skip == 0.0f);
++    }
++    // the default is off
++    {
++        common_params params;
++        CHECK(params.expert_cache_skip == 0.0f);
++        const llama_expert_cache_params ec = llama_expert_cache_default_params();
++        CHECK(ec.skip_weight == 0.0f && ec.skip_map_rank == 1);
++    }
++    // the skip alone still hands the model its params, so that the load refuses it without a cache
++    {
++        common_params params;
++        CHECK(parse(params, { "--expert-cache-skip", "0.05" }));
++        const llama_model_params mp = common_model_params_to_llama(params);
++        CHECK(mp.expert_cache && mp.expert_cache->skip_weight == 0.05f && mp.expert_cache->n_slots == 0);
++    }
++    // the constructor's refusals
++    llama_expert_cache_params p = llama_expert_cache_default_params();
++    p.n_slots     = 8;
++    p.skip_weight = 0.05f;
++    CHECK(refusal(p).find("--expert-cache-skip needs --expert-cache-gpu-remap") != std::string::npos);
++    p.gpu_remap = true;
++    CHECK(refusal(p).empty());
++    for (int rank : { 0, 3, -1 }) {
++        p.skip_map_rank = rank;
++        CHECK_IN("map rank", refusal(p).find("map rank") != std::string::npos);
++    }
++    p.skip_map_rank = 2;
++    CHECK(refusal(p).empty());
++    for (float w : { -0.5f, NAN, INFINITY }) {
++        p.skip_weight = w;
++        CHECK_IN("weight", refusal(p).find("skip weight") != std::string::npos);
++    }
++}
++
+ static void test_concurrent_misses() {
+     std::atomic<int> inside{0};
+     std::atomic<int> most{0};
+@@ -1586,6 +1651,7 @@ int main(int argc, char ** argv) {
+     test_concurrent_misses();
+     test_wait_modes();
+     test_wait_arg();
++    test_skip_arg();
+     test_preads_counted();
+     test_gate_table();
+     test_gate_deferred();
