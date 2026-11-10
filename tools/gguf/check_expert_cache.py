@@ -137,6 +137,18 @@ options the logits must be bit-identical to the UNSPLIT resident run and to the 
 path, with its counters, one pread per expert and 2 scheduler splits per decoded token. --real checks
 the same on the real weight.
 
+Skip in the GPU remap (--expert-cache-skip with --expert-cache-gpu-remap): patch 0020, proposed (fork
+branch feat/kolibri1-gpu-skip; Stage E5, 2026-11-10). The Metal gate applies the rule below in a graph
+layer of one token: a skipped miss is not read, its weight is zeroed in place, and a layer whose misses
+are all skipped does not stop its command buffer. The script tells the two builds apart by the stats
+key skipped_ids, which only the CPU-remap build has, and runs the same checks on Metal with the GPU
+remap: the lossless run is the GPU remap without the flag, no prefill ubatch of more than one token
+may skip, decode stops may not rise, and the skip without the GPU remap must fail to load. With
+--skip-ref CHECKOUT (a build of feat/kolibri1-lossy-skip) it also compares the gate's rule with the CPU
+remap's, an independent implementation: one token per ubatch at 6 slots and weights 0.3, 0.5 and 0.7
+must give the same steps, needed experts, misses and skipped ids, and logits within 1e-3. Controls M113
+(weight not zeroed), M114 (cutoff at rank 3), M115 (rank by position), M116 (the CPU loads skipped ids).
+
 Skip (--expert-cache-skip): former patch 0018 (retired; fork branch feat/kolibri1-lossy-skip), lossy and opt-in (Stage E5). Against a checkout without it the
 skip checks are skipped with a note, and --skip-only is an error. Per token the remap ranks the ids by
 router weight; an id at rank 4 or below whose weight is under skip_weight and whose expert is a true
