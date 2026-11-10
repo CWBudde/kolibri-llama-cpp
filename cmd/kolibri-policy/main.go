@@ -952,6 +952,11 @@ func main() {
 			if len(ids) != sel.Tokens {
 				log.Fatalf("FAIL %s: %d token IDs, %d tokens of selections", wl, len(ids), sel.Tokens)
 			}
+			if captured {
+				if err := captureTokens(*hiddenDir, wl, ids); err != nil {
+					log.Fatalf("FAIL %s %s: %v", short(name), wl, err)
+				}
+			}
 			if err := locality.CheckAnswers(ids, answers); err != nil {
 				log.Fatalf("FAIL %s: %v", wl, err)
 			}

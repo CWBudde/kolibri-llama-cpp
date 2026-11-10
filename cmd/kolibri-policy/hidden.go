@@ -11,6 +11,8 @@ package main
 // every policy with it (captureTrace), as docs/expert-predictor-result.md pre-registers.
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 
 	"kolibri-llm/internal/locality"
@@ -95,7 +98,8 @@ func captureOf(dir, name string, workloads []string) (bool, error) {
 }
 
 // loadPred reads the capture file of horizon h for the trace of sel, which must have its layers
-// and tokens, and checks its rows (locality.CheckPred).
+// and tokens, and checks its rows (locality.CheckPred) and that they are as wide as the widest k
+// the replay ranks: locality.HiddenState panics when asked for more than the file holds.
 func loadPred(path string, h int, sel locality.Selections, nExpert int) (locality.Selections, error) {
 	p, err := locality.ReadNPYFile(path)
 	if err != nil {
@@ -108,7 +112,53 @@ func loadPred(path string, h int, sel locality.Selections, nExpert int) (localit
 	if err := locality.CheckPred(p, h, nExpert); err != nil {
 		return p, fmt.Errorf("%s: %w", path, err)
 	}
+	if need := min(slices.Max(markovKs), nExpert); p.K < need {
+		return p, fmt.Errorf("%s: %d experts per row, the replay ranks at least %d (capture_router.py --top-k %d)", path,
+			p.K, need, need)
+	}
 	return p, nil
+}
+
+// idsSHA256 is tools/locality/workloads.py's ids_sha256 of token IDs: the SHA-256 of their decimals
+// joined by commas.
+func idsSHA256(ids []int32) string {
+	var b []byte
+	for i, id := range ids {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = strconv.AppendInt(b, int64(id), 10)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(b))
+}
+
+// captureTokens fails unless the capture in dir was made from ids, the token IDs the replay builds
+// workload wl's trace from: manifest.json of tools/e6/capture_router.py must hold their hash as the
+// workload's tokens_sha256. Equal selections do not show it, and with the fallback of captureTrace
+// they need not be equal: predictions of another token sequence would be read at the wrong tokens.
+func captureTokens(dir, wl string, ids []int32) error {
+	path := filepath.Join(dir, "manifest.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("the capture's manifest: %w", err)
+	}
+	var m struct {
+		Workloads map[string]struct {
+			TokensSHA256 string `json:"tokens_sha256"`
+		} `json:"workloads"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	w, ok := m.Workloads[wl]
+	if !ok || w.TokensSHA256 == "" {
+		return fmt.Errorf("%s: no tokens_sha256 of workload %s", path, wl)
+	}
+	if got := idsSHA256(ids); got != w.TokensSHA256 {
+		return fmt.Errorf("%s: workload %s was captured from other token IDs (tokens_sha256 %s) than the replayed ones "+
+			"(%s)", path, wl, w.TokensSHA256, got)
+	}
+	return nil
 }
 
 // sameSelections fails unless the capture's selections at path are sel, ID for ID: the predictor

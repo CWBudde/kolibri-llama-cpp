@@ -373,3 +373,82 @@ func TestWriteHiddenAgreement(t *testing.T) {
 		t.Errorf("the fallback changes more of the report than its own paragraph")
 	}
 }
+
+// The capture's manifest must name the token IDs the replay uses: the hash tools/locality/workloads.py's
+// ids_sha256 gives them. Another token sequence, a workload the manifest lacks or no manifest is an
+// error.
+func TestCaptureTokens(t *testing.T) {
+	ids := []int32{1, 22, 333}
+	// sha256 of "1,22,333", as ids_sha256([1, 22, 333])
+	if got := idsSHA256(ids); got != "8915516745284e69425d3f566025a855f5a5718d6d44f09451fb19d0f61fc185" {
+		t.Fatalf("idsSHA256 = %q", got)
+	}
+	dir := t.TempDir()
+	if err := captureTokens(dir, "w", ids); err == nil {
+		t.Fatal("no manifest.json: no error")
+	}
+	manifest := func(body string) {
+		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry := func(sum string, n int, full bool) string {
+		return fmt.Sprintf(`{"tool": "e6-capture-router-1", "workloads": {"w": {"n_tokens": %d, "tokens_sha256": %q, `+
+			`"full": %v}}}`, n, sum, full)
+	}
+	manifest(entry(idsSHA256(ids), 3, true))
+	if err := captureTokens(dir, "w", ids); err != nil {
+		t.Fatalf("the capture's own tokens: %v", err)
+	}
+	if err := captureTokens(dir, "other", ids); err == nil || !strings.Contains(err.Error(), "other") {
+		t.Fatalf("a workload the manifest lacks: %v", err)
+	}
+	// the same count of other tokens
+	if err := captureTokens(dir, "w", []int32{1, 22, 334}); err == nil || !strings.Contains(err.Error(), "token IDs") {
+		t.Fatalf("other token IDs: %v", err)
+	}
+	manifest(entry("", 3, true))
+	if err := captureTokens(dir, "w", ids); err == nil {
+		t.Fatal("an entry without tokens_sha256: no error")
+	}
+	manifest("{")
+	if err := captureTokens(dir, "w", ids); err == nil {
+		t.Fatal("a broken manifest: no error")
+	}
+}
+
+// A capture narrower than the widest k the replay ranks (capture_router.py --top-k 6) would make
+// the predictor panic; loadPred rejects it as an input error that names the width needed.
+func TestLoadPredWidth(t *testing.T) {
+	tr := hiddenTestTrace(t)
+	narrow := synthPred(tr.sel) // 2 experts per row, of 8
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("ranking a pred file of 2 at k 8 does not panic: the width check guards nothing")
+			}
+		}()
+		_, _ = hiddenRanking(tr, narrow)
+	}()
+	dir := t.TempDir()
+	for _, h := range []int{1, locality.HiddenStateBlocks} {
+		p := narrow
+		if h == 1 { // row r holds layer r+1
+			p = locality.Selections{Layers: 4, Tokens: 400, K: 2, IDs: slices.Clone(tr.sel.IDs)}
+			copy(p.IDs, tr.sel.IDs[400*2:])
+			for i := 3 * 400 * 2; i < len(p.IDs); i++ {
+				p.IDs[i] = -1
+			}
+		}
+		path := filepath.Join(dir, fmt.Sprintf("w.M.pred-h%d.npy", h))
+		writeSelections(t, path, p)
+		_, err := loadPred(path, h, tr.sel, 8)
+		if err == nil || !strings.Contains(err.Error(), "2 experts per row") || !strings.Contains(err.Error(), "at least 8") {
+			t.Errorf("pred-h%d of width 2: %v", h, err)
+		}
+		writeSelections(t, path, widen(p, 8))
+		if _, err := loadPred(path, h, tr.sel, 8); err != nil {
+			t.Errorf("pred-h%d of width 8: %v", h, err)
+		}
+	}
+}
