@@ -1637,7 +1637,7 @@ On `15d89aa23`, the whole tiny suite with `--wait-mode spin` gave 1102 PASS, "PA
 - **Quality is measured by KLD on 10,240 wikitext tokens only.** No task benchmark ran, and the generated text differs from the lossless run after 14 to 22 tokens in four of five requests.
 - **W was tuned and gated on wikitext, and the speed was measured on the four workloads,** where the mode skips less.
 - **128 decoded tokens per request.** A sustained decode was not measured.
-- **Prefill is not skipped, with two exceptions.** A one-token prefill ubatch is, since the rule cannot tell it from a decode step. So is the last layer of a prompt ubatch that computes only its last token: the logits of the first generated token are lossy too. The stats count those ids under `prefill`; the benchmark's skip arm has 0 there.
+- **Prefill is not skipped, with two exceptions.** A one-token prefill ubatch is, since the rule cannot tell it from a decode step. So is the last layer of a prompt ubatch that computes only its last token: the logits of the first generated token are lossy too. The stats count those ids under `prefill`: 8 ids per run of the benchmark's skip arm, over its 5 requests.
 - **A `cb_eval` observer of `ffn_moe_weights` sees the weights before the gate zeroes them** (`cmd/kolibri-routing` reads that tensor). Its trace would show a skipped expert with its router weight.
 - **Metal only,** as the GPU remap.
 
