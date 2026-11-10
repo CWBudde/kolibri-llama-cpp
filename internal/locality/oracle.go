@@ -2,12 +2,13 @@ package locality
 
 import "slices"
 
-// Perfect is an oracle at the same token's horizon (PLAN Stage E6's bound): before step (t, l) it
+// Perfect is an oracle at the same token's horizon (PLAN Stage E6's reference): before step (t, l) it
 // predicts layer l+1 of token t, one step ahead, as SameToken does, and its best candidates are
 // exactly the experts that step will use, read from the selections. It is no predictor but the
-// bound of every predictor of that horizon: a hidden-state predictor applying layer l+1's router to
-// layer l-1's output predicts the same step at the same time, and can do no better than knowing
-// it. Beyond the true experts, for k above them, it ranks as the predictor it pads with, without
+// best recall of the predicted step any predictor of that horizon can have: a hidden-state
+// predictor applying layer l+1's router to layer l-1's output predicts the same step at the same
+// time, and cannot cover it better than knowing it. It does not bound what a predictor's other
+// candidates do for later steps. Beyond the true experts, for k above them, it ranks as the predictor it pads with, without
 // them. It predicts where SameToken does: before decoded steps of layers 1 to L-2.
 type Perfect struct {
 	sel Selections

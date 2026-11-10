@@ -1,9 +1,11 @@
 package main
 
-// The perfect same-token predictor (internal/locality/oracle.go), Stage E6's bound: an oracle at
-// the same token's horizon that knows the step it predicts, replayed and judged at Stage B's gate
-// like the predictors, with a declared cost per decoded layer step (-oracle-predictor-us). If it
-// does not pass with a cost, no predictor of that horizon with that cost does. Off by default.
+// The perfect same-token predictor (internal/locality/oracle.go), Stage E6's reference: an oracle
+// at the same token's horizon that knows the step it predicts, replayed and judged at Stage B's
+// gate like the predictors, with a declared cost per decoded layer step (-oracle-predictor-us). No
+// predictor of that horizon covers the predicted step better. It is not a bound on the gate's
+// bytes or time: beyond the true experts it pads with Markov ranks, and other extras can serve
+// later tokens better. Off by default.
 
 import (
 	"fmt"
@@ -143,9 +145,12 @@ func writePerfect(w io.Writer, links []locality.Link, sizes []int, results []res
 		"are exactly the experts that step uses, read from the selection file. Beyond them, for k above the "+
 		"Top-%d, it ranks as the same-token Markov predictor with the own prefix's parameters, without them. It "+
 		"predicts where that horizon does, layers 2 to %d of every decoded token. A hidden-state predictor that "+
-		"applies layer l+1's router to layer l−1's output predicts the same step at the same time and can do no "+
-		"better than knowing it, so if the oracle is not retained with a cost, no predictor of this horizon with "+
-		"that cost is. Its cost per decoded layer step is declared (`-oracle-predictor-us`: %s µs), added to "+
+		"applies layer l+1's router to layer l−1's output predicts the same step at the same time and cannot "+
+		"cover that step better than knowing it. This is a reference, not a bound on the gate: a prefetched "+
+		"expert stays in the cache, so candidates beyond the true experts, which the oracle takes from the "+
+		"Markov predictor, can serve later tokens, and a predictor with better ones can load less or run "+
+		"faster. An oracle that is not retained with a cost makes a predictor of this horizon with that cost "+
+		"unlikely, not impossible. Its cost per decoded layer step is declared (`-oracle-predictor-us`: %s µs), added to "+
 		"every decoded step's compute as the predictors' is. It is replayed and judged at Stage B's gate exactly "+
 		"as they are: k from %s tuned per budget and link on the own training prefix, bytes prefetched counted "+
 		"as loaded.\n", locality.SameToken.Lead(layers), results[0].t.sel.K, layers-1, strings.Join(costs, ", "),
