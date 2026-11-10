@@ -1541,6 +1541,31 @@ This repeats E5's registration on the new path. The thresholds, the rule and the
 
 **The stage passes only if the KLD gate and the speed gate both pass.** If it passes, the skip is proposed as a patch on top of 0019, not merged, and the default stays lossless. If not, the stop rule applies: no patch, and the code stays on the fork branch.
 
+### Tuning (2026-11-10): W = 0.2
+
+Fork build `15d89aa23`, the registered command, `wiki.valid`, 20 × 512 tokens, the GGUF and its side-file on the home volume. Every step is one token. The limit is 1.10 × 0.127461 = 0.140207. The per-token figures divide by the 10,240 tokens of a run.
+
+| W | Mean KLD | Same top token | Skipped ids per token | Misses per token | Stops per token | Run, s |
+|---|---|---|--:|--:|--:|--:|
+| 0 | 0.127461 ± 0.008324 | 88.77% | 0 | 29.38 | 20.29 | 371 |
+| 0.05 | 0.125203 ± 0.008325 | 88.73% | 0.82 | 28.97 | 20.16 | 369 |
+| 0.1 | 0.136878 ± 0.008925 | 88.88% | 3.84 | 26.88 | 19.16 | 360 |
+| **0.2** | **0.130274 ± 0.008295** | 87.96% | 14.47 | 20.10 | 15.42 | 329 |
+| 0.3 | 0.148052 ± 0.008990 | 87.61% | 21.63 | 16.30 | 13.21 | 310 |
+| 0.5 | 0.163861 ± 0.009949 | 86.98% | 26.51 | 14.07 | 11.90 | 299 |
+| 1.0 | 0.170386 ± 0.010332 | 86.51% | 26.13 | 13.98 | 11.85 | 298 |
+
+- **The registered rule picks W = 0.2,** the largest W within the limit, as on the CPU path. The skip counts match E5's tuning closely (14.41 skipped and 20.09 misses per token there).
+- At W = 0.2, stops fall from 20.3 to 15.4 per token, and the run from 371 to 329 s. The run time is not a benchmark.
+- **The matrix `testdata/bench/e5-gpu-skip.json` uses W = 0.2.** It is committed before the KLD gate and before its first run:
+
+  ```sh
+  go run ./cmd/kolibri-bench -matrix testdata/bench/e5-gpu-skip.json -out ~/models/eval/expert-bench-e5-gpu-skip \
+    -server third_party/llama.cpp-gpuskip/build/bin/llama-server
+  ```
+
+- Results: `~/models/eval/e5-gpu/tune/`; scripts: `~/models/eval/e5-gpu/tools/`.
+
 ## Limits
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.
