@@ -1476,6 +1476,203 @@ go run ./cmd/kolibri-admission -models Kolibri-1-IQ3_XXS-IQ4_XS-down-imx -worklo
   -runtime-stats coding=$HOME/models/eval/e4-admission/coding-n16/stats.json,research=$HOME/models/eval/e4-admission/research-n16/stats.json
 ```
 
+## Stage E5: the skip in the GPU remap
+
+**Verdict (2026-11-10): passed.** The KLD gate and the deciding speed gate at 16 GiB both passed, at the tuned W = 0.2. Warm decode is 31.03 against 27.44 t/s, and warm p95 44.2 against 50.5 ms, against the same build without the flag. The skip is proposed as patch 0020, not merged, and the default stays lossless. An unregistered sustained run on repeated generations showed no gain ("Sustained decode" below). The sections below are in the order they were written: mode, checks, registration, tuning, result.
+
+Phase 11, Stage E5's parked item: the lossy skip of "Stage E5: skip-only" inside the GPU remap's Metal gate, which the owner asked for on 2026-11-10. The CPU-remap skip passed its KLD gate and lost its speed gate, because the CPU remap costs more than the skipped waits save. This build keeps the GPU remap. It is on fork branch `feat/kolibri1-gpu-skip` (`15d89aa23`), on top of `feat/kolibri1-waves2` (`5fe8b6df0`), and is off by default.
+
+### The mode
+
+`--expert-cache-skip W` (default 0, off) needs `--expert-cache-gpu-remap`; without it the model fails to load.
+
+1. The rule applies only in a graph layer that computes **one token**, which is every decode step. A prefill ubatch of more tokens is not skipped: the gate would have to know which experts the ubatch's other tokens need. (Its last layer is, when it computes only the last token; see "Limits of this result".)
+2. The gate ranks the token's k router ids by their weight, largest first; ties go by position.
+3. An id is skipped if its expert has no slot, its rank is 4 or lower, and its weight is below W. The GPU remap has no prefetch, so "no slot" is a true miss.
+4. If every miss of the layer is skipped, the gate passes: it maps each skipped id to the slot of the token's rank-1 expert and writes 0 over its weight, in place. **The command buffer does not stop.**
+5. If another miss remains, the gate stops as before and writes neither slots nor weights. The CPU loads the misses that are not skipped, and the resumed gate ranks the same weights again.
+6. The gate logs a skipped id as `-1 - id`. The CPU's bookkeeping counts it (`skipped` per phase in the stats) and neither pins nor loads it.
+
+No graph node is added: the layer's first expert matmul gets the router weights as one more source, so that they are computed before the gate. With W = 0 the graph is the GPU remap's. With W so small that nothing is skipped, the logits are bit-identical to it as well.
+
+For one token this is the rule of the CPU-remap skip. What differs: prefill ubatches are not skipped, and a skipped miss can save a stop, not only a read.
+
+### Checks (before the registration below)
+
+- `test-expert-cache`: "all expert cache tests passed", with the argument parsing and the refusals. `test-arg-parser`: "all tests OK".
+- `check_expert_cache.py --skip-only --skip-ref third_party/llama.cpp-skip`, tiny F32 and Q8_0 on Metal: 49 PASS, "PASS: 0 failures".
+  - W = 0 and W = 1e-30: logits bit-identical to the GPU remap without the option, same counters.
+  - W = 1: decode skips, the counters are consistent (each decode id is needed or skipped, once), no prefill ubatch of more than one token skips, and decode stops do not rise.
+  - Metamorphic: a skipped id on rank 2's slot instead of rank 1's gives bit-identical logits.
+  - 3 experts per token: nothing skips. 4: only the rank-4 id.
+  - **Against the CPU-remap skip** (`--skip-ref`, build `46fcc4069`, an independent implementation of the one-token rule): with one token per ubatch at 6 slots and W = 0.3, 0.5 and 0.7, both builds count the same steps, needed experts, misses and skipped ids (F32: 74, 163 and 339 skipped), and their logits differ by at most 1.3e-4.
+- `--real` IQ3 at 64 slots: "PASS: 0 failures". W = 1 skips 12.7% of the decode ids; decode stops fall from 1050 to 754.
+- Negative controls, each applied, rebuilt, run and reverted:
+
+| Control | Change | Result |
+|---|---|---|
+| **M113** | the gate does not zero the skipped weight | "FAIL: 12 failures": the metamorphic check (max \|diff\| 1.38) and the reference |
+| **M114** | cutoff at rank 3 | the process aborts in the CPU bookkeeping: `GGML_ASSERT(n_kept >= std::min(n_ids, 3))` |
+| **M115** | rank by id position | "FAIL: 6 failures": the reference counts differ (44, 102, 205 skipped against 74, 163, 339) |
+| **M116** | the CPU loads the skipped ids | "FAIL: 17 failures": nothing is counted as skipped |
+
+### Pre-registration (committed and pushed before the tuning runs)
+
+This repeats E5's registration on the new path. The thresholds, the rule and the limits are E5's; only the build and the flag `--expert-cache-gpu-remap` are new.
+
+**All KLD runs** use `llama-perplexity` of fork build `15d89aa23` on `~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf`, Metal, with `-ngl 99 -t 10 --fit off -c 512 -b 512 -ub 1 --expert-cache 128 --expert-cache-sidefile <GGUF>.experts --expert-cache-wait spin --expert-cache-gpu-remap --expert-cache-skip W` and `--expert-cache-stats` for the counts. The ubatch is 1, so every token meets the rule as in decode. W = 0 is the lossless GPU remap on this build.
+
+**Tuning:**
+- wikitext-2 `wiki.valid.raw`, 20 chunks of 512, against E5's base `~/models/eval/e5/kld-bf16-valid-c512-n20.bin`.
+- Thresholds: W ∈ {0.05, 0.1, 0.2, 0.3, 0.5, 1.0}, plus W = 0.
+- **Rule:** the chosen W is the largest whose tuning KLD is at most 1.10 × the tuning KLD at W = 0. If none qualifies, no W is chosen and the stage does not pass; the speed matrix then runs at W = 0.05 as INFO.
+
+**KLD gate:**
+- Base `~/models/eval/kld-bf16-c512-n20.bin`, the 20 `wiki.test` chunks.
+- Two runs: W = 0 and the chosen W.
+- **It passes if** KLD(W) ≤ 1.10 × KLD(0).
+- Reported: same-top-token rates, skipped ids and stops per token.
+
+**Speed gate:**
+- `testdata/bench/e5-gpu-skip.json`, written after tuning with the chosen W and committed before the KLD gate and its own first run. Every arm runs on the one build `15d89aa23`, so the arms differ only in the flag.
+- Candidate: the series' best arm (`--expert-cache 128`, side-file, GPU remap, spin, waves) plus `--expert-cache-skip W`. Baseline: the same arm without it. 3 repetitions each at 16 GiB and at 0 GiB.
+- **Deciding, at 16 GiB, metric `decode-and-p95`** (PLAN's gate, E5's metric): every skip repetition must decode faster than the baseline's fastest, **and** every warm p95 must be below the baseline's lowest.
+- INFO: the same metric at 0 GiB; prefill and TTFT at both ceilings; skipped ids per decoded token; stops per token.
+- The baseline must generate the token IDs of resident (not exact in prefill, which runs waves on the CPU remap, as in E4's retry). The skip arm, being lossy, has no equivalence.
+- The runs are alone on the machine: no agent, no build, home volume, AC power.
+
+**The stage passes only if the KLD gate and the speed gate both pass.** If it passes, the skip is proposed as a patch on top of 0019, not merged, and the default stays lossless. If not, the stop rule applies: no patch, and the code stays on the fork branch.
+
+### Tuning (2026-11-10): W = 0.2
+
+Fork build `15d89aa23`, the registered command, `wiki.valid`, 20 × 512 tokens, the GGUF and its side-file on the home volume. Every step is one token. The limit is 1.10 × 0.127461 = 0.140207. The per-token figures divide by the 10,240 tokens of a run.
+
+| W | Mean KLD | Same top token | Skipped ids per token | Misses per token | Stops per token | Run, s |
+|---|---|---|--:|--:|--:|--:|
+| 0 | 0.127461 ± 0.008324 | 88.77% | 0 | 29.38 | 20.29 | 371 |
+| 0.05 | 0.125203 ± 0.008325 | 88.73% | 0.82 | 28.98 | 20.16 | 369 |
+| 0.1 | 0.136878 ± 0.008925 | 88.88% | 3.84 | 26.89 | 19.16 | 360 |
+| **0.2** | **0.130274 ± 0.008295** | 87.96% | 14.47 | 20.10 | 15.41 | 329 |
+| 0.3 | 0.148052 ± 0.008990 | 87.61% | 21.63 | 16.30 | 13.21 | 310 |
+| 0.5 | 0.163861 ± 0.009949 | 86.98% | 26.50 | 14.07 | 11.90 | 299 |
+| 1.0 | 0.170386 ± 0.010332 | 86.51% | 26.13 | 13.98 | 11.86 | 298 |
+
+- **The registered rule picks W = 0.2,** the largest W within the limit, as on the CPU path. The skip counts match E5's tuning closely (14.41 skipped and 20.09 misses per token there).
+- At W = 0.2, stops fall from 20.29 to 15.41 per token, and the run from 371 to 329 s. The run time is not a benchmark.
+- **The matrix `testdata/bench/e5-gpu-skip.json` uses W = 0.2.** It is committed before the KLD gate and before its first run:
+
+  ```sh
+  go run ./cmd/kolibri-bench -matrix testdata/bench/e5-gpu-skip.json -out ~/models/eval/expert-bench-e5-gpu-skip \
+    -server third_party/llama.cpp-gpuskip/build/bin/llama-server
+  ```
+
+- Results: `~/models/eval/e5-gpu/tune/`; scripts: `~/models/eval/e5-gpu/tools/`.
+
+### Result (2026-11-10): both gates passed
+
+**The KLD gate passed.** Both runs used fork build `15d89aa23`, the registered command, and the 20 `wiki.test` chunks against `kld-bf16-c512-n20.bin`, with the IQ3 GGUF and its side-file on the home volume. The limit is 1.10 × 0.097870 = 0.107657.
+
+| W | Mean KLD | Same top token | PPL(Q)/PPL(base) | Skipped ids per token | Misses per token | Stops per token |
+|---|---|---|---|--:|--:|--:|
+| 0 | 0.097870 ± 0.007511 | 88.86 ± 0.44% | 1.029631 | 0 | 29.06 | 20.17 |
+| 0.2 | 0.101960 ± 0.007076 | 88.26 ± 0.45% | 1.026398 | 14.18 | 20.26 | 15.53 |
+
+- At W = 0.2, KLD rises by 4.2%. As in E5, the difference is within one standard error of either run, so 20 chunks cannot tell a 4% rise from a 10% one with confidence. The gate is the registered one, and it passed.
+- W = 0 on the GPU remap gives 0.097870, where E5's CPU remap gave 0.095231. The two paths round differently.
+
+**The speed gate passed** (`testdata/bench/e5-gpu-skip.json`, matrix committed in `fa44fae` before the KLD gate; 13 of 13 runs ok, 0 restarts, 02:24 to 02:52). Deciding: `decode-and-p95` at 16 GiB, against the same build without `--expert-cache-skip`.
+
+| Arm | Ceiling | Warm decode t/s | Warm p95 ms | Cold decode t/s | Warm prompt t/s | Cold TTFT s |
+|---|--:|--:|--:|--:|--:|--:|
+| skip W = 0.2 | 16 GiB | 31.03 (30.74–31.32) | 44.2 (43.1–45.3) | 30.86 (29.53–30.98) | 359.1 (338.5–359.6) | 7.00 (6.98–7.02) |
+| lossless (baseline) | 16 GiB | 27.44 (27.30–27.53) | 50.5 (49.1–54.9) | 24.82 (24.74–25.02) | 356.4 (332.2–358.1) | 6.97 (6.97–7.02) |
+| skip W = 0.2 | 0 GiB | 31.80 (30.95–32.03) | 45.1 (44.9–45.5) | 31.23 (31.13–32.09) | 357.2 (356.7–357.2) | 6.99 (6.96–7.00) |
+| lossless (baseline) | 0 GiB | 28.01 (27.81–28.11) | 52.0 (51.5–53.1) | 24.73 (24.42–25.47) | 357.8 (357.0–358.0) | 7.06 (6.97–7.06) |
+| resident | 0 GiB | 59.48 | 17.6 | 56.83 | 1155.2 | 2.09 |
+
+Both cache arms are `--expert-cache 128` with the side-file, the GPU remap, spin and waves. Each cell is the median of 3 repetitions with their range.
+
+| Arm, 16 GiB | Decode ms/token | Wait | Remap | Other | Commits per token | Stops per token | Misses per token | Skipped ids per token | Disk GB read |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| skip W = 0.2 | 32.60 | 6.02 | 0.14 | 26.22 | 26.9 | 14.02 | 18.12 | 10.35 | 286.5 |
+| lossless (baseline) | 35.65 | 7.33 | 0.15 | 28.18 | 29.3 | 16.65 | 23.21 | 0 | 292.3 |
+
+- **GATE, 16 GiB: passed, both halves.** The slowest skip repetition decodes at 30.74 t/s against the baseline's fastest 27.53, and the highest skip p95 is 45.3 ms against the baseline's lowest 49.1.
+- **INFO, 0 GiB, same metric: passed** (30.95 against 28.11 t/s; 45.5 against 51.5 ms).
+- **INFO, prefill and TTFT: no difference,** as the mode does not skip in prefill. The report prints "not passed" for these four lines, because the candidate does not beat the baseline's best repetition.
+- **Where the 3.05 ms per token come from:** 1.31 ms less wait and 1.96 ms less "other". Misses fall by 22% and stops by 16%, and each stop saved is one command buffer less. PLAN's estimate counted only the wait and predicted 26.8 to 27.5 t/s.
+- **Against Phase 11's decode target of 30 t/s:** every skip repetition is above it at both ceilings. This is the lossy mode, so whether it counts towards "on par" is the owner's decision. The lossless arm stays at 27.4 to 28.0 t/s.
+- **The skip rate is lower in the benchmark than in the KLD runs** (10.35 against 14.18 ids per token): the workloads' decode misses less than wikitext scored one token at a time (23.2 against 29.1 misses per token).
+- **Text:** the skip arm generates the same token IDs in all 6 of its runs. Against the baseline, the `research` request is identical over its 128 tokens, and the other four first differ at tokens 14 to 22.
+- **Equivalence (INFO, not exact):** the baseline matches resident in 0 of 30 requests, as its prefill runs waves on the CPU remap (E4's retry had 6 of 150 over its arms). It generates the token IDs of E4b's same arm in 30 of 30 requests, so with the flag off this build generates what the waves build did.
+- **An independent recomputation** from `run.json` (median over each repetition's warm requests) gives the same two passes at 16 GiB and at 0 GiB.
+- **Validity:**
+  - One server digest, `8573fa0f0278`, for all 13 runs; the build's sources are `15d89aa23`.
+  - Every eviction left 0 pages resident, and every run read the home volume.
+  - AC power, and no sleep or wake between 02:24 and 02:52.
+  - Each run started with a load average of 1.62 to 2.90, and with 11.4 to 14.0 GiB of swap in use.
+  - Others' CPU averaged 76 to 102% in the baseline runs, and 92 to 247% in the skip runs (the first run, right after the KLD gate, had 247%, peak 410%). The disturbance fell on the candidate.
+  - The arms alternated: skip 16 GiB, skip 0 GiB, baseline 16 GiB, baseline 0 GiB, per repetition.
+
+**Checks on the final build.** After the benchmark, two commits were added. Neither touches the Metal backend (`ggml/` is unchanged since `15d89aa23`), the gate's rule or the CPU bookkeeping.
+- `1dab37af4` keeps the skip out of a draft model's params, which would otherwise fail to load. No benchmarked arm has a draft model.
+- `8ce7227b7` follows an independent review of the diff, which found no defect on Kolibri:
+  - a model with normalised or softmax router weights now fails to load with the skip, instead of asserting at the first decode (Kolibri has neither);
+  - `skip_map_rank` is checked only with the skip on;
+  - the help text says where the rule applies.
+
+On `8ce7227b7`:
+- `test-expert-cache`: "all expert cache tests passed"; `test-arg-parser`: "all tests OK";
+- `check_expert_cache.py --skip-only --skip-ref third_party/llama.cpp-skip`: 49 PASS, "PASS: 0 failures";
+- `--real` IQ3 `--skip-only`: "PASS: 0 failures".
+
+On `15d89aa23`, the whole tiny suite with `--wait-mode spin` gave 1102 PASS, "PASS: 0 failures". The controls M113 to M116 ran on the tree that became `15d89aa23`.
+
+**What follows.**
+- `patches/llama.cpp/0020-kolibri-expert-cache-gpu-skip.patch` is the diff `5fe8b6df0..8ce7227b7`; applied to `5fe8b6df0` it gives the branch's tree `5658a450`. It applies on top of 0019 as PR #87 regenerates it (with `5fe8b6df0`).
+- The fork PR proposes `feat/kolibri1-gpu-skip` for `feat/kolibri1-waves2`. Nothing is merged, and the default stays lossless.
+
+### Sustained decode (INFO, after the gates)
+
+10 minutes of continuous decode per arm at 16 GiB, the skip first and then the lossless arm (`~/models/eval/e5-gpu-sustained/`, build `8ce7227b7`). Each arm ran 84 requests of 256 tokens with `ignore_eos` at temperature 0, four short prompts in turn without the prompt cache, so **each arm generates the same four texts 21 times.**
+
+| Arm | Mean decode t/s | Median | Per 2-minute window | Misses per token | Stops per token | Skipped ids per token |
+|---|--:|--:|---|--:|--:|--:|
+| skip W = 0.2 | 37.84 | 39.74 | 37.37 to 38.57 | 10.65 | 8.30 | 14.13 |
+| lossless | 37.68 | 37.35 | 36.67 to 38.13 | 12.45 | 9.29 | 0 |
+
+- **No measurable gain in the mean** (0.4%), and both arms finished the same 84 requests in their 10 minutes. The short prompts make these speeds not comparable with the matrix.
+- **Why:** on repeated text the lossless cache misses only 12.45 experts per token, against 23.21 in the matrix, because it loads a recurring expert once. The skip leaves 14.13 ids per token out, but saves only 1.80 misses per token, as most of what it skips would have been a hit after the first load.
+- **So the matrix's 13% holds for new text after a long prompt, not for repeated generations.** How the gain behaves over one long generation of new text was not measured.
+- No window shows a trend. `pmset -g therm` reported no thermal or performance warning in any of the 21 samples per arm. Server CPU: 16 min 59 s and 16 min 58 s in 10 minutes.
+- One run per arm, in a fixed order, with no repetition: this is INFO, not a gate.
+
+### Limits of this result
+
+- **Quality is measured by KLD on 10,240 wikitext tokens only.** No task benchmark ran, and the generated text differs from the lossless run after 14 to 22 tokens in four of five requests.
+- **W was tuned and gated on wikitext, and the speed was measured on the four workloads,** where the mode skips less.
+- **128 decoded tokens per request in the matrix.** The sustained run below repeats four generations, and there the skip gains nothing measurable.
+- **A skipped expert is never admitted.** If the router keeps choosing it, the lossless cache loads it once and then hits, while the skip leaves it out every time.
+- **Prefill is not skipped, with two exceptions.** A one-token prefill ubatch is, since the rule cannot tell it from a decode step. So is the last layer of a prompt ubatch that computes only its last token: the logits of the first generated token are lossy too. The stats count those ids under `prefill`: 8 ids per run of the benchmark's skip arm, over its 5 requests.
+- **A `cb_eval` observer of `ffn_moe_weights` sees the weights before the gate zeroes them** (`cmd/kolibri-routing` reads that tensor). Its trace would show a skipped expert with its router weight.
+- **Metal only,** as the GPU remap.
+
+### Reproduce
+
+```sh
+git -C third_party/llama.cpp fetch origin feat/kolibri1-gpu-skip
+git -C third_party/llama.cpp switch --detach 15d89aa23   # the benchmarked build; 8ce7227b7 is the patch
+cmake --build third_party/llama.cpp/build --target llama llama-server llama-perplexity llama-completion test-expert-cache -j
+third_party/llama.cpp/build/bin/test-expert-cache
+.venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp --skip-only \
+  --skip-ref third_party/llama.cpp-skip   # a build of feat/kolibri1-lossy-skip
+.venv/bin/python tools/gguf/check_expert_cache.py --llama-cpp third_party/llama.cpp \
+  --real ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf --skip-only
+~/models/eval/e5-gpu/tools/tune.sh   # then the two gate runs with kld-run.sh, as registered
+go run ./cmd/kolibri-bench -matrix testdata/bench/e5-gpu-skip.json -out ~/models/eval/expert-bench-e5-gpu-skip \
+  -server third_party/llama.cpp/build/bin/llama-server
+```
+
 ## Limits
 
 - One context per model; a second context with the cache fails to be created. The cache is taken at the end of the context's construction, so a construction that fails earlier does not hold it.

@@ -137,6 +137,18 @@ options the logits must be bit-identical to the UNSPLIT resident run and to the 
 path, with its counters, one pread per expert and 2 scheduler splits per decoded token. --real checks
 the same on the real weight.
 
+Skip in the GPU remap (--expert-cache-skip with --expert-cache-gpu-remap): patch 0020, proposed (fork
+branch feat/kolibri1-gpu-skip; Stage E5, 2026-11-10). The Metal gate applies the rule below in a graph
+layer of one token: a skipped miss is not read, its weight is zeroed in place, and a layer whose misses
+are all skipped does not stop its command buffer. The script tells the two builds apart by the stats
+key skipped_ids, which only the CPU-remap build has, and runs the same checks on Metal with the GPU
+remap: the lossless run is the GPU remap without the flag, no prefill ubatch of more than one token
+may skip, decode stops may not rise, and the skip without the GPU remap must fail to load. With
+--skip-ref CHECKOUT (a build of feat/kolibri1-lossy-skip) it also compares the gate's rule with the CPU
+remap's, an independent implementation: one token per ubatch at 6 slots and weights 0.3, 0.5 and 0.7
+must give the same steps, needed experts, misses and skipped ids, and logits within 1e-3. Controls M113
+(weight not zeroed), M114 (cutoff at rank 3), M115 (rank by position), M116 (the CPU loads skipped ids).
+
 Skip (--expert-cache-skip): former patch 0018 (retired; fork branch feat/kolibri1-lossy-skip), lossy and opt-in (Stage E5). Against a checkout without it the
 skip checks are skipped with a note, and --skip-only is an error. Per token the remap ranks the ids by
 router weight; an id at rank 4 or below whose weight is under skip_weight and whose expert is a true
@@ -374,6 +386,11 @@ def main() -> None:
     ap.add_argument("--gpu-remap-only", action="store_true", help="only the GPU remap checks")
     ap.add_argument("--stack-only", action="store_true", help="only the checks of the side-file and the GPU remap together")
     ap.add_argument("--skip-only", action="store_true", help="only the checks of the lossy skip (--expert-cache-skip)")
+    ap.add_argument("--skip-ref", type=Path, metavar="CHECKOUT",
+                    help="with --skip-only on the tiny checkpoint: a built checkout of the other skip build (the CPU remap's, "
+                         "fork branch feat/kolibri1-lossy-skip), whose rule must skip the same ids")
+    ap.add_argument("--skip-dump-type", default="f32", help=argparse.SUPPRESS)
+    ap.add_argument("--skip-dump", type=Path, metavar="NPZ", help=argparse.SUPPRESS)  # --skip-ref's subprocess: write skip_trace and exit
     ap.add_argument("--wait-mode", type=wait_mode, metavar="MODE",
                     help="how the cache runs wait for their loads: sleep, spin, hybrid:US or qos (--expert-cache-wait; "
                          "the resident reference runs never get it; default: the library's, sleep)")
@@ -406,6 +423,9 @@ def main() -> None:
     skip_on = has_skip(r, args.llama_cpp)
     if args.skip_only and not skip_on:
         ap.error(f"--skip-only: {args.llama_cpp} has no --expert-cache-skip; it needs a build of fork branch feat/kolibri1-lossy-skip")
+    # the skip's two builds: on the CPU remap (retired patch 0018, whose stats have skipped_ids), or in the
+    # Metal gate of the GPU remap (fork branch feat/kolibri1-gpu-skip), where it needs gpu_remap
+    skip_gpu = skip_on and b"skipped_ids" not in (args.llama_cpp / "build" / "bin" / ("libllama.dylib" if sys.platform == "darwin" else "libllama.so")).read_bytes()
     if not skip_on:
         print(f"note: {args.llama_cpp} has no expert cache skip (fork branch feat/kolibri1-lossy-skip): skipping check_skip", flush=True)
     if args.wait_mode is not None:
@@ -1175,6 +1195,9 @@ def main() -> None:
         if k < 4:
             report(False, f"{label} {dev_name}: the skip needs at least 4 experts per token, the fixture has {k}")
             return
+        if skip_gpu and not on_gpu(dev):
+            return  # the Metal gate applies it
+        mode = {"gpu_remap": True} if skip_gpu else {}
         chunks = [n_prompt] + [1] * (len(tokens) - n_prompt)
         same_fields = ("steps", "needed", "hits", "hits_loading", "misses", "skipped", "skipped_ids", "evictions", "demand_bytes", "load_failures")
 
@@ -1182,7 +1205,7 @@ def main() -> None:
             stats.unlink(missing_ok=True)
             got = r.logits(gguf, dev, tokens, n_prompt, chunks=chunks, no_repack=True,
                            overrides={"kolibri1.expert_used_count": kk} if kk != k else None,
-                           expert_cache={"n_slots": slots, "stats_path": str(stats), **ec})
+                           expert_cache={"n_slots": slots, "stats_path": str(stats), **mode, **ec})
             return got, json.loads(stats.read_text())
 
         def phases(s: dict) -> str:
@@ -1194,7 +1217,11 @@ def main() -> None:
             pre, dec = s["prefill"], s["decode"]
             bad = []
             for ph, c in (("prefill", pre), ("decode", dec)):
-                sk, ids = c.get("skipped", 0), c.get("skipped_ids", 0)
+                sk = c.get("skipped", 0)
+                ids = c.get("skipped_ids", sk)  # the gate's skip counts ids only: one token's are distinct experts
+                # the gate skips in a graph of one token only
+                if skip_gpu and ph == "prefill" and ub > 1 and sk:
+                    bad.append(f"prefill: {sk} skipped in ubatches of more than one token")
                 if c["hits"] + c["hits_loading"] + c["misses"] != c["needed"]:
                     bad.append(f"{ph}: hits + hits_loading + misses != needed")
                 # distinct experts skipped never outnumber the ids that chose them, and only ranks 4..k skip
@@ -1205,7 +1232,7 @@ def main() -> None:
             if pre["steps"] != n_pre * n_layer or dec["steps"] != n_dec * n_layer:
                 bad.append(f"remaps {pre['steps']} and {dec['steps']}, want {n_pre * n_layer} and {n_dec * n_layer}")
             # a decode remap has one token, whose kk ids are distinct experts: each is needed or skipped, once
-            if dec["needed"] + dec.get("skipped", 0) != dec["steps"] * kk or dec.get("skipped", 0) != dec.get("skipped_ids", 0):
+            if dec["needed"] + dec.get("skipped", 0) != dec["steps"] * kk or dec.get("skipped", 0) != dec.get("skipped_ids", dec.get("skipped", 0)):
                 bad.append(f"decode: needed + skipped = {dec['needed'] + dec.get('skipped', 0)}, want {dec['steps']} remaps * {kk}")
             if pre["needed"] + pre.get("skipped", 0) > pre["steps"] * ub * kk:
                 bad.append("prefill: needed + skipped exceed the ids")
@@ -1254,6 +1281,12 @@ def main() -> None:
                 bad.append(f"{pre['evictions'] + dec['evictions']} evictions and {pre['misses'] + dec['misses']} misses with a slot for every expert")
             finite = bool(np.isfinite(lossy).all())
             changed = not np.array_equal(lossy, lossless)
+            if skip_gpu:
+                # a skipped miss does not stop its command buffer, so the skip can only remove stops
+                if not dec["gpu_stops"] <= ls["decode"]["gpu_stops"]:
+                    bad.append(f"decode stops {dec['gpu_stops']} with the skip, {ls['decode']['gpu_stops']} without")
+                print(f"info {what}, weight 1: decode stops {dec['gpu_stops']} of {dec['gpu_runs']} command buffers, "
+                      f"lossless {ls['decode']['gpu_stops']} of {ls['decode']['gpu_runs']}", flush=True)
             report(dec.get("skipped", 0) > 0 and finite and changed and not bad and s2["expert_cache"].get("skip_weight") == 1,
                    f"{what}, weight 1: decode skips {dec.get('skipped', 0)} experts ({100 * dec.get('skipped', 0) / max(dec['steps'] * k, 1):.1f}% of its ids), "
                    f"logits finite and changed, counters consistent ({phases(s2)}; lossless: {phases(ls)})" + (f": {bad}" if bad else ""))
@@ -1283,7 +1316,7 @@ def main() -> None:
                 lossless, ls = run(slots, ub, kk)
                 lossy, s = run(slots, ub, kk, skip_weight=1.0)
                 bad = counted(s, ub, n_pre, n_dec, slots, kk)
-                n_sk = s["prefill"].get("skipped_ids", 0) + s["decode"].get("skipped_ids", 0)
+                n_sk = s["prefill"].get("skipped", 0) + s["decode"].get("skipped", 0)
                 if kk == 3:
                     report(np.array_equal(lossy, lossless) and n_sk == 0 and not bad,
                            f"{what}, weight 1: no id has rank 4, so nothing skips: logits bit-identical to the lossless run ({phases(s)})" + (f": {bad}" if bad else ""))
@@ -1293,7 +1326,13 @@ def main() -> None:
 
         # what cannot work fails to load: the GPU remap's gate has no weights to read nor a mask to
         # write, and without a cache the model would load fully resident (tiny only)
-        if gpu_remap_on and on_gpu(dev):
+        if skip_gpu:
+            try:
+                r.logits(gguf, dev, tokens[:n_prompt], k, no_repack=True, expert_cache={"n_slots": 64, "skip_weight": 0.5})
+                report(False, f"{label} {dev_name}: the skip on the CPU remap loaded")
+            except RuntimeError:
+                report("--expert-cache-skip needs --expert-cache-gpu-remap" in "".join(r.log), f"{label} {dev_name}: the skip without the GPU remap fails to load, and says why")
+        elif gpu_remap_on and on_gpu(dev):
             try:
                 r.logits(gguf, dev, tokens[:n_prompt], k, no_repack=True, expert_cache={"n_slots": 64, "gpu_remap": True, "skip_weight": 0.5})
                 report(False, f"{label} {dev_name}: GPU remap with the skip loaded")
@@ -1310,11 +1349,50 @@ def main() -> None:
             except RuntimeError:
                 report(needle in "".join(r.log), f"{label} {dev_name}: the skip {how} fails to load, and says why")
 
+    SKIP_REF_WEIGHTS = (0.3, 0.5, 0.7)
+
+    def skip_trace(gguf: Path, dev, tokens: list[int], stats: Path) -> dict:
+        """Every token in its own ubatch at 6 slots, so the two builds' rules see the same one-token
+        steps: the decode counters and the logits per threshold."""
+        out = {}
+        for w in SKIP_REF_WEIGHTS:
+            stats.unlink(missing_ok=True)
+            got = r.logits(gguf, dev, tokens, 1, chunks=[1] * len(tokens), no_repack=True,
+                           expert_cache={"n_slots": 6, "stats_path": str(stats), "skip_weight": w, **({"gpu_remap": True} if skip_gpu else {})})
+            dec = json.loads(stats.read_text())["decode"]
+            out[f"logits_{w}"] = got
+            out[f"counts_{w}"] = np.array([dec["steps"], dec["needed"], dec["misses"], dec["skipped"]], dtype=np.int64)
+        return out
+
+    def check_skip_ref(gguf: Path, outtype: str, dev_name: str, dev, tokens: list[int], stats: Path, tmp: Path) -> None:
+        """The Metal gate's rule against the CPU remap's (retired patch 0018), an independent
+        implementation of the same rule for one token: same steps, misses and skipped ids at each
+        threshold. Their graphs round differently (the CPU remap splits the graph), so the logits
+        are compared with a tolerance, and a routing flip would show as a count off by a few."""
+        mine = skip_trace(gguf, dev, tokens, stats)
+        dump = tmp / f"skip-ref-{outtype}.npz"
+        sub = subprocess.run([sys.executable, __file__, "--llama-cpp", str(args.skip_ref), "--seed", str(args.seed), "--skip-only",
+                              "--skip-dump", str(dump), "--skip-dump-type", outtype], capture_output=True, text=True)
+        if sub.returncode != 0 or not dump.exists():
+            report(False, f"{outtype} {dev_name}, skip reference {args.skip_ref}: rc {sub.returncode}: {(sub.stdout + sub.stderr)[-400:]}")
+            return
+        ref = np.load(dump)
+        for w in SKIP_REF_WEIGHTS:
+            a, b = mine[f"counts_{w}"], ref[f"counts_{w}"]
+            diff = float(np.abs(mine[f"logits_{w}"] - ref[f"logits_{w}"]).max())
+            report(np.array_equal(a, b) and a[3] > 0 and diff < 1e-3,
+                   f"{outtype} {dev_name}, skip at weight {w}, one token per ubatch, 6 slots: steps, needed, misses and skipped "
+                   f"{a.tolist()} as the CPU remap's skip {b.tolist()}, logits max |diff| {diff:.3g}")
+        sk = [int(mine[f"counts_{w}"][3]) for w in SKIP_REF_WEIGHTS]
+        report(sk[0] < sk[1] < sk[2], f"{outtype} {dev_name}, skip: the thresholds {SKIP_REF_WEIGHTS} skip {sk} ids, more at each: the weight decides")
+
     def check_skip_cli(base: list[str], stats: Path, want: str) -> None:
         """--expert-cache-skip on the command line: 0 generates the lossless text; 1 skips and says so
         in the stats; what the library refuses, the tool exits on."""
         if not skip_on:
             return
+        if skip_gpu:
+            base = base + ["--expert-cache-gpu-remap"]
         off = subprocess.run(cli(base + ["--expert-cache", "16", "--expert-cache-skip", "0"]), capture_output=True, text=True, errors="replace")
         report(off.returncode == 0 and off.stdout == want, f"llama-completion --expert-cache-skip 0: same text as without the cache, rc {off.returncode}")
         stats.unlink(missing_ok=True)
@@ -1329,11 +1407,14 @@ def main() -> None:
                f"llama-completion --expert-cache-skip 1: the stats say skip_weight {got[0]}, {got[1]} experts skipped ({run.stdout.strip()[:40]!r}), rc {run.returncode}")
         cases = [([], "needs --expert-cache or --expert-cache-layers", "without a cache"),
                  (["--expert-cache", "16", "--expert-cache-skip", "-1"], "want a finite weight >= 0", "-1")]
-        if gpu_remap_on:
+        if skip_gpu:
+            cases.append((["--expert-cache", "64"], "--expert-cache-skip needs --expert-cache-gpu-remap", "without --expert-cache-gpu-remap"))
+        elif gpu_remap_on:
             cases.append((["--expert-cache", "64", "--expert-cache-gpu-remap"], "does not work with --expert-cache-skip", "and --expert-cache-gpu-remap"))
         for extra, msg, what in cases:
             args_ = extra if "--expert-cache-skip" in extra else extra + ["--expert-cache-skip", "0.5"]
-            run = subprocess.run(cli(base + args_), capture_output=True, text=True, errors="replace")
+            from_ = [a for a in base if a != "--expert-cache-gpu-remap"] if what.startswith("without --expert-cache-gpu") else base
+            run = subprocess.run(cli(from_ + args_), capture_output=True, text=True, errors="replace")
             report(run.returncode != 0 and run.stdout.strip() == "" and msg in run.stderr,
                    f"llama-completion --expert-cache-skip {what} exits {run.returncode} without generating and says why")
 
@@ -1419,11 +1500,18 @@ def main() -> None:
             cfg = json.loads((model / "config.json").read_text())
             rng = random.Random(args.seed)
             tokens = [rng.randrange(1000, 100000) for _ in range(N_PROMPT + N_DECODE)]
+            if args.skip_dump:
+                gguf = convert(model, args.llama_cpp, args.skip_dump_type)
+                dev = next(d for _, d in r.devices() if on_gpu(d))
+                np.savez(args.skip_dump, **skip_trace(gguf, dev, tokens, stats))
+                return
             for outtype in ["f32", "q8_0"]:
                 gguf = convert(model, args.llama_cpp, outtype)
                 for dev_name, dev in r.devices():
                     check_skip(gguf, dev_name, dev, tokens, N_PROMPT, SKIP_SLOTS, cfg["num_hidden_layers"], cfg["num_experts"],
                                cfg["num_experts_per_tok"], stats, outtype)
+                    if args.skip_ref and on_gpu(dev):
+                        check_skip_ref(gguf, outtype, dev_name, dev, tokens, stats, Path(tmp))
             base = [str(args.llama_cpp / "build" / "bin" / "llama-completion"), "-m", str(gguf), "-p", "Die Energiewende in Deutschland hat das Ziel",
                     "-n", "24", "--temp", "0", "--ignore-eos", "-no-cnv", "--no-display-prompt", "-c", "256", "--no-warmup"]
             check_skip_cli(base, stats, subprocess.run(base + ["-ub", "2"], capture_output=True, text=True).stdout)
