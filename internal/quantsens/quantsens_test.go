@@ -99,6 +99,12 @@ func TestItems(t *testing.T) {
 	if err != nil || typ != "Q8_0" || b != (64*64*2+64*32*2)/32*34 {
 		t.Fatalf("blk.0.attn: %d bytes, %s, %v", b, typ, err)
 	}
+	if n, err := TypeBytes(f, items[4], "q8_0"); err != nil || n != b {
+		t.Fatalf("TypeBytes(blk.0.attn, q8_0) = %d, %v; header says %d", n, err, b)
+	}
+	if _, err := TypeBytes(f, items[4], "NOPE"); err == nil {
+		t.Fatal("unknown type priced")
+	}
 	gate := kinds[slices.IndexFunc(kinds, func(i Item) bool { return i.Kind == "ffn_gate_exps" })]
 	if _, typ, _ := ItemBytes(f, gate); typ != "IQ3_XXS" {
 		t.Fatalf("kind ffn_gate_exps type %s", typ)

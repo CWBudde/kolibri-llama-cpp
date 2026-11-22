@@ -114,6 +114,29 @@ func Items(f *gguf.File, scope string) ([]Item, error) {
 	return items, nil
 }
 
+// TypeBytes is the size an item's tensors would have in type typ, from
+// their shapes in f (an error if a shape does not fit the type's blocks).
+// It lets allocate price a type without the donor file at hand.
+func TypeBytes(f *gguf.File, it Item, typ string) (int64, error) {
+	ty, ok := gguf.ParseType(typ)
+	if !ok {
+		return 0, fmt.Errorf("unknown type %q", typ)
+	}
+	var total int64
+	for _, name := range it.Tensors {
+		t, ok := f.Tensor(name)
+		if !ok {
+			return 0, fmt.Errorf("%s: no tensor %s", it.Name, name)
+		}
+		n, err := gguf.Tensor{Name: name, Dims: t.Dims, Type: ty}.Bytes()
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
 // ItemBytes is the size of an item's tensors in f and their type, or
 // "mixed" when they differ.
 func ItemBytes(f *gguf.File, it Item) (bytes int64, typ string, err error) {

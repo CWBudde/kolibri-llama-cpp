@@ -11,7 +11,7 @@
 //	kolibri-qsens splice   -base B.gguf -out X.gguf -take D.gguf=REGEX [-take ...]
 //	kolibri-qsens measure  -base B.gguf -donors D1.gguf,D2.gguf -scope kind|layer \
 //	                       -perplexity llama-perplexity -kld-base base.bin -work DIR -out sens.jsonl
-//	kolibri-qsens allocate -base B.gguf -donors ... -sens sens.jsonl -budget 33 -out plan.json [-types-out t.txt]
+//	kolibri-qsens allocate -base B.gguf -sens sens.jsonl -budget 33 -out plan.json [-types-out t.txt]
 //	kolibri-qsens build    -base B.gguf -donors ... -plan plan.json -out X.gguf
 //
 // measure scores the base file once and then, for each item and each donor
@@ -461,8 +461,10 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 }
 
 // infos describes every layer-scope item of the base for BuildChoices, and
-// returns the bytes of the tensors no item covers.
-func infos(b *opened, ds []*opened) ([]quantsens.Item, []quantsens.ItemInfo, int64, error) {
+// returns the bytes of the tensors no item covers. An item's candidate types
+// are the types measured for it or its kind, priced from its shapes
+// (TypeBytes), so the donor files need not be at hand.
+func infos(b *opened, recs []quantsens.Record) ([]quantsens.Item, []quantsens.ItemInfo, int64, error) {
 	items, err := quantsens.Items(b.src.File, "layer")
 	if err != nil {
 		return nil, nil, 0, err
@@ -474,7 +476,15 @@ func infos(b *opened, ds []*opened) ([]quantsens.Item, []quantsens.ItemInfo, int
 		if err != nil {
 			return nil, nil, 0, err
 		}
-		_, bytes := donorFor(it, ds)
+		bytes := map[string]int64{}
+		for _, r := range recs {
+			if r.Type == "" || (r.Item != it.Name && r.Item != it.Kind) {
+				continue
+			}
+			if n, err := quantsens.TypeBytes(b.src.File, it, r.Type); err == nil {
+				bytes[r.Type] = n
+			}
+		}
 		out = append(out, quantsens.ItemInfo{Item: it, BaseType: bt, BaseBytes: bb, Donor: bytes})
 		for _, n := range it.Tensors {
 			covered[n] = true
@@ -497,7 +507,6 @@ func infos(b *opened, ds []*opened) ([]quantsens.Item, []quantsens.ItemInfo, int
 func cmdAllocate(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("allocate", flag.ContinueOnError)
 	base := fs.String("base", "", "base GGUF the measurements were taken against")
-	donors := fs.String("donors", "", "comma-separated donor GGUFs (for each type's bytes)")
 	sens := fs.String("sens", "", "measure's JSONL")
 	budget := fs.Float64("budget", 0, "tensor bytes allowed, GiB")
 	unit := fs.Int64("unit", 256, "knapsack granularity, KiB (sizes round up)")
@@ -513,15 +522,11 @@ func cmdAllocate(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	ds, err := openDonors(*donors)
-	if err != nil {
-		return err
-	}
 	recs, err := readRecords(*sens)
 	if err != nil {
 		return err
 	}
-	items, in, fixed, err := infos(b, ds)
+	items, in, fixed, err := infos(b, recs)
 	if err != nil {
 		return err
 	}

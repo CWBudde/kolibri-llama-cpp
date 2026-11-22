@@ -138,7 +138,7 @@ func TestMeasureAllocateBuild(t *testing.T) {
 	plan := filepath.Join(dir, "plan.json")
 	types := filepath.Join(dir, "types.txt")
 	out.Reset()
-	if err := cmdAllocate([]string{"-base", base, "-donors", donors, "-sens", sens, "-budget", gibArg(total + 4096), "-unit", "1",
+	if err := cmdAllocate([]string{"-base", base, "-sens", sens, "-budget", gibArg(total + 4096), "-unit", "1",
 		"-out", plan, "-types-out", types}, &out); err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestMeasureAllocateBuild(t *testing.T) {
 	// A tight budget forces downgrades.
 	tight := filepath.Join(dir, "tight.json")
 	out.Reset()
-	if err := cmdAllocate([]string{"-base", base, "-donors", donors, "-sens", sens, "-budget", gibArg(total * 9 / 10), "-unit", "1",
+	if err := cmdAllocate([]string{"-base", base, "-sens", sens, "-budget", gibArg(total * 9 / 10), "-unit", "1",
 		"-out", tight}, &out); err != nil {
 		t.Fatal(err)
 	}

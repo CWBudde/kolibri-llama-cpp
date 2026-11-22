@@ -14,6 +14,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strings"
 )
 
 // Magic is "GGUF" read as a little-endian uint32.
@@ -103,6 +104,17 @@ var types = map[Type]typeInfo{
 	TQ1_0:   {"TQ1_0", qk, 2 + 4*13},
 	TQ2_0:   {"TQ2_0", qk, 2 + 64},
 	MXFP4:   {"MXFP4", 32, 1 + 16},
+}
+
+// ParseType returns the type with a name as String prints it ("IQ4_XS"),
+// in any case.
+func ParseType(name string) (Type, bool) {
+	for t, ti := range types {
+		if strings.EqualFold(ti.name, name) {
+			return t, true
+		}
+	}
+	return 0, false
 }
 
 func (t Type) String() string {
