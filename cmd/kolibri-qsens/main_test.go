@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -282,5 +283,35 @@ func TestMeasureAllocateBand(t *testing.T) {
 	}
 	if down == 0 || p.Total > p.Budget {
 		t.Fatalf("plan %+v\n%s", p, out.String())
+	}
+}
+
+func TestCalibrateCommand(t *testing.T) {
+	dir := t.TempDir()
+	proxy := filepath.Join(dir, "proxy.jsonl")
+	target := filepath.Join(dir, "target.jsonl")
+	write := func(path string, recs ...quantsens.Record) {
+		for _, r := range recs {
+			if err := appendRecord(path, r); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	write(proxy, quantsens.Record{Scope: "base"},
+		quantsens.Record{Scope: "kind", Item: "attn", Type: "Q4_0", DKL: 0.01},
+		quantsens.Record{Scope: "band:2", Item: "blk.0-1.attn", Type: "Q4_0", DKL: 0.004})
+	write(target, quantsens.Record{Scope: "base", KLD: 0.1},
+		quantsens.Record{Scope: "kind", Item: "attn", Type: "Q4_0", DKL: 0.03})
+	out := filepath.Join(dir, "cal.jsonl")
+	var buf bytes.Buffer
+	if err := cmdCalibrate([]string{"-proxy", proxy, "-target", target, "-out", out}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	recs, _ := readRecords(out)
+	if len(recs) != 2 || math.Abs(recs[1].DKL-0.012) > 1e-12 {
+		t.Fatalf("calibrated %+v\n%s", recs, buf.String())
+	}
+	if err := cmdCalibrate([]string{"-proxy", proxy, "-target", target, "-out", out}, &buf); err == nil {
+		t.Fatal("calibrate wrote over its output")
 	}
 }

@@ -11,6 +11,7 @@
 //	kolibri-qsens splice   -base B.gguf -out X.gguf -take D.gguf=REGEX [-take ...]
 //	kolibri-qsens measure  -base B.gguf -donors D1.gguf,D2.gguf -scope kind|layer \
 //	                       -perplexity llama-perplexity -kld-base base.bin -work DIR -out sens.jsonl
+//	kolibri-qsens calibrate -proxy proxy.jsonl -target sens.jsonl -out calibrated.jsonl
 //	kolibri-qsens allocate -base B.gguf -sens sens.jsonl -budget 33 -out plan.json [-types-out t.txt]
 //	kolibri-qsens build    -base B.gguf -donors ... -plan plan.json -out X.gguf
 //
@@ -19,6 +20,10 @@
 // that item alone (gguf.Splice; nothing is requantized). Each record is
 // appended to -out as a JSON line, so an interrupted run resumes where it
 // stopped. The candidate file lives in -work and is deleted after its run.
+//
+// calibrate turns measurements against the base file's own logits (measure
+// with -kld-base of the base's logits) into estimates against BF16, scaled
+// per kind and type by kind-scope measurements of both (quantsens.Calibrate).
 //
 // No command writes over an existing file: outputs are written under a
 // temporary name and linked to their path, which must not exist.
@@ -64,6 +69,8 @@ func main() {
 		err = cmdAllocate(args, os.Stdout)
 	case "build":
 		err = cmdBuild(args, os.Stdout)
+	case "calibrate":
+		err = cmdCalibrate(args, os.Stdout)
 	default:
 		usage()
 	}
@@ -73,7 +80,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kolibri-qsens splice|measure|allocate|build [flags]; -h for a command's flags")
+	fmt.Fprintln(os.Stderr, "usage: kolibri-qsens splice|measure|calibrate|allocate|build [flags]; -h for a command's flags")
 	os.Exit(2)
 }
 
@@ -597,6 +604,47 @@ func summary(w io.Writer, p quantsens.Plan, choices []quantsens.Choice) {
 		opts += len(c.Options)
 	}
 	fmt.Fprintf(w, "  %d items, %d options; %d picks use a cost spread from a kind-scope measurement\n", len(choices), opts, derived)
+}
+
+func cmdCalibrate(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("calibrate", flag.ContinueOnError)
+	proxy := fs.String("proxy", "", "measure's JSONL against the base file's own logits")
+	target := fs.String("target", "", "measure's JSONL against the BF16 logits, with kind-scope records")
+	out := fs.String("out", "", "calibrated JSONL for allocate; must not exist")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *proxy == "" || *target == "" || *out == "" {
+		return errors.New("-proxy, -target and -out are required")
+	}
+	pr, err := readRecords(*proxy)
+	if err != nil {
+		return err
+	}
+	tr, err := readRecords(*target)
+	if err != nil {
+		return err
+	}
+	recs, ratios, dropped := quantsens.Calibrate(pr, tr)
+	if len(recs) == 0 {
+		return fmt.Errorf("no proxy record has kind-scope measurements in both files")
+	}
+	if err := writeNew(*out, func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		for _, r := range recs {
+			if err := enc.Encode(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, r := range ratios {
+		fmt.Fprintln(stdout, r)
+	}
+	fmt.Fprintf(stdout, "%d records calibrated, %d dropped (no kind-scope pair)\n", len(recs), dropped)
+	return nil
 }
 
 func cmdBuild(args []string, stdout io.Writer) error {
