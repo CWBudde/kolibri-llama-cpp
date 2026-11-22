@@ -2,6 +2,7 @@ package quantsens
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"slices"
@@ -279,5 +280,63 @@ func TestTensorTypes(t *testing.T) {
 	}
 	if _, err := TensorTypes(Plan{Picks: []Pick{{Item: "blk.9.attn"}}}, items); err == nil {
 		t.Fatal("unknown item accepted")
+	}
+}
+
+func TestItemsBand(t *testing.T) {
+	f := header(t, twoLayers())
+	items, err := Items(f, "band:5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, it := range items {
+		names = append(names, it.Name)
+	}
+	// Two layers in a band of 5: one band, cut at the last layer.
+	want := []string{"blk.0-1.ffn_gate_exps", "blk.0-1.ffn_up_exps", "blk.0-1.ffn_down_exps", "blk.0-1.shexp", "blk.0-1.attn", "token_embd", "output"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("items %v\nwant %v", names, want)
+	}
+	if it := items[4]; it.Layer != 0 || len(it.Tensors) != 8 {
+		t.Fatalf("band attn = %+v", it)
+	}
+	one, err := Items(f, "band:1")
+	if err != nil || len(one) != 12 || one[0].Name != "blk.0.ffn_gate_exps" {
+		t.Fatalf("band:1 gives %d items (%v), want the layer scope's names", len(one), err)
+	}
+	for _, s := range []string{"band:0", "band:x", "bands"} {
+		if _, err := Items(f, s); err == nil {
+			t.Fatalf("scope %q accepted", s)
+		}
+	}
+	if a, b, k, ok := ParseBand("blk.10-14.ffn_down_exps"); !ok || a != 10 || b != 14 || k != "ffn_down_exps" {
+		t.Fatalf("ParseBand = %d %d %s %v", a, b, k, ok)
+	}
+}
+
+func TestBuildChoicesBand(t *testing.T) {
+	info := func(l int) ItemInfo {
+		return ItemInfo{Item: Item{Name: fmt.Sprintf("blk.%d.attn", l), Kind: "attn", Layer: l}, BaseType: "Q8_0", BaseBytes: 100, Donor: map[string]int64{"Q4_K": 50}}
+	}
+	infos := []ItemInfo{info(0), info(1), info(2), info(3),
+		{Item: Item{Name: "output", Kind: "output", Layer: -1}, BaseType: "Q8_0", BaseBytes: 100, Donor: map[string]int64{"Q4_K": 50}}}
+	recs := []Record{
+		{Scope: "kind", Item: "attn", Type: "Q4_K", DKL: 0.4},
+		{Scope: "band:2", Item: "blk.0-1.attn", Type: "Q4_K", DKL: 0.02},
+		{Scope: "layer", Item: "blk.1.attn", Type: "Q4_K", DKL: 0.015},
+		{Scope: "band:2", Item: "output", Type: "Q4_K", DKL: 0.03},
+	}
+	ch := BuildChoices(infos, recs)
+	got := []float64{}
+	for _, c := range ch {
+		got = append(got, c.Options[1].DKL)
+	}
+	// blk.0 from the band (0.02/2), blk.1 its own record, blk.2-3 the kind (0.4/4), output whole.
+	if want := []float64{0.01, 0.015, 0.1, 0.1, 0.03}; !slices.Equal(got, want) {
+		t.Fatalf("ΔKL %v, want %v", got, want)
+	}
+	if !ch[0].Options[1].Derived || ch[1].Options[1].Derived || ch[4].Options[1].Derived {
+		t.Fatalf("derived flags %+v", ch)
 	}
 }

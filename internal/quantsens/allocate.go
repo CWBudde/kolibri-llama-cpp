@@ -87,19 +87,34 @@ type ItemInfo struct {
 }
 
 // BuildChoices makes each item's options from the measurements: a
-// layer-scope record for the item and type if there is one, else the
-// kind-scope record for its kind and type with its added KL spread evenly
-// over the kind's items (assuming the per-layer costs sum to it), else no
-// option for that type.
+// layer-scope record for the item and type if there is one, else a band
+// record (scope band:N) covering its layer, else the kind-scope record for
+// its kind and type, the band's or kind's added KL spread evenly over its
+// items (assuming the per-layer costs sum to it), else no option for that
+// type.
 func BuildChoices(infos []ItemInfo, recs []Record) []Choice {
 	layer := map[[2]string]Record{}
 	kind := map[[2]string]Record{}
+	type bandKey struct {
+		kind, typ string
+		layer     int
+	}
+	band := map[bandKey]float64{} // per-layer share of a band's added KL
 	for _, r := range recs {
-		switch r.Scope {
-		case "layer":
+		switch {
+		case r.Scope == "layer":
 			layer[[2]string{r.Item, r.Type}] = r
-		case "kind":
+		case r.Scope == "kind":
 			kind[[2]string{r.Item, r.Type}] = r
+		case strings.HasPrefix(r.Scope, "band:"):
+			first, last, k, ok := ParseBand(r.Item)
+			if !ok { // token_embd, output: whole items in any scope but kind
+				layer[[2]string{r.Item, r.Type}] = r
+				continue
+			}
+			for l := first; l <= last; l++ {
+				band[bandKey{k, r.Type, l}] = r.DKL / float64(last-first+1)
+			}
 		}
 	}
 	perKind := map[string]int{}
@@ -115,6 +130,8 @@ func BuildChoices(infos []ItemInfo, recs []Record) []Choice {
 			}
 			if r, ok := layer[[2]string{in.Item.Name, typ}]; ok {
 				c.Options = append(c.Options, Option{Type: typ, Bytes: in.Donor[typ], DKL: r.DKL})
+			} else if d, ok := band[bandKey{in.Item.Kind, typ, in.Item.Layer}]; ok && in.Item.Layer >= 0 {
+				c.Options = append(c.Options, Option{Type: typ, Bytes: in.Donor[typ], DKL: d, Derived: true})
 			} else if r, ok := kind[[2]string{in.Item.Kind, typ}]; ok {
 				c.Options = append(c.Options, Option{Type: typ, Bytes: in.Donor[typ], DKL: r.DKL / float64(perKind[in.Item.Kind]), Derived: true})
 			}

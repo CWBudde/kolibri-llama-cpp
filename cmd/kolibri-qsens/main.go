@@ -322,7 +322,7 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("measure", flag.ContinueOnError)
 	base := fs.String("base", "", "base GGUF")
 	donors := fs.String("donors", "", "comma-separated donor GGUFs")
-	scope := fs.String("scope", "kind", "kind: one item per tensor kind over all layers; layer: per kind and layer")
+	scope := fs.String("scope", "kind", "kind: one item per tensor kind over all layers; layer: per kind and layer; band:N: per kind and N consecutive layers")
 	kinds := fs.String("kinds", "", "measure only these kinds (comma-separated; default all)")
 	types := fs.String("types", "", "measure only these types (comma-separated; default every donor type)")
 	ppl := fs.String("perplexity", "", "llama-perplexity binary")
@@ -442,7 +442,7 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 		if _, err := splice(b, take, cand); err != nil {
 			return err
 		}
-		s, secs, lp, err := sc.score(cand, fmt.Sprintf("%s-%s-%s.log", *scope, r.it.Name, r.typ))
+		s, secs, lp, err := sc.score(cand, fmt.Sprintf("%s-%s-%s.log", strings.ReplaceAll(*scope, ":", ""), r.it.Name, r.typ))
 		if rmErr := os.Remove(cand); rmErr != nil && err == nil {
 			err = rmErr
 		}
@@ -478,7 +478,7 @@ func infos(b *opened, recs []quantsens.Record) ([]quantsens.Item, []quantsens.It
 		}
 		bytes := map[string]int64{}
 		for _, r := range recs {
-			if r.Type == "" || (r.Item != it.Name && r.Item != it.Kind) {
+			if r.Type == "" || !covers(r.Item, it) {
 				continue
 			}
 			if n, err := quantsens.TypeBytes(b.src.File, it, r.Type); err == nil {
@@ -502,6 +502,16 @@ func infos(b *opened, recs []quantsens.Record) ([]quantsens.Item, []quantsens.It
 		fixed += n
 	}
 	return items, out, fixed, nil
+}
+
+// covers reports whether a record's item (a layer item, a band such as
+// blk.10-14.attn, or a kind) includes the layer item it.
+func covers(recItem string, it quantsens.Item) bool {
+	if recItem == it.Name || recItem == it.Kind {
+		return true
+	}
+	first, last, kind, ok := quantsens.ParseBand(recItem)
+	return ok && kind == it.Kind && it.Layer >= first && it.Layer <= last
 }
 
 func cmdAllocate(args []string, stdout io.Writer) error {

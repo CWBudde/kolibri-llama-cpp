@@ -232,3 +232,55 @@ func TestSpliceCommand(t *testing.T) {
 		t.Fatal("overwrote an existing output")
 	}
 }
+
+// Band-scope records price every layer of their band in allocate.
+func TestMeasureAllocateBand(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.gguf")
+	q4 := filepath.Join(dir, "q4.gguf")
+	writeModel(t, base, gguf.IQ4_XS, gguf.Q8_0, 1)
+	writeModel(t, q4, gguf.Q4_0, gguf.Q4_0, 2)
+	ppl := filepath.Join(dir, "llama-perplexity")
+	if err := os.WriteFile(ppl, []byte(fakePerplexity), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sens := filepath.Join(dir, "sens.jsonl")
+	var out bytes.Buffer
+	if err := cmdMeasure([]string{"-base", base, "-donors", q4, "-scope", "band:2", "-perplexity", ppl,
+		"-kld-base", "unused.bin", "-work", filepath.Join(dir, "work"), "-out", sens, "-min-free", "0"}, &out); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	recs, _ := readRecords(sens)
+	// One band of both layers: gate, up, down, attn to Q4_0; plus the base.
+	if len(recs) != 5 || recs[1].Scope != "band:2" || !strings.HasPrefix(recs[1].Item, "blk.0-1.") {
+		t.Fatalf("%d records %+v\n%s", len(recs), recs, out.String())
+	}
+	bf, _ := gguf.Open(base)
+	var total int64
+	for _, x := range bf.Tensors {
+		n, _ := x.Bytes()
+		total += n
+	}
+	plan := filepath.Join(dir, "plan.json")
+	out.Reset()
+	if err := cmdAllocate([]string{"-base", base, "-sens", sens, "-budget", gibArg(total * 9 / 10), "-unit", "1", "-out", plan}, &out); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(plan)
+	var p quantsens.Plan
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	down := 0
+	for _, pk := range p.Picks {
+		if pk.Type == "Q4_0" {
+			down++
+			if !pk.Derived {
+				t.Fatalf("%s priced from its own record", pk.Item)
+			}
+		}
+	}
+	if down == 0 || p.Total > p.Budget {
+		t.Fatalf("plan %+v\n%s", p, out.String())
+	}
+}

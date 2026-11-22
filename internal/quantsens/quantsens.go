@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"kolibri-llm/internal/gguf"
 )
@@ -66,10 +67,19 @@ func KindOf(name string) (kind string, layer int) {
 
 // Items groups f's tensors. scope "layer" gives one item per kind and layer
 // (blk.12.attn) plus token_embd and output; scope "kind" gives one item per
-// kind spanning all layers (attn).
+// kind spanning all layers (attn); scope "band:N" gives one item per kind and
+// band of N consecutive layers (blk.10-14.attn; the last band may be
+// shorter) plus token_embd and output.
 func Items(f *gguf.File, scope string) ([]Item, error) {
-	if scope != "layer" && scope != "kind" {
-		return nil, fmt.Errorf("scope %q: want layer or kind", scope)
+	band, err := bandOf(scope)
+	if err != nil {
+		return nil, err
+	}
+	var nLayers int
+	for _, t := range f.Tensors {
+		if _, l := KindOf(t.Name); l+1 > nLayers {
+			nLayers = l + 1
+		}
 	}
 	byName := map[string]*Item{}
 	var order []string
@@ -79,10 +89,15 @@ func Items(f *gguf.File, scope string) ([]Item, error) {
 			continue
 		}
 		name := kind
-		if scope == "layer" && layer >= 0 {
-			name = fmt.Sprintf("blk.%d.%s", layer, kind)
-		} else if scope == "kind" {
+		switch {
+		case scope == "kind":
 			layer = -1
+		case layer < 0:
+		case band == 1:
+			name = fmt.Sprintf("blk.%d.%s", layer, kind)
+		default:
+			layer -= layer % band
+			name = fmt.Sprintf("blk.%d-%d.%s", layer, min(layer+band, nLayers)-1, kind)
 		}
 		it := byName[name]
 		if it == nil {
@@ -112,6 +127,37 @@ func Items(f *gguf.File, scope string) ([]Item, error) {
 		return rank[a.Kind] < rank[b.Kind]
 	})
 	return items, nil
+}
+
+// bandOf returns the layers per item of a scope: 1 for "layer", N for
+// "band:N", 0 for "kind".
+func bandOf(scope string) (int, error) {
+	switch scope {
+	case "kind":
+		return 0, nil
+	case "layer":
+		return 1, nil
+	}
+	if n, ok := strings.CutPrefix(scope, "band:"); ok {
+		if b, err := strconv.Atoi(n); err == nil && b >= 1 {
+			return b, nil
+		}
+	}
+	return 0, fmt.Errorf("scope %q: want layer, kind or band:N", scope)
+}
+
+var bandRe = regexp.MustCompile(`^blk\.(\d+)-(\d+)\.(.+)$`)
+
+// ParseBand splits a band item's name (blk.10-14.attn) into its first and
+// last layer and its kind.
+func ParseBand(name string) (first, last int, kind string, ok bool) {
+	m := bandRe.FindStringSubmatch(name)
+	if m == nil {
+		return 0, 0, "", false
+	}
+	first, _ = strconv.Atoi(m[1])
+	last, _ = strconv.Atoi(m[2])
+	return first, last, m[3], true
 }
 
 // TypeBytes is the size an item's tensors would have in type typ, from
