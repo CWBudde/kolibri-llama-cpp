@@ -516,7 +516,10 @@ producing a generic Q4.
         file (the band plan realizes −0.0061 of a predicted −0.0206), and
         router mismatch against BF16 adds nothing to the forced cost.
         Whole files are compared by forced KLD on 96 chunks; free routing
-        can't separate them.
+        can't separate them. Same-size variants that trade Q6_K on the
+        non-expert tensors for 8 early layers of IQ4_XS experts lose by
+        +0.0026 to +0.0032 ± 0.0008: the Q6_K downgrades, free one at a time,
+        cost 0.0032 together. The hand mix stays.
 -   [x] Build an importance matrix if supported/useful for the selected
     quantization scheme. (2026-10-05) — built from Q8_0 on a 45/35/20
     English/German/code text (`tools/quant/calibration.py`), "loaded 550

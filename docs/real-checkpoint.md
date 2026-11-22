@@ -836,8 +836,21 @@ Paired per chunk against the reference:
 
 **Result: the gate is not met.** No measured allocation beats the hand mix
 at 33.1 GiB. It wins forced on 96 chunks, and free it ties within the noise.
-A further search would compare whole files by forced KLD on 96 chunks, not
-single-item costs on 20.
+
+**A short search by whole files.** Same-size variants of the reference,
+forced, 96 chunks, paired against the reference's forced 0.0184:
+
+| Variant | Size | Paired ΔKLD |
+|---|---|---|
+| C0: Q6_K on attention, shared experts, `token_embd`, `output` | 32.5 GiB | +0.0032 ± 0.0007 |
+| C1: C0 + up experts IQ4_XS in layers 0–7 | 33.1 GiB | +0.0032 ± 0.0008 |
+| C2: C0 + gate experts IQ4_XS in layers 0–7 | 33.1 GiB | +0.0026 ± 0.0008 |
+
+- The Q6_K downgrades each cost nothing measurable alone, but together they
+  cost 0.0032: the non-expert tensors stay Q8_0.
+- The 0.58 GiB they free buys 8 layers of IQ4_XS experts, worth 0.0006 at
+  most.
+- The search stops here. The hand mix stays the 33.1 GiB recommendation.
 
 To reproduce one whole-file pair:
 
