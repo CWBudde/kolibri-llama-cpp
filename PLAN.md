@@ -259,6 +259,12 @@ when both are.
         >= 0.1: 3.06% of 4282". The torch port's BF16 rounding against itself:
         "Top-1 same 95.14%, Top-6 set same 75.88%".
     -   [ ] vLLM.
+    -   [x] llama.cpp, run against run. (2026-11-22) — the fork's
+        `LLAMA_MOE_ROUTE_DUMP`/`FORCE` (patch 0021) counts the Top-6 set
+        agreement of a run with a dumped route: 97.7% for `token_embd`
+        Q8_0 → BF16 and 95.8% for CPU against Metal of one file. Forcing
+        the route cuts the KLD between such runs from about 0.05 to under
+        0.0004 (docs/real-checkpoint.md, "Routing held fixed").
 -   [x] Report KL divergence for comparable output distributions alongside
     NMSE/top-token agreement, so small numerical drift can be separated from
     behavior-changing drift.
@@ -474,10 +480,13 @@ producing a generic Q4.
     routing/attention errors can amplify across 50 layers. (2026-11-22) —
     partial, attention as a whole: Q4_K adds KLD 0.044 over the IQ3_XXS
     base, while Q6_K and BF16 differ from Q8_0 by less than the noise
-    (docs/real-checkpoint.md, "Measured per-tensor allocation").
+    (docs/real-checkpoint.md, "Measured per-tensor allocation"). With the
+    route forced, Q4_K adds 0.036, Q6_K +0.0006 and BF16 −0.0005; the early
+    layers are the sensitive ones.
 -   [ ] Evaluate whether shared experts deserve higher precision than
     routed experts. (2026-11-22) — partial: Q4_K adds 0.011, and BF16's
-    −0.001 is within the noise.
+    −0.001 is within the noise. With the route forced: Q4_K +0.005, Q6_K
+    −0.0002, BF16 +0.0002. Higher precision does not help.
 -   [x] Allocate types per tensor group from measured KL under a byte
     budget, after LookAtMyQuant's llama.cpp route (MIT). (2026-11-22) —
     `cmd/kolibri-qsens` (splice, measure, calibrate, allocate, build).
@@ -491,6 +500,12 @@ producing a generic Q4.
         are not resolved on 20 × 512 tokens, and they don't add up.
     -   New reference: `~/models/eval/kld-bf16-c512-n96.bin`, 96 chunks
         of BF16 logits.
+    -   With the expert ids forced to BF16's (`measure -route`), the floor
+        goes and band costs add up, but the plans from those costs lose with
+        free routing: +0.0025 ± 0.0038 and +0.0040 ± 0.0037 paired against
+        the reference at 33.1 GiB. About three quarters of free-routing KL
+        is flipped experts, which forced costs can't see
+        (docs/real-checkpoint.md, "Routing held fixed").
 -   [x] Build an importance matrix if supported/useful for the selected
     quantization scheme. (2026-10-05) — built from Q8_0 on a 45/35/20
     English/German/code text (`tools/quant/calibration.py`), "loaded 550
