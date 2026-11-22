@@ -471,9 +471,26 @@ producing a generic Q4.
     1D norms stay F32. `llama-quantize` dry run: "blk.0.attn_norm.weight ...
     type = f32".
 -   [ ] Evaluate Q/K projections and QK norms conservatively because
-    routing/attention errors can amplify across 50 layers.
+    routing/attention errors can amplify across 50 layers. (2026-11-22) —
+    partial, attention as a whole: Q4_K adds KLD 0.044 over the IQ3_XXS
+    base, while Q6_K and BF16 differ from Q8_0 by less than the noise
+    (docs/real-checkpoint.md, "Measured per-tensor allocation").
 -   [ ] Evaluate whether shared experts deserve higher precision than
-    routed experts.
+    routed experts. (2026-11-22) — partial: Q4_K adds 0.011, and BF16's
+    −0.001 is within the noise.
+-   [x] Allocate types per tensor group from measured KL under a byte
+    budget, after LookAtMyQuant's llama.cpp route (MIT). (2026-11-22) —
+    `cmd/kolibri-qsens` (splice, measure, calibrate, allocate, build).
+    **Gate not met; not adopted.** At 33.1 GiB the allocated mix scores
+    "Mean KLD: 0.111593" on 96 chunks against the IQ3_XXS/IQ4_XS file's
+    0.106816 (paired +0.0048 ± 0.0038), and a hand-picked mix ties it
+    (−0.0005 ± 0.0028).
+    -   Any change upstream of the output head costs about 0.05 KL against
+        the unchanged model: `token_embd` Q8_0 → BF16 gives 0.0567, and the
+        same file on CPU against Metal gives 0.0568. So single-item costs
+        are not resolved on 20 × 512 tokens, and they don't add up.
+    -   New reference: `~/models/eval/kld-bf16-c512-n96.bin`, 96 chunks
+        of BF16 logits.
 -   [x] Build an importance matrix if supported/useful for the selected
     quantization scheme. (2026-10-05) — built from Q8_0 on a 45/35/20
     English/German/code text (`tools/quant/calibration.py`), "loaded 550

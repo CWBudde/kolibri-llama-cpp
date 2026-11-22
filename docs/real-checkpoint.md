@@ -329,7 +329,7 @@ on Metal. The Q8_0 row compares like with like on the CPU, at 213 s per pass.
 **Q8_0 KLD is high.** Here Q8_0 reaches 0.050 with 92.5% same top token, on
 the same backend as its reference. For dense models, Q8_0 usually lands near
 KLD 0.001 with over 99% same top token. A likely amplifier is the router: a small error in a
-router logit that sits near the top-6 boundary swaps an expert. That fits the
+router logit that sits near the top-6 boundary swaps an expert. "Measured per-tensor allocation" below shows that any change upstream of the output head, lossless ones and the backend included, costs about 0.05. That fits the
 PLAN Phase 6 note on Metal near-ties and the Phase 7 item "measure how often
 quantization changes Top-6 expert selection".
 
@@ -446,6 +446,178 @@ build/bin/llama-quantize --imatrix ~/models/eval/kolibri-imatrix.gguf \
     --tensor-type ffn_down_exps=iq4_xs ~/models/Kolibri-1-BF16.gguf \
     ~/models/Kolibri-1-IQ3_XXS-IQ4_XS-down-imx.gguf Q8_0
 ```
+
+## Measured per-tensor allocation
+
+This follows the "llama.cpp route" of
+[LookAtMyQuant](https://github.com/ShinMegamiBoson/lookatmyquant) (MIT,
+`gguf_compiler.py`):
+
+1. The menu is llama.cpp's own tensor types.
+2. A type's cost for a group of tensors is the KL divergence it adds when it
+   alone differs from a base file.
+3. The plan is the least summed cost under a byte budget, a multiple-choice
+   knapsack.
+
+The rest of LookAtMyQuant (trellis codes, distillation, an MLX runtime) needs
+its own runtime and HF transformers on CUDA, and does not apply here.
+
+`cmd/kolibri-qsens` implements it without requantizing anything:
+
+| Command | What it does |
+|---|---|
+| `splice` | Copies chosen tensors from donor GGUFs into a base GGUF (`internal/gguf.Splice`). |
+| `measure` | Scores one candidate per item and type with `llama-perplexity --kl-divergence`. |
+| `calibrate` | Scales proxy measurements (below) by kind-level ones. |
+| `allocate` | Runs the knapsack. |
+| `build` | Splices a plan and checks every tensor's type. |
+
+The donors are `llama-quantize --pure` files of the whole model in other
+types.
+
+- **Splices match `llama-quantize`.** A splice whose donor holds every tensor
+  in IQ4_XS down reproduces the IQ3_XXS/IQ4_XS file's mean KLD exactly:
+  "Mean KLD: 0.095291 ± 0.006905", as in the table above.
+- **Items:** per tensor kind (all layers), per band of 5 layers, or per
+  layer. The kinds are gate, up and down experts, the shared expert, attention
+  (q, k, v, output), `token_embd` and `output`. The router, its bias and the
+  norms stay F32.
+
+### Setup
+
+- **Base:** `Kolibri-1-IQ3_XXS-exps-imx.gguf` (30,347 MiB): IQ3_XXS experts,
+  Q8_0 elsewhere.
+- **Donors:**
+  - A: IQ2_S experts, Q4_K elsewhere;
+  - B: IQ4_XS experts, Q6_K elsewhere;
+  - the BF16 master.
+  A and B were built with the imatrix.
+- **Runs:** Metal, `-c 512 -b 512`, against `kld-bf16-c512-n20.bin`.
+- **Run time:** 50 to 90 s per candidate, splice included.
+- **Records:** results and logs are under `~/models/eval/qsens-20261122/`.
+
+### Kind-level costs
+
+ΔKL is against the base's own 0.107130 on the same harness. Size is the
+change in the item's bytes.
+
+| Kind | IQ2_S / Q4_K | Q6_K | IQ4_XS / BF16 |
+|---|---|---|---|
+| gate experts | +0.0113 (−1,500 MiB) | | −0.0105 (+3,563 MiB) |
+| up experts | +0.0104 (−1,500 MiB) | | −0.0129 (+3,563 MiB) |
+| down experts | +0.0196 (−1,500 MiB) | | −0.0118 (+3,563 MiB) |
+| shared expert | +0.0112 (−94 MiB) | +0.0002 (−45 MiB) | −0.0010 (+176 MiB) |
+| attention | +0.0445 (−813 MiB) | −0.0041 (−394 MiB) | −0.0016 (+1,523 MiB) |
+| `token_embd` | +0.0119 (−156 MiB) | −0.0093 (−76 MiB) | −0.0041 (+293 MiB) |
+| `output` | +0.0176 (−156 MiB) | +0.0001 (−76 MiB) | +0.0000 (+293 MiB) |
+
+- **Q4_K on the small tensors costs most per byte saved.** Attention at Q4_K
+  adds 0.044 to save 0.8 GiB. IQ2_S gate experts add 0.011 to save 1.5 GiB.
+- **Some of the numbers are noise.** Q6_K `token_embd` beats lossless BF16
+  (−0.0093 against −0.0041), and Q6_K attention beats BF16 attention. Neither
+  can be true, so differences of about 0.005 are not resolved here.
+
+### Why single items are not resolved: any change costs about 0.05
+
+- **Bands of 5 layers don't add up.** With IQ2_S gate experts, the ten bands
+  sum to 0.027, while the whole kind gives 0.011. With IQ2_S down experts, the
+  sum is 0.029 against 0.020. One band (layers 15 to 19, up experts) comes out
+  at −0.0037, which a downgrade can't truly earn.
+- **The proxy idea:** measure each candidate against the *base's own* logits
+  (Metal, 60 chunks, `kld-iq3xxs-base-c512-n60.bin`). That KL is exactly 0
+  for the base itself, so it should have no floor.
+- **It has a floor anyway, about 0.05:**
+
+| Change from the base | KL against the base | Same top token |
+|---|---|---|
+| none | 0.000000 | 100.0% |
+| `output` Q8_0 → BF16 | 0.000003 | 99.8% |
+| `output` Q8_0 → Q6_K | 0.000447 | 99.1% |
+| shared expert Q8_0 → BF16 | 0.0385 | 93.3% |
+| attention Q8_0 → BF16 | 0.0504 | 92.3% |
+| `token_embd` Q8_0 → BF16 | 0.0567 | 92.2% |
+| gate experts, layers 0 to 4, → IQ4_XS | 0.0617 | 91.5% |
+| gate experts, layers 0 to 4, → IQ2_S | 0.0623 | 91.2% |
+| gate experts, all layers, → IQ2_S | 0.1066 | 87.5% |
+| the same file on the CPU (`-dev none -ngl 0`) | 0.0568 ± 0.0028 | 91.9% |
+
+- **What the table shows:** only the output head, which nothing follows,
+  changes the logits in proportion to its change. Any change upstream of it,
+  even lossless (`token_embd` to BF16) and in either direction, flips about
+  8% of the top tokens. The CPU-versus-Metal difference of one file does the
+  same.
+- **The likely amplifier is the router.** "Router agreement" below finds 16%
+  of (token, layer) Top-6 sets differing between Metal and CPU.
+- **This explains "Q8_0 KLD is high" above.** Q8_0's 0.050 is this floor, not
+  Q8_0's error.
+- **Consequences for this method:**
+  - single-item costs below the floor's spread are not measurable on
+    20 × 512 tokens;
+  - the costs are not additive;
+  - the proxy can't rank items, because a band's upgrade and downgrade give
+    the same KL. `calibrate` is therefore unused, and the band and proxy runs
+    stopped after these results.
+- **A larger reference:** 96 chunks of BF16 logits
+  (`~/models/eval/kld-bf16-c512-n96.bin`, CPU from the cold master,
+  `-b 8192 -ub 8192`, 1,109 s per 16-chunk pass). It halves the spread of
+  the 20-chunk reference, so whole-file mixes can be compared.
+
+### Two mixes against the IQ3_XXS/IQ4_XS file
+
+Both mixes keep IQ4_XS down experts, like the reference:
+
+- **M1, chosen by hand from the kind table:**
+  - `token_embd` and the shared expert in BF16;
+  - attention and `output` in Q6_K.
+  It is 33,909 MiB, the reference's size.
+- **M2, the allocator's plan at 33.109 GiB from the kind table:**
+  - up experts IQ4_XS, and down experts IQ4_XS in 5 layers;
+  - shared expert BF16;
+  - attention, `token_embd` and `output` in Q6_K.
+  It is 33,896 MiB. The plan predicted a KLD of 0.0787.
+
+The 96-chunk runs go against `kld-bf16-c512-n96.bin`. The paired difference
+against the reference is taken over the 96 per-chunk KLDs, computed from
+`llama-perplexity`'s running means.
+
+| File | KLD, 20 chunks | KLD, 96 chunks | Same top token, 96 | Paired ΔKLD against the reference, 96 |
+|---|---|---|---|---|
+| IQ3_XXS experts (base) | 0.1071 | 0.1162 ± 0.0033 | 87.51% | +0.0094 ± 0.0038 |
+| IQ3_XXS/IQ4_XS (reference) | 0.0953 | 0.1068 ± 0.0034 | 87.95% | |
+| M1 | 0.1009 | 0.1063 ± 0.0034 | 88.17% | −0.0005 ± 0.0028 |
+| M2 | 0.0961 | 0.1116 ± 0.0034 | 87.82% | +0.0048 ± 0.0038 |
+
+- **The gate is not met.** Neither mix beats the reference at its size: M1
+  ties it, and M2 is worse.
+- **The allocator fits the noise.** On the 20 chunks it was planned from, M2
+  matches the reference (0.0961 against 0.0953), yet the plan's 0.0787 is far
+  off even there. On 96 chunks, M2 is worse than M1 by 0.0053 ± 0.0028 paired.
+- **Pairing barely helps.** The paired error of a difference (±0.003 to
+  ±0.004 on 96 chunks) is as large as the unpaired error of one file. The
+  floor's flips differ from file to file, so they don't cancel.
+- **What the measurements do answer:**
+  - **Experts:** IQ4_XS gains about 0.003 per GiB.
+  - **Attention:** Q4_K costs 0.044. Between Q6_K and BF16, no difference
+    shows.
+  - **Shared expert:** BF16 does not measurably help. Q4_K costs 0.011.
+  - **`output`:** Q6_K is free (KL 0.0004 against the base).
+
+To reproduce M2:
+
+```sh
+kolibri-qsens measure -base ~/models/Kolibri-1-IQ3_XXS-exps-imx.gguf -donors donor-A.gguf,donor-B.gguf \
+    -scope kind -perplexity build/bin/llama-perplexity -kld-base ~/models/eval/kld-bf16-c512-n20.bin \
+    -work DIR -out sens.jsonl
+kolibri-qsens allocate -base ~/models/Kolibri-1-IQ3_XXS-exps-imx.gguf -sens sens.jsonl -budget 33.109 -out plan.json
+kolibri-qsens build -base ~/models/Kolibri-1-IQ3_XXS-exps-imx.gguf -donors donor-B.gguf,Kolibri-1-BF16.gguf \
+    -plan plan.json -out M2.gguf
+```
+
+Before per-tensor allocation can work here, it needs one of:
+
+- far more evaluation tokens;
+- a cost measured inside each layer with routing held fixed, which the
+  floor does not reach.
 
 ## Context length and memory on Metal
 
