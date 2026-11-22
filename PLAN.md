@@ -265,6 +265,11 @@ when both are.
         Q8_0 → BF16 and 95.8% for CPU against Metal of one file. Forcing
         the route cuts the KLD between such runs from about 0.05 to under
         0.0004 (docs/real-checkpoint.md, "Routing held fixed").
+    -   [x] llama.cpp, against BF16. (2026-11-22) — `LLAMA_MOE_ROUTE_COMPARE`
+        keeps routing free: the IQ3_XXS/IQ4_XS reference keeps BF16's Top-6
+        set in 56.9% of token-layers on 96 chunks, mean overlap 5.448/6; the
+        IQ3_XXS base 53.2%, 5.391. Agreement falls from 96% in layers 0–2 to
+        about 40% from layer 20 on.
 -   [x] Report KL divergence for comparable output distributions alongside
     NMSE/top-token agreement, so small numerical drift can be separated from
     behavior-changing drift.
@@ -503,9 +508,15 @@ producing a generic Q4.
     -   With the expert ids forced to BF16's (`measure -route`), the floor
         goes and band costs add up, but the plans from those costs lose with
         free routing: +0.0025 ± 0.0038 and +0.0040 ± 0.0037 paired against
-        the reference at 33.1 GiB. About three quarters of free-routing KL
-        is flipped experts, which forced costs can't see
-        (docs/real-checkpoint.md, "Routing held fixed").
+        the reference at 33.1 GiB (docs/real-checkpoint.md, "Routing held
+        fixed").
+    -   Scored with the route forced on 96 chunks, the reference is best too
+        (0.0184; band plan +0.0017 ± 0.0008, gate IQ4_XS instead of down
+        +0.0014 ± 0.0009). The single-item costs don't add up over a whole
+        file (the band plan realizes −0.0061 of a predicted −0.0206), and
+        router mismatch against BF16 adds nothing to the forced cost.
+        Whole files are compared by forced KLD on 96 chunks; free routing
+        can't separate them.
 -   [x] Build an importance matrix if supported/useful for the selected
     quantization scheme. (2026-10-05) — built from Q8_0 on a 45/35/20
     English/German/code text (`tools/quant/calibration.py`), "loaded 550

@@ -737,14 +737,11 @@ weights. The run-to-run spread of a ΔKL is now about ±0.0005, against about
 | kind | 33.08 GiB | 0.1108 ± 0.0034 | 87.79% | +0.0040 ± 0.0037 |
 
 - **The gate is not met again.** Neither plan beats the reference.
-- **The forced costs rank the wrong things.** Against the base, the band
-  plan gains 0.0069 ± 0.0028 free, a third of its forced −0.0206. The
-  reference's down experts gain 0.0094 free for a forced −0.0066.
-- **The tensors' own error is not what the user sees.** Free-routing KL is
-  mostly flipped experts, and the forced runs can't see which tensors cause
-  flips. Forced, IQ4_XS gate experts gain most; free, down experts do. A
-  plausible reason is that `ffn_down` writes straight into the residual
-  stream that the next layers' routers read.
+- **The plans realize a third of their prediction.** Against the base, the
+  band plan gains 0.0069 ± 0.0028 free, a third of its forced −0.0206. The
+  reference's down experts gain 0.0094 free for a forced −0.0066. Flips are
+  not the reason: scored with the route forced as well, the plans still
+  realize only 30–40% (next section).
 - **What carries over:**
   - Q6_K costs nothing measurable on attention, the shared expert,
     `token_embd` and `output`.
@@ -762,14 +759,94 @@ kolibri-qsens measure -base ~/models/Kolibri-1-IQ3_XXS-exps-imx.gguf -donors don
     -work DIR -out sens-forced.jsonl
 ```
 
-A per-tensor allocation that holds up with free routing needs a cost for the
-flips a tensor causes. The ingredients exist:
+#### Router mismatch as a cost, and whole files forced
 
-- the router agreement with BF16's ids under free routing, counted over
-  about 500,000 (token, layer) slots;
-- the forced ΔKL.
+The idea was to give each tensor a cost for the flips it causes. The fork's
+`LLAMA_MOE_ROUTE_COMPARE` (patch 0021) leaves routing free and counts the
+agreement with BF16's expert ids, and `kolibri-qsens measure -compare` stores
+it per record (`route_same`, `route_overlap`, `route_layers`).
 
-Untested: whether a weighted sum of the two predicts free-routing KL.
+**Against BF16, the quants pick other experts far more often than run
+against run.** The IQ3_XXS base keeps BF16's set of 6 in 55.6% of
+token-layers (20 chunks): 96% in layers 0–2, falling to about 40% from layer
+20 on. The mean overlap is 5.44 of 6, so 9% of expert slots differ.
+
+**Per kind, the mismatch adds nothing to the forced cost.** Free routing,
+same 20 chunks, items and donors as the forced kind measurements:
+
+| Item | Type | ΔKLD free | ΔKLD forced | Δ mismatched slots |
+|---|---|---|---|---|
+| attn | Q4_K | +0.0417 | +0.0362 | +2.90% |
+| attn | Q6_K | −0.0054 | +0.0006 | +0.20% |
+| attn | BF16 | −0.0088 | −0.0005 | −0.08% |
+| down | IQ4_XS | −0.0126 | −0.0066 | −1.00% |
+| gate | IQ4_XS | −0.0170 | −0.0100 | −0.50% |
+| up | IQ4_XS | −0.0149 | −0.0079 | −0.67% |
+| token_embd | Q4_K | +0.0087 | +0.0102 | +1.68% |
+| token_embd | Q6_K | −0.0101 | −0.0003 | +0.18% |
+| output | Q4_K | +0.0177 | +0.0178 | 0 |
+
+- `output` can't change routing, and its agreement is identical to the
+  base's: the comparison counts what it should.
+- Over the 18 kind items, free ≈ 1.18 × forced leaves a residual SD of
+  0.0055. Adding the mismatch, by set or by slot, leaves 0.0056.
+- Every change upstream of the router moves free KLD by about −0.008 here,
+  even BF16 for Q8_0. The mismatch hardly moves. This offset is the
+  per-file noise of free routing, and the mismatch doesn't see it.
+
+**Whole files, 96 chunks, `-c 512 -b 512 -kvu`, each run twice:** once free
+with the comparison, once with BF16's ids forced.
+
+| File (33.1 GiB unless noted) | KLD free | KLD forced | Same set, free | Mean overlap |
+|---|---|---|---|---|
+| IQ3_XXS base (29.6 GiB) | 0.1166 | 0.0262 | 53.2% | 5.391 |
+| reference: down IQ4_XS | 0.1061 | **0.0184** | 56.9% | 5.448 |
+| gate IQ4_XS instead of down | 0.1047 | 0.0198 | 55.1% | 5.422 |
+| band plan | 0.1086 | 0.0201 | 53.5% | 5.405 |
+| kind plan | 0.1117 | 0.0219 | 53.3% | 5.398 |
+
+Paired per chunk against the reference:
+
+| File | Free | Forced |
+|---|---|---|
+| gate IQ4_XS | −0.0014 ± 0.0037 | +0.0014 ± 0.0009 |
+| band plan | +0.0025 ± 0.0038 | +0.0017 ± 0.0008 |
+| reference without `-kvu` | +0.0007 ± 0.0014 | |
+
+- **The reference is best with the route forced too.** The plans lose because
+  their forced costs don't add up over a whole file, not because of flips.
+  The band plan predicted −0.0206 against the base and realized −0.0061; the
+  kind plan −0.0108 and −0.0043. The reference, one kind change, predicted
+  −0.0066 and realized −0.0078.
+- **Two reasons for the shortfall:**
+  - Selection on noise: the band plan bought IQ2_S downgrades of gate and up
+    and Q4_K shared experts because their band costs came out negative
+    (−0.0028 together), which a downgrade can't really be.
+  - Sampling: 20 chunks rank gate above down (−0.0100 against −0.0066
+    forced), but over 96 chunks the gate file gains −0.0064 and the reference
+    −0.0078.
+- **Free KLD of a whole file follows its forced KLD:** about 0.081 + 1.35 ×
+  forced over the five files, with 1.35 × 0.0008 = 0.0011 of noise instead of
+  0.0037. The mismatch rises and falls with the forced KLD, so it adds no
+  information.
+- **Free routing on 96 chunks can't separate these files.** The same file
+  with and without `-kvu` differs by 0.0007 ± 0.0014, and the candidates by
+  less than their 0.0037 paired SE. To compare files of one size, use the
+  forced KLD on 96 chunks: its paired SE is 0.0008.
+
+**Result: the gate is not met.** No measured allocation beats the hand mix
+at 33.1 GiB. It wins forced on 96 chunks, and free it ties within the noise.
+A further search would compare whole files by forced KLD on 96 chunks, not
+single-item costs on 20.
+
+To reproduce one whole-file pair:
+
+```sh
+for mode in COMPARE FORCE; do
+  env LLAMA_MOE_ROUTE_$mode=bf16.route build/bin/llama-perplexity -m X.gguf -ngl 99 -t 10 --fit off \
+    -c 512 -b 512 -kvu --kl-divergence-base ~/models/eval/kld-bf16-c512-n96.bin --kl-divergence
+done
+```
 
 ## Context length and memory on Metal
 
