@@ -21,6 +21,14 @@
 // appended to -out as a JSON line, so an interrupted run resumes where it
 // stopped. The candidate file lives in -work and is deleted after its run.
 //
+// With -route, every run forces the MoE expert ids to those of a reference run
+// (llama-perplexity LLAMA_MOE_ROUTE_DUMP/FORCE in the fork, with -kvu). Free
+// routing turns any upstream change into ~0.05 KLD of near-tie expert flips;
+// forced routing leaves the error of the tensors themselves, which is small,
+// smooth and roughly additive. It misses the flips a tensor causes, though,
+// and plans from forced costs did not beat the hand mix with free routing.
+// See docs/real-checkpoint.md, "Routing held fixed".
+//
 // calibrate turns measurements against the base file's own logits (measure
 // with -kld-base of the base's logits) into estimates against BF16, scaled
 // per kind and type by kind-scope measurements of both (quantsens.Calibrate).
@@ -302,6 +310,7 @@ func filterSet(list string, upper bool) map[string]bool {
 type scorer struct {
 	bin, kldBase, logDir string
 	extra                []string
+	route                string // LLAMA_MOE_ROUTE_FORCE file, or ""
 }
 
 func (s scorer) score(model, logName string) (quantsens.Score, float64, string, error) {
@@ -309,9 +318,14 @@ func (s scorer) score(model, logName string) (quantsens.Score, float64, string, 
 	args := append([]string{"-m", model}, s.extra...)
 	args = append(args, "--kl-divergence-base", s.kldBase, "--kl-divergence")
 	t0 := time.Now()
-	out, runErr := exec.Command(s.bin, args...).CombinedOutput()
-	secs := time.Since(t0).Seconds()
+	cmd := exec.Command(s.bin, args...)
 	header := fmt.Sprintf("$ %s %s\n", s.bin, strings.Join(args, " "))
+	if s.route != "" {
+		cmd.Env = append(os.Environ(), "LLAMA_MOE_ROUTE_FORCE="+s.route)
+		header = "$ LLAMA_MOE_ROUTE_FORCE=" + s.route + " " + header[2:]
+	}
+	out, runErr := cmd.CombinedOutput()
+	secs := time.Since(t0).Seconds()
 	if err := os.WriteFile(logPath, append([]byte(header), out...), 0o644); err != nil {
 		return quantsens.Score{}, secs, logPath, err
 	}
@@ -335,6 +349,7 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 	ppl := fs.String("perplexity", "", "llama-perplexity binary")
 	kldBase := fs.String("kld-base", "", "llama-perplexity --kl-divergence-base file of the BF16 logits")
 	pplArgs := fs.String("args", "-ngl 99 -t 10 --fit off -c 512 -b 512", "further llama-perplexity arguments (space-separated)")
+	route := fs.String("route", "", "force the MoE expert ids from this llama-perplexity LLAMA_MOE_ROUTE_DUMP file (adds -kvu)")
 	work := fs.String("work", "", "directory for the candidate file and the run logs (needs room for one candidate)")
 	out := fs.String("out", "", "JSONL of the records; appended to, and read to resume")
 	dry := fs.Bool("dry", false, "list the runs and their sizes, run nothing")
@@ -416,7 +431,10 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return err
 	}
-	sc := scorer{bin: *ppl, kldBase: *kldBase, logDir: logDir, extra: strings.Fields(*pplArgs)}
+	sc := scorer{bin: *ppl, kldBase: *kldBase, logDir: logDir, extra: strings.Fields(*pplArgs), route: *route}
+	if sc.route != "" && !slices.Contains(sc.extra, "-kvu") && !slices.Contains(sc.extra, "--kv-unified") {
+		sc.extra = append(sc.extra, "-kvu")
+	}
 	if baseRec == nil {
 		s, secs, lp, err := sc.score(*base, "base.log")
 		if err != nil {
