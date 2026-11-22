@@ -27,7 +27,10 @@
 // forced routing leaves the error of the tensors themselves, which is small,
 // smooth and roughly additive. It misses the flips a tensor causes, though,
 // and plans from forced costs did not beat the hand mix with free routing.
-// See docs/real-checkpoint.md, "Routing held fixed".
+// With -compare, routing stays free and each record also holds the router
+// agreement with the reference ids (LLAMA_MOE_ROUTE_COMPARE). On Kolibri it
+// added nothing to the forced cost. See docs/real-checkpoint.md, "Routing
+// held fixed".
 //
 // calibrate turns measurements against the base file's own logits (measure
 // with -kld-base of the base's logits) into estimates against BF16, scaled
@@ -310,7 +313,8 @@ func filterSet(list string, upper bool) map[string]bool {
 type scorer struct {
 	bin, kldBase, logDir string
 	extra                []string
-	route                string // LLAMA_MOE_ROUTE_FORCE file, or ""
+	route                string // reference expert ids (LLAMA_MOE_ROUTE_DUMP file), or ""
+	routeEnv             string // LLAMA_MOE_ROUTE_FORCE or LLAMA_MOE_ROUTE_COMPARE
 }
 
 func (s scorer) score(model, logName string) (quantsens.Score, float64, string, error) {
@@ -321,8 +325,8 @@ func (s scorer) score(model, logName string) (quantsens.Score, float64, string, 
 	cmd := exec.Command(s.bin, args...)
 	header := fmt.Sprintf("$ %s %s\n", s.bin, strings.Join(args, " "))
 	if s.route != "" {
-		cmd.Env = append(os.Environ(), "LLAMA_MOE_ROUTE_FORCE="+s.route)
-		header = "$ LLAMA_MOE_ROUTE_FORCE=" + s.route + " " + header[2:]
+		cmd.Env = append(os.Environ(), s.routeEnv+"="+s.route)
+		header = "$ " + s.routeEnv + "=" + s.route + " " + header[2:]
 	}
 	out, runErr := cmd.CombinedOutput()
 	secs := time.Since(t0).Seconds()
@@ -350,6 +354,7 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 	kldBase := fs.String("kld-base", "", "llama-perplexity --kl-divergence-base file of the BF16 logits")
 	pplArgs := fs.String("args", "-ngl 99 -t 10 --fit off -c 512 -b 512", "further llama-perplexity arguments (space-separated)")
 	route := fs.String("route", "", "force the MoE expert ids from this llama-perplexity LLAMA_MOE_ROUTE_DUMP file (adds -kvu)")
+	compare := fs.String("compare", "", "keep routing free, but record the router agreement with the expert ids in this LLAMA_MOE_ROUTE_DUMP file (adds -kvu)")
 	work := fs.String("work", "", "directory for the candidate file and the run logs (needs room for one candidate)")
 	out := fs.String("out", "", "JSONL of the records; appended to, and read to resume")
 	dry := fs.Bool("dry", false, "list the runs and their sizes, run nothing")
@@ -360,6 +365,9 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 	}
 	if *base == "" || *out == "" || (!*dry && (*ppl == "" || *kldBase == "" || *work == "")) {
 		return errors.New("-base and -out are required, and -perplexity, -kld-base and -work unless -dry")
+	}
+	if *route != "" && *compare != "" {
+		return errors.New("-route and -compare exclude each other")
 	}
 	b, err := open(*base)
 	if err != nil {
@@ -431,7 +439,10 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return err
 	}
-	sc := scorer{bin: *ppl, kldBase: *kldBase, logDir: logDir, extra: strings.Fields(*pplArgs), route: *route}
+	sc := scorer{bin: *ppl, kldBase: *kldBase, logDir: logDir, extra: strings.Fields(*pplArgs), route: *route, routeEnv: "LLAMA_MOE_ROUTE_FORCE"}
+	if *compare != "" {
+		sc.route, sc.routeEnv = *compare, "LLAMA_MOE_ROUTE_COMPARE"
+	}
 	if sc.route != "" && !slices.Contains(sc.extra, "-kvu") && !slices.Contains(sc.extra, "--kv-unified") {
 		sc.extra = append(sc.extra, "-kvu")
 	}
@@ -440,12 +451,13 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		r := quantsens.Record{Scope: "base", KLD: s.KLD, KLDErr: s.KLDErr, SameTop: s.SameTop, LnPPLRatio: s.LnPPLRatio, Seconds: secs, Log: lp}
+		r := quantsens.Record{Scope: "base", KLD: s.KLD, KLDErr: s.KLDErr, SameTop: s.SameTop, LnPPLRatio: s.LnPPLRatio, Seconds: secs, Log: lp,
+			RouteSame: s.RouteSame, RouteOverlap: s.RouteOverlap, RouteLayers: s.RouteLayers}
 		if err := appendRecord(*out, r); err != nil {
 			return err
 		}
 		baseRec = &r
-		fmt.Fprintf(stdout, "base: KLD %.6f ± %.6f, same top %.3f%% (%.0f s)\n", s.KLD, s.KLDErr, s.SameTop, secs)
+		fmt.Fprintf(stdout, "base: KLD %.6f ± %.6f, same top %.3f%%%s (%.0f s)\n", s.KLD, s.KLDErr, s.SameTop, routeNote(s), secs)
 	}
 	cand := filepath.Join(*work, "candidate.gguf")
 	for i, r := range runs {
@@ -475,14 +487,23 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 			return err
 		}
 		rec := quantsens.Record{Scope: *scope, Item: r.it.Name, Type: r.typ, Bytes: r.bytes, BaseType: r.baseType, BaseBytes: r.baseBytes,
-			KLD: s.KLD, KLDErr: s.KLDErr, SameTop: s.SameTop, LnPPLRatio: s.LnPPLRatio, DKL: s.KLD - baseRec.KLD, Seconds: secs, Log: lp}
+			KLD: s.KLD, KLDErr: s.KLDErr, SameTop: s.SameTop, LnPPLRatio: s.LnPPLRatio, DKL: s.KLD - baseRec.KLD, Seconds: secs, Log: lp,
+			RouteSame: s.RouteSame, RouteOverlap: s.RouteOverlap, RouteLayers: s.RouteLayers}
 		if err := appendRecord(*out, rec); err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "[%d/%d] %-24s %-8s -> %-8s KLD %.6f (Δ %+.6f), same top %.3f%% (%.0f s)\n", i+1, len(runs), r.it.Name, r.baseType, r.typ,
-			s.KLD, rec.DKL, s.SameTop, secs)
+		fmt.Fprintf(stdout, "[%d/%d] %-24s %-8s -> %-8s KLD %.6f (Δ %+.6f), same top %.3f%%%s (%.0f s)\n", i+1, len(runs), r.it.Name, r.baseType, r.typ,
+			s.KLD, rec.DKL, s.SameTop, routeNote(s), secs)
 	}
 	return nil
+}
+
+// routeNote prints the router agreement of a run, if it was measured.
+func routeNote(s quantsens.Score) string {
+	if s.RouteTokens == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", route same %.3f%%", s.RouteSame)
 }
 
 // infos describes every layer-scope item of the base for BuildChoices, and

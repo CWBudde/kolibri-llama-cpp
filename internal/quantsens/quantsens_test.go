@@ -139,6 +139,22 @@ func TestParseKLD(t *testing.T) {
 	if s.KLD != 0.095291 || s.KLDErr != 0.006905 || s.SameTop != 88.54 || s.SameTopErr != 0.446 || s.LnPPLRatio != -0.006532 {
 		t.Fatalf("%+v", s)
 	}
+	if s.RouteTokens != 0 || s.RouteLayers != nil {
+		t.Fatalf("route stats without a route run: %+v", s)
+	}
+	r, err := ParseKLD(kldTail + `
+moe_route: router agreement with the reference ids (own top-6 vs file)
+moe_route: layer  same set  mean overlap
+moe_route:     1   99.512%   5.995
+moe_route:    12   96.000%   5.950
+moe_route: all     97.756%   5.972  (20480 token-layers)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.RouteSame != 97.756 || r.RouteOverlap != 5.972 || r.RouteTokens != 20480 || len(r.RouteLayers) != 2 || r.RouteLayers[12] != 96 {
+		t.Fatalf("%+v", r)
+	}
 	if _, err := ParseKLD("llama_model_load: error loading model"); err == nil {
 		t.Fatal("parsed a failed run")
 	}

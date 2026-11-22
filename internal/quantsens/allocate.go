@@ -15,12 +15,24 @@ type Score struct {
 	KLD, KLDErr         float64
 	SameTop, SameTopErr float64 // percent
 	LnPPLRatio          float64
+
+	// Router agreement with a reference run's expert ids, when the fork's
+	// LLAMA_MOE_ROUTE_FORCE or _COMPARE was set: the share of token-layers whose
+	// top-k set equals the reference's (percent), the mean overlap of the two
+	// sets, and the same-set share per MoE layer. RouteTokens is 0 without it.
+	RouteSame, RouteOverlap float64
+	RouteTokens             int64
+	RouteLayers             map[int]float64
 }
 
 var (
 	kldRe  = regexp.MustCompile(`Mean\s+KLD:\s*(-?[\d.]+)\s*±\s*([\d.]+)`)
 	topRe  = regexp.MustCompile(`Same top p:\s*([\d.]+)\s*±\s*([\d.]+)\s*%`)
 	lnppRe = regexp.MustCompile(`Mean ln\(PPL\(Q\)/PPL\(base\)\)\s*:\s*(-?[\d.]+)`)
+	// moe_route: all     97.700%   5.973  (491520 token-layers)
+	routeAllRe = regexp.MustCompile(`moe_route: all\s+([\d.]+)%\s+([\d.]+)\s+\((\d+) token-layers\)`)
+	// moe_route:     3   98.112%   5.981
+	routeLayerRe = regexp.MustCompile(`(?m)^moe_route:\s+(\d+)\s+([\d.]+)%\s+([\d.]+)\s*$`)
 )
 
 // ParseKLD reads the summary of a llama-perplexity --kl-divergence run.
@@ -38,6 +50,16 @@ func ParseKLD(out string) (Score, error) {
 	}
 	if m := lnppRe.FindStringSubmatch(out); m != nil {
 		s.LnPPLRatio, _ = strconv.ParseFloat(m[1], 64)
+	}
+	if m := routeAllRe.FindStringSubmatch(out); m != nil {
+		s.RouteSame, _ = strconv.ParseFloat(m[1], 64)
+		s.RouteOverlap, _ = strconv.ParseFloat(m[2], 64)
+		s.RouteTokens, _ = strconv.ParseInt(m[3], 10, 64)
+		s.RouteLayers = map[int]float64{}
+		for _, m := range routeLayerRe.FindAllStringSubmatch(out, -1) {
+			il, _ := strconv.Atoi(m[1])
+			s.RouteLayers[il], _ = strconv.ParseFloat(m[2], 64)
+		}
 	}
 	return s, nil
 }
@@ -59,6 +81,11 @@ type Record struct {
 	DKL        float64 `json:"dkl"` // KLD minus the base file's KLD
 	Seconds    float64 `json:"seconds"`
 	Log        string  `json:"log,omitempty"`
+
+	// Router agreement with the reference ids (see Score), when measured.
+	RouteSame    float64         `json:"route_same,omitempty"`
+	RouteOverlap float64         `json:"route_overlap,omitempty"`
+	RouteLayers  map[int]float64 `json:"route_layers,omitempty"`
 }
 
 // Option is one type for an item: its bytes and the KL it adds over the

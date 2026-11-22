@@ -1,13 +1,14 @@
 diff --git a/tools/perplexity/moe-route.h b/tools/perplexity/moe-route.h
 new file mode 100644
-index 000000000..6469f95c6
+index 000000000..59ecd1ebf
 --- /dev/null
 +++ b/tools/perplexity/moe-route.h
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,178 @@
 +// MoE routing dump/force for llama-perplexity (Kolibri fork).
 +//
 +// LLAMA_MOE_ROUTE_DUMP=<file>   write the selected expert ids of every MoE layer and token.
 +// LLAMA_MOE_ROUTE_FORCE=<file>  replace the model's own top-k choice with the ids from <file>.
++// LLAMA_MOE_ROUTE_COMPARE=<file> read the ids like FORCE, but only count agreement: routing stays free.
 +//
 +// The hook is an eval callback on the "ffn_moe_topk-<il>" view. Forcing overwrites the ids
 +// after the top-k is computed and before the gating weights are gathered, so the weights are
@@ -18,8 +19,9 @@ index 000000000..6469f95c6
 +// ubatch interleaves its sequences, and the token order then depends on -ub. --chunks may be smaller than in
 +// the dump: the forced run uses a prefix. Warmup is disabled when the hook is active.
 +//
-+// In force mode the hook also counts how often the model's own top-k set equals the forced
-+// one, per layer: the router agreement between the two runs.
++// In force and compare mode the hook counts how often the model's own top-k set equals the one
++// from the file, per layer: the router agreement between the two runs. With COMPARE the run's
++// own ids are used, so its agreement includes the flips that earlier flips cause downstream.
 +#pragma once
 +
 +#include "ggml.h"
@@ -36,6 +38,7 @@ index 000000000..6469f95c6
 +struct moe_route {
 +    FILE * dump = nullptr;
 +    bool force = false;
++    bool compare = false; // with force: count only, do not overwrite
 +
 +    std::map<int, std::vector<int32_t>> ids; // force: per layer, all tokens in order
 +    std::map<int, size_t> cursor;            // force: per layer, next token
@@ -59,7 +62,11 @@ index 000000000..6469f95c6
 +        static const char magic[8] = {'K', 'M', 'O', 'E', 'R', 'O', 'U', 'T'};
 +        const char * dpath = getenv("LLAMA_MOE_ROUTE_DUMP");
 +        const char * fpath = getenv("LLAMA_MOE_ROUTE_FORCE");
-+        if (dpath && fpath) { LOG_ERR("moe_route: set only one of DUMP and FORCE\n"); return false; }
++        const char * cpath = getenv("LLAMA_MOE_ROUTE_COMPARE");
++        if ((dpath != nullptr) + (fpath != nullptr) + (cpath != nullptr) > 1) {
++            LOG_ERR("moe_route: set only one of DUMP, FORCE and COMPARE\n"); return false;
++        }
++        if (cpath) { fpath = cpath; compare = true; }
 +        if (dpath) {
 +            dump = fopen(dpath, "wb");
 +            if (!dump) { LOG_ERR("moe_route: cannot create %s\n", dpath); return false; }
@@ -106,7 +113,8 @@ index 000000000..6469f95c6
 +            }
 +            fclose(f);
 +            force = true;
-+            LOG_INF("moe_route: forcing expert ids from %s (%zu records, %zu layers)\n", fpath, n_rec, ids.size());
++            LOG_INF("moe_route: %s expert ids from %s (%zu records, %zu layers)\n", compare ? "comparing with" : "forcing",
++                    fpath, n_rec, ids.size());
 +        }
 +        return true;
 +    }
@@ -151,7 +159,7 @@ index 000000000..6469f95c6
 +                int ov = 0;
 +                for (int64_t x = 0; x < k; x++) for (int64_t y = 0; y < k; y++) ov += a[x] == b[y];
 +                s.tokens++; s.overlap += ov; s.same_set += ov == k;
-+                ggml_backend_tensor_set(t, b, i * t->nb[1], row);
++                if (!compare) ggml_backend_tensor_set(t, b, i * t->nb[1], row);
 +            }
 +        }
 +        return true;
@@ -162,9 +170,9 @@ index 000000000..6469f95c6
 +        if (!force) return;
 +        size_t left = 0;
 +        for (auto & [il, v] : ids) left += v.size() / k_file - cursor[il];
-+        if (left) LOG_INF("moe_route: %zu forced token-layers were not used (fewer chunks than the dump)\n", left);
++        if (left) LOG_INF("moe_route: %zu token-layers of the file were not used (fewer chunks than the dump)\n", left);
 +        int64_t tok = 0, same = 0, ov = 0;
-+        LOG_INF("\nmoe_route: router agreement with the forced ids (own top-%lld vs forced)\n", (long long) k_seen);
++        LOG_INF("\nmoe_route: router agreement with the %s ids (own top-%lld vs file)\n", compare ? "reference" : "forced", (long long) k_seen);
 +        LOG_INF("moe_route: layer  same set  mean overlap\n");
 +        for (auto & [il, s] : stats) {
 +            if (s.tokens == 0) continue;
