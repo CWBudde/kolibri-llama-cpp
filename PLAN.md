@@ -259,6 +259,17 @@ when both are.
         >= 0.1: 3.06% of 4282". The torch port's BF16 rounding against itself:
         "Top-1 same 95.14%, Top-6 set same 75.88%".
     -   [ ] vLLM.
+    -   [x] llama.cpp, run against run. (2026-11-22) — the fork's
+        `LLAMA_MOE_ROUTE_DUMP`/`FORCE` (patch 0021) counts the Top-6 set
+        agreement of a run with a dumped route: 97.7% for `token_embd`
+        Q8_0 → BF16 and 95.8% for CPU against Metal of one file. Forcing
+        the route cuts the KLD between such runs from about 0.05 to under
+        0.0004 (docs/real-checkpoint.md, "Routing held fixed").
+    -   [x] llama.cpp, against BF16. (2026-11-22) — `LLAMA_MOE_ROUTE_COMPARE`
+        keeps routing free: the IQ3_XXS/IQ4_XS reference keeps BF16's Top-6
+        set in 56.9% of token-layers on 96 chunks, mean overlap 5.448/6; the
+        IQ3_XXS base 53.2%, 5.391. Agreement falls from 96% in layers 0–2 to
+        about 40% from layer 20 on.
 -   [x] Report KL divergence for comparable output distributions alongside
     NMSE/top-token agreement, so small numerical drift can be separated from
     behavior-changing drift.
@@ -471,9 +482,44 @@ producing a generic Q4.
     1D norms stay F32. `llama-quantize` dry run: "blk.0.attn_norm.weight ...
     type = f32".
 -   [ ] Evaluate Q/K projections and QK norms conservatively because
-    routing/attention errors can amplify across 50 layers.
+    routing/attention errors can amplify across 50 layers. (2026-11-22) —
+    partial, attention as a whole: Q4_K adds KLD 0.044 over the IQ3_XXS
+    base, while Q6_K and BF16 differ from Q8_0 by less than the noise
+    (docs/real-checkpoint.md, "Measured per-tensor allocation"). With the
+    route forced, Q4_K adds 0.036, Q6_K +0.0006 and BF16 −0.0005; the early
+    layers are the sensitive ones.
 -   [ ] Evaluate whether shared experts deserve higher precision than
-    routed experts.
+    routed experts. (2026-11-22) — partial: Q4_K adds 0.011, and BF16's
+    −0.001 is within the noise. With the route forced: Q4_K +0.005, Q6_K
+    −0.0002, BF16 +0.0002. Higher precision does not help.
+-   [x] Allocate types per tensor group from measured KL under a byte
+    budget, after LookAtMyQuant's llama.cpp route (MIT). (2026-11-22) —
+    `cmd/kolibri-qsens` (splice, measure, calibrate, allocate, build).
+    **Gate not met; not adopted.** At 33.1 GiB the allocated mix scores
+    "Mean KLD: 0.111593" on 96 chunks against the IQ3_XXS/IQ4_XS file's
+    0.106816 (paired +0.0048 ± 0.0038), and a hand-picked mix ties it
+    (−0.0005 ± 0.0028).
+    -   Any change upstream of the output head costs about 0.05 KL against
+        the unchanged model: `token_embd` Q8_0 → BF16 gives 0.0567, and the
+        same file on CPU against Metal gives 0.0568. So single-item costs
+        are not resolved on 20 × 512 tokens, and they don't add up.
+    -   New reference: `~/models/eval/kld-bf16-c512-n96.bin`, 96 chunks
+        of BF16 logits.
+    -   With the expert ids forced to BF16's (`measure -route`), the floor
+        goes and band costs add up, but the plans from those costs lose with
+        free routing: +0.0025 ± 0.0038 and +0.0040 ± 0.0037 paired against
+        the reference at 33.1 GiB (docs/real-checkpoint.md, "Routing held
+        fixed").
+    -   Scored with the route forced on 96 chunks, the reference is best too
+        (0.0184; band plan +0.0017 ± 0.0008, gate IQ4_XS instead of down
+        +0.0014 ± 0.0009). The single-item costs don't add up over a whole
+        file (the band plan realizes −0.0061 of a predicted −0.0206), and
+        router mismatch against BF16 adds nothing to the forced cost.
+        Whole files are compared by forced KLD on 96 chunks; free routing
+        can't separate them. Same-size variants that trade Q6_K on the
+        non-expert tensors for 8 early layers of IQ4_XS experts lose by
+        +0.0026 to +0.0032 ± 0.0008: the Q6_K downgrades, free one at a time,
+        cost 0.0032 together. The hand mix stays.
 -   [x] Build an importance matrix if supported/useful for the selected
     quantization scheme. (2026-10-05) — built from Q8_0 on a 45/35/20
     English/German/code text (`tools/quant/calibration.py`), "loaded 550

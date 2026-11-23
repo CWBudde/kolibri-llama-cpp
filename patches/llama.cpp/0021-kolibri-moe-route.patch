@@ -1,0 +1,222 @@
+diff --git a/tools/perplexity/moe-route.h b/tools/perplexity/moe-route.h
+new file mode 100644
+index 000000000..59ecd1ebf
+--- /dev/null
++++ b/tools/perplexity/moe-route.h
+@@ -0,0 +1,178 @@
++// MoE routing dump/force for llama-perplexity (Kolibri fork).
++//
++// LLAMA_MOE_ROUTE_DUMP=<file>   write the selected expert ids of every MoE layer and token.
++// LLAMA_MOE_ROUTE_FORCE=<file>  replace the model's own top-k choice with the ids from <file>.
++// LLAMA_MOE_ROUTE_COMPARE=<file> read the ids like FORCE, but only count agreement: routing stays free.
++//
++// The hook is an eval callback on the "ffn_moe_topk-<il>" view. Forcing overwrites the ids
++// after the top-k is computed and before the gating weights are gathered, so the weights are
++// still the model's own router probabilities at the forced experts: only the discrete choice
++// is fixed. The ids are consumed per layer as one token stream in evaluation order, so the
++// forced run must use the same -c and chunk order as the dump (n_ctx is checked). -b/-ub may
++// differ only if both runs use a unified KV cache (-kvu): with one KV stream per sequence a
++// ubatch interleaves its sequences, and the token order then depends on -ub. --chunks may be smaller than in
++// the dump: the forced run uses a prefix. Warmup is disabled when the hook is active.
++//
++// In force and compare mode the hook counts how often the model's own top-k set equals the one
++// from the file, per layer: the router agreement between the two runs. With COMPARE the run's
++// own ids are used, so its agreement includes the flips that earlier flips cause downstream.
++#pragma once
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "log.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <vector>
++
++struct moe_route {
++    FILE * dump = nullptr;
++    bool force = false;
++    bool compare = false; // with force: count only, do not overwrite
++
++    std::map<int, std::vector<int32_t>> ids; // force: per layer, all tokens in order
++    std::map<int, size_t> cursor;            // force: per layer, next token
++    int64_t k_file = 0;
++
++    // force-mode stats per layer
++    struct stat { int64_t tokens = 0, same_set = 0, overlap = 0; };
++    std::map<int, stat> stats;
++    int64_t k_seen = 0;
++
++    std::vector<int32_t> buf;
++
++    static int layer_of(const char * name) {
++        static const char pfx[] = "ffn_moe_topk-";
++        if (strncmp(name, pfx, sizeof(pfx) - 1) != 0) return -1;
++        return atoi(name + sizeof(pfx) - 1);
++    }
++
++    // returns false on error
++    bool init(int32_t n_ctx, int32_t n_batch, int32_t n_ubatch, bool unified) {
++        static const char magic[8] = {'K', 'M', 'O', 'E', 'R', 'O', 'U', 'T'};
++        const char * dpath = getenv("LLAMA_MOE_ROUTE_DUMP");
++        const char * fpath = getenv("LLAMA_MOE_ROUTE_FORCE");
++        const char * cpath = getenv("LLAMA_MOE_ROUTE_COMPARE");
++        if ((dpath != nullptr) + (fpath != nullptr) + (cpath != nullptr) > 1) {
++            LOG_ERR("moe_route: set only one of DUMP, FORCE and COMPARE\n"); return false;
++        }
++        if (cpath) { fpath = cpath; compare = true; }
++        if (dpath) {
++            dump = fopen(dpath, "wb");
++            if (!dump) { LOG_ERR("moe_route: cannot create %s\n", dpath); return false; }
++            int32_t h[5] = {1, n_ctx, n_batch, n_ubatch, unified ? 1 : 0};
++            fwrite(magic, 1, 8, dump);
++            fwrite(h, sizeof(int32_t), 5, dump);
++            LOG_INF("moe_route: dumping expert ids to %s\n", dpath);
++        }
++        if (fpath) {
++            FILE * f = fopen(fpath, "rb");
++            if (!f) { LOG_ERR("moe_route: cannot open %s\n", fpath); return false; }
++            char m[8]; int32_t h[5];
++            if (fread(m, 1, 8, f) != 8 || memcmp(m, magic, 8) != 0 || fread(h, sizeof(int32_t), 5, f) != 5 || h[0] != 1) {
++                LOG_ERR("moe_route: %s is not a route file\n", fpath); fclose(f); return false;
++            }
++            if (h[1] != n_ctx) {
++                LOG_ERR("moe_route: %s was dumped with n_ctx=%d, this run has %d\n", fpath, h[1], n_ctx);
++                fclose(f); return false;
++            }
++            const bool same_layout = h[2] == n_batch && h[3] == n_ubatch && h[4] == (unified ? 1 : 0);
++            if (!same_layout && !(h[4] == 1 && unified)) {
++                LOG_ERR("moe_route: %s was dumped with n_batch=%d n_ubatch=%d unified=%d, this run has %d/%d/%d; "
++                        "different batch sizes need -kvu in both runs\n", fpath, h[2], h[3], h[4], n_batch, n_ubatch, unified ? 1 : 0);
++                fclose(f); return false;
++            }
++            if (!same_layout) {
++                LOG_INF("moe_route: %s was dumped with n_batch=%d n_ubatch=%d, this run has %d/%d\n",
++                        fpath, h[2], h[3], n_batch, n_ubatch);
++            }
++            size_t n_rec = 0;
++            int32_t rh[3];
++            while (fread(rh, sizeof(int32_t), 3, f) == 3) { // il, n_tokens, k
++                if (k_file != 0 && rh[2] != k_file) {
++                    LOG_ERR("moe_route: %s mixes k=%lld and k=%d\n", fpath, (long long) k_file, rh[2]); fclose(f); return false;
++                }
++                k_file = rh[2];
++                auto & v = ids[rh[0]];
++                const size_t at = v.size();
++                v.resize(at + (size_t) rh[1] * rh[2]);
++                if (fread(v.data() + at, sizeof(int32_t), (size_t) rh[1] * rh[2], f) != (size_t) rh[1] * rh[2]) {
++                    LOG_ERR("moe_route: %s is truncated\n", fpath); fclose(f); return false;
++                }
++                n_rec++;
++            }
++            fclose(f);
++            force = true;
++            LOG_INF("moe_route: %s expert ids from %s (%zu records, %zu layers)\n", compare ? "comparing with" : "forcing",
++                    fpath, n_rec, ids.size());
++        }
++        return true;
++    }
++
++    bool active() const { return dump || force; }
++
++    static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
++        auto * self = (moe_route *) ud;
++        const int il = layer_of(t->name);
++        if (ask) return il >= 0;
++        if (il < 0) return true;
++        return self->on_topk(t, il);
++    }
++
++    bool on_topk(struct ggml_tensor * t, int il) {
++        GGML_ASSERT(t->type == GGML_TYPE_I32 && t->ne[2] == 1 && t->ne[3] == 1);
++        const int64_t k = t->ne[0], n = t->ne[1];
++        const size_t row = (size_t) k * sizeof(int32_t);
++        buf.resize((size_t) k * n);
++        for (int64_t i = 0; i < n; i++) {
++            ggml_backend_tensor_get(t, buf.data() + i * k, i * t->nb[1], row);
++        }
++        k_seen = k;
++        if (dump) {
++            int32_t rh[3] = {il, (int32_t) n, (int32_t) k};
++            fwrite(rh, sizeof(int32_t), 3, dump);
++            fwrite(buf.data(), sizeof(int32_t), buf.size(), dump);
++        }
++        if (force) {
++            auto it = ids.find(il);
++            size_t & c = cursor[il];
++            if (k != k_file || it == ids.end() || (c + n) * k > it->second.size()) {
++                LOG_ERR("moe_route: not enough forced ids for layer %d (k=%lld, %lld tokens)\n", il, (long long) k, (long long) n);
++                return false;
++            }
++            const int32_t * src = it->second.data() + c * k;
++            c += n;
++            stat & s = stats[il];
++            for (int64_t i = 0; i < n; i++) {
++                const int32_t * a = buf.data() + i * k;
++                const int32_t * b = src + i * k;
++                int ov = 0;
++                for (int64_t x = 0; x < k; x++) for (int64_t y = 0; y < k; y++) ov += a[x] == b[y];
++                s.tokens++; s.overlap += ov; s.same_set += ov == k;
++                if (!compare) ggml_backend_tensor_set(t, b, i * t->nb[1], row);
++            }
++        }
++        return true;
++    }
++
++    void finish() {
++        if (dump) { fclose(dump); dump = nullptr; }
++        if (!force) return;
++        size_t left = 0;
++        for (auto & [il, v] : ids) left += v.size() / k_file - cursor[il];
++        if (left) LOG_INF("moe_route: %zu token-layers of the file were not used (fewer chunks than the dump)\n", left);
++        int64_t tok = 0, same = 0, ov = 0;
++        LOG_INF("\nmoe_route: router agreement with the %s ids (own top-%lld vs file)\n", compare ? "reference" : "forced", (long long) k_seen);
++        LOG_INF("moe_route: layer  same set  mean overlap\n");
++        for (auto & [il, s] : stats) {
++            if (s.tokens == 0) continue;
++            LOG_INF("moe_route: %5d  %7.3f%%  %6.3f\n", il, 100.0 * s.same_set / s.tokens, (double) s.overlap / s.tokens);
++            tok += s.tokens; same += s.same_set; ov += s.overlap;
++        }
++        if (tok) LOG_INF("moe_route: all    %7.3f%%  %6.3f  (%lld token-layers)\n", 100.0 * same / tok, (double) ov / tok, (long long) tok);
++    }
++};
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index 601361acd..ec3f5edc9 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -3,6 +3,7 @@
+ #include "fit.h"
+ #include "log.h"
+ #include "llama.h"
++#include "moe-route.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -2023,6 +2024,16 @@ int llama_perplexity(int argc, char ** argv) {
+     llama_backend_init();
+     llama_numa_init(params.numa);
+ 
++    moe_route route;
++    if (!route.init(n_ctx, params.n_batch, params.n_ubatch, params.kv_unified)) {
++        return 1;
++    }
++    if (route.active()) {
++        params.cb_eval = moe_route::cb;
++        params.cb_eval_user_data = &route;
++        params.warmup = false;
++    }
++
+     // load the model and apply lora adapter, if any
+     auto llama_init = common_init_from_params(params);
+ 
+@@ -2065,6 +2076,8 @@ int llama_perplexity(int argc, char ** argv) {
+         results = perplexity(ctx, params, n_ctx);
+     }
+ 
++    route.finish();
++
+     LOG("\n");
+     llama_perf_context_print(ctx);
+     common_memory_breakdown_print(ctx);
