@@ -19,7 +19,8 @@
 // type the item does not already have, a file that differs from the base in
 // that item alone (gguf.Splice; nothing is requantized). Each record is
 // appended to -out as a JSON line, so an interrupted run resumes where it
-// stopped. The candidate file lives in -work and is deleted after its run.
+// stopped. The candidate file lives in -work and is deleted after its run; one
+// left behind by an interrupted run is deleted before the first run.
 //
 // With -route, every run forces the MoE expert ids to those of a reference run
 // (llama-perplexity LLAMA_MOE_ROUTE_DUMP/FORCE in the fork, with -kvu). Free
@@ -460,6 +461,11 @@ func cmdMeasure(args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "base: KLD %.6f ± %.6f, same top %.3f%%%s (%.0f s)\n", s.KLD, s.KLDErr, s.SameTop, routeNote(s), secs)
 	}
 	cand := filepath.Join(*work, "candidate.gguf")
+	// An interrupted run leaves its candidate behind, and splice refuses to
+	// overwrite it. The name belongs to measure, so remove it.
+	if err := os.Remove(cand); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	for i, r := range runs {
 		if *limit > 0 && i >= *limit {
 			fmt.Fprintf(stdout, "stopped after %d runs (-limit)\n", i)
